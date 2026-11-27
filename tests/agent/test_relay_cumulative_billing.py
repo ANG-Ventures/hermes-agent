@@ -271,3 +271,203 @@ def test_blackbox_rows_store_billed_columns_and_mark_the_deferred_row(tmp_path, 
     assert rows[0] == (0, 0, 0, 0, 1, None)
     assert rows[1] == (BILLED["input_tokens"], BILLED["cache_read_tokens"],
                        BILLED["cache_write_tokens"], OUTPUT, None, 2)
+
+
+def test_moa_finalizer_window_split_excludes_advisor_prompts(tmp_path, monkeypatch):
+    """/context's last-call split is the aggregator's own request, like context_used (Prism f40b9825fcf3)."""
+    from agent import turn_finalizer as tf
+
+    a = _agent(tmp_path, monkeypatch)
+    captured = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "on_session_end":
+            captured["turn_usage"] = kwargs.get("turn_usage")
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    usage = {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
+             "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 0}}
+    try:
+        a.client = _MoaClient(REF)
+        calls: list = []
+        _record(a, _response(usage), 1, calls)
+        tf.emit_session_end(
+            a, turn_id="turn", effective_task_id="task", completed=True, failed=False,
+            interrupted=False, turn_exit_reason="text_response(stop)",
+            original_user_message="go", final_response="ok", turn_calls=calls,
+        )
+    finally:
+        a.close()
+    tu = captured["turn_usage"]
+    assert tu["context_used"] == 100
+    assert tu["last_uncached_tokens"] == 100
+    # The bill still carries the advisors.
+    assert tu["input_tokens"] == 100 + REF.input_tokens
+
+
+def test_multi_request_relay_prices_at_the_per_request_tier(tmp_path, monkeypatch):
+    """Two 60k requests (each under Haiku 5.5's 100k tier) bill 120k at the BASE rate (Prism 5d68c042e279)."""
+    from decimal import Decimal
+
+    from plugins.blackbox.cost import compute_turn_cost
+
+    usage = {"prompt_tokens": 60_000, "completion_tokens": 0, "total_tokens": 60_000,
+             "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 0},
+             "upstream_requests": 2, "cumulative_prompt_tokens": 120_000,
+             "cumulative_prompt_tokens_details": {"input_tokens": 120_000, "cached_tokens": 0,
+                                                  "cache_creation_tokens": 0}}
+    route = {"provider": "anthropic", "model": "claude-haiku-5-5", "base_url": ""}
+    one = estimate_usage_cost("claude-haiku-5-5", CanonicalUsage(input_tokens=60_000), provider="anthropic")
+    assert 2 * one.amount_usd == Decimal("0.012")  # each request priced alone, at the base tier
+    a = _agent(tmp_path, monkeypatch)
+    try:
+        from agent import turn_usage
+
+        calls: list = []
+        turn_usage.record_response_usage(
+            a, _response(usage), messages=[{"role": "user", "content": "go"}], api_call_count=1,
+            api_duration=1.0, compression_attempts=0, max_compression_attempts=3,
+            turn_calls=calls, call_route=route)
+        assert a.session_input_tokens == 120_000
+        assert a.session_estimated_cost_usd == pytest.approx(0.012)
+    finally:
+        a.close()
+    cost, status, _ = compute_turn_cost("claude-haiku-5-5", "anthropic", None, calls)
+    assert status == "estimated"
+    assert cost == pytest.approx(0.012)
+
+
+# --- Mixed-tier multi-request bills (t_044f701c, Prism f783806e1416 / 1a8fd0dd1f37) -----------------
+# Haiku 5.5: T=100k; uncached input $0.10/M base, $0.50/M above; output $0.50/M base, $2.50/M above.
+
+
+def _relay_usage(last_input, cumulative_input, requests, output=0):
+    return {"prompt_tokens": last_input, "completion_tokens": output,
+            "total_tokens": last_input + output,
+            "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 0},
+            "upstream_requests": requests, "cumulative_prompt_tokens": cumulative_input,
+            "cumulative_prompt_tokens_details": {"input_tokens": cumulative_input, "cached_tokens": 0,
+                                                 "cache_creation_tokens": 0}}
+
+
+def _record_and_blackbox(tmp_path, monkeypatch, usage):
+    from plugins.blackbox.cost import compute_turn_cost
+
+    route = {"provider": "anthropic", "model": "claude-haiku-5-5", "base_url": ""}
+    a = _agent(tmp_path, monkeypatch)
+    try:
+        from agent import turn_usage
+
+        calls: list = []
+        turn_usage.record_response_usage(
+            a, _response(usage), messages=[{"role": "user", "content": "go"}], api_call_count=1,
+            api_duration=1.0, compression_attempts=0, max_compression_attempts=3,
+            turn_calls=calls, call_route=route)
+        session = (a.session_estimated_cost_usd, a.session_cost_status)
+    finally:
+        a.close()
+    return session, compute_turn_cost("claude-haiku-5-5", "anthropic", None, calls)
+
+
+def test_relay_bill_with_an_earlier_above_tier_request_is_not_priced_at_base(tmp_path, monkeypatch):
+    """Prism f783806e1416: 120k then 60k uncached. The 120k request is above the 100k tier, so the
+    bill is 120k x $0.50/M + 60k x $0.10/M = $0.066, never the all-base $0.018."""
+    (session_cost, session_status), (cost, status, _) = _record_and_blackbox(
+        tmp_path, monkeypatch, _relay_usage(60_000, 180_000, 2))
+    assert session_cost == pytest.approx(0.066)
+    assert session_status != "unknown"
+    assert status == "estimated"
+    assert cost == pytest.approx(0.066)
+
+
+def test_estimate_without_the_request_split_is_unknown_when_tiers_may_mix():
+    """Prism 1a8fd0dd1f37: 150k then 60k with only the last request's size known. The 150k remainder
+    exceeds the tier, so one tier cannot be chosen: unknown, never the all-base $0.021."""
+    r = estimate_usage_cost("claude-haiku-5-5", CanonicalUsage(input_tokens=210_000),
+                            provider="anthropic", tier_prompt_tokens=60_000)
+    assert r.amount_usd is None
+    assert r.status == "unknown"
+
+
+def test_estimate_prices_each_request_at_its_own_tier_when_the_split_is_known():
+    from decimal import Decimal
+
+    r = estimate_usage_cost("claude-haiku-5-5", CanonicalUsage(input_tokens=210_000),
+                            provider="anthropic", tier_prompt_tokens=60_000,
+                            tier_last_usage=CanonicalUsage(input_tokens=60_000), tier_requests=2)
+    assert r.status == "estimated"
+    assert r.amount_usd == Decimal("0.081")  # 150k x 0.50/M + 60k x 0.10/M
+    assert r.cost_input_usd == Decimal("0.081")
+
+
+def test_three_request_bill_with_an_ambiguous_remainder_is_unknown(tmp_path, monkeypatch):
+    """Three requests, last 60k, earlier two sum to 120k: either could be above 100k. Unknown."""
+    (_, session_status), (cost, status, _) = _record_and_blackbox(
+        tmp_path, monkeypatch, _relay_usage(60_000, 180_000, 3))
+    assert session_status in {"unknown", "partial"}
+    assert cost is None and status == "unknown"
+
+
+def test_growing_tool_loop_prices_the_earlier_request_at_base(tmp_path, monkeypatch):
+    """The usual direction: 60k then 120k. Only the last request is above the tier. Output, whose
+    per-request split is not reported, is priced at the last request's (higher) tier, with a note."""
+    from decimal import Decimal
+
+    usage = CanonicalUsage(input_tokens=180_000, output_tokens=1_000)
+    r = estimate_usage_cost("claude-haiku-5-5", usage, provider="anthropic",
+                            tier_prompt_tokens=120_000,
+                            tier_last_usage=CanonicalUsage(input_tokens=120_000), tier_requests=2)
+    # 60k x 0.10/M + 120k x 0.50/M + 1k x 2.50/M
+    assert r.amount_usd == Decimal("0.0685")
+    assert any("output" in n and "tier" in n for n in r.notes)
+    (session_cost, _), (cost, status, _) = _record_and_blackbox(
+        tmp_path, monkeypatch, _relay_usage(120_000, 180_000, 2))
+    assert session_cost == pytest.approx(0.066)  # 60k base + 120k above, no output
+    assert cost == pytest.approx(0.066) and status == "estimated"
+
+
+def test_untiered_model_keeps_the_cumulative_price_without_a_split():
+    one = estimate_usage_cost("claude-haiku-4-5", CanonicalUsage(input_tokens=1_000), provider="anthropic")
+    many = estimate_usage_cost("claude-haiku-4-5", CanonicalUsage(input_tokens=300_000),
+                               provider="anthropic", tier_prompt_tokens=60_000)
+    if one.amount_usd is None:
+        pytest.skip("no anthropic pricing entry for claude-haiku-4-5")
+    assert many.amount_usd == one.amount_usd * 300
+
+
+# --- Unmeasured last-request prompt (Prism bf75d0b8acfd / 287fcee94ef0, t_044f701c r1) ------------
+# The relay can bill a complete cumulative split while the LAST request's own prompt is unmeasured
+# (``*_unknown`` flags over placeholder zeros). Those zeros must not choose the tier or the split.
+
+
+def test_unmeasured_last_prompt_above_the_tier_is_unknown_not_split_on_zeros():
+    last = CanonicalUsage(input_tokens_unknown=True)
+    r = estimate_usage_cost("claude-haiku-5-5", CanonicalUsage(input_tokens=180_000),
+                            provider="anthropic", tier_prompt_tokens=0,
+                            tier_last_usage=last, tier_requests=2)
+    assert r.amount_usd is None
+    assert r.status == "unknown"
+
+
+def test_unmeasured_last_prompt_with_the_whole_bill_below_the_tier_prices_at_base():
+    from decimal import Decimal
+
+    last = CanonicalUsage(cache_read_tokens_unknown=True)
+    r = estimate_usage_cost("claude-haiku-5-5", CanonicalUsage(input_tokens=90_000),
+                            provider="anthropic", tier_prompt_tokens=0,
+                            tier_last_usage=last, tier_requests=3)
+    assert r.status == "estimated"
+    assert r.amount_usd == Decimal("0.009")  # every request <= 90k <= T: 90k x 0.10/M
+
+
+def test_blackbox_reads_the_last_request_unknown_flags():
+    from plugins.blackbox.cost import compute_turn_cost
+
+    calls = [{"model": "claude-haiku-5-5", "provider": "anthropic", "input_tokens": 180_000,
+              "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+              "tier_prompt_tokens": 0, "tier_requests": 2,
+              "tier_last_usage": {"input_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                                  "input_tokens_unknown": True}}]
+    cost, status, _ = compute_turn_cost("claude-haiku-5-5", "anthropic", None, calls)
+    assert cost is None and status == "unknown"

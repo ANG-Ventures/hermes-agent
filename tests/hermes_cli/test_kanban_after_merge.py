@@ -94,7 +94,7 @@ def test_after_merge_releases_on_merged_pr_while_parent_open(kanban_home):
         assert "after_merge_released" in kinds
 
 
-@pytest.mark.parametrize("state", ["OPEN", "CLOSED", None])
+@pytest.mark.parametrize("state", ["OPEN", None])
 def test_after_merge_holds_while_pr_not_merged(kanban_home, state):
     with kb.connect() as conn:
         parent = _parent_with_pr(conn)
@@ -105,6 +105,21 @@ def test_after_merge_holds_while_pr_not_merged(kanban_home, state):
         assert q.calls == [("ANG-Ventures/hermes-agent", 4242)]
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "todo"
+
+
+def test_closed_unmerged_pr_escalates_once_without_releasing_edge(kanban_home):
+    with kb.connect() as conn:
+        parent = _parent_with_pr(conn)
+        child = kb.create_task(conn, title="drill", assignee="daedalus")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        q = _oracle("CLOSED")
+        assert am.release_merged_edges(conn, query_fn=q) == []
+        assert kb.get_task(conn, child).status == "triage"
+        assert kb.parent_links(conn, child) == [(parent, kb.LINK_KIND_AFTER_MERGE)]
+        assert "closed unmerged" in kb.get_task(conn, child).result
+        am.release_merged_edges(conn, query_fn=q)
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? "
+                            "AND kind='after_merge_prerequisite_closed'", (child,)).fetchone()[0] == 1
 
 
 def test_lookup_budget_rotates_across_parents(kanban_home):

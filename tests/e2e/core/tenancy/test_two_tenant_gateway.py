@@ -37,6 +37,8 @@ from typing import Any
 import pytest
 import hermes_yaml as yaml
 
+from tests import rig_parent_watch
+
 from . import _helpers as H
 
 # The api_server platform's aiohttp ships in a PM runtime extra the test env does not carry.
@@ -75,6 +77,7 @@ class MultiplexGateway:
             start_new_session=True,
         )
         log.close()
+        rig_parent_watch.track(self.proc.pid)  # own session: only this watch ends it if pytest dies first
         self.pids.append(self.proc.pid)
 
     def _rebind(self, port: int) -> None:
@@ -114,6 +117,7 @@ class MultiplexGateway:
             H.kill_group(self.proc)
             self.proc.wait(timeout=10)
         H.kill_group(self.proc)
+        rig_parent_watch.untrack(self.proc.pid)
 
     def tail(self, n: int = 3000, offset: int = 0) -> str:
         if not self.log_path.exists():

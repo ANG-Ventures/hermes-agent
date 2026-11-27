@@ -30,9 +30,11 @@ OWNER_WAKE_TRIGGER_EVENTS = {
     ow.TRIGGER_PRECONDITION: [("blocked", {"reason": "waiting on PR#12"})],
     ow.TRIGGER_STUCK: [(k, {"error": "boom"}) for k in sorted(ow.STUCK_KINDS)],
     ow.TRIGGER_LAST_BLOCKER: [("completed", {"summary": "done"})],
-    ow.TRIGGER_RED_HANDBACK: [("review_requested", {"own_repo": True, "pr_state": "red"})],
+    ow.TRIGGER_RED_HANDBACK: [("review_requested", {"own_repo": True, "pr_state": "red"}),
+                              ("review_requested", {"own_repo": True, "pr_state": "dirty"})],
     ow.TRIGGER_WOKE_NONSPAWNABLE: [("skipped_nonspawnable", {"assignee": "apollo"})],
     ow.TRIGGER_REVIEW_DEADMAN: [("review_deadman", {"waiting_min": 25})],
+    ow.TRIGGER_MECHANICAL_WAKE: [("mechanical_wake", {"source": "detached-run", "text": "rc=1"})],
 }
 
 PLAIN = {"id": "t_1", "title": "plain card", "body": "do the thing"}
@@ -47,10 +49,11 @@ EXPECTED = {
     # kind: verdict on a plain card, first occurrence, for a payload with no review fields
     "completed": AUTO, "changes_requested": AUTO,
     "crashed": AUTO, "timed_out": AUTO, "gave_up": AUTO, "stalled": AUTO,
-    "blocked": SURFACE, "block_loop_detected": SURFACE,
+    "blocked": AUTO, "block_loop_detected": SURFACE,
     "review_requested": SURFACE,   # no own_repo/pr_state -> upstream row -> surface
     "reclaimed": SURFACE, "skipped_nonspawnable": SURFACE,
     "review_deadman": AUTO,   # t_1e0ffee4: the deadman's tier-1 event -> the attended-read child
+    "mechanical_wake": AUTO,   # t_6a70430e: a producer's mechanical wake -> the acknowledge/surface child
 }
 
 
@@ -75,7 +78,7 @@ def test_every_kind_x_payload_returns_a_known_verdict(kind, payload):
     d = classify(kind, payload, PLAIN, retries=0)
     assert d.verdict in (AUTO, SURFACE, NONE)
     assert (d.mode is not None) == (d.verdict == AUTO)
-    if kind == "blocked" or kind == "block_loop_detected":
+    if kind == "block_loop_detected":
         assert d.verdict == SURFACE
     if d.verdict == NONE:
         assert kind == "review_requested" and payload["own_repo"] is True
@@ -85,8 +88,10 @@ def test_every_kind_x_payload_returns_a_known_verdict(kind, payload):
 def test_every_owner_wake_reason_is_dispositioned(trigger):
     for kind, payload in OWNER_WAKE_TRIGGER_EVENTS[trigger]:
         verdict = wake_disposition(kind, payload, PLAIN, retries=0)
-        if trigger in (ow.TRIGGER_NEEDS_INPUT, ow.TRIGGER_PRECONDITION, ow.TRIGGER_WOKE_NONSPAWNABLE):
+        if kind != "blocked" and trigger in (ow.TRIGGER_NEEDS_INPUT, ow.TRIGGER_PRECONDITION, ow.TRIGGER_WOKE_NONSPAWNABLE):
             assert verdict == SURFACE, (trigger, kind)
+        elif trigger == ow.TRIGGER_RED_HANDBACK and payload["pr_state"] == "red":
+            assert verdict == NONE, (trigger, kind)   # t_88864f95: an unconflicted red takes no fork
         else:
             assert verdict == AUTO, (trigger, kind)
 
@@ -94,9 +99,9 @@ def test_every_owner_wake_reason_is_dispositioned(trigger):
 @pytest.mark.parametrize("payload_extra", [{}, {"reason": "x"}, {"own_repo": True, "pr_state": "red"}])
 @pytest.mark.parametrize("retries", [0, 1, 5])
 @pytest.mark.parametrize("card", [PLAIN, {"title": "t", "body": "boomerang_wake: on"}, None])
-def test_needs_input_surfaces_always(payload_extra, retries, card):
+def test_needs_input_is_assessed(payload_extra, retries, card):
     payload = {"kind": "needs_input", **payload_extra}
-    assert wake_disposition("blocked", payload, card, retries=retries) == SURFACE
+    assert wake_disposition("blocked", payload, card, retries=retries) == AUTO
 
 
 @pytest.mark.parametrize("kind", ["status", "heartbeat", "unblocked", "archived", "brand_new_kind", ""])
@@ -131,10 +136,16 @@ def test_own_repo_green_or_pending_is_none(state):
     assert wake_disposition("review_requested", {"own_repo": True, "pr_state": state}, PLAIN) == NONE
 
 
-@pytest.mark.parametrize("state", ["red", "dirty"])
-def test_own_repo_red_is_auto(state):
+def test_own_repo_dirty_is_auto_fork():
+    d = classify("review_requested", {"own_repo": True, "pr_state": "dirty"}, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "own_repo_review_red")
+
+
+@pytest.mark.parametrize("state", ["red", "RED"])
+def test_own_repo_red_unconflicted_takes_the_no_fork_row(state):
+    """t_88864f95 (Ace 2026-11-14): a red check holds no merge, so no child proves the red is main's."""
     d = classify("review_requested", {"own_repo": True, "pr_state": state}, PLAIN)
-    assert d.verdict == AUTO and d.mode == "fork"
+    assert (d.verdict, d.mode, d.row) == (NONE, None, "own_repo_review_green_or_pending")
 
 
 # --- t_6e9f48cc: every open Prism key answered in the handback -> a mechanical fork ----------
@@ -150,11 +161,39 @@ def test_own_repo_review_all_keys_answered_is_auto_fork(state):
 @pytest.mark.parametrize("answered", [False, None, "true", 1])
 @pytest.mark.parametrize("state,row", [("green", "own_repo_review_green_or_pending"),
                                        ("pending", "own_repo_review_green_or_pending"),
-                                       ("red", "own_repo_review_red"), (None, "default")])
+                                       ("red", "own_repo_review_green_or_pending"),
+                                       ("dirty", "own_repo_review_red"), (None, "default")])
 def test_unanswered_or_unreadable_keys_keep_todays_rows(answered, state, row):
     """One key missing (False), unreadable prism state (None) or a non-bool: today's row."""
     payload = {"own_repo": True, "prism_all_answered": answered, **({"pr_state": state} if state else {})}
     assert classify("review_requested", payload, PLAIN).row == row
+
+
+# --- t_efb6f435: a review handed to a human reviewer -> a first-read fork, not the home session ---
+
+
+@pytest.mark.parametrize("state", ["green", "pending", "red", "GREEN"])
+def test_own_repo_review_to_human_reviewer_is_auto_fork(state):
+    d = classify("review_requested", {"own_repo": True, "pr_state": state, "human_reviewer": True}, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "own_repo_review_human")
+
+
+@pytest.mark.parametrize("human", [False, None, "true", 1])
+def test_own_repo_review_without_human_reviewer_stays_none(human):
+    """The pipeline-owned case (no human reviewer): today's ``none`` row, no child."""
+    payload = {"own_repo": True, "pr_state": "green", "human_reviewer": human}
+    assert classify("review_requested", payload, PLAIN).row == "own_repo_review_green_or_pending"
+
+
+def test_human_reviewer_keeps_the_dirty_and_all_answered_rows_and_surfaces_on_spend():
+    dirty = {"own_repo": True, "pr_state": "dirty", "human_reviewer": True}
+    assert classify("review_requested", dirty, PLAIN).row == "own_repo_review_red"
+    answered = {"own_repo": True, "pr_state": "green", "human_reviewer": True, "prism_all_answered": True}
+    assert classify("review_requested", answered, PLAIN).row == "own_repo_review_all_keys_answered"
+    card = {"title": "buy", "body": "tags: spend"}
+    assert wake_disposition("review_requested", {"own_repo": True, "pr_state": "green",
+                                                 "human_reviewer": True}, card) == SURFACE
+    assert wake_disposition("review_requested", {"own_repo": False, "human_reviewer": True}, PLAIN) == SURFACE
 
 
 def test_all_answered_upstream_or_spend_card_surfaces():
@@ -235,3 +274,27 @@ def test_review_deadman_event_is_an_auto_fork_row_and_a_tag_surfaces_it():
     d = classify("review_deadman", {"waiting_min": 25}, PLAIN)
     assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "review_deadman")
     assert classify("review_deadman", {}, dict(PLAIN, title="[spend] card")).verdict == SURFACE
+
+
+def test_mechanical_wake_event_is_an_auto_fork_row_and_a_tag_surfaces_it():
+    d = classify("mechanical_wake", {"source": "detached-run"}, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "mechanical_wake")
+    assert classify("mechanical_wake", {}, dict(PLAIN, title="[spend] card")).verdict == SURFACE
+
+
+# --- t_ff6f4be4: a card back in review from a park -> the attended-read fork ---
+
+
+@pytest.mark.parametrize("payload", [
+    {"park_return": True, "own_repo": False},
+    {"park_return": True, "own_repo": True, "pr_state": "green", "human_reviewer": True},
+])
+def test_park_return_review_is_auto_fork_whatever_its_pr(payload):
+    d = classify("review_requested", payload, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "review_park_return")
+
+
+def test_park_return_review_on_a_spend_card_surfaces():
+    card = {"title": "buy", "body": "tags: spend"}
+    assert wake_disposition("review_requested", {"park_return": True}, card) == SURFACE
+    assert wake_disposition("review_requested", {"park_return": "true"}, PLAIN) == SURFACE

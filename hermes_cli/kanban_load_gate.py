@@ -129,6 +129,7 @@ tick, then ``record_spawns(n, now=)`` with what was actually spawned.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -358,12 +359,38 @@ class LoadGate:
             self.band, self.spill_reason = "proc_paused", None
             self.pool = {"planned": False, "reason": "proc_paused"}
             return 0, proc_hard
+        # Prism b9b45a76cc17: a kanban kind pause on this host closes local starts (the pool path closes it in
+        # placement.choose); remote hosts stay allowed, they answer for their own pause. Unreadable = closed.
+        from hermes_cli import kanban_headroom as _kh
+        try:
+            paused = _kh.local_kind_pause()
+        except Exception as exc:
+            paused = f"kind pause unreadable ({type(exc).__name__}: {exc}); refusing, fail closed"
+        if paused:
+            self.state, self.allowance, self.last_reason = "saturated", 0, paused
+            self.band, self.spill_reason = "spilling", "kind_paused"
+            return 0, paused
         ctx = utilization_context()
         sample = {"host": ctx["host"], "os": _os_name(), "at": now, "ncpu": self.ncpu, "cpu_busy": self.cpu_busy,
                   "mem_available_gb": ctx["mem_available_gb"], "mem_total_gb": ctx["mem_total_gb"],
                   "procs": self.procs, "maxproc": self.proc_limit, **sample_psi()}
+        wall = time.time()
+        if ctx["limits"].fleet_cap:
+            sample.update(_local_fleet_pressure(sample["os"], wall=wall, now=now))
         leases = [_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=ts)
                   for ts, n in self._ramp for _ in range(int(n))]
+        try:
+            # t_02aa6d86 (doctrine rule 15): every OTHER consumer's lease on this host (Prism, test-gate, CI) is load
+            # this gate's ramp never saw; an unreadable shared ledger fails closed, never as "nothing booked"
+            # Lease.at is wall-clock; ``now`` is the gate's clock (time.monotonic() in admit_now): re-date each lease by
+            # its age, as GateTickBuilder.seed_out_of_tick does, or a settled lease reads newer than the sample and is
+            # counted on top of the cpu_busy that already holds it (Prism c-79e25e334a28b343)
+            leases += [dataclasses.replace(le, at=now - max(0.0, wall - le.at)) for le in shared_leases(ctx["host"])]
+        except Exception as exc:
+            why = f"utilization: shared ledger unreadable ({type(exc).__name__}: {exc}); refusing, fail closed"
+            self.state, self.allowance, self.last_reason = "saturated", 0, why
+            self.band, self.spill_reason = "spilling", "utilization"
+            return 0, why
         allowance, verdict = 0, None
         # the worker slice's own memory cap (Linux kanbanw.slice; None elsewhere = host axis only, Prism 616c5f0203bd)
         slice_mem = _ad.read_slice_memory(classes=(UTIL_CLASS,))
@@ -722,6 +749,31 @@ def _os_name() -> str:
     return "darwin" if sys.platform == "darwin" else ("linux" if sys.platform.startswith("linux") else sys.platform)
 
 
+def _local_fleet_pressure(os_name: str, *, wall: float, now: float) -> dict:
+    """Use the same sampler fields and freshness policy as remote kanban admission."""
+    from hermes_cli import allocation_policy, kanban_headroom
+    from hermes_cli.kanban_db import kanban_home
+
+    policy = allocation_policy.load(kanban_home() / "fleet")
+    path = policy.pressure_path
+    if os_name == "darwin":
+        paths = policy.doc.get("pressure_path")
+        configured = paths.get("darwin") if isinstance(paths, dict) else None
+        path = configured if isinstance(configured, str) and configured else "/Users/Shared/placement/host-pressure.json"
+    try:
+        fields = kanban_headroom.sample_fields(None, wall, Path(path).read_text(encoding="utf-8-sig"),
+                                              stale_after_s=policy.stale_after_s, local_now=now)
+    except (OSError, ValueError, OverflowError):
+        fields = {}
+    if fields.get("sample_status") != "fresh":
+        return {"mem_total_gb": None}  # no psutil fallback for a percentage fleet RAM cap
+    total = fields["mem_total_gb"]
+    # Age leases against the sampler, not the newer live contention sample:
+    # work started since the fleet reading may not be reflected in it yet.
+    return {"fleet_at": min(now, fields["sample_at"]), "mem_total_gb": total if total is not None and total > 0 else None,
+            "fleet_cpus": fields["fleet_cpus"], "fleet_ram_gb": fields["fleet_ram_gb"]}
+
+
 def sample_psi(root: str = "/proc/pressure") -> dict:
     """PSI ``some avg10`` for cpu / memory / io as ``psi_<x>_some10`` (Linux). An unreadable file is left out, so
     admission.admit() refuses it as unmeasured rather than reading 0; darwin has no /proc/pressure and admit()
@@ -740,6 +792,26 @@ def sample_psi(root: str = "/proc/pressure") -> dict:
 
 
 UNIFIED_WORKLOAD = "kanban"
+
+
+def shared_leases(host: str, root=None, now: Optional[float] = None) -> list:
+    """The shared reservation ledger's live leases on ``host`` booked by every consumer BUT kanban (t_02aa6d86,
+    doctrine rule 15): a Prism review, a test-gate run or a CI runner admitted on this host is load the gate must
+    count before its sample shows it. Kanban's own rows are left out: the gate's ramp already carries every local
+    kanban start (its own spawns plus GateTickBuilder.seed_out_of_tick), so they would be booked twice. A missing
+    ledger is empty; an unreadable one raises (the caller fails closed)."""
+    from hermes_cli.fleet_placement import placement as _pl
+
+    base = Path(root) if root is not None else _pl.fleet_root()
+    rpath = base / _pl.RESERVATIONS_REL
+    if not rpath.exists():
+        return []
+    try:
+        table = _pl.load_hosts(base / _pl.TABLE_REL)
+    except Exception:            # no table: the ledger's own host names, matched as written
+        table = None
+    return [le for le in _pl.ledger_leases(rpath, now=now, table=table)
+            if le.host == host and not str(le.job_class).startswith(UNIFIED_WORKLOAD)]
 
 
 def unified_admit(env: Optional[dict] = None) -> bool:
@@ -779,7 +851,8 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
 
     Fire-and-forget (fault-taxonomy ruling 2026-11-05): the whole call spends at most PUBLISH_BUDGET_S across every
     host (a host left when the budget is gone is skipped, not waited for), never raises, and is counted in
-    PUBLISH_STATS (ok / failed / skipped hosts)."""
+    PUBLISH_STATS (ok / failed / skipped hosts). A host with no local publisher token is skipped, not failed, and is
+    re-checked every pass (t_93618cb2)."""
     try:
         return _publish_ready_demand(queued, root)
     except Exception as exc:  # advisory: nothing here may fail the tick
@@ -789,6 +862,8 @@ def publish_ready_demand(queued: int, root=None) -> Optional[str]:
 
 PUBLISH_BUDGET_S = 1.0
 PUBLISH_STATS = {"ok": 0, "failed": 0, "skipped": 0}
+TOKENLESS_REFUSAL = "provisioned demand publisher token required"
+_TOKENLESS_LOGGED = set()                 # host names already logged as token-less; gates the log line only
 
 
 def _publish_ready_demand(queued, root):
@@ -820,6 +895,18 @@ def _publish_ready_demand(queued, root):
                               {"cpus": unit.cpus, "ram_gb": unit.ram_gb, "gpu_mib": unit.gpu_mib},
                               unified=unified_admit(), timeout=left)
             PUBLISH_STATS["ok"] += 1
+        except _ac.Refused as exc:
+            if isinstance(exc, _ac.AuthorizeRefused) or str(exc) != TOKENLESS_REFUSAL:
+                PUBLISH_STATS["failed"] += 1
+                errors.append(f"{hid}: {type(exc).__name__}: {exc}")
+                continue
+            # a local token-file check, not an answer from a host: re-checked every pass (a token provisioned
+            # later is used at once), never a failure, logged once per host per process (t_93618cb2)
+            PUBLISH_STATS["skipped"] += 1
+            if hid not in _TOKENLESS_LOGGED:
+                _TOKENLESS_LOGGED.add(hid)
+                _log.warning("kanban demand: %s has no demand publisher token; not published until one is "
+                             "provisioned (checked every tick, logged once)", hid)
         except Exception as exc:
             PUBLISH_STATS["failed"] += 1
             errors.append(f"{hid}: {type(exc).__name__}: {exc}")
@@ -860,6 +947,7 @@ def utilization_context() -> dict:
     except Exception:
         pass
     limits = _ad.Limits(mem_reserve_gb=spec.mem_reserve_gb if spec else 0.0,
+                        fleet_cap=spec.fleet_cap if spec else (),
                         cpu_saturable=bool(spec.cpu_saturable) if spec else False,
                         # R2c closures follow this host's scorer, as placement._limits() does (Prism 8e21846c06c9)
                         r2c=spec is not None and spec.scorer == "v2",

@@ -610,6 +610,7 @@ def test_e_ac15_config_refusals_exit_78(root, tmp_path, procs, case):
     assert _hb(root) is None
     text = log.read_text(encoding="utf-8")
     assert sum("refusing to start" in line for line in text.splitlines()) == 1, text[-3000:]
+    assert "cron script runner exit: reason=config refused" in text, text[-3000:]
 
 
 # --- S2 (i): one strike re-arm ---------------------------------------------------------------------
@@ -648,7 +649,7 @@ def test_recovery_runs_once_per_home_only_when_gated_in(root, monkeypatch):
     prof = _make_profile(root, "p1")
     seen = []
     monkeypatch.setattr(InProcessCronScheduler, "recover_interrupted",
-                        lambda self: seen.append(__import__("hermes_constants").get_hermes_home()) or 0)
+                        lambda self, **_kw: seen.append(__import__("hermes_constants").get_hermes_home()) or 0)
     gate = {"default": "knob_disabled", "p1": "home_gateway_not_delegating"}
     monkeypatch.setattr(script_runner, "runner_gate_reason", lambda name, home: gate[name])
     r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root), ("p1", prof)])
@@ -690,6 +691,212 @@ def test_d_code_skew_drains_then_exits_0(root, monkeypatch):
     assert not script_runner.trip_marker_path().exists()
 
 
+
+# --- t_2ddabbc4: drain only when the skew touches a loaded module; every exit logs a reason ---------
+
+def _git(repo: Path, *args) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                          text=True, encoding="utf-8").stdout.strip()
+
+
+def test_skew_loaded_changes_intersects_the_diff_with_loaded_modules(tmp_path, monkeypatch):
+    """The real ``git diff`` path: a skew whose diff misses every loaded module is ``[]``, one that
+    touches (or renames away) a loaded module names it, and an unreadable diff is None."""
+    import types
+
+    from cron import script_runner
+
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    _git(tmp_path, "init", "-q", str(repo))
+    for name in ("loaded.py", "other.py", "moved.py"):
+        (repo / "pkg" / name).write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "boot")
+    boot = _git(repo, "rev-parse", "HEAD")
+    (repo / "pkg" / "other.py").write_text("x = 2\n", encoding="utf-8")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "unloaded only")
+    disk1 = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "mv", "pkg/moved.py", "pkg/renamed.py")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rename loaded")
+    disk2 = _git(repo, "rev-parse", "HEAD")
+
+    for name in ("loaded", "moved"):
+        mod = types.ModuleType(f"t2dd_{name}")
+        mod.__file__ = str(repo / "pkg" / f"{name}.py")
+        monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    shas = {"v": (repo, boot, disk1)}
+    monkeypatch.setattr(script_runner, "_skew_shas", lambda: shas["v"])
+    assert script_runner._skew_loaded_changes() == []
+    shas["v"] = (repo, boot, disk2)
+    assert script_runner._skew_loaded_changes() == ["pkg/moved.py"]
+    shas["v"] = (repo, boot, "f" * 40)  # sha not in the repo
+    assert script_runner._skew_loaded_changes() is None
+    shas["v"] = (repo, None, disk1)  # boot unresolved
+    assert script_runner._skew_loaded_changes() is None
+    shas["v"] = (tmp_path / "missing", boot, disk1)
+    assert script_runner._skew_loaded_changes() is None
+
+
+@pytest.mark.parametrize("changes,drains", [([], False), (["cron/scheduler.py"], True),
+                                            (None, True)],
+                         ids=["unchanged_modules", "changed_module", "unreadable_diff"])
+def test_d_code_skew_drains_only_when_a_loaded_module_changed(root, monkeypatch, changes, drains):
+    from cron import script_runner
+
+    calls = []
+    disk = {"sha": "b" * 40}
+    monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
+    monkeypatch.setattr(script_runner, "_skew_shas", lambda: (root, "a" * 40, disk["sha"]))
+    monkeypatch.setattr(script_runner, "_skew_loaded_changes",
+                        lambda *_a: calls.append(disk["sha"]) or changes)
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 1)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(threading.Event())
+    r.enumerate_homes()
+    r.enumerate_homes()
+    assert r.draining is drains
+    assert r.can_dispatch() is (not drains)
+    if not drains:
+        assert calls == ["b" * 40]  # one diff per disk sha, not one per cycle
+        # A later deploy that does touch a loaded module still drains.
+        disk["sha"] = "c" * 40
+        monkeypatch.setattr(script_runner, "_skew_loaded_changes",
+                            lambda *_a: calls.append(disk["sha"]) or ["cron/jobs.py"])
+        r.enumerate_homes()
+        assert r.draining is True and calls == ["b" * 40, "c" * 40]
+
+
+@pytest.mark.parametrize("switch", ["env", "file"])
+def test_d_skew_kill_switch_restores_drain_on_any_skew(root, monkeypatch, switch):
+    """The kill switch (env HERMES_CRON_SKEW_LOADED_ONLY=0 or <home>/cron/script_runner_skew_any)
+    drains a skew that touches no loaded module; it is read on each check, so setting it on a
+    running runner after a kept skew drains the next skew."""
+    from cron import script_runner
+
+    disk = {"sha": "b" * 40}
+    monkeypatch.delenv("HERMES_CRON_SKEW_LOADED_ONLY", raising=False)
+    monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
+    monkeypatch.setattr(script_runner, "_skew_shas", lambda: (root, "a" * 40, disk["sha"]))
+    monkeypatch.setattr(script_runner, "_skew_loaded_changes", lambda *_a: [])
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 1)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(threading.Event())
+    r.enumerate_homes()
+    assert r.draining is False  # switch off: unchanged-module skew is kept
+    if switch == "env":
+        monkeypatch.setenv("HERMES_CRON_SKEW_LOADED_ONLY", "0")
+    else:
+        (root / "cron" / "script_runner_skew_any").write_text("", encoding="utf-8")
+    disk["sha"] = "c" * 40
+    r.enumerate_homes()
+    assert r.draining is True
+
+
+def test_d_skew_kill_switch_marker_lookup_error_drains(tmp_path, monkeypatch):
+    """Prism bf5dfded8c79: an absent marker is off; a marker that cannot be stat'ed (a symlink
+    loop, where Path.exists() says False) counts as set, so the runner drains."""
+    from cron import script_runner
+
+    monkeypatch.delenv("HERMES_CRON_SKEW_LOADED_ONLY", raising=False)
+    monkeypatch.setattr(script_runner, "trip_marker_path",
+                        lambda: tmp_path / "script_runner_tripped")
+    marker = tmp_path / "script_runner_skew_any"
+    assert script_runner._skew_any_forced() is False
+    marker.symlink_to(marker)  # ELOOP on stat()
+    assert script_runner._skew_any_forced() is True
+
+
+@pytest.mark.parametrize("back_to_boot", [False, True], ids=["revert_commit", "checkout_boot"])
+def test_d_code_skew_diffs_against_the_last_accepted_sha(tmp_path, root, monkeypatch,
+                                                         back_to_boot):
+    """Prism 05d607795190: boot at A, accept B (changes only the unloaded pkg/other.py), import
+    pkg/other.py from B, then a revert (new commit C, or the checkout back at A) must drain: the
+    runner runs B's code, and an A..disk diff would miss it."""
+    import types
+
+    from cron import script_runner
+
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    _git(tmp_path, "init", "-q", str(repo))
+    other = repo / "pkg" / "other.py"
+    other.write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "A")
+    a = _git(repo, "rev-parse", "HEAD")
+    other.write_text("x = 2\n", encoding="utf-8")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "B")
+    b = _git(repo, "rev-parse", "HEAD")
+    if back_to_boot:
+        c = a
+    else:
+        other.write_text("x = 1\n", encoding="utf-8")
+        _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "C revert")
+        c = _git(repo, "rev-parse", "HEAD")
+
+    disk = {"sha": b}
+    monkeypatch.setattr(script_runner, "_skew_shas", lambda: (repo, a, disk["sha"]))
+    monkeypatch.setattr(script_runner, "_detect_code_skew",
+                        lambda: None if disk["sha"] == a else ("a", "d"))
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 1)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(threading.Event())
+    r.enumerate_homes()
+    assert r.draining is False  # B touches no loaded module: accepted
+    mod = types.ModuleType("t2dd_other")
+    mod.__file__ = str(other)
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)  # lazily imported from B
+    r.enumerate_homes()
+    assert r.draining is False  # disk still B: nothing new
+    disk["sha"] = c
+    r.enumerate_homes()
+    assert r.draining is True
+
+
+def test_exit_reason_lines_cover_clean_drain_signal_crash_and_unrecorded(root, monkeypatch,
+                                                                         caplog):
+    from cron import script_runner
+
+    caplog.set_level(logging.WARNING, logger="cron.script_runner")
+    # Clean skew drain: no script in flight.
+    monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
+    monkeypatch.setattr(script_runner, "_skew_loaded_changes", lambda *_a: None)
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 0)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(threading.Event())
+    r.enumerate_homes()
+    assert r.exit_reason == "code skew drain (no script in flight)"
+    r2 = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r2.request_shutdown("signal SIGHUP")
+    r2.request_shutdown("signal SIGTERM")  # the first cause wins
+    assert r2.exit_reason == "signal SIGHUP"
+
+    # A crash in main logs its exception class, and the exit record closes this start.
+    monkeypatch.setattr(script_runner, "_setup_logging", lambda: None)
+
+    def boom(_info):
+        raise RuntimeError("ticker setup")
+
+    monkeypatch.setattr(script_runner, "_run", boom)
+    with pytest.raises(RuntimeError):
+        script_runner.main([])
+    assert "cron script runner exit: reason=crash RuntimeError: ticker setup code=exception" \
+        in caplog.text
+    record = json.loads(script_runner._exit_record_path().read_text(encoding="utf-8-sig"))
+    assert record["pid"] == os.getpid() and record["exit"]["reason"].startswith("crash")
+
+    # A previous runner that died without an exit line (SIGKILL) gets one at the next start.
+    caplog.clear()
+    script_runner._exit_record_path().write_text(
+        json.dumps({"pid": 999999, "started_at": "then", "exit": None}), encoding="utf-8")
+    script_runner.note_start()
+    assert "cron script runner exit: reason=unrecorded code=? pid 999999" in caplog.text
+    caplog.clear()
+    script_runner.note_start()  # own pid, exit None: not a previous runner
+    assert "reason=unrecorded" not in caplog.text
+
+
 @pytest.mark.slow_test(180, reason="real runner subprocess")
 def test_d_code_skew_drain_is_bounded_then_requeues(root, tmp_path, procs):
     """t_c15baa4b: a deploy (code skew) while a long script runs must not park the runner for the
@@ -720,6 +927,7 @@ def test_d_code_skew_drain_is_bounded_then_requeues(root, tmp_path, procs):
     assert rec.get(RESTART_REQUEUE_KEY), rec
     assert not (root / "cron" / "script_runner_tripped").exists()
     assert "drain bounded: re-fire available" in log.read_text(encoding="utf-8")
+    assert "exit: reason=code skew drain bounded" in log.read_text(encoding="utf-8-sig")
 
 
 @pytest.mark.slow_test(180, reason="real runner subprocess")
@@ -1587,9 +1795,13 @@ def test_d_code_skew_drain_waits_when_refire_is_spent(root, tmp_path, procs):
     skew = tmp_path / "skew"
     _script(root, "refire.sh", f"trap 'touch {termed}; exit 143' TERM\necho $$ > {spid}\n"
                                f"sleep 8 & wait $!\ntouch {done}")
-    job = _job(root, "refire", "refire.sh")
+    job = _job(root, "refire", "refire.sh", due_now=False)
+    # Fired the way _apply_restart_requeue fires a re-fire (manual_run_at == next_run_at): a plain
+    # scheduled occurrence starts a fresh re-fire budget (t_2b319a64), so it would not be spent.
+    stamp = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
     with _profile_cron_scope(root):
-        update_job(job["id"], {RESTART_REQUEUE_COUNT_KEY: RESTART_REQUEUE_MAX})
+        update_job(job["id"], {RESTART_REQUEUE_COUNT_KEY: RESTART_REQUEUE_MAX,
+                               "next_run_at": stamp, "manual_run_at": stamp})
     log = tmp_path / "runner.log"
     runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1,
                            RUNNER_HARNESS_SKEW=skew, RUNNER_HARNESS_SKEW_DRAIN_S=1)
@@ -1894,6 +2106,9 @@ def test_c_sigterm_terminates_script_requeues_and_exits_0(root, tmp_path, procs)
     assert _group_gone(s_pid)
     rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
     assert rec.get(RESTART_REQUEUE_KEY), rec
+    # t_2ddabbc4: the signal exit names its cause.
+    assert "cron script runner exit: reason=signal SIGTERM code=0" in log.read_text(
+        encoding="utf-8-sig")
 
 
 # --- t_302ab1e8: ledger-lock trips name the holder, self re-arm, killed jobs re-queue -----------------
@@ -2440,3 +2655,346 @@ def test_second_trip_in_24h_pages_alerts_and_backs_off(root, tmp_path, monkeypat
     r.enumerate_homes()
     assert not marker.exists() and not r.tripped
     assert r._rearmed and r._rearmed["trips_24h"] == 2
+
+
+# --- t_fa0b5cff: a drain-killed long script is re-fired once, promptly; a row may ask to finish ---
+
+def _job_rec(root: Path, job_id: str) -> dict:
+    from cron.runtime_state import merged_jobs
+
+    return {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job_id]
+
+
+def _daily_job_run_now(root: Path, name: str, script: str) -> dict:
+    """A daily ``30 2 * * *`` job fired now the way ``hermes cron run`` does (``trigger_job``): a
+    hand-set ``next_run_at`` on a cron row is re-anchored by the due scan's stale-edit guard."""
+    from cron.jobs import trigger_job
+    from cron.scheduler_provider import _profile_cron_scope
+
+    job = _job(root, name, script, schedule="30 2 * * *", due_now=False)
+    with _profile_cron_scope(root):
+        trigger_job(job["id"])
+    return job
+
+
+def _long_once_script(root: Path, tmp_path: Path) -> tuple:
+    """First run: records its pid and sleeps (the long backup); any later run: touches ``done``."""
+    spid, first, done = tmp_path / "s.pid", tmp_path / "first", tmp_path / "done"
+    _script(root, "backup.sh", f"if [ -e {first} ]; then touch {done}; exit 0; fi\n"
+                               f"touch {first}\necho $$ > {spid}\nsleep 300")
+    return spid, done
+
+
+@pytest.mark.slow_test(240, reason="three real runner subprocesses: a drain kill, a restart, a re-fire")
+def test_t_fa0b_drain_killed_daily_job_refires_once_after_an_extra_restart(root, tmp_path, procs):
+    """2026-11-11 02:52: the code-skew drain killed sub-vps-backup (a daily ``30 2 * * *`` script) at
+    22 of 26 hosts. The run must re-fire once, promptly, after the runner is back, and that must
+    survive a second restart in between (03:06 and 03:15 that night): runner 1 drains and kills,
+    runner 2 starts on still-skewed code and drains at once, runner 3 runs the re-fire."""
+    from cron.jobs import RESTART_REQUEUE_KEY
+
+    spid, done = _long_once_script(root, tmp_path)
+    skew = tmp_path / "skew"
+    job = _daily_job_run_now(root, "backup", "backup.sh")
+    log = tmp_path / "runner.log"
+    r1 = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1, RUNNER_HARNESS_SKEW=skew,
+                       RUNNER_HARNESS_SKEW_DRAIN_S=2)
+    s_pid = int(_wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script"))
+    skew.touch()
+    assert r1.wait(timeout=60) == 0, log.read_text(encoding="utf-8")[-3000:]
+    assert _group_gone(s_pid)
+    rec = _job_rec(root, job["id"])
+    assert rec.get(RESTART_REQUEUE_KEY), rec
+    assert "will re-run once" in (rec.get("last_error") or ""), rec
+    # The extra restart: still skewed, nothing in flight, so it drains and exits at once.
+    r2 = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1, RUNNER_HARNESS_SKEW=skew,
+                       RUNNER_HARNESS_SKEW_DRAIN_S=2)
+    assert r2.wait(timeout=60) == 0, log.read_text(encoding="utf-8")[-3000:]
+    assert _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY), "marker lost across a restart"
+    assert not done.exists()
+    skew.unlink()
+    r3 = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1)
+    try:
+        _wait_for(done.exists, 90, step=0.2, what="the one re-fire")
+        _wait_for(lambda: _job_rec(root, job["id"]).get("last_status") == "ok", 30,
+                  what="re-fire recorded ok")
+        rec = _job_rec(root, job["id"])
+        assert not rec.get(RESTART_REQUEUE_KEY), rec
+    finally:
+        r3.send_signal(signal.SIGTERM)
+        assert r3.wait(timeout=30) == 0, log.read_text(encoding="utf-8")[-3000:]
+
+
+@pytest.mark.slow_test(180, reason="real runner subprocess")
+def test_t_fa0b_drain_lets_a_finish_flagged_job_complete(root, tmp_path, procs):
+    """A row with ``drain_finish_s`` is not terminated at RUNNER_SKEW_DRAIN_MAX_S: the drain waits
+    for it (up to that many seconds of run time) and the run completes ``ok`` with no re-fire."""
+    from cron.jobs import DRAIN_FINISH_KEY, RESTART_REQUEUE_KEY, update_job
+    from cron.scheduler_provider import _profile_cron_scope
+
+    spid, done, termed = tmp_path / "s.pid", tmp_path / "done", tmp_path / "termed"
+    skew = tmp_path / "skew"
+    _script(root, "finish.sh", f"trap 'touch {termed}; exit 143' TERM\necho $$ > {spid}\n"
+                               f"sleep 8 & wait $!\ntouch {done}")
+    job = _daily_job_run_now(root, "finish", "finish.sh")
+    with _profile_cron_scope(root):
+        update_job(job["id"], {DRAIN_FINISH_KEY: 600})
+    log = tmp_path / "runner.log"
+    runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1, RUNNER_HARNESS_SKEW=skew,
+                           RUNNER_HARNESS_SKEW_DRAIN_S=1)
+    _wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script")
+    skew.touch()
+    try:
+        rc = runner.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("runner never exited after the script ended: "
+                             + log.read_text(encoding="utf-8")[-3000:])
+    text = log.read_text(encoding="utf-8")
+    assert rc == 0, text[-3000:]
+    assert done.exists() and not termed.exists(), text[-3000:]
+    assert "drain waiting: finish requested, " + job["id"] in text, text[-3000:]
+    assert "drain bounded" not in text, text
+    rec = _job_rec(root, job["id"])
+    assert rec.get("last_status") == "ok" and not rec.get(RESTART_REQUEUE_KEY), rec
+
+
+def test_t_fa0b_finish_window_is_bounded_by_the_row(root, monkeypatch):
+    """The finish window is the row's own maximum, measured from the run's start: inside it the
+    run holds the drain; past it the run is terminated like any other (one re-fire). A job
+    without the field keeps today's behaviour (never holds)."""
+    import cron.scheduler as sched
+    from cron import script_runner
+    from cron.jobs import DRAIN_FINISH_KEY, update_job
+    from cron.scheduler_provider import _profile_cron_scope
+
+    flagged = _job(root, "flagged", "x.sh", schedule="30 2 * * *", due_now=False)
+    plain = _job(root, "plain", "y.sh", schedule="30 2 * * *", due_now=False)
+    with _profile_cron_scope(root):
+        update_job(flagged["id"], {DRAIN_FINISH_KEY: 1800})
+    kf, kp = sched._inflight_key(flagged["id"], root), sched._inflight_key(plain["id"], root)
+    now = time.time()
+    for started, holds in ((now - 1320, True), (now - 1900, False)):  # 22 min in / past 30 min
+        with sched._running_lock:
+            sched._running_job_ids.update({kf, kp})
+            sched._running_since[kf] = started
+            sched._running_since[kp] = started
+        try:
+            spent, _failed = script_runner._inflight_refire_status()
+            finishing = script_runner._inflight_finish_requested()
+        finally:
+            with sched._running_lock:
+                sched._running_job_ids.difference_update({kf, kp})
+                sched._running_since.pop(kf, None)
+                sched._running_since.pop(kp, None)
+        assert spent == []
+        assert [j for j, _e, _m in finishing] == ([flagged["id"]] if holds else [])
+
+
+@pytest.mark.parametrize("raw,expected", [(None, None), (0, None), (-5, None), ("x", None),
+                                          (True, None), (600, 600), ("900", 900)])
+def test_t_fa0b_drain_finish_seconds_parses_the_row(raw, expected):
+    from cron.jobs import DRAIN_FINISH_KEY, drain_finish_seconds
+
+    job = {} if raw is None else {DRAIN_FINISH_KEY: raw}
+    assert drain_finish_seconds(job) == expected
+
+
+def test_t_fa0b_refire_eta_text_names_the_next_run():
+    """The delivered failure says whether and when the job runs again, so a reader knows if a
+    night was lost: one re-fire when the runner is back, else the next scheduled run."""
+    from cron.scheduler_script import drain_kill_followup
+
+    job = {"id": "j", "schedule": {"kind": "cron", "expr": "30 2 * * *"},
+           "next_run_at": "2026-11-12T02:30:00-08:00"}
+    assert "will re-run once" in drain_kill_followup(job, refire=True)
+    assert "not at its next scheduled time" in drain_kill_followup(job, refire=True)
+    text = drain_kill_followup(job, refire=False)
+    assert "NOT be re-fired" in text and "2026-11-12T02:30:00-08:00" in text
+
+
+def test_t_fa0b_survivor_tree_defers_the_refire_instead_of_dropping_it(root, monkeypatch):
+    """The 2026-11-11 root cause: ``12 script tree(s) survived SIGKILL``, so every cut run's re-fire
+    was withheld and, before this change, never requested: sub-vps-backup ended at 22 of 26 hosts
+    with no re-run. A survivor now leaves a gated row; the re-fire is requested once the surviving
+    member is gone (a real member) and survives a restart in between (the row is on disk)."""
+    import psutil
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+    from cron import script_runner_rearm as rearm
+    from cron.jobs import RESTART_REQUEUE_KEY
+
+    job = _daily_job_run_now(root, "survivor", "s.sh")
+    survivor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        if sys.platform.startswith("linux"):
+            _wait_for(lambda: Path(f"/proc/{leader.pid}/stat").read_text().split()[2] == "Z", 10,
+                      what="leader exited, unreaped")
+        else:
+            time.sleep(1.0)
+        key = sched._inflight_key(job["id"], root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_spent_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+        # The run is cut (a real member alive), and the member outlives TERM and KILL.
+        monkeypatch.setattr(ss, "_script_run_token_members",
+                            lambda _p: [psutil.Process(survivor.pid)])
+        monkeypatch.setattr(ss, "_signal_script_tree", lambda *_a: None)
+        with sched._running_lock:
+            sched._running_since[key] = time.time() - 1320
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+        assert sched._refire_withheld_job_ids == {key}  # never beside the live copy
+        assert key not in sched._refire_spent_withheld_job_ids
+        rows = rearm._read_gated(rearm._gated_path())
+        assert [r["job_id"] for r in rows] == [job["id"]]
+        assert rows[0]["members"] and rows[0]["until"] > time.time()
+        # Next runner start, the tree still alive: kept, no re-fire yet.
+        assert rearm.apply_gated_refires() == 0
+        assert not _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY)
+        survivor.kill()
+        survivor.wait(timeout=10)
+        assert rearm.apply_gated_refires() == 1
+        assert _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY)
+        assert not rearm._gated_path().exists()
+    finally:
+        sched.clear_shutdown()
+        with sched._running_lock:
+            sched._running_since.pop(sched._inflight_key(job["id"], root), None)
+        with contextlib.suppress(Exception):
+            survivor.kill()
+        leader.wait(timeout=10)
+
+
+def test_t_fa0b_gated_refire_bounds_unsure_and_real_members(root):
+    """An unsure member (unreadable environ, may not be ours) holds the re-fire only until
+    ``unsure_until``; a real member until ``until`` (the run's own script deadline)."""
+    from cron import script_runner_rearm as rearm
+    from cron.jobs import RESTART_REQUEUE_KEY
+
+    a = _daily_job_run_now(root, "unsure", "u.sh")
+    b = _daily_job_run_now(root, "real", "r.sh")
+    sib = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        import psutil
+
+        me = [[sib.pid, psutil.Process(sib.pid).create_time()]]
+        now = time.time()
+        rearm.record_gated_refires([
+            {"home": str(root), "job_id": a["id"], "start": now - 100, "members": [],
+             "unsure": me, "until": now + 3600, "unsure_until": now + 50},
+            {"home": str(root), "job_id": b["id"], "start": now - 100, "members": me,
+             "unsure": [], "until": now + 100, "unsure_until": now + 50}])
+        assert rearm.apply_gated_refires(now=now) == 0
+        assert rearm.apply_gated_refires(now=now + 60) == 1  # unsure bound passed
+        assert _job_rec(root, a["id"]).get(RESTART_REQUEUE_KEY)
+        assert not _job_rec(root, b["id"]).get(RESTART_REQUEUE_KEY)
+        assert rearm.apply_gated_refires(now=now + 120) == 1  # the run's deadline passed
+        assert _job_rec(root, b["id"]).get(RESTART_REQUEUE_KEY)
+    finally:
+        sib.kill()
+        sib.wait(timeout=10)
+
+
+def test_t_fa0b_unproven_survivor_holds_the_refire_to_the_deadline(root, monkeypatch):
+    """Prism 28e1906cda71 / 68af07493f6b: a survivor known only through a failed scan
+    (``_UnprovenMember``) produced an empty gate that read as "gone" and re-fired at once, beside a
+    copy that could not be ruled out. It now records ``unproven`` and holds until ``until``."""
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+    from cron import script_runner_rearm as rearm
+    from cron.jobs import RESTART_REQUEUE_KEY
+
+    job = _daily_job_run_now(root, "unproven", "u.sh")
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        if sys.platform.startswith("linux"):
+            _wait_for(lambda: Path(f"/proc/{leader.pid}/stat").read_text().split()[2] == "Z", 10,
+                      what="leader exited, unreaped")
+        else:
+            time.sleep(1.0)
+        key = sched._inflight_key(job["id"], root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_spent_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+        monkeypatch.setattr(ss, "_script_run_token_members", lambda _p: [ss._UnprovenMember()])
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+        assert sched._refire_withheld_job_ids == {key}
+        rows = rearm._read_gated(rearm._gated_path())
+        assert [r["job_id"] for r in rows] == [job["id"]] and rows[0]["unproven"] is True
+        until = float(rows[0]["until"])
+        assert rearm.apply_gated_refires(now=until - 1) == 0
+        assert not _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY)
+        assert rearm.apply_gated_refires(now=until + 1) == 1
+        assert _job_rec(root, job["id"]).get(RESTART_REQUEUE_KEY)
+    finally:
+        sched.clear_shutdown()
+        leader.wait(timeout=10)
+
+
+def test_t_fa0b_gated_record_never_writes_unlocked(root, monkeypatch):
+    """Prism 24de0198b435: on a lock timeout the record did an unlocked read-modify-write, which a
+    concurrent apply could overwrite or unlink, losing the row. It now spills to its own file and
+    the next locked pass folds it in."""
+    import contextlib as _cl
+    from cron import script_runner_rearm as rearm
+
+    a = _daily_job_run_now(root, "rowa", "a.sh")
+    b = _daily_job_run_now(root, "rowb", "b.sh")
+    now = time.time()
+    row = lambda j: {"home": str(root), "job_id": j["id"], "start": now, "members": [],  # noqa: E731
+                     "unsure": [], "unproven": True, "until": now + 3600,
+                     "unsure_until": now + 600}
+    rearm.record_gated_refires([row(a)])
+    real_lock = rearm._file_lock
+
+    @_cl.contextmanager
+    def timed_out(_path, timeout=5.0):
+        yield False
+
+    monkeypatch.setattr(rearm, "_file_lock", timed_out)
+    rearm.record_gated_refires([row(b)])
+    assert [r["job_id"] for r in rearm._read_gated(rearm._gated_path())] == [a["id"]]
+    monkeypatch.setattr(rearm, "_file_lock", real_lock)
+    assert rearm.apply_gated_refires(now=now) == 0  # both held; the spill is folded in
+    ids = sorted(r["job_id"] for r in rearm._read_gated(rearm._gated_path()))
+    assert ids == sorted([a["id"], b["id"]])
+    assert not list(rearm._gated_path().parent.glob(rearm.GATED_SPILL_NAME + ".*"))
+
+
+def test_t_fa0b_gated_fold_keeps_bad_spills_and_the_newest_row(root):
+    """Prism fd3f1ffbf3c5: a spill that could not be read was swallowed and then unlinked, losing
+    its re-fire; now a non-JSON spill is quarantined as ``.bad`` and only folded spills are
+    removed. Prism 65ed2a0864c8: a spill folded late replaced a newer gate for the same job; on a
+    clash the row with the later ``start`` wins."""
+    from cron import script_runner_rearm as rearm
+
+    path = rearm._gated_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    newer = {"home": str(root), "job_id": "j1", "start": now, "unproven": True,
+             "members": [], "unsure": [], "until": now + 3600, "unsure_until": now}
+    older = dict(newer, start=now - 86400, until=now - 1)
+    path.write_text(json.dumps([newer]), encoding="utf-8")
+    good = path.with_name(rearm.GATED_SPILL_NAME + ".1.1.1")
+    good.write_text(json.dumps([older]), encoding="utf-8")
+    bad = path.with_name(rearm.GATED_SPILL_NAME + ".2.2.2")
+    bad.write_text("{not json", encoding="utf-8")
+    locked = path.with_name(rearm.GATED_SPILL_NAME + ".3.3.3")
+    locked.write_text(json.dumps([dict(newer, job_id="j2")]), encoding="utf-8")
+    locked.chmod(0)  # unreadable (an OSError): kept for the next pass, never unlinked
+    try:
+        with rearm._file_lock(path):
+            rows = rearm._fold_gated_spill(path)
+        assert locked.exists()
+    finally:
+        locked.chmod(0o600)
+    assert [r["start"] for r in rows] == [now]  # the stale spill did not replace the newer gate
+    assert not good.exists()
+    assert not bad.exists() and bad.with_name(bad.name + ".bad").exists()
+    assert rearm.apply_gated_refires(now=now) == 0  # still held to the newer run's deadline

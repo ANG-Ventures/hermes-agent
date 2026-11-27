@@ -684,6 +684,18 @@ class SessionCompressionMixin:
             ).rowcount > 0
         return bool(self._execute_write(_do))
 
+    def get_session_turn_lease_holder(self, session_id: str) -> Optional[str]:
+        """Holder of the conversation's turn lease row (expired or not), or None when there is no
+        row. A WAL read, so it answers while another writer holds the write lock."""
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            row = conn.execute(
+                "SELECT holder FROM session_turn_leases WHERE conversation_id = ?", (conversation_id,)
+            ).fetchone()
+        return None if row is None else row[0]
+
     def release_session_turn_lease(self, session_id: str, holder: str) -> None:
         """Release a turn lease iff ``holder`` still owns it; idempotent."""
         if not session_id or not holder:

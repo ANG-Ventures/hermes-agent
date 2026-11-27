@@ -8,6 +8,7 @@ depend on the registry being populated should use it explicitly or via
 ``@pytest.mark.usefixtures("web_registry_populated")``.
 """
 
+import contextlib
 from unittest.mock import patch
 
 import pytest
@@ -32,6 +33,124 @@ def _no_host_browser_use_cli():
     if not hasattr(bu_cli, "_find_cli_unpatched"):
         bu_cli._find_cli_unpatched = bu_cli._find_cli
     with patch.object(bu_cli, "_find_cli", lambda: None):
+        yield
+
+
+_PROC_TAG_ENV = "HERMES_TEST_PROC_TAG"
+_EXIT_GRACE_S = 5.0
+# The live-system guard patches os.kill per test and refuses a pid outside the test's subtree, which a
+# daemon reparented to pid 1 is; the tag re-read right before the signal is the ownership proof instead.
+_REAL_KILL = __import__("os").kill
+import psutil as _psutil  # bound now: tests stub sys.modules["psutil"] with fakes, and the check must not see them
+
+
+@contextlib.contextmanager
+def _real_psutil():
+    """The real psutil, with ``sys.modules["psutil"]`` pointing at it meanwhile: its Linux backend reads
+    ``sys.modules["psutil"].PROCFS_PATH``, and a test that stubbed the module must not stand in."""
+    import sys
+
+    stubbed = sys.modules.get("psutil")
+    sys.modules["psutil"] = _psutil
+    try:
+        yield _psutil
+    finally:
+        if stubbed is not None:
+            sys.modules["psutil"] = stubbed
+
+
+def _end_tagged_processes(tag: str, since: float, kill: bool = True) -> list:
+    """SIGKILL every live process of this user started at/after ``since`` whose environment carries
+    ``tag`` (any parent: a daemon that double-forked to pid 1 counts); returns one line per process.
+    ``kill=False`` only lists them."""
+    import os
+    import signal
+
+    ended = []
+    with _real_psutil() as psutil:
+        for proc in psutil.process_iter(["create_time", "uids"]):
+            try:
+                if proc.pid == os.getpid() or proc.info["create_time"] < since - 1 or (
+                        proc.info["uids"] and proc.info["uids"].real != os.getuid()):
+                    continue
+                # Pin the process before reading its tag, so the signal cannot reach a reused pid:
+                # a pidfd on Linux; elsewhere psutil's create_time identity check right before the kill.
+                pidfd = os.pidfd_open(proc.pid) if hasattr(os, "pidfd_open") else None
+            except (psutil.Error, OSError):
+                continue
+            try:
+                if proc.environ().get(_PROC_TAG_ENV) != tag or proc.status() == psutil.STATUS_ZOMBIE:
+                    continue
+                ended.append(f"pid {proc.pid} ppid {proc.ppid()} {' '.join(proc.cmdline())[:160]}")
+                if not kill:
+                    continue
+                if pidfd is not None:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                elif proc.is_running():
+                    _REAL_KILL(proc.pid, signal.SIGKILL)
+            except (psutil.Error, OSError):
+                continue
+            finally:
+                if pidfd is not None:
+                    os.close(pidfd)
+    return ended
+
+
+@pytest.fixture(autouse=True)
+def _browser_test_leaves_no_process(request, monkeypatch):
+    """A browser test must not leave a process it started alive at teardown (t_12d4dee2).
+
+    Every process a ``test_browser*`` test spawns inherits a per-test tag in its environment; at
+    teardown any live process carrying it is ended and the test fails, naming it. This is what the
+    real-profile ``agent-browser`` daemon (no idle timeout, reparented to pid 1) did for days."""
+    import sys
+    import time
+    import uuid
+
+    if sys.platform == "win32" or not request.node.path.name.startswith("test_browser"):
+        yield
+        return
+    tag = uuid.uuid4().hex
+    since = time.time()
+    monkeypatch.setenv(_PROC_TAG_ENV, tag)
+    yield
+    # agent-browser's ``close`` returns before its session daemon has exited (measured on Linux: still
+    # alive right after close, gone 0.5 s later), so give tagged processes a bounded grace to exit
+    # on their own; one still alive after it is a leak.
+    deadline = time.monotonic() + _EXIT_GRACE_S
+    while _end_tagged_processes(tag, since, kill=False) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    ended = _end_tagged_processes(tag, since)
+    if ended:
+        pytest.fail(f"test left {len(ended)} process(es) it started alive at teardown: {ended}", pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_agent_browser(request):
+    """A unit test must never spawn the host's real agent-browser.
+
+    The real-profile session drops the daemon idle timeout on purpose, so a test that reaches
+    ``agent-browser --session hermes-real-profile get cdp-url`` leaves a daemon at ppid 1 that
+    never exits (t_6bf3a00e). Discovery raises FileNotFoundError, which every caller already
+    treats as "not installed"; tests that patch ``_find_agent_browser`` themselves still win,
+    and tests of discovery itself opt in with ``@pytest.mark.real_agent_browser``.
+    """
+    if request.node.get_closest_marker("real_agent_browser"):
+        yield
+        return
+    try:
+        from tools import browser_tool_install as bt_install
+    except Exception:
+        yield
+        return
+
+    def _refuse(*_a, **_kw):
+        raise FileNotFoundError(
+            "agent-browser discovery is disabled in tests/tools (it would spawn a real daemon); "
+            "patch _find_agent_browser or mark the test real_agent_browser"
+        )
+
+    with patch.object(bt_install, "_find_agent_browser", _refuse):
         yield
 
 

@@ -84,11 +84,11 @@ def _cross_process_enabled() -> bool:
             return True
     except Exception:
         pass
-    # Kanban units that outlived a knob flip (a gateway restarted with ``in_process``) still edit
-    # files in their own processes: this process keeps coordinating while any of them is live.
+    # Units outside this gateway PID (including adopted detached fallbacks) still edit after a
+    # knob flip: every served profile coordinates while any such unit is live.
     ad = sys.modules.get("tools.async_delegation")
     try:
-        return bool(ad is not None and ad.kanban_active_count())
+        return bool(ad is not None and ad.cross_process_active_count())
     except Exception:
         return False
 

@@ -11,6 +11,7 @@ keeps resolving.
 
 import json
 import logging
+import os
 import re
 import shlex
 import stat
@@ -147,13 +148,21 @@ def _foreground_background_guidance(command: str) -> str | None:
     return next((msg for hit, msg in _FOREGROUND_GUIDANCE if hit(unquoted)), None)
 
 
-def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes: int) -> Optional[str]:
+def _read_script_for_guard(
+    env: Any, guard_cwd: str, script_path: str, max_bytes: int, *, local_backend: bool = False,
+) -> Optional[str]:
     """Best-effort script read: host filesystem first, then a bounded
     ``env.execute('head -c ... < path')`` for remote backends. Binary content
     (NUL byte) is not a script: feeding it to the guard tokenizes machine code
-    into bogus paths and crashes the scanner, so it yields None."""
+    into bogus paths and crashes the scanner, so it yields None.
+
+    ``local_backend``: the backend shell sees the same filesystem as this
+    process, so the ``head -c`` fallback is replaced by the identical bounded
+    read done in-process — same bytes, same oversize signal, no bash spawn
+    eating the pre-execution guard's deadline under host load."""
     if env is None:
         return None
+    local_path: Optional[Path] = None
     try:
         local_path = Path(script_path).expanduser()
         if not local_path.is_absolute():
@@ -166,6 +175,8 @@ def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes
                     return None if b"\x00" in data else data.decode("utf-8", errors="replace")
     except Exception:
         pass
+    if local_backend:
+        return None if local_path is None else _bounded_local_read(local_path, max_bytes)
     # Remote backend: bound the read at the source with `head -c` so an
     # oversized binary never crosses the wire (an unbounded `cat` once
     # pinned the gateway's tool thread for 30+ min on a shlex scan). One
@@ -179,6 +190,34 @@ def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes
     except Exception:
         pass
     return None
+
+
+def _bounded_local_read(path: Path, max_bytes: int) -> Optional[str]:
+    """In-process equivalent of ``head -c max_bytes+1 < path`` on the local host.
+
+    Reads at most one byte over budget so lifecycle_guard's sanitizer still
+    fails an oversized file closed. Missing/unreadable paths yield None, as
+    the failed ``head`` did. Non-regular files yield None without reading:
+    the walk's own reader already rejects FIFOs/devices before this callback,
+    and O_NONBLOCK keeps a path swapped for a FIFO since then from blocking."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except (OSError, ValueError):
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        data = b""
+        while len(data) <= max_bytes:
+            chunk = os.read(descriptor, max_bytes + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    return None if b"\x00" in data else data.decode("utf-8", errors="replace")
 
 
 def gateway_lifecycle_block(
@@ -238,10 +277,14 @@ def gateway_lifecycle_block(
         mounted_host=getattr(env, "host_cwd", None),
         env=env,
     )
+    local_backend = env_type == "local"
     unsafe, refusal, hit = scan_gateway_lifecycle_detail(
         command,
         cwd=guard_cwd,
-        read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
+        read_remote_script=lambda p: _read_script_for_guard(
+            env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES, local_backend=local_backend,
+        ),
+        read_remote_script_is_local=local_backend,
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
@@ -250,8 +293,8 @@ def gateway_lifecycle_block(
         return _blocked_json(
             f"Blocked: the lifecycle guard could not scan this command or referenced script: {refusal}. "
             "Nothing in the command is known to contain a gateway lifecycle command, but a "
-            "script the command executes must be scannable (a regular text file under 1 MiB) "
-            "before it can run inside the gateway process.",
+            "script the command executes must be scannable (a regular text file under 1 MiB, at most "
+            "16384 lines, no line over 65,536 characters) before it can run inside the gateway process.",
             "error", blocked_by=_GATEWAY_LIFECYCLE_BLOCK_MARKER,
         )
     if unsafe:
@@ -385,4 +428,20 @@ def home_deletion_block(
     if not hit:
         return None
     logger.warning("Blocked protected-home delete: %s (command: %s)", hit, _safe_command_preview(command))
+    return _blocked_json(refusal_message(hit), "blocked", blocked_by=BLOCK_MARKER)
+
+
+def pkill_argorder_block(*, command: str) -> Optional[str]:
+    """Refuse ``pkill``/``pgrep`` with an option after the pattern (``tools.pkill_argorder_guard``).
+
+    Text-only, so it applies on every backend, including a command shipped to
+    another host inside ``ssh host "..."``. Returns the JSON error string when
+    blocked, else None.
+    """
+    from tools.pkill_argorder_guard import BLOCK_MARKER, find_misordered_pkill, refusal_message
+
+    hit = find_misordered_pkill(command)
+    if not hit:
+        return None
+    logger.warning("Blocked misordered pkill/pgrep: %s (command: %s)", hit, _safe_command_preview(command))
     return _blocked_json(refusal_message(hit), "blocked", blocked_by=BLOCK_MARKER)

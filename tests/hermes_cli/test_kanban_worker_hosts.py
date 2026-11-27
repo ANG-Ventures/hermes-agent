@@ -66,6 +66,7 @@ def reapply_state(monkeypatch):
 @pytest.mark.parametrize("boot,placed,expect_host,expect_failures", [
     ("ace-ai", True, "ace-ai", 0),   # placed at boot, re-apply holds
     ("ace-ai", False, None, 1),      # placed at boot, variable gone: loud
+    ("ci-box", True, "ace-ai", 1),   # re-applied onto another host than boot: loud
     (None, False, None, 0),          # an unplaced worker: the normal local case
 ])
 def test_rc9_reapply_table(reapply_state, caplog, boot, placed, expect_host, expect_failures):

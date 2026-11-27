@@ -315,8 +315,12 @@ def verified_home_sid(conn: sqlite3.Connection, owner: str, home_sid: Any) -> Op
     return None
 
 
-def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
+def owner_acted(conn: sqlite3.Connection, row: dict,
+                skip: Optional[Callable[[sqlite3.Row], bool]] = None) -> Optional[str]:
     """Why the owner has already acted on the card since the deferred cursor, else None.
+
+    ``skip``: a predicate over each event row (id, kind, payload, created_at, ...); a row it
+    returns True for is never evidence (the review-deadman wake's trigger cursor, t_a6da8394).
 
     Evidence: a ``task_events`` row after the cursor written from the owner's
     own human session (:func:`_session_is_owner`), or a non-subagent ``commented`` event
@@ -331,12 +335,14 @@ def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
     task_id = row["task_id"]
     try:
         events = conn.execute(
-            "SELECT id, kind, payload, actor_profile, actor_session_id FROM task_events "
+            "SELECT id, kind, payload, actor_profile, actor_session_id, created_at FROM task_events "
             "WHERE task_id = ? AND id > ? ORDER BY id",
             (task_id, int(row.get("cursor") or 0)),
         ).fetchall()
         human: dict[tuple, bool] = {}  # one provenance probe per (sid, profile)
         for r in events:
+            if skip is not None and skip(r):
+                continue
             sid = r["actor_session_id"]
             profiles = [r["actor_profile"]]
             if r["kind"] == "commented":
@@ -364,9 +370,8 @@ def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
 
 def evaluate(conn: sqlite3.Connection, row: dict) -> Optional[str]:
     """Sync (worker thread): the drop reason for ``row``, or None when it still waits."""
-    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (row["task_id"],)).fetchone()
-    now_status = str(status[0] or "") if status else _fresh.GONE
-    if all(_fresh.is_stale(now_status, k) for k in row.get("kinds") or ()):
+    now_status = _fresh.current_status(conn, row["task_id"])
+    if all(_fresh.is_stale_notice(now_status, k) for k in row.get("kinds") or ()):
         return f"card is {now_status}"
     return owner_acted(conn, row)
 
@@ -447,6 +452,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     from gateway.kanban_watchers_common import _to_thread_process_service, _wake_downgrade_reason
     from gateway.kanban_watchers_notifier import _adapter_for_subscription
     from gateway.wake import adapter_supports_push, deliver_wake
+    from gateway.wake_kind import KANBAN, kanban_wake_sub, wake_meta
     from hermes_cli import kanban_db as kb
 
     state = getattr(runner, "_kanban_pending_wakes", None)
@@ -510,7 +516,9 @@ async def tick(runner: Any, *, now: Optional[float] = None,
                 )
                 await deliver_wake(
                     adapter, text=text, session_id=row.get("session_key") or "", source=source,
-                    metadata={_fresh.META_KEY: [_fresh.card_entry(
+                    wake_kind=KANBAN,
+                    metadata={**wake_meta(sub=kanban_wake_sub(row.get("kinds") or ()), card_id=task_id),
+                              _fresh.META_KEY: [_fresh.card_entry(
                         row.get("board") or None, task_id, row.get("kinds") or (),
                         row.get("event_ts"), text,
                     )]},
@@ -518,7 +526,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             else:
                 await deliver_wake(
                     adapter, text=text, session_id=row.get("session_key") or chat_id,
-                    profile=sub_profile,
+                    profile=sub_profile, wake_kind=KANBAN,
                 )
         except Exception as exc:
             logger.warning("kanban wake deferred-fire failed for %s on %s/%s: %s; kept for retry",

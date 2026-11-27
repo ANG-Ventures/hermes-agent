@@ -112,7 +112,7 @@ def test_trusted_events_route(monkeypatch, capsys, event, same_repo):
 def test_trust_guard_fails_closed(monkeypatch, capsys, event, same_repo):
     runs_on = generate(monkeypatch, capsys, bs="5", event=event, same_repo=same_repo)
     assert not any("blacksmith" in r for r in runs_on)
-    assert runs_on == generate(monkeypatch, capsys, bs=None)
+    assert set(runs_on) == {HOSTED}
 
 
 def test_scoped_plugin_matrix_uses_the_same_rung(monkeypatch, capsys):
@@ -126,7 +126,7 @@ def test_scoped_plugin_matrix_uses_the_same_rung(monkeypatch, capsys):
     t = {s["name"]: s["runs_on"] for s in json.loads(trusted.stdout)["slice"]}
     f = {s["name"]: s["runs_on"] for s in json.loads(fork.stdout)["slice"]}
     assert t[f"plugin {plugin}"] == POOL and t["core smoke"] == POOL
-    assert f == {k: (HOSTED if v == BS else v) for k, v in t.items()}
+    assert f == {k: HOSTED for k in t}
     assert "blacksmith" not in fork.stdout
 
 
@@ -140,7 +140,8 @@ def test_workflow_binds_variable_event_and_same_repo():
     for flag in ('--blacksmith-slices="$CI_BLACKSMITH_SLICES"', '--event="$EVENT_NAME"', '--same-repo="$SAME_REPO"'):
         assert flag in step["run"]
     # Membership never changes: every slice still takes its label from the matrix.
-    assert jobs["test"]["runs-on"] == "${{ fromJSON(matrix.slice.runs_on) }}"
+    assert "fromJSON(matrix.slice.runs_on)" in jobs["test"]["runs-on"]
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in jobs["test"]["runs-on"]
 
 
 def test_blacksmith_is_reachable_only_through_tests_yml():

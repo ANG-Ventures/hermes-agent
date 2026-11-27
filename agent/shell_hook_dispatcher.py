@@ -17,12 +17,42 @@ process group is killed.
 
 stdout: one JSON line per finished hook, in completion order:
 ``{"i", "rc", "out", "err", "timed_out", "elapsed"}`` (``out``/``err`` base64 of the raw bytes),
+plus ``"skipped": true`` for a hook its prefilter skipped (below),
 or ``{"i", "missing": true}`` when the script could not be opened; the driver then runs that hook
 the old way, so the interpreter's own error and the missing-hook self-heal stay unchanged.
+
+Compile once (t_492356b3): the dispatcher compiles each hook's source in the warm parent, keyed on
+(path, device, inode, mtime_ns, size), and the forked child execs that code object instead of
+re-reading and re-compiling the file. Same ``compile(source, abspath, "exec")`` call, so the hook
+sees the same code, ``__file__``, tracebacks and argv. A file that does not compile is not cached;
+its child compiles it the old way and reports the error exactly as before. An edit on disk changes
+the key and is recompiled on the next request.
+
+Prefilter (t_492356b3, opt-in): a hook may declare, as ONE top-level literal assignment
+``HOOK_PREFILTER = {"tools": [...], "tokens": [...], "tool_input_tokens": [...]}`` (any of the
+keys, non-empty string lists), which calls it can act on. The dispatcher reads it with ``ast``
+(never executes it) once per
+compile. A hook is not forked, and answers ``rc 0`` with stdout ``{}`` (the no-op every hook mode
+accepts) plus ``"skipped": true``, only when its declaration provably misses: ``tools`` names the
+tool calls it acts on and the payload's ``tool_name`` is a string outside it; ``tokens`` are
+substrings of which none occurs in the raw payload, in any decoded string in it (keys and values),
+or in that string re-joined after ``shlex.split`` (so shell quoting such as ``g''it`` still matches
+``git``); when any string in the payload does not shell-split, tokens never skip. Because the raw
+text always carries the envelope's ``{``, ``}`` and ``,``, a ``tokens`` list containing one of those
+can never skip; ``tool_input_tokens`` (t_7d9b8ad4) is the same test scoped to the decoded strings
+(keys and values, recursively) under ``tool_input`` and their shlex re-joins only, never the raw
+JSON, so ``{`` matches only a ``{`` the tool call itself carries. It never skips when ``tool_input``
+is absent or not an object, or when a string under it does not shell-split. ``tokens`` keeps its
+raw-text scope for existing declarations. A hook without a
+valid declaration, or a payload that is not a JSON object, runs as before. A hook file written
+while the dispatcher reads it is not cached. Tokens cannot
+see through shell indirection (``$X``, ``eval``): declare tokens only when the hook itself acts on
+nothing but the literal text.
 
 Stdlib only, Python 3.9-compatible: it runs under whatever interpreter the hooks name.
 """
 
+import ast
 import base64
 import json
 import os
@@ -40,6 +70,8 @@ import subprocess  # noqa: F401
 from importlib.machinery import SourceFileLoader
 
 _AGENT_PID = os.getppid()
+_SKIPPED = object()
+_NOOP_OUT = base64.b64encode(b"{}").decode("ascii")
 _CHUNK = 65536
 
 
@@ -93,7 +125,145 @@ def _close_inherited_fds():
                 pass
 
 
-def _run_child(script, args, in_fd, out_fd, err_fd):
+_PREFILTER_NAME = "HOOK_PREFILTER"
+# abspath -> (stat key, code or None, prefilter or None). One entry per hook path.
+_compiled = {}
+
+
+def _stat_key(st):
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _read_prefilter(source):
+    """The hook's ``HOOK_PREFILTER`` declaration, validated, or None (run the hook as before)."""
+    if _PREFILTER_NAME.encode("ascii") not in source:
+        return None
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return None
+    values = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id == _PREFILTER_NAME for t in targets):
+            values.append(node.value)
+    if len(values) != 1:
+        return None
+    try:
+        decl = ast.literal_eval(values[0])
+    except Exception:
+        return None
+    if not isinstance(decl, dict) or not decl or set(decl) - {"tools", "tokens", "tool_input_tokens"}:
+        return None
+    out = {}
+    for key, items in decl.items():
+        if not isinstance(items, (list, tuple)) or not items:
+            return None
+        if not all(isinstance(s, str) and s for s in items):
+            return None
+        out[key] = frozenset(items) if key == "tools" else tuple(items)
+    return out
+
+
+def _load(script):
+    """``(code, prefilter)`` for the script, compiled once per (path, dev, inode, mtime, size).
+    ``code`` None: the child reads and compiles the file itself, exactly as before."""
+    path = os.path.abspath(script)
+    try:
+        key = _stat_key(os.stat(path))
+    except OSError:
+        return None, None
+    hit = _compiled.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1], hit[2]
+    try:
+        with open(path, "rb") as fh:
+            before = _stat_key(os.fstat(fh.fileno()))
+            source = fh.read()
+            after = _stat_key(os.fstat(fh.fileno()))
+        code = compile(source, path, "exec")
+    except Exception:
+        _compiled.pop(path, None)
+        return None, None
+    prefilter = _read_prefilter(source)
+    if before != after or after != key:
+        # Written while we read: the bytes match no single version. Use nothing cached; the child
+        # reads the file itself, and the next request compiles the settled version.
+        _compiled.pop(path, None)
+        return None, None
+    _compiled[path] = (key, code, prefilter)
+    return code, prefilter
+
+
+def _strings(value, out):
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            _strings(k, out)
+            _strings(v, out)
+    elif isinstance(value, list):
+        for v in value:
+            _strings(v, out)
+
+
+def _haystack(found, head=()):
+    """Each string plus its ``shlex.split`` re-join, newline-joined; None when one does not split."""
+    parts = list(head)
+    for s in found:
+        parts.append(s)
+        try:
+            parts.append(" ".join(shlex.split(s)))
+        except ValueError:
+            return None
+    return "\n".join(parts)
+
+
+def _payload_view(payload):
+    """``(tool_name, haystack, input_haystack)`` for prefilter matching, or None when the payload is
+    not a JSON object. ``haystack`` (for ``tokens``) is the raw text plus every decoded string;
+    ``input_haystack`` (for ``tool_input_tokens``) is only the decoded strings under ``tool_input``,
+    and None when ``tool_input`` is absent or not an object. Either is None when one of its strings
+    does not shell-split: then no token miss is provable (a hook may parse it another way)."""
+    try:
+        text = payload.decode("utf-8")
+        data = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    found = []
+    _strings(data, found)
+    tool_input = data.get("tool_input")
+    input_haystack = None
+    if isinstance(tool_input, dict):
+        scoped = []
+        _strings(tool_input, scoped)
+        input_haystack = _haystack(scoped)
+    return data.get("tool_name"), _haystack(found, (text,)), input_haystack
+
+
+def _prefilter_skips(prefilter, view):
+    """True only when the hook's declaration provably does not match this call."""
+    if prefilter is None or view is None:
+        return False
+    tool_name, haystack, input_haystack = view
+    tools = prefilter.get("tools")
+    if tools is not None and isinstance(tool_name, str) and tool_name not in tools:
+        return True
+    for key, hay in (("tokens", haystack), ("tool_input_tokens", input_haystack)):
+        tokens = prefilter.get(key)
+        if tokens is not None and hay is not None and not any(t in hay for t in tokens):
+            return True
+    return False
+
+
+def _run_child(script, args, in_fd, out_fd, err_fd, code=None):
     """In the forked child: become ``python <script> <args>``; never returns."""
     status = 1
     try:
@@ -120,9 +290,11 @@ def _run_child(script, args, in_fd, out_fd, err_fd):
         _keep.append(sys.modules.get("__main__"))  # the dispatcher's own module stays alive
         sys.modules["__main__"] = main
         try:
-            with open(script, "rb") as fh:
-                source = fh.read()
-            exec(compile(source, path, "exec"), main.__dict__)
+            if code is None:
+                with open(script, "rb") as fh:
+                    source = fh.read()
+                code = compile(source, path, "exec")
+            exec(code, main.__dict__)
             status = 0
         except SystemExit as exc:
             status = _exit_code(exc)
@@ -173,13 +345,18 @@ class _Hook:
         self.out = self.err = b""
 
 
-def _start(i, hook, payload):
+def _start(i, hook, payload, view):
+    """A running ``_Hook``; None when the script cannot be opened; ``_SKIPPED`` when its prefilter
+    provably misses (``view()`` gives the payload's prefilter view, built once per request)."""
     script, args = hook["script"], hook.get("args") or []
     try:
         with open(script, "rb"):
             pass
     except OSError:
         return None
+    code, prefilter = _load(script)
+    if prefilter is not None and _prefilter_skips(prefilter, view()):
+        return _SKIPPED
     in_r, in_w = os.pipe()
     out_r, out_w = os.pipe()
     err_r, err_w = os.pipe()
@@ -187,7 +364,7 @@ def _start(i, hook, payload):
     sys.stderr.flush()
     pid = os.fork()  # windows-footgun: ok — POSIX fork model; on Windows this raises and shell_hooks_batch runs hooks one by one
     if pid == 0:
-        _run_child(script, args, in_r, out_w, err_w)
+        _run_child(script, args, in_r, out_w, err_w, code)
     for fd in (in_r, out_w, err_w):
         os.close(fd)
     for fd in (in_w, out_r, err_r):
@@ -246,10 +423,21 @@ def _run_request(request):
 
 def _run_hooks(request, payload, sel):
     live = []
+    views = []
+
+    def view():
+        if not views:
+            views.append(_payload_view(payload))
+        return views[0]
+
     for i, hook in enumerate(request["hooks"]):
-        h = _start(i, hook, payload)
+        h = _start(i, hook, payload, view)
         if h is None:
             _emit({"i": i, "missing": True})
+            continue
+        if h is _SKIPPED:
+            _emit({"i": i, "rc": 0, "out": _NOOP_OUT, "err": "", "timed_out": False, "elapsed": 0.0,
+                   "skipped": True})
             continue
         live.append(h)
     for h in live:
@@ -269,6 +457,10 @@ def _run_hooks(request, payload, sel):
                 try:
                     n = os.write(h.in_w, h.payload[:_CHUNK])
                     h.payload = h.payload[n:]
+                except (BlockingIOError, InterruptedError):
+                    # A nonblocking pipe can become full after readiness was reported.
+                    # Keep the unwritten suffix and retry; closing here truncates hook JSON.
+                    continue
                 except (BrokenPipeError, OSError):
                     h.payload = h.payload[:0]
                 if not len(h.payload):

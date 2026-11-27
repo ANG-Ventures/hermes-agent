@@ -430,3 +430,85 @@ def test_copy_constructing_a_lazy_container_still_triggers_the_extend(tmp_path, 
         f"{which}(...) of a lazy container did not trigger the plugin "
         f"auto-extend; the copy is missing {PLUGIN_NAME}"
     )
+
+
+# A plugin-only provider that also lists ITSELF on import, the shape of every fleet
+# plugin-only lane (openai-elr, claude-alrs, each claude-apx-N pin): register, then
+# ``CANONICAL_PROVIDERS.append`` guarded by a slug check.
+SELF_LISTING_PLUGIN_INIT = PLUGIN_INIT + textwrap.dedent(
+    f"""
+    from hermes_cli.models import ProviderEntry
+    if not any(p.slug == {PLUGIN_NAME!r} for p in CANONICAL_PROVIDERS):
+        CANONICAL_PROVIDERS.append(ProviderEntry({PLUGIN_NAME!r}, "Lazy Canonical Probe", "self-listed"))
+    """
+)
+
+DUP_DRIVER = textwrap.dedent(
+    """
+    import collections, json, sys
+
+    if sys.argv[1] == "discovery-first":
+        import providers
+        providers.list_providers()
+    import hermes_cli.models as models
+
+    # In "read-first" this is the first read of the lazy list: it runs discovery (the gateway order).
+    slugs = [p.slug for p in models.CANONICAL_PROVIDERS]
+    avail = [row["id"] for row in models.list_available_providers()]
+    rep = lambda xs: sorted(s for s, n in collections.Counter(xs).items() if n > 1)
+    probe = sys.argv[2]
+    print("PROBE_JSON " + json.dumps({"slugs": slugs, "repeated": rep(slugs),
+                                      "avail": avail, "avail_repeated": rep(avail),
+                                      "label": models._PROVIDER_LABELS.get(probe),
+                                      "in_known_names": probe in models._KNOWN_PROVIDER_NAMES,
+                                      "parsed": list(models.parse_model_input(
+                                          probe + ":probe-model-a", "openrouter"))}))
+    """
+)
+
+
+@pytest.mark.parametrize("order", ["read-first", "discovery-first"])
+def test_plugin_only_provider_is_listed_once(tmp_path, order):
+    """t_169d0cee: no slug is listed twice when the first read of the list runs discovery.
+
+    The auto-extend captured its "already listed" set BEFORE ``list_providers()`` ran
+    discovery; the plugin's own append (and the post-discovery catalog sync) then listed
+    the provider, and the auto-extend appended it a second time.
+    """
+    home = tmp_path / f"hermes_home_{order}"
+    plugin_dir = home / "plugins" / "model-providers" / PLUGIN_NAME
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text(SELF_LISTING_PLUGIN_INIT)
+    (plugin_dir / "plugin.yaml").write_text(
+        f"name: {PLUGIN_NAME}\nkind: model-provider\nversion: 0.0.1\n"
+    )
+    driver = tmp_path / f"dup_{order}.py"
+    driver.write_text(DUP_DRIVER)
+
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    env[PROBE_KEY_ENV] = "sk-laz...robe"
+
+    proc = subprocess.run(
+        [sys.executable, str(driver), order, PLUGIN_NAME],
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=300,
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("PROBE_JSON ")]
+    assert lines, (
+        f"driver produced no verdict (rc={proc.returncode})\n"
+        f"--- stdout ---\n{proc.stdout[-4000:]}\n--- stderr ---\n{proc.stderr[-4000:]}"
+    )
+    result = json.loads(lines[-1][len("PROBE_JSON "):])
+    # Not lost: the fixture's provider is present exactly once on both surfaces.
+    assert result["slugs"].count(PLUGIN_NAME) == 1, (order, result["slugs"][-5:])
+    assert result["avail"].count(PLUGIN_NAME) == 1, (order, result["avail"][-5:])
+    assert result["repeated"] == [], f"[{order}] CANONICAL_PROVIDERS repeats {result['repeated']}"
+    assert result["avail_repeated"] == [], (
+        f"[{order}] list_available_providers repeats {result['avail_repeated']}"
+    )
+    # The label / parser backfill must not depend on which writer appended the row
+    # (Prism c26fac2582c4): a self-listing plugin is still selectable as ``slug:model``.
+    assert result["label"] == "Lazy Canonical Probe", (order, result["label"])
+    assert result["in_known_names"], f"[{order}] {PLUGIN_NAME} missing from _KNOWN_PROVIDER_NAMES"
+    assert result["parsed"] == [PLUGIN_NAME, "probe-model-a"], (order, result["parsed"])

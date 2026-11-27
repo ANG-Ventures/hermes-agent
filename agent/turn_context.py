@@ -112,7 +112,8 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
         from agent.message_sanitization import stale_thinking_reaches_wire
 
         return stale_thinking_reaches_wire(
-            *(_str_attr(agent, k) for k in ("api_mode", "provider", "model", "base_url"))
+            *(_str_attr(agent, k) for k in ("api_mode", "provider", "model", "base_url")),
+            requested_provider=_str_attr(agent, "requested_provider"),
         )
     except Exception:
         return True
@@ -681,6 +682,10 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
     ("_pre_verify_nudges", 0),
     # Cross-lane no-first-byte clock (agent/fallback_wall_budget.py, t_452c6ead).
     ("_wall_budget", None),
+    # Models the relay pool said it cannot serve this turn (t_5188f4ed).
+    ("_pool_exhausted_models", None),
+    # Largest request a fallback lane rejected as too long this turn (t_5188f4ed).
+    ("_context_rejected_tokens", 0),
 )
 
 
@@ -1244,6 +1249,9 @@ def build_turn_context(
         persist_user_timestamp, persist_user_platform_id,
     )
     agent._restore_primary_runtime()
+    # A slot-configured seat follows a re-rendered model-slots.json from this turn on.
+    from agent.model_slots import refresh_slot_for_turn
+    refresh_slot_for_turn(agent)
     _publish_runtime_main(agent)
     _publish_cron_auto_model(agent)
     _refresh_mcp_tools_between_turns(agent)

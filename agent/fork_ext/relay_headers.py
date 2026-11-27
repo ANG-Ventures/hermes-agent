@@ -569,12 +569,14 @@ def consume_first_request_headers(agent) -> dict:
     Consumed on the first request build whatever the provider, so a later turn
     can never carry it; returned only on a pool-affinity lane (INV-8).
     """
+    agent._fork_pin_sent = False
     pending = getattr(agent, "_first_request_extra_headers", None)
     if not pending:
         return {}
     agent._first_request_extra_headers = None
     if (getattr(agent, "provider", "") or "").strip().lower() not in _POOL_AFFINITY_PROVIDERS:
         return {}
+    agent._fork_pin_sent = bool(pending.get(POOL_PIN_SUB_HEADER))
     return dict(pending)
 
 

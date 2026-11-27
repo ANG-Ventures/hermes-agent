@@ -70,6 +70,9 @@ def _attach_child(parent_agent: Any, child: Any) -> None:
     so the whole spawn tree dies with its parent."""
     if hasattr(parent_agent, "_active_children"):
         _with_children_lock(parent_agent, "append", child)
+    # Done/running counts for the gateway's in-flight heartbeat line (t_90e5c823).
+    from gateway.inflight_tool_status import record_delegate_child
+    record_delegate_child(parent_agent, child)
     if getattr(parent_agent, "_interrupt_requested", False) is not True:
         return
     # Same soft/hard split as ``interrupt()``'s own fan-out: a hard stop cancels, a soft one redirects.
@@ -631,6 +634,8 @@ def _build_result_entry(
             entry["failure_reason"] = _failure_reason
     elif interrupt_note:
         entry["error"] = interrupt_note
+    if status == "interrupted" and result.get("interrupt_message"):
+        entry["interrupt_message"] = result["interrupt_message"]
 
     # Schema-validation outcome — emitted ONLY when a schema was requested, so
     # legacy (schema-less) payloads keep their exact shape.

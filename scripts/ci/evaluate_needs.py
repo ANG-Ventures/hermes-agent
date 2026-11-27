@@ -27,8 +27,11 @@ def _expected_jobs(
         "lint": (python, "detect.outputs.python == 'true'"),
         # The only macOS/Windows coverage: a mis-gated `if:` must not drop it silently.
         "tests-os": (
-            python and detect.get("hosted_os") == "true",
-            "detect.outputs.python == 'true' and detect.outputs.hosted_os == 'true'",
+            python and detect.get("hosted_os") == "true"
+            and any(detect.get(lane) == "true" for lane in
+                    ("os_tests", "e2e", "e2e_upgrade")),
+            "detect.outputs.python == 'true' and detect.outputs.hosted_os == 'true' "
+            "and at least one tests-os child lane is selected",
         ),
         "bootstrap-installer": (
             detect.get("bootstrap") == "true",

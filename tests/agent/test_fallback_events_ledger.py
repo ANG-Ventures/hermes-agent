@@ -217,6 +217,91 @@ def test_401_token_redacted_in_err_head(_home, monkeypatch):
     assert len(r["err_head"]) <= 160
 
 
+@pytest.mark.parametrize("reset", [None, "2026-11-10T03:00:00Z", "not-a-time", "nan", "inf"])
+def test_model_cap_notice_names_route_and_only_upstream_reset(reset):
+    import datetime as dt
+    from agent import fallback_policy as fp
+
+    a = types.SimpleNamespace(session_id="quota-notice")
+    msg = ("no eligible sub for the requested model; this model's budget is capped "
+           "on every subscription while other models are unaffected")
+    body = {"error": {"message": msg}}
+    if reset is not None:
+        body["error"]["reset_at"] = reset
+    err = _Err(msg, 503, headers={"x-relay-error-class": "quota_model",
+                                "x-relay-error-hop": "relay"}, body=body)
+    fbe.stash_api_error(a, err, 503)
+    row = fbe.build_row(a, "failover", from_provider="claude-alr",
+                        from_model="claude-opus-5-5", to_provider="cpa",
+                        to_model="gpt-6.1-sol", extra={"sticky_until_epoch": 9_999_999_999})
+    text = fp.format_cause_rider(row, tz=dt.timezone.utc)
+    assert "claude-opus-5-5 via claude-alr" in text
+    assert "model-specific, not account-wide" in text
+    assert "at the relay" in text
+    assert "connection" not in text and "Anthropic 503" not in text
+    if reset == "2026-11-10T03:00:00Z":
+        assert "upstream reset 2026-11-10 03:00 UTC" in text
+    else:
+        assert "reset" not in text
+
+
+@pytest.mark.parametrize("headers,reset_expected", [
+    ({}, False),
+    ({"x-ratelimit-reset": "2026-11-10T03:00:00Z"}, True),
+    ({"retry-after": "60"}, True),
+])
+def test_model_cap_notice_reaches_persisted_banner(_home, monkeypatch, headers, reset_expected):
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    a.model = "claude-opus-5-5"
+    msg = ("no eligible sub for the requested model; this model's budget is capped "
+           "on every subscription while other models are unaffected")
+    err = _Err(msg, 503, headers={"x-relay-error-class": "quota_model",
+                                "x-relay-error-hop": "relay", **headers},
+               body={"error": msg})
+    fbe.stash_api_error(a, err, 503)
+    assert try_activate_fallback(a, reason=FailoverReason.pool_exhausted)
+    text = _rows(_home)[0]["notice_text"]
+    assert "model budget capped for claude-opus-5-5 via claude-alr" in text
+    assert "model-specific, not account-wide" in text
+    assert ("upstream reset" in text) is reset_expected
+
+
+@pytest.mark.parametrize("err_head", [
+    "your account budget is capped",   # Prism 341f2b8e51c2 repro: account-wide, not model-specific
+    "this model's budget is capped",   # spec rev12 §4.8 pinned example: no model scope in the text
+])
+def test_unscoped_budget_cap_is_not_attributed_to_the_model(err_head):
+    from agent import fallback_policy as fp
+
+    row = {"trigger_class": "quota_model", "hop": "relay", "attempts": 1, "err_head": err_head,
+           "from_model": "m", "from_provider": "p"}
+    text = fp.format_cause_rider(row)
+    assert "model-specific" not in text and "for m via p" not in text, text
+    assert text.startswith("model budget capped at the relay"), text
+
+
+@pytest.mark.parametrize("msg,cls", [
+    ("This request would exceed your account's rate limit", "rate_upstream"),
+    ("upstream connect timed out", "conn"),
+    ("pool at capacity", "pool_pressure"),
+])
+def test_non_model_cap_not_described_as_model_exhaustion(msg, cls):
+    from agent import fallback_policy as fp
+
+    a = types.SimpleNamespace(session_id="quota-notice")
+    fbe.stash_api_error(a, _Err(msg, 503, body={"error": msg}), 503)
+    row = fbe.build_row(a, "failover", from_provider="claude-alr",
+                        from_model="claude-opus-5-5", to_provider="cpa", to_model="gpt-6.1-sol")
+    assert row["trigger_class"] == cls
+    text = fp.format_cause_rider(row)
+    assert "model-specific" not in text and "model budget capped" not in text
+    if cls == "rate_upstream":
+        assert "account rate limit" in text
+
+
 def test_url_credentials_redacted_in_err_head(_home, monkeypatch):
     """Backfill C3 (#1211): a provider error echoing a credential-bearing URL."""
     msg = "bad redirect https://u:hunter2pw@h.test/cb?access_token=" + "opaque123" + "secret"

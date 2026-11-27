@@ -69,6 +69,7 @@ def _make_completed_task(delivery_mode):
     try:
         tid = kb.create_task(
             conn,
+            boomerang_wake=False,
             title="wake ordering task",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",

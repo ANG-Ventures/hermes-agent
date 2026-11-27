@@ -59,8 +59,13 @@ ROUTE_HASH_KEY = "route_hash"
 REQUIRES_KEY = "requires"
 
 # #1876's spelling for the two rail tokens (spec s3, one token family).
-_TOKEN_OF_CAP = {"browser-session": "BROWSER_RAIL_ABSENT", "screen": "SCREEN_RAIL_ABSENT"}
-_CAP_OF_TOKEN = {v: k for k, v in _TOKEN_OF_CAP.items()}
+# t_f935cb6f: only a signed-in identity is the browser RAIL. ``browser-identity`` and its one-release alias
+# ``browser-session`` share the token; ``browser-public`` (the agent's own Chromium) and ``lan-reach`` are plain
+# capabilities (BROWSER_PUBLIC_ABSENT, LAN_REACH_ABSENT), so a public page never reads as Ace's browser.
+_TOKEN_OF_CAP = {"browser-identity": "BROWSER_RAIL_ABSENT", "browser-session": "BROWSER_RAIL_ABSENT",
+                 "screen": "SCREEN_RAIL_ABSENT"}
+# A capless #1876 rail line re-routes as ``browser-session``: the word every map (old or split) defines.
+_CAP_OF_TOKEN = {"BROWSER_RAIL_ABSENT": "browser-session", "SCREEN_RAIL_ABSENT": "screen"}
 _FIELD_RE = re.compile(r"\b(cap|host)=([A-Za-z0-9._-]+)")
 
 
@@ -97,6 +102,19 @@ def parse_absent(message: Optional[str]) -> Optional[Tuple[str, Optional[str], O
     return token, cap, host
 
 
+def absent_cause(message: Optional[str]) -> Optional[str]:
+    """The ``cause:`` line under an ABSENT token line (t_f1a3ee84): why the tool could not run there."""
+    for line in str(message or "").splitlines()[1:]:
+        if line.startswith("cause: "):
+            return line[len("cause: "):].strip() or None
+    return None
+
+
+def _cause_suffix(message: str) -> str:
+    cause = absent_cause(message)
+    return f"\ncause: {cause}" if cause else ""
+
+
 # -- the board decision (F1) ----------------------------------------------------
 
 def prior_reroutes(conn, task_id: str) -> int:
@@ -106,12 +124,14 @@ def prior_reroutes(conn, task_id: str) -> int:
         (task_id, REROUTE_EVENT)).fetchone()[0])
 
 
-def _with_requires_line(body: Optional[str], cap: str) -> str:
+def _with_requires_line(body: Optional[str], cap: str, note: str) -> str:
+    """Append ``requires: <cap> (<note>)``: a reasoned line hermes-home create_refusal() accepts (t_1aea9763)."""
     from hermes_cli.kanban_host_capabilities import declared_words
+    from hermes_cli.kanban_studio_pin import requires_line
     text = body or ""
     if cap in declared_words(text):
         return text
-    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + f"requires: {cap}\n"
+    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + requires_line(cap, note) + "\n"
 
 
 def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
@@ -150,7 +170,7 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
             if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
                 return None
             if prior_reroutes(conn, task_id) == 0:
-                body = _with_requires_line(row["body"], cap)
+                body = _with_requires_line(row["body"], cap, f"re-routed after {token} on {host or 'a pool host'}")
                 # A reviewer run goes back to the review queue, never to ready (#1963 Prism).
                 back_to = kb._retry_status_for_run(conn, task_id, int(run_id))
                 conn.execute(
@@ -161,10 +181,11 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
                             summary=message.split("\n", 1)[0])
                 kb._append_event(conn, task_id, REROUTE_EVENT,
                                  {"from": host, "cap": cap, "run_id": int(run_id), "token": token,
-                                  "to": back_to},
+                                  "to": back_to,
+                                  **({"cause": absent_cause(message)} if absent_cause(message) else {})},
                                  run_id=int(run_id))
                 kb.add_comment(conn, task_id, "dispatcher",
-                               f're-routed: {cap}, ran on {host}; I added "requires: {cap}" to the body. '
+                               f're-routed: {cap}, ran on {host}; I added a "requires: {cap} (...)" line to the body. '
                                f"Delete that line to undo.")
                 decided = "rerouted"
         if decided:
@@ -177,7 +198,7 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
                   f"Second placement miss: the first ({prev.get('token')} cap={prev.get('cap')} "
                   f"host={prev.get('from')}) was re-routed once already, so the capability map or "
                   f"the derivation is wrong. Fix fleet/host-capabilities.json or the skill index, "
-                  f"or pin the card by hand.")
+                  f"or pin the card by hand.{_cause_suffix(message)}")
     else:
         reason = message
     # The re-route ledger, not block_recurrences, decided this: the loop
@@ -203,7 +224,7 @@ def _custody_hold(conn, task_id: str, run_id: int, message: str, *, cap: str, ho
               f"Placement custody hold: run {run_id} on {host} may have left work in its workspace "
               f"{workspace or '(unknown path)'} on {host}. Workspaces are host-local (no sync), so the "
               f"pool cannot move that work to another host. Recover or discard it on {host}, add "
-              f"`requires: {cap}` to pin the next run, then unblock.")
+              f"`requires: {cap}` to pin the next run, then unblock.{_cause_suffix(message)}")
     if not kb.block_task(conn, task_id, reason=reason, kind="needs_input",
                          expected_run_id=int(run_id), loop_breaker=False):
         return None
@@ -329,10 +350,10 @@ def decide(cmap, host: str, requirements: Iterable[str], modes: Mapping[str, str
     refusal line for ``requirements`` on ``host`` under ``cmap``, else None. An unresolved
     ``unknown:<word>`` parks before any routable known miss (470af3484c95): a re-route can never
     satisfy a word no host serves. An absent/invalid map gates nothing (F11)."""
-    from hermes_cli.kanban_host_capabilities import UNKNOWN_PREFIX
+    from hermes_cli.kanban_host_capabilities import UNKNOWN_PREFIX, mapped_caps
     if cmap is None or not cmap.valid:
         return None
-    have = cmap.hosts.get(host.lower(), frozenset())
+    have = mapped_caps(cmap, host.lower())
     for cap in sorted(dict.fromkeys(requirements), key=lambda c: not c.startswith(UNKNOWN_PREFIX)):
         if (line := _refusal(cap, have, host, modes)) is not None:
             return line
@@ -414,7 +435,9 @@ def attached_skill_gap(skills: Iterable[str], host: str, caps) -> Optional[str]:
     if caps is None or not caps.cmap.valid or caps.cmap.index_error is not None:
         return None
     from hermes_cli import kanban_host_capabilities as khc
-    have = caps.cmap.hosts.get(host.lower(), frozenset())
+    # The host's EFFECTIVE capabilities (browser_remote grant/veto applied), the one reading
+    # dispatch, boot and the mid-run gates share (Prism 17187502307d, t_6e8eac1c).
+    have = khc.mapped_caps(caps.cmap, host.lower())
     for s in dict.fromkeys(skills or ()):
         if not isinstance(s, str):
             continue

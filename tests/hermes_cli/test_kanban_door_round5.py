@@ -103,6 +103,7 @@ def _pool_table(fleet):
     d.mkdir(parents=True, exist_ok=True)
     for name in doc["hosts"]:
         (d / f"kanban@{name}").write_text("pair-token\n", encoding="utf-8")
+    (d / "kanban").write_text("capacity-owner-token\n", encoding="utf-8")
 
 
 def _plan(*, remote=True):
@@ -211,7 +212,10 @@ def test_a_card_that_moves_host_after_a_real_restart_is_withdrawn_from_the_old_h
     the pool enqueue got 409 invalid and the door latched."""
     tid = _card()
     door_fleet.allocd.hold = True
-    proc = subprocess.run([sys.executable, "-c", _HELD_TICK], env=dict(os.environ), timeout=120,
+    # a subprocess has no conftest: hand it this test's provisioned root receipt (hermes-home #9789)
+    from hermes_cli import fleet_placement
+    receipt = fleet_placement.admission_demand._receipt_path(Path(os.environ["ALLOCATION_HOME"]).absolute())
+    proc = subprocess.run([sys.executable, "-c", _HELD_TICK], env=dict(os.environ, PLACEMENT_ROOT_RECEIPT=str(receipt)), timeout=120,
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert _uid(tid) in door_fleet.allocd.waiting("mac-studio")
@@ -304,6 +308,7 @@ def test_repairing_the_owner_reservation_token_clears_the_latch(door_fleet):
     """Prism d5a47f67cca8: the reservation upgrade authenticates with the token named exactly ``kanban``. RED on
     1f9b456d: the fingerprint read only kanban@* files, so repairing ``kanban`` never cleared the latch."""
     alloc_client.mark_protected("kanban")                    # a protected consumer whose token is missing
+    (door_fleet.root / alloc_client.TOKENS_REL / "kanban").unlink()
     tid = _card()
     with kbc.connect_closing() as conn:
         task = kb.claim_task(conn, tid)
@@ -378,7 +383,8 @@ def test_a_stale_record_entry_on_an_unreachable_host_is_dropped_never_latched(do
             assert priority.publish_waiting(conn, {}) == {}
             assert faults.latched() is None, faults.latched()
         assert door.load_published(conn) == set()
-    dropped = [r for r in caplog.records if "dropped published unit" in r.getMessage()]
+    message = "dropped published unit" if lost == "host_left_table" else "pending withdrawal of published unit"
+    dropped = [r for r in caplog.records if message in r.getMessage()]
     assert len(dropped) == 1 and uid in dropped[0].getMessage()
 
 
@@ -399,6 +405,35 @@ def test_a_permission_only_token_repair_clears_the_latch(door_fleet):
         token.chmod(0o600)
 
 
+def test_a_root_receipt_repair_clears_the_latch(door_fleet, monkeypatch, tmp_path):
+    """Prism f6e8a5c31293: a latch caused by missing root provisioning clears once PLACEMENT_ROOT_RECEIPT is set,
+    and again when the receipt file it names is repaired."""
+    monkeypatch.delenv("PLACEMENT_ROOT_RECEIPT", raising=False)
+    faults.latch("PLACEMENT_ROOT_RECEIPT required")
+    assert faults.latched()
+    receipt = tmp_path / "placement-root.json"
+    monkeypatch.setenv("PLACEMENT_ROOT_RECEIPT", str(receipt))
+    assert faults.latched() is None                       # env repaired: a fresh door attempt is allowed
+    faults.latch("receipt unreadable")
+    assert faults.latched()
+    receipt.write_text("{}", encoding="utf-8")
+    assert faults.latched() is None                       # receipt file created: cleared again
+
+
+def test_a_root_generation_repair_clears_the_latch(door_fleet, monkeypatch, tmp_path):
+    """Prism f6e8a5c31293 (t_8400247f): root validation also refuses on the root's generation nonce ("root generation
+    changed"). Restoring that file is a provisioning repair the receipt never sees, so the fingerprint must cover it.
+    RED on 9ae3cf71fe: the fingerprint read the receipt env and file only."""
+    from hermes_cli.fleet_placement import admission_demand
+    receipt = tmp_path / "placement-root.json"
+    receipt.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("PLACEMENT_ROOT_RECEIPT", str(receipt))
+    faults.latch("root generation changed")
+    assert faults.latched()
+    (door_fleet.root / admission_demand._NONCE).write_text("restored-generation", encoding="utf-8")
+    assert faults.latched() is None                       # nonce restored: a fresh door attempt is allowed
+
+
 def test_an_idle_publish_does_not_clear_a_publish_outage(door_fleet):
     """Prism 0056dc604414. RED on 605a9c86: with nothing waiting and nothing recorded, publish_waiting made no allocd
     call yet recorded publish success, so an idle tick after the backoff cleared the outage and paged recovery."""
@@ -412,3 +447,30 @@ def test_an_idle_publish_does_not_clear_a_publish_outage(door_fleet):
     with faults._state() as doc:
         assert "publish" in faults._transport(doc)
     assert not any("reachable again" in p for p in door_fleet.pages)
+
+
+def test_real_review_spawn_does_not_retry_after_post_launch_typeerror(door_fleet):
+    from hermes_cli import kanban_db_dispatch as dispatch
+    tid=_card('review me')
+    with kbc.connect_closing() as conn,kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?",(tid,))
+    import subprocess
+    import sys
+    starts=[]
+    def spawn(task,workspace,*,board=None):
+        process=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'])
+        starts.append(process)
+        if len(starts)==1:
+            raise TypeError('after external process creation')
+        return process.pid
+    try:
+        with kbc.connect_closing() as conn:
+            dispatch.dispatch_once(conn,spawn_fn=spawn,dry_run=False,default_assignee='default',
+                                   max_spawn=64,reconcile_orphans=False)
+        auth=[b for p,b in door_fleet.allocd.calls if p=='/demand/authorize']
+        assert len(auth)==1
+        assert len(starts)==1, f'one shared authorization started two real children: {[p.pid for p in starts]}'
+    finally:
+        for process in starts:
+            process.terminate()
+            process.wait(timeout=5)

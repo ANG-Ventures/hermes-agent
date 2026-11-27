@@ -131,8 +131,7 @@ def test_reclaim_preserves_worker_review_required_block(conn):
     tid = kb.create_task(conn, title="review handoff", assignee="w")
     kb.claim_task(conn, tid)
     assert kb.block_task(
-        conn, tid, reason="review-required: PR #1 open",
-    ) is True
+        conn, tid, reason="review-required: PR #1 open", kind="needs_input") is True
     assert _status(conn, tid) == "blocked"
 
     _stamp_stale_claim(conn, tid)

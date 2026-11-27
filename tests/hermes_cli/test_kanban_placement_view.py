@@ -1,6 +1,6 @@
 """AC-12 (Traceability-vs-Placement spec v1.1 §10, Phase 3; card t_87e6afb5).
 
-``hermes kanban placement --fleet`` reads ONE module
+``hermes kanban allocation --fleet`` reads ONE module
 (``kanban_placement_view``): a fixture of 3 pool hosts x 2 boards, the band
 from a ``load_gate.json`` fixture, held rows grouped by code with the host
 that refused. Named mutations (each shown red once on the card):
@@ -52,7 +52,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "alpha-box": {"roles": {"kanban-worker": {"slots": 2}}, "state": "active"},
         "mid-box": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}}})
     _write(h / "fleet" / "kanban-pool.json", {
-        "schema": 1, "ssh_user": "kanbanw", "capacity_pct": 0.8, "priority": LADDER,
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "capacity_pct": 0.8, "priority": LADDER,
         "profiles": ["alpha"], "hosts": {n: {"enabled": True, "absence": "optional"} for n in LADDER}})
     return h
 
@@ -282,12 +282,12 @@ def test_cli_placement_fleet_and_diagnostics_alias(home, boards, tmp_path, capsy
     _write(gate_file, _gate(band_zeta="warm"))
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
     # --gate PATH reads that file; the default path is <root>/load_gate.json.
-    assert kcli._cmd_placement(_parse("placement", "--fleet", "--gate", str(gate_file), "--json")) == 0
+    assert kcli._cmd_placement(_parse("allocation", "--fleet", "--gate", str(gate_file), "--json")) == 0
     rep = json.loads(capsys.readouterr().out)
     assert rep["hosts"]["zeta-box"]["band"] == "warm" and rep["hosts"]["zeta-box"]["running"] == 3
     _write(home / "load_gate.json", _gate(band_zeta="hot"))
     assert kcli._cmd_diagnostics(_parse("diagnostics", "--placement", "--fleet")) == 0
     assert any(ln.startswith("  zeta-box: running=3 slots=uncounted") and "band=hot" in ln
                for ln in capsys.readouterr().out.splitlines())
-    assert kcli._cmd_placement(_parse("placement", boards["h_pin"])) == 0
+    assert kcli._cmd_placement(_parse("allocation", boards["h_pin"])) == 0
     assert "held: pin_host_full host=zeta-box" in capsys.readouterr().out

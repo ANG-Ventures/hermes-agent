@@ -25,10 +25,11 @@ def backfill_origin_hosts(conn) -> int:
     Local legacy runs have no placement event and remain unknown. Remote
     events populate their run even when the card is terminal.
     """
+    from hermes_cli import kanban_placement_reasons as _pr
     latest = {}
     for row in conn.execute(
         "SELECT task_id, run_id, payload FROM task_events "
-        "WHERE kind='worker_placed' ORDER BY id"
+        f"WHERE kind IN ({_pr.kind_marks('worker_placed')}) ORDER BY id", _pr.kind_names("worker_placed")
     ):
         try:
             host = json.loads(row[2] or "{}").get("host")
@@ -121,7 +122,9 @@ def origin_hard_refusal(conn, row, pool, host: str, caps=None) -> Optional[str]:
         # here too, with or without a capability map. A Studio-only access
         # never runs on the origin host.
         from hermes_cli import kanban_worker_pool as kwp
-        access = kwp.access_bound_for(row["body"], pool)
+        from hermes_cli import kanban_host_capabilities as khc
+        # A served ssh-root (t_79c2259b) was checked above as a hard capability on ``host``.
+        access = kwp.access_bound_for(row["body"], pool, served=khc.served_ssh_root(caps))
         if access is not None:
             reason = f"access {access} is Studio-only; state is on {host}"
     if reason is None:
@@ -175,9 +178,11 @@ def origin_route(conn, row, pool, *, config: dict, states: dict, caps=None,
         origin_hard_refusal(conn, row, pool, host, caps)
     now = int(time.time()) if now is None else now
     if reason is None and state == "unknown":
+        from hermes_cli import kanban_placement_reasons as _pr
         last = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' ORDER BY id DESC LIMIT 1",
-            (tid,),
+            f"SELECT payload FROM task_events WHERE task_id=? AND kind IN ({_pr.kind_marks('placement_wait')}) "
+            "ORDER BY id DESC LIMIT 1",
+            (tid, *_pr.kind_names("placement_wait")),
         ).fetchone()
         prev = kb._json_or(last[0]) if last else {}
         prev = prev if isinstance(prev, dict) else {}
@@ -209,6 +214,104 @@ def remote_cleanup_host(conn, task_id):
         return None
     pool = kwp.read_pool(kb.kanban_home() / 'fleet', kanban_cfg=kb._board_home_kanban_cfg())
     return next((h for h in pool.pool_hosts if h.name == row[0]), None)
+
+
+def remote_run_host(conn, task_id: str) -> Optional[str]:
+    """The pool host holding the card's scratch tree, or None.
+
+    Read from ``tasks.origin_host``, the field enforce-mode placement routes
+    on (:func:`origin_route`), so a restored placeholder and the next
+    placement name the same host (Prism c544a7721690). The dispatcher's copy
+    of the path is only the placeholder ``resolve_workspace`` made, so a
+    missing local dir there is not a lost mount (t_8721e331). None when the
+    card has no remote origin, or when it ran on the Studio at its current
+    path: that dir held real work and its loss stays a stranded refusal
+    (Prism 029eb26d973c).
+    """
+    row = conn.execute("SELECT origin_host FROM tasks WHERE id=?", (task_id,)).fetchone()
+    host = row[0] if row else None
+    if not host or host.lower() == STUDIO or _ran_on_studio_at_current_path(conn, task_id):
+        return None
+    return host
+
+
+def _ran_on_studio_at_current_path(conn, task_id: str) -> bool:
+    """True when any card that held the current path ran on the Studio while holding it.
+
+    The path is held from the card's latest ``origin_dropped`` or outgoing
+    ``workspace_transferred`` (both leave the card on a fresh path) to now,
+    and back through the ``--continues`` chain: each source held it up to its
+    ``workspace_transferred`` event (Prism e641269822db), and from its
+    previous drop or transfer (Prism f98378c58467). Run order against those events is by event id, so a run
+    in the same second as the event is placed exactly (Prism c920880fe89d);
+    a run with no events falls back to ``started_at`` and a tie counts
+    (fail closed: the stranded refusal stays). Runs with a NULL host never
+    spawned (or predate host recording) and are not counted.
+    """
+    card, upper, seen = task_id, None, set()
+    while card and card not in seen and len(seen) < 32:
+        seen.add(card)
+        lower = conn.execute(
+            "SELECT id, created_at FROM task_events WHERE task_id=?"
+            " AND kind IN ('origin_dropped','workspace_transferred')"
+            " AND id<? ORDER BY id DESC LIMIT 1",
+            (card, upper[0] if upper else 2**62),
+        ).fetchone()
+        for run_id, started in conn.execute(
+            "SELECT id, COALESCE(started_at, 0) FROM task_runs WHERE task_id=? AND LOWER(host)=?",
+            (card, STUDIO),
+        ).fetchall():
+            first = conn.execute(
+                "SELECT MIN(id) FROM task_events WHERE task_id=? AND run_id=?", (card, run_id),
+            ).fetchone()[0]
+            after = lower is None or (first > lower[0] if first is not None else started >= lower[1])
+            before = upper is None or (first < upper[0] if first is not None else started <= upper[1])
+            if after and before:
+                return True
+        if lower is not None:
+            return False  # the path began at that drop/transfer; earlier holders used another dir
+        cont = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='continues' ORDER BY id DESC LIMIT 1",
+            (card,),
+        ).fetchone()
+        try:
+            parent = json.loads(cont[0]).get("parent") if cont else None
+        except (TypeError, ValueError, AttributeError):
+            parent = None
+        if not parent:
+            return False
+        upper = conn.execute(
+            "SELECT id, created_at FROM task_events WHERE task_id=? AND kind='workspace_transferred'"
+            " AND json_extract(payload, '$.to')=? ORDER BY id DESC LIMIT 1",
+            (parent, card),
+        ).fetchone()
+        if upper is None:
+            return True  # a chain we cannot place: keep the refusal
+        card = parent
+    return False
+
+
+def restore_remote_placeholder(conn, task) -> Optional[str]:
+    """Re-create the local placeholder of a scratch card whose tree lives on a pool host.
+
+    Returns that host when the placeholder now exists, else None. The path is
+    unchanged, so the card's state on its origin host stays bound to it (an
+    enforce-mode origin route sends it back there; elsewhere it starts in an
+    empty dir, as any re-placed scratch card does). Mount checks stay in
+    :func:`_materialize_fresh`: an unmounted root raises and nothing is made.
+    """
+    import os
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    if (task.workspace_kind or "scratch") != "scratch" or not task.workspace_path:
+        return None
+    host = remote_run_host(conn, task.id)
+    if host is None:
+        return None
+    try:
+        _materialize_fresh(conn, task.workspace_path)
+    except (WorkspaceUnavailable, OSError):
+        return None
+    return host if os.path.isdir(os.path.expanduser(task.workspace_path)) else None
 
 
 def _fresh_path(path: str, tag: str) -> str:
@@ -371,6 +474,7 @@ def drop_origin(conn, task_id: str, *, actor: str, files: list) -> bool:
 def create_hints(conn, task_id: str, body: Optional[str], *, continues=None) -> None:
     import re
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_placement_reasons as _pr
     for source in sorted(set(re.findall(r"\bt_[0-9a-f]{8}\b", body or ""))):
         if source in (task_id, continues):
             continue
@@ -378,4 +482,4 @@ def create_hints(conn, task_id: str, body: Optional[str], *, continues=None) -> 
         if row and row[0]:
             message = f"{source} left state on {row[0]}; recreate with --continues {source} to keep it"
             kb.add_comment(conn, task_id, "dispatcher", message)
-            kb._append_event(conn, task_id, "placement_hint", {"source": source, "host": row[0]})
+            kb._append_event(conn, task_id, _pr.PLACEMENT_HINT_EVENT, {"source": source, "host": row[0]})

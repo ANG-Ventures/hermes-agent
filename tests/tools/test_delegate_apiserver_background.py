@@ -103,6 +103,9 @@ def _patch_delegate(monkeypatch):
     fake_child.enabled_toolsets = ["file", "terminal"]
     fake_child.reasoning_config = None
     fake_child.fallback_model = None
+    fake_child._fallback_chain = []
+    fake_child._boomerang_route_source = "delegation-default"
+    fake_child._boomerang_route = None
     fake_child.service_tier = None
     fake_child.providers_allowed = None
     fake_child.providers_ignored = None

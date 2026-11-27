@@ -6,6 +6,7 @@ from pathlib import Path
 from ruamel.yaml import YAML
 
 from tests.ci.desktop_release_roles import gate
+from tests.ci.public_workflow_allowlist import assert_dispatch_only, self_start_allowed
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -267,13 +268,17 @@ def test_publication_reconciler_has_every_recovery_trigger_and_shared_lock():
     assert stable["concurrency"] == publication["concurrency"] == {
         "group": "stable-release", "cancel-in-progress": "false",
     }
-    assert {"workflow_dispatch", "workflow_run"} <= set(publication["on"])
-    assert publication["on"]["workflow_run"] == {
-        "workflows": ["Stable Release"], "types": ["completed"],
-        # fork: a ci-overflow-ledger data commit starts zero workflows (spec §5.3,
-        # tests/test_ci_overflow_workflow_contract.py::test_ledger_branch_commit_starts_no_workflow).
-        "branches-ignore": ["ci-overflow-ledger"],
-    }
+    if self_start_allowed("stable-release-publication.yml"):
+        assert {"workflow_dispatch", "workflow_run"} <= set(publication["on"])
+        assert publication["on"]["workflow_run"] == {
+            "workflows": ["Stable Release"], "types": ["completed"],
+            # fork: a ci-overflow-ledger data commit starts zero workflows (spec §5.3,
+            # tests/test_ci_overflow_workflow_contract.py::test_ledger_branch_commit_starts_no_workflow).
+            "branches-ignore": ["ci-overflow-ledger"],
+        }
+    else:
+        assert "workflow_dispatch" in publication["on"]
+        assert_dispatch_only(publication["on"], "stable-release-publication.yml")
     reconcile = publication["jobs"]["reconcile"]
     assert reconcile["environment"] == "release-signing"
     assert publication["permissions"] == {"contents": "write", "actions": "write"}

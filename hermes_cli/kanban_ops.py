@@ -148,8 +148,8 @@ def _recent_local_starts(since: float) -> list:
             with kbc.connect_closing(board=slug) as bconn:
                 out.extend(float(r[0]) for r in bconn.execute(
                     "SELECT r.started_at FROM task_runs r WHERE r.started_at >= ? AND NOT EXISTS ("
-                    "SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind = ?)",
-                    (int(since), _kwp.PLACED_EVENT)).fetchall())
+                    "SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind IN (?, ?))",
+                    (int(since), "worker_placed", "worker_allocated")).fetchall())
         except Exception:
             continue
     return out
@@ -198,7 +198,10 @@ def _cli_utilization_gate(conn, args, gate, out, emit, load1):
              f"cpu_busy={busy})")
         return out
     if reason:
-        emit(f"Load gate: utilization SATURATED cpu_busy={busy} (load {l1} not read) - spawning 0 this call: {reason}")
+        # spawn_limit 0 is the LOCAL budget only (dispatch_once local_budget); the saturated band is `spilling`,
+        # so the pool plan still places portable cards remote this call (t_e604c0f9: the old line read as 0 total).
+        emit(f"Load gate: utilization SATURATED cpu_busy={busy} (load {l1} not read) - spawning 0 LOCAL this call "
+             f"(remote placement continues via the pool plan): {reason}")
         out["spawn_paused"] = reason
         out["spawn_limit"] = 0
         out["limit_source"] = "load gate"
@@ -354,6 +357,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             except Exception as exc:
                 print(f"warning: could not record load_gate_override events: {exc}", file=sys.stderr)
         limit_notes = _dispatch_limit_notes(res, gate, max_spawn_source)
+        live_band = None
+        try:  # the default priority a person's/operator's bare create gets now (t_febbdb61)
+            from hermes_cli.kanban_parser import live_priority_band
+            live_band = live_priority_band(conn)
+        except Exception:
+            pass
         # Spawned cards nobody is watching will finish silently — surface
         # that on every dispatch run instead of relying on the operator
         # remembering to notify-subscribe. Best-effort: notification
@@ -448,6 +457,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "memory_pressure": res.memory_pressure,
             "placement_waits": dict(res.placement_waits or {}),
             "routes": list(res.routes or []),
+            "live_band": live_band,
         }, ascii=True)
         return 0
     if res.skipped_locked:
@@ -482,6 +492,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"a human: {', '.join(res.gate_closed_unmerged)}"
         )
     print(f"Spawned:      {len(res.spawned)}")
+    if live_band is not None:
+        print(f"Live band:    {live_band} (default priority of a person/operator create; median of 24 h spawns, floor 100)")
     # Say WHY nothing (or less than asked) spawned: a bare "Spawned: 0" with
     # dispatchable cards on the board is indistinguishable from an idle board
     # (t_f78d1938: manual `dispatch --max 3` spawned 0 of 2 with no reason).

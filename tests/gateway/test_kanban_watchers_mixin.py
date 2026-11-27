@@ -559,18 +559,18 @@ def test_prior_worker_cohort_is_not_starved_by_slow_sends(tmp_path, monkeypatch)
     assert sent == []
 
 
-def test_timed_out_cohort_page_does_not_starve_land_requests(tmp_path, monkeypatch):
+def test_timed_out_cohort_page_does_not_starve_per_card_pages(tmp_path, monkeypatch):
     """Prism a6b3974d616e on #1972: a cohort notify.py send that hits its 30 s
-    timeout spent the whole tick budget, so the active_pr land-request behind
-    it never ran, every tick, for as long as notify was down. Land-requests get
-    their own budget; the cohort still goes out first."""
+    timeout spent the whole tick budget, so the active_pr send behind it never
+    ran, every tick, for as long as notify was down. Per-card sends get their
+    own budget; the cohort still goes out first."""
     import gateway.kanban_watchers as kw
     from gateway.kanban_watchers import _GuardStuckNotifier
 
     cohort = [("default", {"task_id": f"t_{i:04x}", "reason": "prior_worker_still_alive",
                            "status": "ready", "prev_pid": 1000 + i, "guarded_since": 50,
                            "clear_verb": f"hermes kanban show t_{i:04x}"}) for i in range(3)]
-    land = ("default", _mergeable_hold(guarded_since=100))
+    held = ("default", _mergeable_hold(guarded_since=100))
     clock = {"t": 1000.0}
     monkeypatch.setattr(kw.time, "monotonic", lambda: clock["t"])
     sent = []
@@ -580,17 +580,14 @@ def test_timed_out_cohort_page_does_not_starve_land_requests(tmp_path, monkeypat
         if row.get("reason") == "prior_worker_still_alive":
             clock["t"] += kw._GUARD_STUCK_PAGE_BUDGET_S  # notify.py timed out
             return False
-        row["land_request"] = "enqueued"
         return True
 
     notifier = _GuardStuckNotifier(tmp_path / "g.json")
-    for tick in range(2):  # the failed cohort stays due; the land-request still runs
+    for tick in range(2):  # the failed cohort stays due; the active_pr page still goes out once
         sent.clear()
-        notifier.observe(cohort + [land], send, now=10_000.0 + 60 * tick)
-        assert sent[0] == "prior_worker_still_alive"
-        if tick == 0:
-            assert sent == ["prior_worker_still_alive", "active_pr"]
-    assert any(k.endswith("|land") for k in notifier._sent)
+        notifier.observe(cohort + [held], send, now=10_000.0 + 60 * tick)
+        assert sent == (["prior_worker_still_alive", "active_pr"] if tick == 0 else ["prior_worker_still_alive"])
+    assert any("|active_pr|pr=" in k for k in notifier._sent)
 
 
 def test_failing_head_page_does_not_starve_later_cards(monkeypatch):
@@ -712,27 +709,30 @@ def test_legacy_entry_left_by_a_prior_migration_is_consumed(tmp_path):
 def test_active_pr_page_names_the_wanted_verb():
     from gateway.kanban_watchers import _active_pr_detail
     requeue = "hermes kanban --board default requeue t_x '<reason>'"
-    base = {"task_id": "t_x", "reason": "active_pr", "clear_verb": requeue,
+    base = {"task_id": "t_x", "reason": "active_pr", "clear_verb": requeue, "pr_owned": True,
             "pr": "https://github.com/ANG-Ventures/hermes-home/pull/1838"}
     timed_out = _active_pr_detail("default", {**base, "last_outcome": "timed_out"})
     assert f"Wanted: **REQUEUE** (worker resumes on its PR): `{requeue}`" in timed_out
-    assert "fleet-merge.sh ANG-Ventures/hermes-home 1838 --by" in timed_out  # the alternative
+    stamp = ("operator_approve.py --card t_x --head '<head sha>' --pr 'ANG-Ventures/hermes-home#1838' "
+             "--by apollo/operator")
+    assert stamp in timed_out  # the alternative
     for interrupted in ("stale", "stalled", "changes_requested", "cohort_death", None, "future_kind"):
         page = _active_pr_detail("default", {**base, "last_outcome": interrupted})
         assert "Wanted: **REQUEUE**" in page, interrupted
     finished = _active_pr_detail("default", {**base, "last_outcome": "completed"})
     assert finished.index("Wanted: **LAND**") < finished.index(requeue)
-    assert "fleet-merge.sh ANG-Ventures/hermes-home 1838" in finished
+    assert stamp in finished and "fleet-merge" not in finished
     no_pr = _active_pr_detail("default", {**base, "pr": None, "last_outcome": None})
-    assert "Wanted: **REQUEUE**" in no_pr and "fleet-merge" not in no_pr
+    assert "Wanted: **REQUEUE**" in no_pr and "operator_approve" not in no_pr
 
 
 def test_land_verb_rejects_shell_metacharacters_and_quotes_args():
     """Prism #1530: the PR URL is card text; it must never reach a shell command raw."""
     import shlex
     from gateway.kanban_watchers import _land_verb
-    verb = _land_verb("https://github.com/ANG-Ventures/hermes-home/pull/1838")
-    assert shlex.split(verb)[1:4] == ["ANG-Ventures/hermes-home", "1838", "--by"]
+    verb = _land_verb("https://github.com/ANG-Ventures/hermes-home/pull/1838", "t_x")
+    assert shlex.split(verb)[2:] == ["--card", "t_x", "--head", "<head sha>",
+                                     "--pr", "ANG-Ventures/hermes-home#1838", "--by", "apollo/operator"]
     for bad in ("https://github.com/$(id)/repo/pull/9", "https://github.com/o/r;rm -rf ~/pull/9",
                 "https://github.com/o/`x`/pull/9", "https://github.com/o/../pull/9",
                 "http://github.com/o/r/pull/9x", "https://evil.example/github.com/o/r/pull/9"):
@@ -763,7 +763,7 @@ def test_guard_stuck_pages_spend_a_bounded_time_per_tick(monkeypatch):
 
 
 def _land_rig(tmp_path, monkeypatch, returncode=0):
-    """Redirected Hermes home with notify.py + apollo_land_queue.py; records argv."""
+    """Redirected Hermes home with notify.py + the retired apollo_land_queue.py; records argv."""
     from types import SimpleNamespace
 
     root = tmp_path / "home"
@@ -777,8 +777,7 @@ def _land_rig(tmp_path, monkeypatch, returncode=0):
 
     def run(argv, **kw):
         calls.append(argv)
-        rc = returncode if "enqueue" in argv else 0
-        return SimpleNamespace(returncode=rc, stdout="", stderr="")
+        return SimpleNamespace(returncode=returncode, stdout="", stderr="")
 
     monkeypatch.setattr("gateway.kanban_watchers.subprocess.run", run)
     return root, calls
@@ -795,21 +794,52 @@ def _mergeable_hold(**over):
     return item
 
 
-def test_active_pr_mergeable_hold_enqueues_land_request_not_a_page(tmp_path, monkeypatch):
-    """t_5a9deed5 (r19 spec): a finished card's green holding PR gets a
-    land-request on the durable land queue; nobody is paged."""
+def _page_text(argv):
+    return argv[argv.index("--send") + 1]
+
+
+def test_active_pr_mergeable_hold_pages_the_stamp_verb_never_enqueues(tmp_path, monkeypatch):
+    """Retired-lander PR A: a finished card's green holding PR is no longer put on the
+    retired apollo land queue (its drain answered rc 61); the operator is paged with the
+    operator_approve stamp verb, which land_on_approve merges."""
     from gateway.kanban_watchers import _send_guard_stuck_alert
 
     root, calls = _land_rig(tmp_path, monkeypatch)
     assert _send_guard_stuck_alert("default", _mergeable_hold()) is True
-    assert len(calls) == 1
-    argv = calls[0]
-    assert argv[1] == str(root / "scripts" / "apollo_land_queue.py") and argv[2] == "enqueue"
-    assert argv[argv.index("--repo") + 1] == "ANG-Ventures/prism-router"
-    assert argv[argv.index("--pr") + 1] == "281"
-    assert argv[argv.index("--card") + 1] == "t_0000abcd"
-    assert argv[argv.index("--board") + 1] == "default"
-    assert not any(str(a).endswith("notify.py") for a in argv)
+    assert len(calls) == 1 and str(calls[0][1]).endswith("notify.py")
+    assert not any("apollo_land_queue" in str(a) or a == "enqueue" for a in calls[0])
+    text = _page_text(calls[0])
+    assert ("Wanted: **LAND** the PR if CI is green, then complete the card: `python3 "
+            "~/.hermes/scripts/lib/operator_approve.py --card t_0000abcd --head '<head sha>' "
+            "--pr 'ANG-Ventures/prism-router#281' --by apollo/operator`") in text
+    assert "fleet-merge" not in text
+    head_rule = "Read the diff at a full 40-character head first and paste only that head.\n"
+    assert head_rule + "Wanted: **LAND**" in text
+
+
+def test_page_that_replaced_an_enqueue_cannot_starve_a_page_main_sent(tmp_path, monkeypatch):
+    """Outside read at 8a2d1659: A (own mergeable PR, finished: main enqueued it, no
+    page) ahead of B (a mentioned PR: main paged it). A's page spends the whole tick
+    budget; B must still go out this tick, since its row may be gone by the next."""
+    import gateway.kanban_watchers as kw
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(kw.time, "monotonic", lambda: clock["t"])
+    a = _mergeable_hold()
+    b = _mergeable_hold(task_id="t_0000beef", pr_owned=False,
+                        pr="https://github.com/ANG-Ventures/prism-router/pull/282")
+    sent = []
+
+    def send(board, row):
+        sent.append(row["task_id"])
+        if row["task_id"] == a["task_id"]:
+            clock["t"] += kw._GUARD_STUCK_PAGE_BUDGET_S
+        return True
+
+    notifier = kw._GuardStuckNotifier(tmp_path / "g.json")
+    notifier.observe([("default", a), ("default", b)], send, now=10_000.0)
+    notifier.observe([("default", a)], send, now=10_001.0)  # B left READY
+    assert sent == ["t_0000beef", "t_0000abcd"]
 
 
 @pytest.mark.parametrize("over", [
@@ -830,99 +860,31 @@ def test_active_pr_hold_that_is_not_landable_pages_the_operator(tmp_path, monkey
     assert "enqueue" not in calls[0]
 
 
-def test_active_pr_enqueue_failure_falls_back_to_the_page(tmp_path, monkeypatch):
+def test_active_pr_hold_on_a_mentioned_pr_prints_no_stamp_verb(tmp_path, monkeypatch):
+    """A PR the card only mentions (pr_owned False) gets no operator_approve verb:
+    the stamp would name THIS card. The page says the PR is not this card's."""
     from gateway.kanban_watchers import _send_guard_stuck_alert
 
-    _root, calls = _land_rig(tmp_path, monkeypatch, returncode=2)
-    assert _send_guard_stuck_alert("default", _mergeable_hold()) is True
-    assert "enqueue" in calls[0] and str(calls[1][1]).endswith("notify.py")
+    _root, calls = _land_rig(tmp_path, monkeypatch)
+    assert _send_guard_stuck_alert("default", _mergeable_hold(pr_owned=False)) is True
+    text = _page_text(calls[0])
+    assert "operator_approve" not in text and "fleet-merge" not in text
+    assert ("That PR is not this card's (the card only mentions it): "
+            "https://github.com/ANG-Ventures/prism-router/pull/281") in text
+    assert "Wanted: **REQUEUE**" in text
 
 
-def test_active_pr_pages_once_the_land_queue_gave_up_on_the_pr(tmp_path, monkeypatch):
-    """A land queue that already stopped on this PR (FAILED/DIRTY/GAVE UP) needs
-    a human: page with its status, do not re-enqueue the same PR."""
-    import json
-
-    from gateway.kanban_watchers import _send_guard_stuck_alert
-
-    root, calls = _land_rig(tmp_path, monkeypatch)
-    done = root / "state" / "apollo-land-queue.done"
-    done.mkdir(parents=True)
-    (done / "1-x.json").write_text(json.dumps(
-        {"repo": "ANG-Ventures/prism-router", "pr": 281, "status": "failed"}), encoding="utf-8")
-    assert _send_guard_stuck_alert("default", _mergeable_hold()) is True
-    assert len(calls) == 1 and str(calls[0][1]).endswith("notify.py")
-    assert "Land queue already stopped on this PR: `failed`" in calls[0][calls[0].index("--send") + 1]
-
-
-def test_active_pr_land_request_is_once_per_card_and_pr(tmp_path, monkeypatch):
-    """The notifier ledger gates the enqueue like a page: one per (card, PR)."""
+def test_active_pr_page_is_once_per_card_and_pr(tmp_path, monkeypatch):
+    """One page per (card, PR), across a restarted streak and a red -> green turn; nothing is enqueued."""
     from gateway.kanban_watchers import _GuardStuckNotifier, _send_guard_stuck_alert
 
     _root, calls = _land_rig(tmp_path, monkeypatch)
     notifier = _GuardStuckNotifier(tmp_path / "ledger.json")
-    item = _mergeable_hold(guarded_since=100)
-    # An enqueue is an action, not a page: not counted (Prism #1545).
-    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=1000) == 0
-    assert notifier.observe([("default", {**item, "guarded_since": 900})],
-                            _send_guard_stuck_alert, now=2000) == 0
-    assert [a for a in calls if "enqueue" in a] == [calls[0]] and len(calls) == 1
-
-
-def test_active_pr_failed_land_request_pages_once_without_re_enqueue(tmp_path, monkeypatch):
-    """Prism #1545 52766705e3e6: the enqueue must not spend the (card, PR) page
-    slot. When the queue later stops on the PR (FAILED/DIRTY/GAVE UP), the next
-    tick pages once; the PR is never re-enqueued inside the reminder window."""
-    import json
-
-    from gateway.kanban_watchers import _GuardStuckNotifier, _send_guard_stuck_alert
-
-    root, calls = _land_rig(tmp_path, monkeypatch)
-    notifier = _GuardStuckNotifier(tmp_path / "ledger.json")
-    item = _mergeable_hold(guarded_since=100)
-    # Enqueue is an action, not a page: no "#alerts paged" count.
-    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=1000) == 0
-    assert len(calls) == 1 and "enqueue" in calls[0]
-    # Still pending: silent, and no second enqueue subprocess.
-    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=1060) == 0
-    assert len(calls) == 1
-    done = root / "state" / "apollo-land-queue.done"
-    done.mkdir(parents=True)
-    (done / "1-x.json").write_text(json.dumps(
-        {"repo": "ANG-Ventures/prism-router", "pr": 281, "status": "failed"}), encoding="utf-8")
-    # A restarted gateway reloads the ledger and still escalates.
-    notifier = _GuardStuckNotifier(tmp_path / "ledger.json")
-    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=2000) == 1
-    assert len(calls) == 2 and str(calls[1][1]).endswith("notify.py")
-    assert "Land queue already stopped on this PR: `failed`" in calls[1][calls[1].index("--send") + 1]
-    # Paged once: silent until the 6h reminder, never re-enqueued.
-    assert notifier.observe([("default", item)], _send_guard_stuck_alert, now=3000) == 0
-    assert len(calls) == 2
-    assert not [a for a in calls[1:] if "enqueue" in a]
-
-
-def test_active_pr_paged_while_red_still_enqueues_once_green(tmp_path, monkeypatch):
-    """Prism #1631 7279b2c05f7a: the once-only active_pr page must not also stop
-    the land-request. Paged while red; once mergeable it is enqueued (no page),
-    and a later queue failure stays silent (the episode already paged)."""
-    import json
-
-    from gateway.kanban_watchers import _GuardStuckNotifier, _send_guard_stuck_alert
-
-    root, calls = _land_rig(tmp_path, monkeypatch)
-    notifier = _GuardStuckNotifier(tmp_path / "ledger.json")
     red = _mergeable_hold(guarded_since=100, hold="PR has a red check", merge_state="BLOCKED")
     assert notifier.observe([("default", red)], _send_guard_stuck_alert, now=1000) == 1
-    assert len(calls) == 1 and str(calls[0][1]).endswith("notify.py")
-    green = _mergeable_hold(guarded_since=100)
-    assert notifier.observe([("default", green)], _send_guard_stuck_alert, now=1060) == 0
-    assert len(calls) == 2 and "enqueue" in calls[1]
-    # Pending in the queue: no second enqueue, no page.
-    assert notifier.observe([("default", green)], _send_guard_stuck_alert, now=1120) == 0
-    assert len(calls) == 2
-    done = root / "state" / "apollo-land-queue.done"
-    done.mkdir(parents=True)
-    (done / "1-x.json").write_text(json.dumps(
-        {"repo": "ANG-Ventures/prism-router", "pr": 281, "status": "failed"}), encoding="utf-8")
+    green = _mergeable_hold(guarded_since=900)
     assert notifier.observe([("default", green)], _send_guard_stuck_alert, now=2000) == 0
-    assert len(calls) == 2
+    # A restarted gateway reloads the ledger and stays silent.
+    notifier = _GuardStuckNotifier(tmp_path / "ledger.json")
+    assert notifier.observe([("default", green)], _send_guard_stuck_alert, now=30_000) == 0
+    assert len(calls) == 1 and str(calls[0][1]).endswith("notify.py")

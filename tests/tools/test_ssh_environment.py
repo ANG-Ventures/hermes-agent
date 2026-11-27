@@ -1,8 +1,15 @@
 """Tests for the SSH remote execution environment backend."""
 
+import contextlib
 import json
 import os
+import shlex
+import shutil
+import signal
 import subprocess
+import time
+import uuid
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,6 +23,7 @@ _SSH_PORT = int(os.getenv("TERMINAL_SSH_PORT", "22"))
 _SSH_KEY = os.getenv("TERMINAL_SSH_KEY", "")
 
 _has_ssh = bool(_SSH_HOST and _SSH_USER)
+_REAL_POPEN = subprocess.Popen  # TestBuildSSHCommand mocks subprocess.Popen/run module-wide
 
 requires_ssh = pytest.mark.skipif(
     not _has_ssh,
@@ -54,6 +62,18 @@ class TestBuildSSHCommand:
         for flag in ("ControlMaster=auto", "ControlPersist=300",
                       "BatchMode=yes", "StrictHostKeyChecking=accept-new"):
             assert flag in cmd
+
+    @pytest.mark.parametrize("multiplex", [True, False])
+    def test_keepalive_flags(self, monkeypatch, multiplex):
+        """t_c20e3ec8: a host that dies mid-command sends no RST/FIN; without ServerAlive* the call
+        hangs to the tool timeout. With multiplexing this argv also starts the ControlMaster, the
+        process that owns the TCP connection, so the flags must ride every built command."""
+        monkeypatch.setattr(ssh_env, "_SSH_MULTIPLEX", multiplex)
+        env = SSHEnvironment(host="h", user="u")
+        argv = env._build_ssh_command()
+        for opt in ("ServerAliveInterval=5", "ServerAliveCountMax=2"):
+            assert argv[argv.index(opt) - 1] == "-o"
+        assert argv.index("ServerAliveInterval=5") < argv.index("u@h")
 
     def test_controlmaster_gated_off_on_windows(self, monkeypatch):
         """#73927: Windows OpenSSH has no Unix-domain ControlMaster, so the
@@ -117,6 +137,415 @@ class TestBuildSSHCommand:
         captured = self._capture_run_bash(monkeypatch, SSHEnvironment(host="h", user="u"))
         assert not any(a.startswith("SendEnv=") for a in captured["cmd"])
         assert captured["env"] is None
+
+    def _run_remote_text_locally(self, captured, tmp_path):
+        """Run the remote ``bash -c`` text the way the pool host's shell would, with a bare env."""
+        remote = " ".join(captured["cmd"][captured["cmd"].index("u@h") + 1:])
+        with _REAL_POPEN(["sh", "-c", remote], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                         env={"HOME": str(tmp_path), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}) as proc:
+            return proc.communicate(timeout=20)[0].strip()
+
+    def test_placed_worker_shell_carries_task_and_host_workspace(self, monkeypatch, tmp_path):
+        """t_dad3fadc: a placed worker's remote shell had HERMES_KANBAN_TASK/WORKSPACE empty on every
+        pool host (kanbanw and owner login alike): ssh carries no env. The task id and the HOST
+        workspace (the placement's TERMINAL_CWD, not the Studio path) ride the command, with an owner
+        marker no remote pid can equal, so a remote ``hermes`` never takes the grant."""
+        monkeypatch.setenv("KANBAN_WORKER_PLACEMENT", json.dumps(
+            {"host": "ace-media", "env": {"TERMINAL_CWD": "/Volumes/fleet-scratch/workspaces/default/t_abc"}}))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/Users/x/.hermes/kanban/workspaces/t_abc")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/Users/x/.hermes/kanban.db")
+        env = SSHEnvironment(host="h", user="u")
+        captured = self._capture_run_bash(
+            monkeypatch, env,
+            'echo "$HERMES_KANBAN_TASK|$HERMES_KANBAN_WORKSPACE|$HERMES_KANBAN_OWNER_PID|${HERMES_KANBAN_DB-unset}"')
+        task, ws, owner, db = self._run_remote_text_locally(captured, tmp_path).split("|")
+        assert (task, ws, db) == ("t_abc", "/Volumes/fleet-scratch/workspaces/default/t_abc", "unset")
+        with pytest.raises(ValueError):
+            int(owner)  # owns_kanban_worker_authority() refuses a non-pid marker
+        assert owner
+
+    def test_unplaced_or_delegated_shell_gets_no_kanban_identity(self, monkeypatch, tmp_path):
+        """No placement (a plain ssh backend) or a delegate_task child: nothing is exported."""
+        from agent import delegation_context
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+        probe = 'echo "[${HERMES_KANBAN_TASK-}]"'
+        monkeypatch.delenv("KANBAN_WORKER_PLACEMENT", raising=False)
+        captured = self._capture_run_bash(monkeypatch, SSHEnvironment(host="h", user="u"), probe)
+        assert self._run_remote_text_locally(captured, tmp_path) == "[]"
+        monkeypatch.setenv("KANBAN_WORKER_PLACEMENT", json.dumps({"host": "h", "env": {"TERMINAL_CWD": "/w"}}))
+        monkeypatch.setattr(delegation_context, "is_delegated_child_process_context", lambda: True)
+        captured = self._capture_run_bash(monkeypatch, SSHEnvironment(host="h", user="u"), probe)
+        assert self._run_remote_text_locally(captured, tmp_path) == "[]"
+
+    def test_run_bash_tags_remote_command_with_its_run_token(self, monkeypatch):
+        """t_44017fbc: the remote ``bash -c`` records its pid where the kill path can find it."""
+        env = SSHEnvironment(host="h", user="u")
+        proc = MagicMock()
+        captured = {}
+        monkeypatch.setattr(ssh_env, "_popen_bash", lambda cmd, stdin_data=None, **kw: captured.update(cmd=cmd) or proc)
+        assert env._run_bash("echo ok") is proc
+        token = proc._hermes_run_token
+        assert token and len(token) == 32
+        assert captured["cmd"][-7:-4] == ["exec", "sh", "-c"]
+        remote = shlex.split(captured["cmd"][-1])[0]
+        assert ssh_env._run_preamble(token, "_vr_runtime") in remote
+        assert ssh_env._run_pidfile(token) in remote
+
+    def test_kill_process_kills_the_client_then_the_remote_group(self, monkeypatch):
+        """t_44017fbc: killing only the local ssh client left the remote tree running for 30+ h."""
+        env = SSHEnvironment(host="h", user="u")
+        order = []
+        proc = MagicMock(_hermes_run_token="ab12")
+        proc.kill.side_effect = lambda: order.append("client")
+        monkeypatch.setattr(env, "_run_ssh", lambda remote, timeout: order.append((remote, timeout)))
+        env._kill_process(proc)
+        assert order[0] == "client" and len(order) == 2
+        remote, timeout = order[1]
+        assert timeout <= 5
+        assert remote.startswith("sh -c ") and ssh_env._run_pidfile("ab12") in remote and "TERM KILL" in remote
+
+    def test_force_kill_runs_a_kill_only_remote_kill_off_thread(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        seen = []
+        monkeypatch.setattr(env, "_run_ssh", lambda remote, timeout: seen.append(remote))
+        proc = MagicMock(_hermes_run_token="ab12")
+        env._force_kill_process(proc)
+        proc.kill.assert_called_once()
+        (remote,) = seen
+        assert ssh_env._run_pidfile("ab12") in remote and "for sig in KILL;" in remote
+
+
+def _group_sleeps(pgid):
+    import psutil
+    out = []
+    for p in psutil.process_iter(["name"]):
+        try:
+            if p.info["name"] == "sleep" and os.getpgid(p.pid) == pgid:
+                out.append(p)
+        except (ProcessLookupError, psutil.Error):
+            pass
+    return out
+
+
+def _pidfile(token):
+    return os.path.expandvars(ssh_env._run_pidfile(token))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pidfile_env(monkeypatch):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("HERMES_SSH_RUNTIME_PIDFILES", raising=False)
+
+
+@pytest.fixture
+def runtime_dir(monkeypatch):
+    """Use a private directory on Linux tmpfs, not pytest's disk-backed tmp_path."""
+    import tempfile
+
+    if not os.path.isdir("/dev/shm") or not os.access("/dev/shm", os.W_OK):
+        pytest.skip("requires writable Linux tmpfs")
+    with tempfile.TemporaryDirectory(prefix="hermes pidfiles '", dir="/dev/shm") as directory:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", directory)
+        yield Path(directory)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+@pytest.mark.parametrize("location", ["runtime", "missing", "wrong-mode", "wrong-owner", "disabled"])
+def test_pidfile_location(location, monkeypatch, tmp_path, runtime_dir):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    setup = ""
+    if location == "missing":
+        monkeypatch.delenv("XDG_RUNTIME_DIR")
+    if location == "wrong-mode":
+        runtime_dir.chmod(0o755)
+    if location == "wrong-owner":
+        # Unprivileged CI cannot chown a private directory to another user. Inject only
+        # the failed ownership result; the real cwd, tmpfs and 0700 checks still run.
+        setup = 'function [ { if [[ $1 == -O && $2 == . ]]; then return 1; fi; builtin [ "$@"; }\n'
+    if location == "disabled":
+        monkeypatch.setenv("HERMES_SSH_RUNTIME_PIDFILES", "0")
+
+    token = uuid.uuid4().hex
+    legacy = _pidfile(token)
+    runtime_pid = runtime_dir / os.path.basename(legacy)
+    if location == "runtime":
+        expected, unexpected = runtime_pid, tmp_path / ".hermes-run"
+    else:
+        expected, unexpected = legacy, runtime_pid
+    body = f'[ -f {shlex.quote(str(expected))} ] && [ ! -e {shlex.quote(str(unexpected))} ]'
+    subprocess.run(["bash", "-c", setup + ssh_env._run_preamble(token) + body],
+                   stdin=subprocess.DEVNULL, check=True, timeout=10)
+    assert not os.path.exists(expected)
+
+
+@pytest.mark.parametrize("outer_runtime", [False, True], ids=["absent", "valid"])
+@pytest.mark.parametrize("login_shell", ["sh", "fish"])
+def test_runtime_dir_lookup_ignores_bash_startup_override(
+    login_shell, outer_runtime, monkeypatch, tmp_path, runtime_dir,
+):
+    shell = shutil.which(login_shell)
+    if shell is None:
+        pytest.skip(f"requires {login_shell}")
+    shell_argv = [shell, "--no-config", "-c"] if login_shell == "fish" else [shell, "-c"]
+    monkeypatch.setenv("HOME", str(tmp_path))
+    alternate = runtime_dir / "from-bash"
+    alternate.mkdir(mode=0o700)
+    if not outer_runtime:
+        monkeypatch.delenv("XDG_RUNTIME_DIR")
+    startup = tmp_path / "bash-env"
+    startup.write_text(f"export XDG_RUNTIME_DIR={shlex.quote(str(alternate))}\n")
+    monkeypatch.setenv("BASH_ENV", str(startup))
+    monkeypatch.setattr(SSHEnvironment, "_establish_connection", lambda self: None)
+    env = SSHEnvironment(host="h", user="u", probe_only=True)
+
+    def spawn(argv, stdin_data, **kwargs):
+        command = " ".join(argv[argv.index("u@h") + 1:])
+        return _REAL_POPEN([*shell_argv, command], start_new_session=True, stdin=subprocess.DEVNULL)
+
+    def kill_remote(command, timeout):
+        return subprocess.run([*shell_argv, command], timeout=timeout,
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+    monkeypatch.setattr(ssh_env, "_popen_bash", spawn)
+    monkeypatch.setattr(env, "_run_ssh", kill_remote)
+    tree = env._run_bash("exec sleep 60")
+    token = tree._hermes_run_token
+    runtime_pid = runtime_dir / os.path.basename(_pidfile(token))
+    alternate_pid = alternate / runtime_pid.name
+    expected = runtime_pid if outer_runtime else Path(_pidfile(token))
+    try:
+        deadline = time.monotonic() + 5
+        while not any(p.exists() for p in (expected, alternate_pid)) and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert expected.is_file() and not alternate_pid.exists()
+        assert env._remote_group_kill(token, grace=False)
+        tree.wait(timeout=5)
+        assert not any(p.exists() for p in (runtime_pid, alternate_pid, Path(_pidfile(token))))
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(tree.pid, signal.SIGKILL)
+        tree.wait()
+
+
+def test_failed_runtime_write_removes_empty_file_before_fallback(monkeypatch, tmp_path, runtime_dir):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = uuid.uuid4().hex
+    legacy = _pidfile(token)
+    runtime_pid = runtime_dir / os.path.basename(legacy)
+    # Redirection really creates the file; simulate a write failure only on tmpfs.
+    setup = 'echo() { if [ "$PWD" = "$XDG_RUNTIME_DIR" ]; then return 1; fi; builtin echo "$@"; }\n'
+    result = subprocess.run(["bash", "-c", setup + ssh_env._run_preamble(token)
+                             + f'[ -s {shlex.quote(legacy)} ]'], stdin=subprocess.DEVNULL, timeout=10)
+    assert result.returncode == 0
+    assert not runtime_pid.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+@pytest.mark.parametrize("body", ["(sleep 600 &); sleep 601 & sleep 602; true", "sleep 601 & exec sleep 602"],
+                         ids=["background-grandchild", "top-level-exec"])
+@pytest.mark.parametrize("use_runtime", [False, True], ids=["legacy", "runtime"])
+def test_remote_group_kill_reaps_the_whole_tree(body, use_runtime, request, monkeypatch, tmp_path):
+    """t_44017fbc: run the real remote kill script against a ``bash -c`` started the way sshd starts
+    it (own session). Every sleep in its group dies, incl. a ``(cmd &)`` grandchild re-parented to
+    init and a top-level ``exec`` that replaced the tagged bash; the pidfile is removed."""
+    import stat
+    import time
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    runtime = request.getfixturevalue("runtime_dir") if use_runtime else None
+    monkeypatch.delenv("HERMES_SSH_RUNTIME_PIDFILES", raising=False)
+    if not use_runtime:
+        # Start in the legacy location, then present XDG to the new kill command.
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    token = uuid.uuid4().hex
+    pidfile = runtime / os.path.basename(_pidfile(token)) if use_runtime else _pidfile(token)
+    tree = subprocess.Popen(["bash", "-c", ssh_env._run_preamble(token) + body], start_new_session=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    want = 3 if body.startswith("(") else 2
+    try:
+        deadline = time.monotonic() + 10
+        while len(_group_sleeps(tree.pid)) < want and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(_group_sleeps(tree.pid)) == want
+        assert os.path.exists(pidfile)
+        assert stat.S_IMODE(os.stat(os.path.dirname(pidfile)).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(pidfile).st_mode) == 0o600
+        if not use_runtime:
+            monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "other-runtime"))
+        monkeypatch.setenv("HERMES_SSH_RUNTIME_PIDFILES", "0")
+        rc = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=30).returncode
+        assert rc == 0
+        tree.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while _group_sleeps(tree.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _group_sleeps(tree.pid) == []
+        assert not os.path.exists(pidfile)
+    finally:
+        for p in _group_sleeps(tree.pid):
+            p.kill()
+        tree.kill()
+        tree.wait()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(pidfile)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_runtime_dir_case_arms_parse_inside_command_substitution():
+    """t_4786c7b1: the kill command nests ``_enter_runtime_dir()`` in ``$( )``. macOS /bin/sh is
+    bash 3.2, which reads a bare ``pattern)`` there as the closing paren: rc 2, no kill, and every
+    timed-out command on a Mac host lived on. Every arm must use the ``(pattern)`` form."""
+    import re
+
+    snippet = ssh_env._enter_runtime_dir()
+    arms = re.findall(r'(?:" in |;; )(\S+)', snippet)
+    assert arms[-1] == "esac" and len(arms) >= 3
+    assert all(a.startswith("(") for a in arms[:-1]), arms
+    for shell in ("sh", "bash", "/bin/bash", "dash", "zsh"):
+        if shutil.which(shell):
+            r = subprocess.run([shell, "-n", "-c", f"p=$({{ {snippet}; }} && echo x)"], capture_output=True,
+                               text=True, timeout=10)
+            assert r.returncode == 0, (shell, r.stderr)
+
+
+def _pgrep(pattern: str) -> list[str]:
+    out = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True).stdout
+    return out.split()
+
+
+@pytest.mark.skipif(os.name == "nt" or not shutil.which("pgrep"), reason="POSIX remote shell")
+def test_remote_deadline_hangs_up_the_command_and_spares_nohup(monkeypatch):
+    """t_4786c7b1: the plain-ssh wrapper, started the way sshd starts a command (own session): after
+    the deadline the command's group gets SIGHUP within 5 s; a nohup'd job in that group lives on."""
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    tag = f"{uuid.uuid4().int % 10**7}"
+    cmd = f"nohup sleep 71.{tag} >/dev/null 2>&1 & sleep 70.{tag}"
+    t0 = time.monotonic()
+    proc = subprocess.Popen(["sh", "-c", ssh_env.remote_deadline_command(cmd, 1)], start_new_session=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert proc.wait(timeout=6) in (128 + signal.SIGHUP, -signal.SIGHUP)  # login shell may be HUPed too
+        assert time.monotonic() - t0 < 6
+        deadline = time.monotonic() + 5
+        while _pgrep(f"slee[p] 70.{tag}") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _pgrep(f"slee[p] 70.{tag}") == []
+        assert len(_pgrep(f"slee[p] 71.{tag}")) == 1
+    finally:
+        subprocess.run(["pkill", "-f", f"slee[p] 7[01].{tag}"])
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.skipif(os.name == "nt" or not shutil.which("pgrep"), reason="POSIX remote shell")
+def test_remote_deadline_passes_stdin_and_status_and_leaves_no_watchdog(monkeypatch):
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    timeout = f"3{uuid.uuid4().int % 10**6}.5"
+    r = subprocess.run(["sh", "-c", ssh_env.remote_deadline_command("cat; [ \"it's\" = \"it's\" ] && exit 7", float(timeout))],
+                       input="it's =here\n", capture_output=True, text=True, start_new_session=True, timeout=10)
+    assert (r.returncode, r.stdout) == (7, "it's =here\n")
+    deadline = time.monotonic() + 3
+    while _pgrep(f"slee[p] {timeout}") and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _pgrep(f"slee[p] {timeout}") == []
+
+
+@pytest.mark.parametrize("timeout", [0, 0.0, -1, 1e-9, float("nan"), float("inf"), None])
+def test_remote_deadline_without_a_positive_timeout_sets_no_deadline(timeout):
+    """Prism 7573b7439bbf: ``sleep 0`` hung the command up as it started. No positive finite
+    deadline = the command, unwrapped, as plain ``ssh host cmd`` runs it."""
+    assert ssh_env.remote_deadline_command("echo hi", timeout) == "echo hi"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_finished_command_leaves_no_pidfile_and_kill_is_a_noop(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = uuid.uuid4().hex
+    subprocess.run(["bash", "-c", ssh_env._run_preamble(token) + "true"], check=True, timeout=10)
+    assert not os.path.exists(_pidfile(token))
+    assert subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=10).returncode == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+@pytest.mark.parametrize("body,rc", [
+    # write_file's atomic-write script sets its own EXIT trap, then clears it (t_70090b16: one
+    # leaked pidfile per write_file/patch on every pool host).
+    ("trap 'rm -f /nonexistent' EXIT; true; trap - EXIT", 0),
+    ("trap 'true' EXIT; exit 4", 4),
+    ("exec true", 0),
+    ("kill -KILL $$", -9),
+], ids=["user-trap-cleared", "user-trap-exit", "top-level-exec", "command-sigkilled"])
+def test_next_command_sweeps_a_pidfile_the_command_left(body, rc, monkeypatch, tmp_path):
+    """t_70090b16: a command that takes the EXIT trap, ``exec``s or is SIGKILLed leaves its pidfile;
+    the next command on the host removes it, and keeps its own."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = uuid.uuid4().hex
+    res = subprocess.run(["bash", "-c", ssh_env._run_preamble(token) + body], timeout=10,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert res.returncode == rc
+    nxt = uuid.uuid4().hex
+    seen = subprocess.run(["bash", "-c", ssh_env._run_preamble(nxt) + f'[ -f "{_pidfile(nxt)}" ] && echo own; '
+                           'echo "vars=${_vr_f-}${_vr_p-}"'],
+                          timeout=10, capture_output=True, text=True, check=True).stdout.split()
+    assert seen == ["own", "vars="]
+    assert not os.path.exists(_pidfile(token))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_kill_dollar_dollar_still_ends_the_command(monkeypatch, tmp_path):
+    """``kill $$`` must stop the command itself, not a wrapper around it (Prism 8f40170a101e on #480:
+    a subshell wrapper let the body run on, orphaned and out of the kill path's reach)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    marker = tmp_path / "survived"
+    res = subprocess.run(["bash", "-c", ssh_env._run_preamble(uuid.uuid4().hex) + f"kill $$; sleep 1; touch {marker}"],
+                         timeout=10)
+    time.sleep(1.5)
+    assert res.returncode == -15
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+@pytest.mark.parametrize("both_dirs", [False, True], ids=["legacy", "both"])
+def test_stale_pidfile_sweep_removes_dead_keeps_live_and_foreign(both_dirs, request, monkeypatch, tmp_path):
+    """t_70090b16: a wrapper killed outright cannot clean up; the next start sweeps files whose pid
+    is dead, and touches nothing outside its own name pattern."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    run_dir = tmp_path / ".hermes-run"
+    run_dir.mkdir(mode=0o700)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    live = subprocess.Popen(["sleep", "60"])
+    try:
+        files = {
+            "dead": (f"hermes-run-{uuid.uuid4().hex}.pid", f"{dead.pid}\n"),
+            "live": (f"hermes-run-{uuid.uuid4().hex}.pid", f"{live.pid}\n"),
+            "empty": (f"hermes-run-{uuid.uuid4().hex}.pid", ""),  # pid not written yet
+            "foreign_name": (f"other-{uuid.uuid4().hex}.pid", f"{dead.pid}\n"),
+            "short_token": ("hermes-run-abc.pid", f"{dead.pid}\n"),
+        }
+        dirs = [run_dir, request.getfixturevalue("runtime_dir")] if both_dirs else [run_dir]
+        for directory in dirs:
+            for name, content in files.values():
+                (directory / name).write_text(content)
+        # Even with writes rolled back, sweep leftover files from both versions.
+        monkeypatch.setenv("HERMES_SSH_RUNTIME_PIDFILES", "0")
+        subprocess.run(["bash", "-c", ssh_env._run_preamble(uuid.uuid4().hex) + "true"],
+                       stdin=subprocess.DEVNULL, check=True, timeout=10)
+        for directory in dirs:
+            left = {k for k, (name, _) in files.items() if (directory / name).exists()}
+            assert left == {"live", "empty", "foreign_name", "short_token"}
+    finally:
+        live.kill()
+        live.wait()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_stale_pidfile_sweep_without_dir_is_a_noop(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert subprocess.run(["bash", "-c", ssh_env._stale_pidfile_sweep()], timeout=10).returncode == 0
+    assert not (tmp_path / ".hermes-run").exists()
 
 
 class TestControlSocketPath:
@@ -366,3 +795,135 @@ class TestPersistentSSH:
         assert len(lines) == 1000
         assert lines[0] == "1"
         assert lines[-1] == "1000"
+
+
+class TestIdleReaperSparesARunningCommand:
+    """t_db3261ec: the idle reaper (TERMINAL_LIFETIME_SECONDS=300, checked every 60 s) timed an env
+    from its LAST CALL START, so a foreground command still running at 300-360 s had its env torn
+    down under it: SSHEnvironment.cleanup() sends ``ssh -O exit`` to the master, the call returns
+    255 with no output and the remote command runs on unowned. 209 of 209 such drops in the logged
+    24 h sat within 3 s of 'Cleaned up inactive environment'."""
+
+    @pytest.fixture
+    def stale_env(self, monkeypatch):
+        import time
+        import tools.terminal_tool as tt
+        from tools.environments import base
+        env = MagicMock()
+        monkeypatch.setitem(tt._active_environments, "t_reap", env)
+        monkeypatch.setitem(tt._last_activity, "t_reap", time.time() - 340)
+        yield env, base
+        tt._active_environments.pop("t_reap", None)
+        tt._last_activity.pop("t_reap", None)
+
+    def test_env_with_a_live_foreground_command_is_not_reaped(self, stale_env, monkeypatch):
+        from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
+        import tools.terminal_tool as tt
+        env, base = stale_env
+        proc = MagicMock()
+        monkeypatch.setitem(base._live_foreground, id(proc), (env, proc))
+        _cleanup_inactive_envs(300)
+        env.cleanup.assert_not_called()
+        assert tt._active_environments.get("t_reap") is env
+
+    def test_idle_env_sharing_a_busy_envs_master_is_not_reaped(self, stale_env, monkeypatch):
+        """Prism b928ca3e4fd8: cleanup() ends the ControlMaster, which every env on the same target and
+        control scope shares (a delegate_task child in the same worker): reaping the idle one would drop
+        the busy one's call."""
+        from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
+        env, base = stale_env
+        env.control_socket = "/tmp/hermes-ssh/abc.sock"
+        busy = MagicMock(control_socket="/tmp/hermes-ssh/abc.sock")
+        proc = MagicMock()
+        monkeypatch.setitem(base._live_foreground, id(proc), (busy, proc))
+        _cleanup_inactive_envs(300)
+        env.cleanup.assert_not_called()
+
+    def test_idle_env_without_a_command_is_still_reaped(self, stale_env):
+        from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
+        import tools.terminal_tool as tt
+        env, _ = stale_env
+        _cleanup_inactive_envs(300)
+        env.cleanup.assert_called_once()
+        assert "t_reap" not in tt._active_environments
+
+
+class TestLostConnectionIsNamedAndTheRemoteCommandDecided:
+    """t_db3261ec: an ssh client that exits 255 while its remote command still runs (master gone)
+    must not hand back a bare empty 255 and leave the command running: the remote group is killed
+    and the result says so. A command that itself exited 255 is left alone."""
+
+    @pytest.fixture
+    def env(self, monkeypatch):
+        monkeypatch.setattr("tools.environments.ssh.subprocess.run",
+                            lambda *a, **k: subprocess.CompletedProcess([], 0))
+        monkeypatch.setattr("tools.environments.ssh.subprocess.Popen",
+                            lambda *a, **k: MagicMock(stdout=iter([]), stderr=iter([]), stdin=MagicMock()))
+        return SSHEnvironment(host="h", user="u", sync_files=False)
+
+    def _wait(self, env, monkeypatch, output, rc, remote_stdout):
+        from tools.environments.base import BaseEnvironment
+        monkeypatch.setattr(BaseEnvironment, "_wait_for_process",
+                            lambda self, proc, timeout=120, **kw: {"output": output, "returncode": rc})
+        calls = []
+
+        def fake_run_ssh(remote, timeout):
+            calls.append(remote)
+            if isinstance(remote_stdout, Exception):
+                raise remote_stdout
+            return subprocess.CompletedProcess([], 0, stdout=remote_stdout, stderr="")
+        monkeypatch.setattr(env, "_run_ssh", fake_run_ssh)
+        return env._wait_for_process(MagicMock(_hermes_run_token="ab12"), timeout=600), calls
+
+    def test_dropped_connection_kills_the_remote_command_and_names_it(self, env, monkeypatch):
+        r, calls = self._wait(env, monkeypatch, "02:37:04\n", 255, ssh_env._KILLED_MARK + "\n")
+        assert len(calls) == 1 and ssh_env._run_pidfile("ab12") in calls[0]
+        assert r["returncode"] == 255 and r["hermes_connection_lost"] is True
+        assert r["output"].startswith("02:37:04\n")
+        assert "ssh connection to u@h closed" in r["output"] and "has been killed" in r["output"]
+
+    def test_unreachable_host_still_names_the_failure(self, env, monkeypatch):
+        r, _ = self._wait(env, monkeypatch, "", 255, subprocess.TimeoutExpired("ssh", 5))
+        assert r["hermes_connection_lost"] is True
+        assert r["output"].startswith("[ssh connection to u@h closed") and "could not be checked" in r["output"]
+
+    def test_no_marker_and_nothing_running_is_named_without_claiming_a_lost_link(self, env, monkeypatch):
+        """Prism dbd92286d045: a chatty command SIGPIPEd by the drop leaves no pidfile, just like a command
+        that ran ``exit 255``; neither prints the completion marker. Say which two it can be, never bare."""
+        r, calls = self._wait(env, monkeypatch, "tick 31\n", 255, "")
+        assert len(calls) == 1 and r["returncode"] == 255 and "hermes_connection_lost" not in r
+        assert r["output"].startswith("tick 31\n[exit 255 without the completion marker")
+        assert "no remote process is left" in r["output"]
+
+    def test_completed_command_with_cwd_marker_costs_no_probe(self, env, monkeypatch):
+        out = f"x\n{env._cwd_marker}/tmp{env._cwd_marker}git: seq=1\n"
+        r, calls = self._wait(env, monkeypatch, out, 255, ssh_env._KILLED_MARK)
+        assert calls == [] and "hermes_connection_lost" not in r
+
+    def test_other_exit_codes_cost_no_probe(self, env, monkeypatch):
+        r, calls = self._wait(env, monkeypatch, "", 1, ssh_env._KILLED_MARK)
+        assert calls == [] and r == {"output": "", "returncode": 1}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_remote_group_kill_reports_whether_it_killed_a_live_command(monkeypatch, tmp_path):
+    """The kill script prints the marker only when it signalled a live group, so the lost-connection
+    path can tell 'still running, now killed' from 'already finished'."""
+    import time
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = uuid.uuid4().hex
+    tree = subprocess.Popen(["bash", "-c", ssh_env._run_preamble(token) + "sleep 603; true"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while not os.path.exists(_pidfile(token)) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        out = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], capture_output=True,
+                             text=True, timeout=30).stdout
+        assert ssh_env._KILLED_MARK in out
+        tree.wait(timeout=5)
+        out = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], capture_output=True,
+                             text=True, timeout=30).stdout
+        assert ssh_env._KILLED_MARK not in out
+    finally:
+        tree.kill()
+        tree.wait()

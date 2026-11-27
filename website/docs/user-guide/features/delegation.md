@@ -212,7 +212,7 @@ The dispatch handle lists each unit (`units[].delegation_id`, `group`, `task_ind
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
 - **Progress display:** In CLI mode, a tree-view shows tool calls from each subagent in real-time with per-task completion lines. In gateway mode, progress is batched and relayed to the parent's progress callback. CLI and TUI completion notices use task-first titles such as `Subagent Task Completed: Review changes`; multi-task groups use the group name and task count. Unsuccessful or incomplete work gets a corresponding status label. These compact notices do not replace the full results delivered to the parent agent.
 - **Result ordering:** Within a unit, results are sorted by task index to match input order regardless of completion order; `TASK i/N` labels index the whole call
-- **Cancellation:** Follow-up messages do not cancel a top-level background batch. `/stop` (gateway `/stop`, CLI `/stop`, the Desktop/TUI Stop button, an ACP cancel) or closing/resetting the owning session ends its background children and every synchronous descendant beneath them; each stopped child still returns as a completion with `status="interrupted"` and its partial output
+- **Cancellation:** Follow-up messages and the turn Stop (gateway `/stop`, the Desktop/TUI Stop button, an ACP cancel) do not cancel a top-level background batch: it belongs to the async registry, not to the turn, and still delivers its result. `delegate_task(action="stop")`, the CLI `/stop` (which kills background work, not the turn) or closing/resetting the owning session ends its background children and every synchronous descendant beneath them; each stopped child still returns as a completion with `status="interrupted"` and its partial output
 
 Synchronous single-task delegation from an orchestrator runs directly without thread pool overhead.
 
@@ -571,7 +571,8 @@ delegate_task(
 :::warning Background completion durability is not durable execution
 Top-level model-facing `delegate_task` calls run in the background automatically where the session supports later delivery. Hermes returns a handle immediately, and the result re-enters the conversation after the child or batch finishes. Orchestrator subagents wait for their workers in the current turn because they must synthesize those results before returning. Stateless request/response endpoints fall back to synchronous execution when they cannot deliver a detached result later.
 
-- Normal follow-up messages do not cancel background children. `/stop` on any surface (gateway `/stop` — also when the session is idle after the dispatching turn ended — CLI `/stop`, the Desktop/TUI Stop button, an ACP cancel) ends the session's running background delegations, and closing or resetting the owning session does the same.
+- Normal follow-up messages and the turn Stop (gateway `/stop`, also when the session is idle, the Desktop/TUI Stop button, an ACP cancel) do not cancel background children; the CLI `/stop` (a background-work kill, separate from interrupting the turn), `delegate_task(action="stop")`, and closing or resetting the owning session do.
+- When a background call cannot be admitted (the pool is at `delegation.max_concurrent_children`, or the restart-durable registry is full or unreadable), `delegate_task` returns `{"status": "rejected", "reason": ...}` and starts nothing. It never runs the refused work synchronously in its place, so the parent stays interactive.
 - Explicit session close/reset interrupts that session's background children. Closing a TUI viewer of a gateway-owned session does not kill the gateway's work.
 - A Hermes process restart does **not** resume a running child. Its attempt becomes `unknown` because Hermes cannot prove which side effects happened.
 - A child that completed before restart but whose result was not delivered is restored and routed back through the owning session's normal checks.
@@ -589,7 +590,7 @@ For **durable execution** that must survive session closure or process restart, 
 - Subagents inherit the parent's enabled toolsets; the model cannot select or widen them per call
 - **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, and only when `max_spawn_depth` is raised from its default of 1 (flat). Disable globally with `orchestrator_enabled: false`.
 - Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`. Orchestrator subagents retain `delegate_task` but keep the other blocks. Both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work instead of burning reasoning iterations.
-- **Cancellation follows ownership** — `/stop` or closing/resetting the owning session ends its background children and the synchronous descendants beneath them; each returns an interrupted completion carrying its partial output
+- **Cancellation follows ownership** — `delegate_task(action="stop")` or closing/resetting the owning session ends its background children and the synchronous descendants beneath them (a turn `/stop` does not); each returns an interrupted completion carrying its partial output
 - Only the final summary enters the parent's context, keeping token usage efficient
 - Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
 

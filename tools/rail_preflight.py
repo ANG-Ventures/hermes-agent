@@ -11,7 +11,8 @@ minutes in (t_db491366).
 Scope: only the dispatcher-owned worker (``owned_kanban_task``); interactive sessions, in-process
 cron and delegate children never see these errors. A configured LOOPBACK CDP override is the
 operator's browser: the browser_* tools (whose agent-browser runs on the pool host under
-placement) are refused up front off the dispatcher host, while ``browser_cdp`` (which connects from
+placement) are refused up front off the dispatcher host, except the port of the identity lease the
+tool itself started (``tools.browser_lease``, t_ce9bd5a3), while ``browser_cdp`` (which connects from
 the dispatcher process itself) only gets the liveness probe. The agent's own Chromium and the
 computer_use desktop are not operator rails: a placed worker keeps both wherever the pool host can
 host them, and only when that placement fails is the failure reported as this rail
@@ -26,6 +27,7 @@ turn loop, and only it, parks the card ``needs_input`` with the message verbatim
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import threading
@@ -33,6 +35,8 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Dict, Iterator, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 RAIL_ABSENT_SUFFIX = "_RAIL_ABSENT"
 _PROBE_TIMEOUT_S = 2.0
@@ -143,7 +147,9 @@ def _emit(task: str, message: str) -> str:
     from hermes_cli import kanban_worker_hosts as kwh
     placed = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
     modes = pff.caps_modes() if kwh.is_pool_host(placed) else {}
-    cap = _RAIL_CAP.get(message.split("_", 1)[0])
+    parsed = pff.parse_absent(message)   # a ``cap=`` line names its own capability (t_f935cb6f)
+    cap = (parsed[1] if parsed and "cap=" in message.split("\n", 1)[0] else None) \
+        or _RAIL_CAP.get(message.split("_", 1)[0])
     if modes and cap and not pff.enforced(cap, modes):
         pff.note_gate_warn(cap, message, modes)
         return message
@@ -163,17 +169,37 @@ def record_absent(message: str) -> Optional[str]:
     return message
 
 
+def placed_loopback(cdp_url: str) -> bool:
+    """A dispatcher-owned worker on a pool host with a loopback CDP override: the endpoint lives on the
+    pool host, so this process must not discover or attach to it (its own loopback is another machine's)."""
+    if not cdp_url or not _owned_task() or not _placed_host():
+        return False
+    from agent.proxy_bypass import is_loopback_host, split_host_port
+    return is_loopback_host(split_host_port(cdp_url.strip())[0])
+
+
+LEASE_HOST_SIDE = ("BROWSER_LEASE_TOOLS_ONLY: the identity lease is driven by the browser_* tools; "
+                   "browser_cdp connects from this process and cannot reach it")
+
+
 def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str]:
     """``BROWSER_RAIL_ABSENT`` for a configured loopback CDP override (the operator's browser),
     or None to proceed. ``cdp_url`` is the configured, unresolved override. ``host_side``: the
     caller connects from this (dispatcher) process, not from the pool host, so placement does
     not move the endpoint and only liveness counts."""
+    from tools.browser_lease import is_lease_url, unavailable_error
+    gone = unavailable_error()
+    if gone:   # a selected identity whose lease child exited: refuse, never fall back (Prism 52ec81c4713e)
+        return gone
     task = _owned_task()
     if not task or not cdp_url:
         return None
     from agent.proxy_bypass import is_loopback_host, split_host_port
     if not is_loopback_host(split_host_port(cdp_url)[0]):
         return None  # a remote CDP endpoint is reachable from any host
+    if is_lease_url(cdp_url):
+        # the port the lease client this tool started printed, while that child lives (t_ce9bd5a3)
+        return LEASE_HOST_SIDE if host_side else None
     placed = None if host_side else _placed_host()
     if placed:
         return _emit(task, rail_absent_message("browser", placed))
@@ -182,30 +208,87 @@ def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str
     return None
 
 
-def browser_capability_error() -> Optional[str]:
+def browser_capability_error(*, identity: bool = False) -> Optional[str]:
     """Layer 1b (D1b-undeclared, t_f813a42f): a browser_* call from a placed worker whose host
-    lacks an ENFORCED ``browser-session`` gets the placement ABSENT line at once, recorded like
-    the mid-run skill_view gate, whether or not the card declared the need. Without it the call
-    passes every declared-need gate and fails slowly inside CDP on the pool host."""
+    lacks the ENFORCED capability the call needs gets the placement ABSENT line at once, recorded
+    like the mid-run skill_view gate, whether or not the card declared the need. Without it the
+    call passes every declared-need gate and fails slowly inside CDP on the pool host.
+
+    Which capability (t_f935cb6f): a configured CDP override is a signed-in browser, so the call
+    needs ``browser-session`` (the identity; every map defines that word). Without one the call
+    drives the agent's own Chromium on a public page and needs only ``browser-public``, so a pool
+    host with agent-browser serves it and the card is never sent to the Studio for it.
+    ``identity``: the call puts a credential into the page (browser_vault_*), which is identity
+    work in any browser: a pool host's own Chromium never gets one."""
     if not _owned_task():   # background-review fork / delegate child / interactive: never gated
         return None
+    from tools.browser_tool_cdp import _get_cdp_override_raw
     from hermes_cli.kanban_placement_failfast import capability_gate
-    absent = capability_gate("browser-session")
+    from tools.browser_tool_cloud import _use_real_profile
+    # browser.use_real_profile opens a copy of the user's signed-in profile: identity work too (Prism a270aad9f004).
+    absent = capability_gate("browser-session" if identity or _get_cdp_override_raw() or _use_real_profile()
+                             else "browser-public")
     if absent is not None:
         record_absent(absent)
     return absent
 
 
-def placed_browser_rail_error() -> Optional[str]:
+def _card_requires(cap: str) -> bool:
+    """Whether this worker's card HARD-requires ``cap`` (declared or via an attached skill): the
+    dispatcher's placement stamp when present, else derived from the card and the fleet map now.
+    Unknown (no card row, unreadable map) reads as required, the pre-t_f1a3ee84 behaviour."""
+    from hermes_cli import kanban_placement_failfast as pff
+    from hermes_cli import kanban_worker_hosts as kwh
+    try:
+        import json
+        record = json.loads(os.environ.get(kwh.PLACEMENT_ENV) or "{}")
+        stamped = record.get(pff.REQUIRES_KEY) if isinstance(record, dict) else None
+        if isinstance(stamped, list):
+            return cap in stamped
+        from hermes_cli import kanban_db as kb
+        with kb.connect_closing() as conn:
+            row = conn.execute("SELECT body, skills FROM tasks WHERE id = ?", (_owned_task(),)).fetchone()
+        if row is None:
+            return True
+        skills = [s for s in (json.loads(row["skills"] or "[]") or []) if isinstance(s, str)]
+        cmap = pff.snapshot_map(pff._fleet_bytes(pff._fleet_dir()))
+        return cap in pff.hard_requirements(cmap, row["body"], skills)
+    except Exception:
+        logger.debug("rail preflight: could not read the card's requirements", exc_info=True)
+        return True
+
+
+def placed_browser_rail_error(cause: str = "") -> Optional[str]:
     """The agent's own browser could not be placed on this worker's pool host (no desktop stack
-    in its sandbox): report it as the browser rail, since the only browser left is the Studio's.
+    in its sandbox): report it as a missing ``browser-public`` (t_f935cb6f), never as Ace's
+    browser rail, so the re-route goes to a pool host whose agent-browser works, not the Studio.
     None for anything but a placed, dispatcher-owned worker. Never recorded for parking from a
-    background cleanup ``close`` (``background_cleanup``)."""
+    background cleanup ``close`` (``background_cleanup``).
+
+    ``cause`` (t_f1a3ee84): the placement error this replaces. It is logged at WARNING and its
+    first line rides on a ``cause:`` line under the token line (``parse_absent`` reads line one
+    only), so the card event and park reason say why. A card that does not require
+    ``browser-public`` gets a plain tool error it can route around, never recorded: only a
+    declared need ends the run."""
     task = _owned_task()
     placed = _placed_host() if task else None
     if not placed:
         return None
-    message = rail_absent_message("browser", placed)
+    from hermes_cli.kanban_placement_failfast import absent_line
+    first = next((ln.strip() for ln in str(cause or "").splitlines() if ln.strip()), "")[:300]
+    sid = ""
+    try:
+        from gateway.session_context import get_session_env
+        sid = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        pass
+    logger.warning("agent browser could not start on placed host %s (task %s, session %s): %s",
+                   placed, task, sid or "?", cause or "(no error text)")
+    if not _card_requires("browser-public"):
+        return (f"No browser on {placed} for this card: {first or 'the agent browser could not start'}. "
+                "Use web_extract, or curl in the terminal, instead; add `requires: browser-public` "
+                "to the card body only if a real browser is essential.")
+    message = absent_line("browser-public", placed) + (f"\ncause: {first}" if first else "")
     return message if _in_cleanup.get() else _emit(task, message)
 
 

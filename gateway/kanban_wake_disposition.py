@@ -6,8 +6,8 @@ card event's wake should become once ``resolve_boomerang_wake`` says the card is
 
 - ``"surface"`` — today's path (passive line + wake turn). Every judgment event, every
   event on a spend/egress card, and every kind this table does not name (INV-5).
-- ``"none"``    — no child and no wake change: the merge pass owns a green or pending
-  own-repo review handback (pass-1 B3).
+- ``"none"``    — no child and no wake change: the merge pass owns a green, pending or
+  unconflicted red own-repo review handback (pass-1 B3; red since t_88864f95).
 - ``"auto"``    — a mechanical event a boomerang child may handle. Only this exact string
   dispatches; a caller must never dispatch on ``!= "surface"`` (pass-3 residue).
 
@@ -27,6 +27,10 @@ its ``trigger``. The payload is the event payload, plus two keys the caller reso
 - ``prism_all_answered``: True only when the handback text answers every Prism key open at
   the handback head (``gateway/kanban_prism_answers.py``) and the row's config knob is on.
   Anything else (False / None / missing) leaves today's rows deciding (t_6e9f48cc).
+- ``human_reviewer``: True only when the handback's reviewer (the event's ``reviewer``, else the
+  card's assignee) is the human sentinel and the row's stop file is absent (t_efb6f435).
+- ``park_return``: True only when the event is the board's ``lifecycle_entry_repair`` re-entry into
+  review, its reviewer is the human sentinel and the row's stop file is absent (t_ff6f4be4).
 
 Card tags are read from ``task.tags`` (an iterable) when the caller has one, else from the
 card title/body: a ``tags: a, b`` line or a ``[tag]`` marker (the ``[milestone]`` /
@@ -110,13 +114,19 @@ def _pr_state(c: _Ctx) -> str:
 
 # THE table. Ordered by tier; the first matching row wins. Every ``auto`` row names a mode.
 _TABLE: tuple = (
-    # Tier 1 — card tags beat every kind row.
+    # Restricted cards may be diagnosed, never auto-authorized by that diagnosis.
+    _Row(1, "blocked_assess", lambda c: c.kind == "blocked", AUTO, MODE_FORK),
+    # Tier 1 — card tags beat other kind rows.
     _Row(1, "card_tag_surface", lambda c: bool(c.tags & SURFACE_TAGS), SURFACE),
     # Tier 2 — judgment kinds.
-    _Row(2, "blocked_needs_input",
-         lambda c: c.kind == "blocked" and str(c.payload.get("kind") or "") == "needs_input", SURFACE),
-    _Row(2, "blocked", lambda c: c.kind == "blocked", SURFACE),
     _Row(2, "block_loop_detected", lambda c: c.kind == "block_loop_detected", SURFACE),
+    # Tier 3 — a card back in review from a park or schedule (the board's ``lifecycle_entry_repair``
+    # ``review_requested``: no run, no summary) for a HUMAN reviewer: a child does the attended read
+    # (why it waits, or surface) instead of a bare home-session turn (t_ff6f4be4). It never approves or
+    # lands. The caller sets ``park_return`` (False while the row's stop file is present). Above the PR
+    # rows: a returned park is not a fresh handback, whatever state its PR is in.
+    _Row(3, "review_park_return", lambda c: _is_review(c) and c.payload.get("park_return") is True,
+         AUTO, MODE_FORK),
     # Tier 3 — a mechanical own-repo handback: every open Prism key is answered in the
     # handback text, so posting those lines, the coverage and the enqueue is not a verdict
     # (t_6e9f48cc). Above the green and red rows: the queue owns CI (a red row's existing
@@ -124,12 +134,23 @@ _TABLE: tuple = (
     # the child surfaces). An unanswered key falls through to today's rows.
     _Row(3, "own_repo_review_all_keys_answered",
          lambda c: _own_review(c) and c.payload.get("prism_all_answered") is True, AUTO, MODE_FORK),
-    # Tier 3 — the merge pass owns a green/pending own-repo handback.
+    # Tier 3 — a green/pending/red own-repo handback whose review was handed to a HUMAN reviewer
+    # (``human`` / ``human:<name>``): the operator owes a read, so a child does the first read
+    # (stage it and surface, or send back a plainly incomplete handback; never approve or land)
+    # instead of a bare home-session turn (t_efb6f435). The caller sets ``human_reviewer`` (False
+    # while the row's stop file is present). A dirty PR keeps its own row below.
+    _Row(3, "own_repo_review_human",
+         lambda c: _own_review(c) and c.payload.get("human_reviewer") is True
+         and _pr_state(c) in ("green", "pending", "red"), AUTO, MODE_FORK),
+    # Tier 3 — the merge pass owns a green/pending own-repo handback, and a red one without a
+    # conflict too: a red check has not held a merge since 2026-11-09, so no child proves the red
+    # is main's (Ace 2026-11-14, t_88864f95).
     _Row(3, "own_repo_review_green_or_pending",
-         lambda c: _own_review(c) and _pr_state(c) in ("green", "pending"), NONE),
-    # Tier 4 — specific mechanical rows.
+         lambda c: _own_review(c) and _pr_state(c) in ("green", "pending", "red"), NONE),
+    # Tier 4 — specific mechanical rows. The row keeps its name (claimed state + ALLOWED key) but
+    # matches a DIRTY (conflicted) PR only.
     _Row(4, "own_repo_review_red",
-         lambda c: _own_review(c) and _pr_state(c) in ("red", "dirty"), AUTO, MODE_FORK),
+         lambda c: _own_review(c) and _pr_state(c) == "dirty", AUTO, MODE_FORK),
     _Row(4, "completed", lambda c: c.kind == "completed", AUTO, MODE_FORK),
     _Row(4, "changes_requested", lambda c: c.kind == "changes_requested", AUTO, MODE_FORK),
     _Row(4, "crash_first_occurrence",
@@ -138,6 +159,10 @@ _TABLE: tuple = (
     # (hermes-home scripts/kanban-review-deadman.py) instead of a direct wake. The child does the
     # attended read: a bounded why-waits comment, or surface.
     _Row(4, "review_deadman", lambda c: c.kind == "review_deadman", AUTO, MODE_FORK),
+    # t_6a70430e: a producer's card-owned mechanical wake (a detached job's failure/handoff, an obligation
+    # routine wake), emitted as a ``mechanical_wake`` card event instead of a direct socket turn. The child
+    # reads it and acknowledges (receipt + one comment, any open status) or surfaces it.
+    _Row(4, "mechanical_wake", lambda c: c.kind == "mechanical_wake", AUTO, MODE_FORK),
     # Tier 5 — default: upstream handbacks, repeat crashes, reclaimed, skipped_nonspawnable,
     # status/heartbeat plumbing and any kind nobody listed.
     _Row(5, "default", lambda c: True, SURFACE),

@@ -87,7 +87,7 @@ def test_takeover_schedule_posts_foreign_change(kanban_home):
         tid = _card(conn, blocked=False)
         with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
                                foreign_ok=f"Ace: park to 10-04 (msg {NEW_MSG})"):
-            assert kb.schedule_task(conn, tid, reason="10-04")
+            assert kb.schedule_task(conn, tid, reason="10-04", wake_at=2_000_000_000)
         bodies = _comments(conn, tid)
         assert (f"FOREIGN CHANGE by {OTHER} (Ace: park to 10-04 (msg {NEW_MSG})) "
                 f"[schedule]") in bodies
@@ -147,7 +147,7 @@ def test_takeover_with_older_ruling_is_refused_too(kanban_home):
         with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
                                foreign_ok=f"Ace: park (msg {OLD_MSG})"):
             with pytest.raises(kb.ForeignSessionMutationError) as exc:
-                kb.schedule_task(conn, tid, reason="10-04")
+                kb.schedule_task(conn, tid, reason="10-04", wake_at=2_000_000_000)
         assert f"(msg {NEW_MSG})" in str(exc.value)
         assert kb.get_task(conn, tid).status != "scheduled"
 

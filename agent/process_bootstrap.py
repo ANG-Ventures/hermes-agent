@@ -166,6 +166,11 @@ class _SafeWriter:
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
+    def _hermes_unwrap_stdio_layer(self):
+        # Shared unwrap protocol (see ``agent.thread_scoped_output.UNWRAP_STDIO_LAYER``)
+        # so the per-thread routing proxy can see through us and vice versa.
+        return self._inner
+
 
 def _get_proxy_from_env() -> Optional[str]:
     """First configured proxy URL from HTTPS_PROXY / HTTP_PROXY / ALL_PROXY (any case), or None."""
@@ -333,11 +338,22 @@ def build_keepalive_http_client(
 
 
 def _install_safe_stdio() -> None:
-    """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
+    """Wrap stdout/stderr so best-effort console output cannot crash the agent.
+
+    Idempotent across the WHOLE wrapper chain, not just the outermost object: a
+    per-thread routing proxy (``agent.thread_scoped_output``) may sit above an
+    earlier ``_SafeWriter``, and wrapping again on every fresh agent build grew
+    the chain two layers at a time until attribute lookups hit ``RecursionError``.
+    """
+    from agent.thread_scoped_output import iter_wrapped_streams
+
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
-        if stream is not None and not isinstance(stream, _SafeWriter):
-            setattr(sys, stream_name, _SafeWriter(stream))
+        if stream is None:
+            continue
+        if any(isinstance(layer, _SafeWriter) for layer in iter_wrapped_streams(stream)):
+            continue
+        setattr(sys, stream_name, _SafeWriter(stream))
 
 
 # Drop-in for ``openai.OpenAI``.

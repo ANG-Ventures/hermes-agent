@@ -16,6 +16,13 @@ class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
     reply_expected: Optional[bool] = None
+    # Effective policy only: never rewrite the opening row's persisted provenance.
+    human_engaged: bool = False
+
+    @property
+    def effective_display_kind(self) -> Optional[str]:
+        return None if self.human_engaged else self.persist_user_display_kind
+
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False

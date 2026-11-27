@@ -17,6 +17,12 @@ from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_notify as kbn
 
+import agent.delegation_context as _dc
+from tools import kanban_tools as _kt
+
+_REAL_DC_PREDICATE = _dc.is_dispatcher_owned_worker_context
+_REAL_KT_PREDICATE = _kt._is_dispatcher_owned_worker
+
 HOME_SID = "20261106_091900_home"
 CLI_SID = "20261106_091901_cli"  # a session with no routable chat (CLI origin)
 
@@ -103,38 +109,63 @@ def test_tool_create_opt_out(script_env):
     assert all(mode == "notify" for _, mode, _ in subs)
 
 
-# (c) a home with no routable chat (CLI origin / unknown / operator) -> unchanged
+# (c) a home with no routable chat (CLI origin / unknown / operator): the card still gets the
+# level (t_c24b1cc7: every producer), but no recipient is invented.
 @pytest.mark.parametrize("sid", [CLI_SID, "20260101_000000_gone", "operator:apollo"])
-def test_cli_unroutable_home_unchanged(script_env, sid):
-    assert _state(_cli_create(f"--session {sid}")) == (None, [])
+def test_cli_unroutable_home_level_without_waker(script_env, sid):
+    assert _state(_cli_create(f"--session {sid}")) == (True, [])
 
 
-def test_cli_no_session_flag_unchanged(script_env):
-    assert _state(_cli_create("")) == (None, [])
+def test_cli_no_session_flag_level_without_waker(script_env):
+    assert _state(_cli_create("")) == (True, [])
 
 
-def test_tool_unroutable_home_unchanged(script_env):
+def test_tool_unroutable_home_level_without_waker(script_env):
     from tools import kanban_tools as kt
     created = json.loads(kt._handle_create(
         {"board": "default", "title": "tool card", "assignee": "peer", "session_id": CLI_SID}))
     assert created["ok"], created
-    assert _state(created["task_id"]) == (None, [])
+    assert _state(created["task_id"]) == (True, [])
 
 
-# (d) a dispatcher-owned worker caller keeps today's behaviour
-def test_cli_worker_caller_unchanged(script_env, monkeypatch):
+# (d) a dispatcher-owned worker caller: the card gets the level; the worker's create does not
+# subscribe the home (worker cards report through the parent lineage).
+def test_cli_worker_caller_level_no_home_row(script_env, monkeypatch):
     import agent.delegation_context as dc
     monkeypatch.setattr(dc, "is_dispatcher_owned_worker_context", lambda: True)
-    assert _state(_cli_create(f"--session {HOME_SID}")) == (None, [])
+    assert _state(_cli_create(f"--session {HOME_SID}")) == (True, [])
 
 
-def test_tool_worker_caller_unchanged(script_env, monkeypatch):
+def test_tool_worker_caller_level_no_home_row(script_env, monkeypatch):
     from tools import kanban_tools as kt
     monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
     created = json.loads(kt._handle_create(
         {"board": "default", "title": "tool card", "assignee": "peer", "session_id": HOME_SID}))
     assert created["ok"], created
-    assert _state(created["task_id"]) == (None, [])
+    assert _state(created["task_id"]) == (True, [])
+
+
+@pytest.fixture
+def real_predicate(script_env, monkeypatch):
+    """Undo ``script_env``'s worker pin: the caller is classed by the REAL predicate
+    over an env with no Kanban grant at all (t_39f5f042: it failed open)."""
+    import agent.delegation_context as dc
+    from tools import kanban_tools as kt
+    for k in (*dc.KANBAN_ENV_KEYS, dc.DELEGATED_CHILD_ENV_MARKER):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(dc, "is_dispatcher_owned_worker_context", _REAL_DC_PREDICATE)
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", _REAL_KT_PREDICATE)
+    return script_env
+
+
+def test_cli_script_create_real_predicate_defaults_boomerang(real_predicate):
+    assert _state(_cli_create(f"--session {HOME_SID}")) == (True, [("chat-home", "notify+wake", "u1")])
+
+
+def test_cli_script_create_real_predicate_opt_out(real_predicate):
+    level, subs = _state(_cli_create(f"--session {HOME_SID} --no-boomerang-wake"))
+    assert not level
+    assert all(mode == "notify" for _, mode, _ in subs)
 
 
 def test_config_knob_off_disables_the_default(script_env):

@@ -530,6 +530,7 @@ class TestDefaultContextLengths:
             "claude-opus-5-fast",
             "claude-sonnet-5",
             "claude-fable-5",
+            "claude-fable-5-2",
             "claude-mythos-5",
         ]
         for model_id in frontier:

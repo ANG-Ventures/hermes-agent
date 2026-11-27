@@ -26,7 +26,6 @@ HEAD = "a" * 40
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o", "u"})
-    monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(tmp_path / "absent-mgp.json"))
     cfg = tmp_path / "worker-pr-draft.json"
     cfg.write_text(json.dumps({"enabled": True, "repos": ["O/R"]}))
     monkeypatch.setenv("KANBAN_WORKER_PR_DRAFT", str(cfg))
@@ -78,7 +77,7 @@ def test_lookup_failing_twice_refuses_own_pr_in_worker_draft_repo():
     gh = _gh("daedalus/t_5c6c67c5-x", fail_first=2)
     with pytest.raises(fr.DraftLookupError) as exc:
         fr.check(op.extract_pr_refs(PR_URL), task_id="t_5c6c67c5", allow_arm=True, gh=gh,
-                 armable={"o/r#5"}, arm=lambda *a: pytest.fail("armed"))
+                 armable={"o/r#5"}, evaluate=lambda *a: pytest.fail("evaluated"), event_land=True)
     assert exc.value.prs == ["o/r#5"]
     assert isinstance(exc.value, fr.DraftPrError)
     assert "failed twice" in str(exc.value) and "draft_ok" in str(exc.value)
@@ -165,7 +164,7 @@ def test_no_github_client_refuses_own_pr_in_worker_draft_repo(monkeypatch):
     monkeypatch.setattr(fr, "_default_gh", lambda: None)
     with pytest.raises(fr.DraftLookupError) as exc:
         fr.check(op.extract_pr_refs(PR_URL), task_id="t_5c6c67c5", allow_arm=True, armable={"o/r#5"},
-                 arm=lambda *a: pytest.fail("armed"))
+                 evaluate=lambda *a: pytest.fail("evaluated"), event_land=True)
     assert exc.value.prs == ["o/r#5"]
 
 
@@ -231,6 +230,73 @@ def test_review_requested_ping_shows_the_draft_note():
     plain = nt._fmt_review_requested(SimpleNamespace(payload={"summary": "NOT met"}),
                                      SimpleNamespace(head="h", title="T"))[0]
     assert "ace_gate.py" not in plain
+
+
+# --- t_1938555e: prose that DESCRIBES code is not a negative result ---------------------------
+
+# t_c5cbe356 run 86561's handback summary as recorded, with its PR ref pointed at the test PR. Its
+# "Any other failure is reported as not proven" (a sentence about the code) left the fixed PR a draft
+# with no CI and no Prism round.
+C5CBE356 = (
+    "Prism round 1 fixed on o/r#5, new head 605d5d850d3a. All 3 findings fixed:\n"
+    "- 90ae2f202cc7 (P1): CI's oracle graded GitHub's merge tree, not the head. The oracle path is removed "
+    "(heal_oracle and _mrf are deleted), so the proof is always the tick's own `derived-artifacts.py check --id "
+    "<row>` on a clean checkout of the head.\n"
+    "- 3d71c7a2d7de (P1): the proof cache key now includes the row id and a hash of the row's definition.\n"
+    "- f67496fc94d3 (P2): a result counts as stale only on rc 1 with the check's own `stale: ... (<row>): run` "
+    "line and no traceback. Any other failure is reported as not proven and is not cached.\n"
+    "All 5 Prism simplify cuts were applied, net -16 lines in the tick. `always-review-derive.py --write` dropped "
+    "3 closure rows that the removed main-red-fastlane import had added.\n\n"
+    "Tests: `pytest scripts/tests/test_derived_approve.py -k \"bot or t112 or tc5c\"` gave 66 passed on ci-box. "
+    "Each fix was reverted once and its test went red: the stamp test fails against origin/main's tick, the cache "
+    "test fails without the row hash in the key, and the heal_check test fails when any rc 1 counts as stale. "
+    "`derived-artifacts.py check --base origin/main` says ok. PR body updated (Problem/Proof/revert-fails).\n\n"
+    "CI on 694d7dd0 was OWN 0 · MAIN 2, per the operator note. The new head has not run CI yet. Nothing was run "
+    "on the Studio.\n\n"
+    "live-evidence: yes: the first derive/merged-not-live-globset PR after deploy gets a `stamped ...; heal-exact "
+    "(merged-not-live-globset)` receipt"
+)
+
+
+def _wire_flip(monkeypatch, tid_box, ready):
+    from hermes_cli import kanban_open_pr as _op
+    monkeypatch.setattr(fr, "_default_gh", lambda: _gh(f"daedalus/{tid_box[0]}-heal-exact"))
+    monkeypatch.setattr(fr, "_default_ready", lambda: (lambda r, n: ready.append((r, n)) or 0))
+    monkeypatch.setattr(fr, "spawn_evaluate", lambda *a: "/tmp/log")
+    monkeypatch.setattr(_op, "_default_query", lambda: (lambda repo, n: {"state": "OPEN"}))
+
+
+def test_e2e_c5cbe356_summary_flips_its_draft_ready(board, monkeypatch):
+    """Red with the change reverted: review_negative_result {match: 'not proven'}, the PR stays draft."""
+    ready, tid_box = [], []
+    _wire_flip(monkeypatch, tid_box, ready)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        tid_box.append(tid)
+        ok, reason = kb.request_review(conn, tid, summary=C5CBE356, metadata={"pr_url": PR_URL},
+                                       expected_run_id=run, with_reason=True)
+        assert ok is True, reason
+        assert _events(conn, tid, "review_negative_result") == []
+        assert ready == [("o/r", 5)]
+        assert kb.latest_run(conn, tid).metadata["handoff_freshness"]["draft_flipped"] == ["o/r#5"]
+
+
+def test_e2e_first_line_negative_still_leaves_the_draft(board, monkeypatch):
+    """The same body under a first line that says the result was negative keeps today's route."""
+    ready, tid_box = [], []
+    _wire_flip(monkeypatch, tid_box, ready)
+    monkeypatch.setattr(fr, "ace_gate_ready", lambda *a: pytest.fail("flipped a negative-result draft"))
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        tid_box.append(tid)
+        summary = "Result: acceptance not proven; the live receipt has not been seen.\n" + C5CBE356
+        assert kb.request_review(conn, tid, summary=summary, metadata={"pr_url": PR_URL},
+                                 expected_run_id=run) is True
+        assert _status(conn, tid) == "review"
+        (neg,) = _events(conn, tid, "review_negative_result")
+        assert neg["match"] == "not proven"
+        assert _events(conn, tid, "handoff_draft_flipped") == []
+    assert ready == []
 
 
 # --- Prism d0bec1125a49: only the card's OWN handoff PRs become flip commands ------------------

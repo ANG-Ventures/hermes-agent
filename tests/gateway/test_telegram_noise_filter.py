@@ -64,6 +64,12 @@ NOISY_STATUS_MESSAGES = [
 # feedback (manual_compression_feedback.py headlines) and abort/failure
 # notices that require user action.
 VISIBLE_COMPRESSION_MESSAGES = [
+    # t_5be6185c: damaged compaction store notice (display.notice.compression_store_unavailable).
+    (
+        "⚠️ Context is over the compression threshold (~730,000 tokens >= 650,000) but compression cannot "
+        "run: the compaction store is damaged (database error). /compress uses the same store and will not "
+        "help. Run /new to start a fresh session."
+    ),
     "Compressed: 30 → 12 messages",
     "Compression aborted: 30 messages preserved",
     "Compressed with fallback: 30 → 12 messages",

@@ -107,7 +107,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
 
     def _block(reason: str) -> None:
         with _kbc.connect_closing() as c:
-            _kb.block_task(c, task_id, reason=reason, expected_run_id=expected_run_id)
+            _kb.block_task(c, task_id, reason=reason, kind="needs_input", expected_run_id=expected_run_id)
 
     _run_loop(
         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
@@ -221,6 +221,11 @@ def _raise_worker_exit(cli, result, code: int):
     exc.code = int(code)
     if os.environ.get("HERMES_KANBAN_TASK"):
         with suppress(Exception):
+            # rc=130 alone reads as a signal; an in-process stop (turn lease, liveness watchdog)
+            # names itself here so the worker log says who stopped the turn (t_61a89317).
+            reason = result.get("turn_exit_reason") if isinstance(result, dict) and result.get("interrupted") else None
+            if reason:
+                print(f"\n[kanban-worker-exit] interrupted: {reason}", file=sys.stderr, flush=True)
             print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
     raise exc
 

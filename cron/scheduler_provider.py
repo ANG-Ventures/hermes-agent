@@ -199,8 +199,12 @@ class CronScheduler(ABC):
         report it as scheduled). Built-in: no-op."""
         return None
 
-    def recover_interrupted(self) -> int:
+    def recover_interrupted(self, *, replay_pass: bool = True) -> int:
         """Run profile-local attempt recovery for every provider lifecycle.
+
+        ``replay_pass`` runs cron/shutdown_replay.py's boot pass around recovery, so every
+        provider (builtin or Chronos) consumes stop-drain markers. The script-runner lane
+        passes False: it never owns agent-lane markers (t_b5c315bb).
 
         Two stores must be reconciled, not one:
 
@@ -232,6 +236,8 @@ class CronScheduler(ABC):
         """
         from cron.executions import recover_interrupted_executions
 
+        if replay_pass:
+            _shutdown_replay_pass("pre")
         recovered = recover_interrupted_executions()
         if recovered:
             try:
@@ -243,6 +249,8 @@ class CronScheduler(ABC):
                     exc_info=True,
                 )
         _settle_script_outcomes()
+        if replay_pass:
+            _shutdown_replay_pass("post")
         return recovered
 
     @staticmethod
@@ -273,6 +281,9 @@ class CronScheduler(ABC):
             last_run = job.get("last_run_at") or ""
             if _stamp_not_before(last_run, claimed_at):
                 continue  # the job already recorded this run (or a newer one)
+            marker = job.get("replay_pending")
+            if isinstance(marker, dict) and marker.get("run_id") == row.get("id"):
+                continue  # the stop drain marked this run for replay (cron/shutdown_replay.py)
             mark_job_run(
                 job_id, False,
                 "Interrupted: the scheduler process exited before this run's "
@@ -614,7 +625,7 @@ class InProcessCronScheduler(CronScheduler):
         # store here must not take the whole ticker thread down (#111010) — the loop's own
         # per-tick handling logs, persists the reason and keeps the thread alive.
         try:
-            recovered = self.recover_interrupted()
+            recovered = self.recover_interrupted(replay_pass=lane != "script")
             if recovered:
                 logger.warning(
                     "Marked %d interrupted cron execution(s) unknown after restart", recovered
@@ -733,7 +744,7 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 with _profile_cron_scope(home):
                     if startup_recovery:
-                        recovered = self.recover_interrupted()
+                        recovered = self.recover_interrupted(replay_pass=lane != "script")
                         if recovered:
                             logger.warning(
                                 "Marked %d interrupted cron execution(s) for profile at %s",
@@ -880,6 +891,21 @@ class InProcessCronScheduler(CronScheduler):
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
             stop_event.wait(max(0.0, next_tick - now))
+
+
+def _shutdown_replay_pass(phase: str) -> None:
+    """Boot pass of cron/shutdown_replay.py for the current store: ``"pre"`` (before execution
+    recovery) releases hard-kill claims, ``"post"`` consumes stop-drain replay markers. Never
+    lets that bookkeeping break scheduler startup."""
+    try:
+        from cron import shutdown_replay
+
+        if phase == "pre":
+            shutdown_replay.release_orphaned_claims()
+        else:
+            shutdown_replay.consume_replay_markers()
+    except Exception:
+        logger.warning("cron shutdown-replay %s-recovery pass failed", phase, exc_info=True)
 
 
 def _stamp_not_before(last_run: str, claimed_at: str) -> bool:

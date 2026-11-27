@@ -129,7 +129,9 @@ def _tool_call(tool: str, args: dict) -> tuple[bool, str]:
 
 
 def _block(reason: str) -> bool:
-    ok, detail = _tool_call("kanban_block", {"reason": reason[:1000]})
+    from hermes_cli.kanban_human_ask import shaped_for_machine
+    ok, detail = _tool_call("kanban_block", {"reason": shaped_for_machine(reason[:1000]),
+                                             "kind": "needs_input"})
     _log(f"board kanban_block ok={ok}: {detail}")
     return ok
 
@@ -149,6 +151,11 @@ def handback(receipt: Optional[dict], rc: Optional[int], stderr_tail: str) -> bo
         return _block(f"native worker: receipt handback not allowed (tool={tool!r}); "
                       f"only {', '.join(HANDBACK_TOOLS)} are")
     args = {k: v for k, v in args.items() if k != "task_id"}  # always this worker's own card
+    if tool == "kanban_block":
+        args.setdefault("kind", "needs_input")
+        if args["kind"] == "needs_input" and isinstance(args.get("reason"), str):
+            from hermes_cli.kanban_human_ask import shaped_for_machine
+            args["reason"] = shaped_for_machine(args["reason"])
     ok, detail = _tool_call(tool, args)
     _log(f"board {tool} ok={ok}: {detail}")
     if ok:

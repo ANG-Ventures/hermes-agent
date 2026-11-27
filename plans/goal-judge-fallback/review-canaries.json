@@ -1,0 +1,15 @@
+{
+  "scope": "Branch-code judge_goal forced-unreachable-primary canaries; not deployed acceptance",
+  "studio": [
+    {"identity": "default/Apollo", "provider": "xai-oauth", "requested": "grok-4.7", "served_model": "grok-4.7", "verdict": "continue", "parse_failed": false, "transport_failed": false},
+    {"identity": "default/Apollo", "provider": "cpa", "requested": "kimi-k3.1-pro", "served_model": "k3.1-pro", "verdict": "continue", "parse_failed": false, "transport_failed": false},
+    {"identity": "aegis", "provider": "xai-oauth", "requested": "grok-4.7", "served_model": "grok-4.7", "verdict": "continue", "parse_failed": false, "transport_failed": false},
+    {"identity": "aegis", "provider": "cpa", "requested": "kimi-k3.1-pro", "served_model": "k3.1-pro", "verdict": "continue", "parse_failed": false, "transport_failed": false}
+  ],
+  "ace_ai": {
+    "identity": "default/Agora",
+    "result": "blocked before provider transport",
+    "prerequisite": "Use a real scratch source/interpreter entry rather than ACE-AI's managed launcher that rewrites -m/-c to installed source and consumes stdin. Overlay child returned worker_error; diagnostic showed installed source prepended and json.load(sys.stdin) JSONDecodeError. Neither Grok nor Kimi availability is certified by that run.",
+    "live_changes": "none"
+  }
+}

@@ -82,6 +82,16 @@ def _summary_rows(messages):
     return [m for m in messages if isinstance(m.get("content"), str) and m["content"].startswith(SUMMARY_PREFIX)]
 
 
+def _wait_for_detached_workers(timeout=15.0):
+    """Block until every fence-cancelled compression worker has finished unwinding. Its future's
+    done-callback frees the pool admission slot strictly after the worker's late ``stall_interrupted``
+    record, so a zero count means no late cooldown write is still in flight."""
+    deadline = time.monotonic() + timeout
+    while cc._compress_admitted_count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert cc._compress_admitted_count == 0, "a cancelled compression worker never settled"
+
+
 @pytest.fixture
 def fast_timeouts(monkeypatch):
     monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (0.4, 4.0))
@@ -103,6 +113,12 @@ def test_second_consecutive_stall_commits_the_deterministic_fallback_summary(tmp
         assert compressor._summary_failure_cooldown_until > time.monotonic()
         assert calls == ["primary"], "no deterministic rung on the FIRST stall: the LLM route gets its backoff retry"
 
+        # The fence-cancelled stall-1 worker keeps unwinding after ``_compress_context`` returned and records its
+        # ``stall_interrupted`` cooldown from its own thread. Wait for that worker to SETTLE (its future's
+        # done-callback frees the admission slot, strictly after the record) so the clear below cannot be
+        # re-armed behind our back: a late arm made the primary skip its LLM call and commit the static
+        # summary (calls == [], CI run 43259635914).
+        _wait_for_detached_workers()
         # The backoff lapses; the still-oversized context re-triggers compression (the reporter's next turn).
         # The host arms this cooldown synchronously, but the fence-cancelled worker keeps unwinding after
         # ``_compress_context`` has returned and may re-arm it from its own thread — a legitimate late write,
@@ -131,7 +147,8 @@ def test_second_consecutive_stall_commits_the_deterministic_fallback_summary(tmp
     # The stalled LLM route stays in its backoff even though the deterministic rung committed. This arm
     # comes from the cancelled PRIMARY worker's `stall_interrupted` record (the deterministic retry path
     # never reaches `on_timeout`), which normally lands while the retry above runs — hence the read last,
-    # after that work, rather than immediately after the clear.
+    # after that work, rather than immediately after the clear. Wait for that worker to settle first.
+    _wait_for_detached_workers()
     assert compressor._summary_failure_cooldown_until > time.monotonic(), (
         "the stalled LLM route keeps its stall backoff after the deterministic commit"
     )

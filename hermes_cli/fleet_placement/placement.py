@@ -41,9 +41,9 @@ available - reserve - the job's declared footprint; the score is the BINDING axi
 host's capacity, so a 16-core and a 128-core box compare on the same scale. choose() applies the three
 layers above with hysteresis (a previous pick is kept unless another host beats it by `margin`), refuses when
 no host has headroom >= the footprint (the caller queues; it never spills), and treats an absent / stale /
-unmeasured sample as CLOSED, never "ok". A host may be EXCLUDED (``eligible: false`` for the consumer, or a row in
-the exclusions file). The ONLY ordinal in the table is `default_first` (one host, the one to saturate); a table
-carrying a ladder / prio / order / rank / last key is refused.
+unmeasured sample as CLOSED, never "ok". A host may be EXCLUDED (``eligible: false`` for the consumer, or a live fwa
+hold on its lane; B5-P3 t_00664b58 retired the exclusions file). The ONLY ordinal in the table is `default_first`
+(one host, the one to saturate); a table carrying a ladder / prio / order / rank / last key is refused.
 
 Reservation at pick time (A3, t_08de4ba5 folded in here): twenty picks in one tick must see twenty different
 headrooms, so a pick is followed by ``reserve(...)`` which records the footprint against the host for the job's
@@ -73,7 +73,9 @@ Stdlib only; python3.9+.
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
+import contextvars
 import dataclasses
 import json
 import math
@@ -84,6 +86,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
 if __package__:                      # hermes_cli.placement (the fork's vendored copy) / lib.placement
@@ -94,7 +97,10 @@ else:                                # scripts/lib on sys.path (every hermes-hom
 
 SCHEMA = 1
 TABLE_REL = Path("config") / "fleet-hosts.json"
-EXCLUSIONS_REL = Path("var") / "placement" / "exclusions.json"
+# Fleet-wide work-kind switches (t_47109d72, `fleet pause <host|all> --work <kind>`), written only by
+# scripts/lib/fleet_kinds.py. A live row closes its kind's consumers on its scope (one host, or every host).
+KINDS_REL = Path("state") / "fleet-pause" / "kinds.json"
+CONSUMER_KIND = {"kanban": "kanban", "athena": "kanban", "prism": "prism", "ci": "ci"}
 RESERVATIONS_REL = Path("var") / "placement" / "headroom-reservations.json"
 ADMISSIONS_REL = Path("var") / "placement" / "admissions.jsonl"
 # Utilization admission (t_dc960eab R2 / t_da6f84f7; Ace 2026-10-18 14:33 / 15:5x): the kill switch is config.yaml
@@ -133,8 +139,40 @@ SPEED_REL = Path("var") / "placement" / "host-speed.json"     # written by R2b (
 SEED_MT_YIELD_SMT2 = 1.3     # Ace 10-18 09:48: ci-box 166 = 128 x 1.3 until measured; SMT2 hosts only, else 1.0
 # CLOSED on PSI cpu some avg10 >= 40 is closed_when (DEFAULT_CLOSED_WHEN, both scorers); v2 adds avg60 >= 25
 V2_PSI_CPU_SOME60 = 25.0
+# Intermittent hosts (t_58366dea, MBP-2026; Apollo ruling 2026-11-06 09:15): ``hosts.<h>.power_policy: ac_only`` closes
+# the host unless its CURRENT sample says it runs on AC and sleep is disabled. The sampler measures both (macOS IOKit
+# power source + pmset SleepDisabled); unmeasured = closed, like every other safety axis.
+POWER_POLICIES = ("ac_only",)
 ALPHA_DEFAULT, ALPHA_FAST, ALPHA_WIDE = 0.5, 1.0, 0.0     # D2: P0/P1 or core_class fast = 1, wide = 0
+# FWA E2E F5 (t_e3384bea): the P0/P1 / core_class fast leg under v2 with a measured st_speed. "speed" (default) takes
+# the FASTEST eligible host (st_speed first, score as the tie-break), the docstring's rule; "score" is the kill switch
+# back to the pre-F5 pick (max headroom_fraction x st_speed), which sent 49/199 fast picks to the slower ace-media.
+FAST_PICKS = ("speed", "score")
 OCCUPANCY_TAU_S = 60.0       # the sampler's EWMA time constant for procs_running - 1
+# ── the points score (t_b01ab307, Ace msgs 1573974283267350589 / 1573979972475949168) ─────────────────────────────
+# Among the hosts the gate left open: used = cpu_busy + (lease threads + this job's threads) / host threads (CPU only,
+# clamped 0..0.99); score = hosts.<h>.points + bonuses - 10 x used / (1 - used). Highest wins; tie -> more points ->
+# host id (lexically first). The previous pick is kept unless another host beats it by keep_margin. The dials live
+# in the table's top-level ``points_score`` block; a consumer not listed there as "points" keeps the old layers.
+POINTS_TOGGLES = ("off", "points")
+POINTS_CONTINUITY = ("bonus", "override")
+POINTS_USED_MAX = 0.99
+POINTS_COST_K = 10.0
+
+
+@dataclasses.dataclass(frozen=True)
+class PointsDials:
+    """The ``points_score`` block: per-consumer toggle (off | points; absent = off), the two bonuses, the keep
+    margin and the continuity mode (bonus = +bonus_continuity on the job's previous host; override = pin there when
+    it is open, the old behaviour)."""
+    consumers: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    bonus_continuity: float = 25.0
+    bonus_fast_core: float = 60.0
+    keep_margin: float = 5.0
+    continuity: str = "bonus"
+
+    def on(self, consumer: str) -> bool:
+        return self.consumers.get(consumer) == "points"
 
 
 class PlacementError(ValueError):
@@ -145,11 +183,31 @@ class LedgerError(PlacementError):
     """The reservation ledger exists but cannot be read or parsed: it is never overwritten (Prism P1 51e7cfc6)."""
 
 
-def fleet_root() -> Path:
-    env = os.environ.get("PLACEMENT_HOME")
-    if env:
-        return Path(env)
-    return Path(__file__).resolve().parents[2]
+def _allocation_home_env():
+    """``ALLOCATION_HOME``, the fleet root override. The pre-rename ``PLACEMENT_HOME`` is no longer read (rename wave 3
+    done, t_5931d620): a process that sets only the old name resolves as if neither were set."""
+    return os.environ.get("ALLOCATION_HOME")
+
+
+def fleet_root(root: Optional[Path] = None) -> Path:
+    if __package__ == "fleet_admission":
+        from .roots import resolve_root
+        return resolve_root(root, source_file=__file__, package=__package__)
+    if root is not None:
+        return Path(root)
+    env = _allocation_home_env()
+    return Path(env) if env else _tree_root()
+
+
+def _tree_root() -> Path:
+    """The tree this file sits in; a release of the fleet home answers the home (t_5d7db1b6: during the 11-13 cut
+    allocd's root became releases/<x>/, which holds no admission receipt, and it refused every request 503)."""
+    here = Path(__file__).resolve().parents[2]
+    try:
+        from fleet_root import release_home
+    except ImportError:   # a partial copy without the resolver is never a release
+        return here
+    return Path(release_home(here) or here)
 
 
 def _num(v) -> bool:
@@ -220,6 +278,10 @@ class HostSpec:
     aliases: tuple
     clock_mhz: float = 0.0           # max single-core clock (core_class "fast")
     default_preference: str = "normal"   # "low" = the headroom layer takes it only when no normal host has headroom
+    yields_overrides: bool = False       # true = never wins by continuity / the fast pick while an unflagged host is eligible
+    #                                      (old layers only: a consumer on the points score never reads it)
+    points: float = 0.0                  # the points score's preference (hosts.<h>.points; absent = 0)
+    fast_core: bool = False              # hosts.<h>.fast_core: core_class fast gets the bonus here, fast-only runs only here
     unmeasurable_axes: tuple = ()        # axes this host's OS cannot report (darwin: no PSI, no %system); never required
     cpu_saturable: bool = False          # v1 only: negative cpu headroom is a score penalty, not a refusal (t_bfb88c23)
     # scorer v2 (t_f8a3b6c3): the active scorer and the host's MEASURED speed (var/placement/host-speed.json, R2b),
@@ -236,9 +298,17 @@ class HostSpec:
     # row names with ``eligible: true``; every other consumer is closed for it (``closed:guest-not-enrolled``)
     enrolled: frozenset = frozenset()
     # a pressure_from guest's OWN size in CPUs (its VM: OrbStack studio-arm is 12 vCPU while it is judged on the
-    # Studio's 24P/32T): the cap on the work admitted ON the guest, apart from the domain's shared headroom. None on
-    # a guest = unmeasured, and the guest is closed (guest_vm_refusal); unused on a non-guest.
+    # Studio's 24P/32T): a discovered hardware fact only. It is no longer a cap (t_31911eb0): the guest's measured use
+    # is fleet use, bounded by hosts.<id>.fleet_cap inside admission.admit().
     vm_cpus: Optional[int] = None
+    # t_58366dea: "ac_only" = closed unless the sample shows AC power and sleep disabled (power_refusal); None = no gate
+    power_policy: Optional[str] = None
+    # t_7566ba56: ((job_class, cpus), ...) from consumers.<c>.ramp_cpus: an unsettled lease of that class is charged its
+    # measured first-90-s CPU (admission.Limits.ramp_cpus); () = full estimate. A malformed value is dropped, never fatal
+    ramp_cpus: tuple = ()
+    # t_31911eb0: ((axis, N | "P%"), ...) from hosts.<id>.fleet_cap, the host's ONE cap on fleet work
+    # (admission.Limits.fleet_cap); () = no cap
+    fleet_cap: tuple = ()
 
     @property
     def cpu_capacity(self) -> float:
@@ -262,10 +332,12 @@ class HostTable:
     # listed keeps the consumer's own class
     profile_footprints: Mapping[str, Mapping[str, Footprint]] = dataclasses.field(default_factory=dict)
     scorer: str = DEFAULT_SCORER                 # the kill switch (v1|v2); active_scorer() applies PLACEMENT_SCORER
+    fast_pick: str = "speed"                     # the F5 kill switch (speed|score), table key ``fast_pick``
     # {host id: (pressure_from or None, aliases)} for EVERY row the table declares, the ones load_hosts() left out
     # included: resource-domain membership is the registry's, not candidate eligibility's, so a closed guest's live
     # leases and reservations still count on its source (Prism 7e9f3e2ed307 / c2f0087775e6 / 03f3bf40fe6b)
     declared: Mapping[str, tuple] = dataclasses.field(default_factory=dict)
+    points: PointsDials = dataclasses.field(default_factory=PointsDials)   # the ``points_score`` block (t_b01ab307)
 
     def declared_id(self, name) -> Optional[str]:
         """Canonical id for ``name`` over the admitted hosts first, then every declared row (left-out ones too)."""
@@ -303,11 +375,11 @@ class HostTable:
 
 
 COORDINATION_HOST = "_fleet"   # allocd /lease fence rows (prism-portable R-4): zero need, never a work admission
-MAX_CEILING = 64     # prism-portable R-2 (t_24b005e5): the router's upper bound; an eligible row without a ceiling
+MAX_CEILING = 1000   # prism-portable R-2 (t_24b005e5), = prism_pool_members.SAFETY_STOP and the prism-router registry ceiling (#823): the router's upper bound; an eligible row without a ceiling
 
 
 def _eligible_errors(hid, c, cv) -> List[str]:
-    """``consumers.<c>`` = {eligible: bool, ceiling: 1..64 optional} XOR the legacy count key (prism-portable R-1;
+    """``consumers.<c>`` = {eligible: bool, ceiling: 1..MAX_CEILING optional} XOR the legacy count key (prism-portable R-1;
     read until t_21a7ace3's deploy cycle ends, then refused);
     ``source`` lives only in the top-level ``consumers_<c>`` block, never in a host row (Q5(b))."""
     errs = []
@@ -323,6 +395,16 @@ def _eligible_errors(hid, c, cv) -> List[str]:
             errs.append(f"hosts.{hid}.consumers.{c}.ceiling needs eligible")
         if not isinstance(cl, int) or isinstance(cl, bool) or not 1 <= cl <= MAX_CEILING:
             errs.append(f"hosts.{hid}.consumers.{c}.ceiling must be an int 1..{MAX_CEILING}")
+    if "allocd" in cv:
+        # t_1b9b2980: the CI start door's per-host kill switch, read on the pool host by fleet-ops-scripts
+        # ci-runner-pool.sh / ci-runner-start.py / ci-runner-allocator.py (host_arm). CI only; a typo must not arm.
+        # t_d3a0df9d: the Prism per-review door reads the same switch from consumers.prism (prism-router#892,
+        # fwa.prism_allocd_mode). Only these two consumers have a start door.
+        if c not in ("ci", "prism"):
+            errs.append(f"hosts.{hid}.consumers.{c}.allocd: only consumers.ci and consumers.prism carry the start-door "
+                        f"switch")
+        elif cv["allocd"] not in ("armed", "spawn-only"):
+            errs.append(f"hosts.{hid}.consumers.{c}.allocd must be armed|spawn-only")
     return errs
 
 
@@ -432,17 +514,28 @@ def validate(doc) -> List[str]:
     for hid, h in hosts.items():
         if isinstance(h, dict) and "clock_mhz" in h and (not _num(h["clock_mhz"]) or h["clock_mhz"] <= 0):
             errs.append(f"hosts.{hid}.clock_mhz must be a number > 0")
+        # a list of strings, nothing more (t_ad5a855d): no name check. A reader never asks for an axis it does not
+        # know, and a mistyped name leaves the real axis required, so only that host reads unmeasured and closes.
         if isinstance(h, dict) and not (isinstance(h.get("unmeasurable_axes", []), list)
-                                        and all(a in REQUIRED_AXES and a not in ("mem_available_gb", "load1", "load5")
-                                                for a in h.get("unmeasurable_axes", []))):
-            errs.append(f"hosts.{hid}.unmeasurable_axes may list only psi_cpu_some10, psi_mem_some10, system_pct")
+                                        and all(isinstance(a, str) for a in h.get("unmeasurable_axes", []))):
+            errs.append(f"hosts.{hid}.unmeasurable_axes must be a list of strings")
         if isinstance(h, dict) and "pressure_from" in h and (not isinstance(h["pressure_from"], str)
                                                              or h["pressure_from"] == hid or h["pressure_from"] not in hosts
                                                              or not isinstance(hosts[h["pressure_from"]], dict)
                                                              or "pressure_from" in hosts[h["pressure_from"]]):
             errs.append(f"hosts.{hid}.pressure_from must name another host in hosts that has its own sample")
+        if isinstance(h, dict) and "power_policy" in h and h["power_policy"] not in POWER_POLICIES:
+            errs.append(f"hosts.{hid}.power_policy must be one of {list(POWER_POLICIES)} when present")
         if isinstance(h, dict) and h.get("default_preference", "normal") not in ("normal", "low"):
             errs.append(f"hosts.{hid}.default_preference must be normal|low (never an ordinal)")
+        if isinstance(h, dict) and "yields_overrides" in h and not isinstance(h["yields_overrides"], bool):
+            errs.append(f"hosts.{hid}.yields_overrides must be true|false")
+        if isinstance(h, dict) and "points" in h and not _num(h["points"]):
+            errs.append(f"hosts.{hid}.points must be a finite number")
+        if isinstance(h, dict) and "fast_core" in h and not isinstance(h["fast_core"], bool):
+            errs.append(f"hosts.{hid}.fast_core must be true|false")
+        if isinstance(h, dict) and "fleet_cap" in h:     # the ONE per-host fleet-work cap (t_31911eb0)
+            errs.extend(f"hosts.{hid}.{e}" for e in admission.fleet_cap_errors(h["fleet_cap"]))
         if isinstance(h, dict) and "cpu_saturable" in h:
             # LEGACY (pre-R2c tables): still read for v1 so a tree that has the new code but not yet the new table
             # keeps today's decisions; the shipped table carries scorer_v1.cpu_saturable instead
@@ -453,6 +546,10 @@ def validate(doc) -> List[str]:
     sc = doc.get("scorer", DEFAULT_SCORER)
     if sc not in SCORERS:
         errs.append(f"scorer must be one of {list(SCORERS)}, not {sc!r}")
+    errs.extend(_points_errors(doc.get("points_score")))
+    fp_mode = doc.get("fast_pick", "speed")
+    if fp_mode not in FAST_PICKS:
+        errs.append(f"fast_pick must be one of {list(FAST_PICKS)}, not {fp_mode!r}")
     v1 = doc.get("scorer_v1", {})
     if not isinstance(v1, dict):
         errs.append("scorer_v1 must be an object")
@@ -478,6 +575,38 @@ def validate(doc) -> List[str]:
     return errs
 
 
+def _points_errors(ps) -> List[str]:
+    """The top-level ``points_score`` block (t_b01ab307); absent = every consumer off."""
+    if ps is None:
+        return []
+    if not isinstance(ps, dict):
+        return ["points_score must be an object"]
+    errs = []
+    cons = ps.get("consumers", {})
+    if not isinstance(cons, dict) or any(not k.startswith("_") and v not in POINTS_TOGGLES for k, v in cons.items()):
+        errs.append(f"points_score.consumers must map consumer -> one of {list(POINTS_TOGGLES)}")
+    bonus = ps.get("bonus", {})
+    if not isinstance(bonus, dict) or any(k in bonus and not _num(bonus[k]) for k in ("continuity", "fast_core")):
+        errs.append("points_score.bonus must be {continuity: number, fast_core: number}")
+    if "keep_margin" in ps and (not _num(ps["keep_margin"]) or ps["keep_margin"] < 0):
+        errs.append("points_score.keep_margin must be a number >= 0")
+    if ps.get("continuity", "bonus") not in POINTS_CONTINUITY:
+        errs.append(f"points_score.continuity must be one of {list(POINTS_CONTINUITY)}")
+    return errs
+
+
+def _points_dials(ps) -> PointsDials:
+    if not isinstance(ps, dict):
+        return PointsDials()
+    bonus = ps.get("bonus") or {}
+    d = PointsDials()
+    return PointsDials(consumers={k: v for k, v in (ps.get("consumers") or {}).items() if not k.startswith("_")},
+                       bonus_continuity=float(bonus.get("continuity", d.bonus_continuity)),
+                       bonus_fast_core=float(bonus.get("fast_core", d.bonus_fast_core)),
+                       keep_margin=float(ps.get("keep_margin", d.keep_margin)),
+                       continuity=str(ps.get("continuity", d.continuity)))
+
+
 INVENTORY_REL = Path("var") / "placement" / "host-inventory.json"
 # FWA R2a (t_e3f34b3e): HostSpec field -> discovered field. Discovered wins; the table is the fallback.
 INVENTORY_FACTS = (("cores", "physical_cores"), ("threads", "threads"), ("clock_mhz", "max_mhz"))
@@ -485,6 +614,10 @@ _PRINTED_ONCE: set = set()
 
 
 def _print_once(key, line: str) -> None:
+    # PLACEMENT_QUIET_CLOSED=1: a caller that only READS the table (fleet-pause status/pause) does not repeat the
+    # table's data-quality notices on every call; the placement verbs still print them (t_7dfac0ca D-2).
+    if os.environ.get("PLACEMENT_QUIET_CLOSED") == "1":
+        return
     if key not in _PRINTED_ONCE:
         _PRINTED_ONCE.add(key)
         print(line, file=sys.stderr)
@@ -541,14 +674,14 @@ def host_facts(hid: str, h: Mapping, inv: Mapping) -> Dict[str, float]:
     return out
 
 
-def read_host_speed(path=None) -> Dict[str, dict]:
+def read_host_speed(path=None, *, root: Optional[Path] = None) -> Dict[str, dict]:
     """{host: {"st_speed": x, "mt_yield": y}} from var/placement/host-speed.json (R2b, t_ea50af1c), values > 0 only.
 
     Accepted shapes (the R2b contract is the first): ``{"hosts": {h: {"st_speed": 1.0, "mt_yield": 1.3, ...}}}``,
     or the same rows at top level; a value may also be ``{"value": x, ...}``. MISSING file = {} (every host on the
     seed); an unreadable / malformed file is ALSO {} plus one stderr line: speed only orders eligible hosts and the
     capacity seed is the ruled default, so a bad speed file must not close the fleet."""
-    p = Path(path) if path is not None else fleet_root() / SPEED_REL
+    p = Path(path) if path is not None else fleet_root(root=root) / SPEED_REL
     try:
         doc = json.loads(p.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -584,13 +717,13 @@ def active_scorer(doc_scorer=None) -> str:
     return doc_scorer or DEFAULT_SCORER
 
 
-def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[str] = None) -> HostTable:
+def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[str] = None, root: Optional[Path] = None) -> HostTable:
     """The host table. Each host's cores / threads / clock come from ``inventory`` ({host: discovered row}; default
     read_inventory(inventory_path(table))) first, the table second (FWA R2a). A host with neither, or whose discovered
     facts contradict its policy (threads < cores, cores_reserve >= cores), is LEFT OUT (closed: never picked), printed
     once; it never fails the whole table. ``scorer`` (v1|v2) beats PLACEMENT_SCORER and the table's key (the replay
     compares both)."""
-    p = Path(path) if path is not None else fleet_root() / TABLE_REL
+    p = Path(path) if path is not None else fleet_root(root=root) / TABLE_REL
     try:
         doc = json.loads(p.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -609,15 +742,15 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
     saturable |= {hid for hid, h in doc["hosts"].items() if h.get("pressure_from") in saturable}
     # the speed file sits next to the table's state root (var/placement/), so a test table in tmp_path never reads
     # the live fleet's measurements
-    speed = read_host_speed(speed_path if speed_path is not None else p.parent.parent / SPEED_REL) \
+    speed = read_host_speed(speed_path if speed_path is not None else p.parent.parent / SPEED_REL, root=root) \
         if scorer == "v2" else {}
     inv = read_inventory(inventory_path(p)) if inventory is None else inventory
     hosts = {}
     for hid, h in doc["hosts"].items():
         f = host_facts(hid, h, inv)
-        root = h.get("pressure_from")
+        pressure_from = h.get("pressure_from")
         vm_cpus = None
-        if root in doc["hosts"]:
+        if pressure_from in doc["hosts"]:
             # the guest's own size: its own facts (a typed or discovered row of its own) when it has them, else the
             # VM size the collector discovered for it (vm_cpus, OrbStack machine config); never its host's
             own = [inv[n] for n in [hid, *(h.get("aliases") or [])] if isinstance(inv.get(n), dict)]
@@ -627,13 +760,13 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
             # reads the host's 32): the VM's own measurement is authoritative (Prism c6575b98633e)
             own_thr = int(f["threads"]) if "cores" in f and "threads" in f else None
             vm_cpus = min(own_thr, vm) if own_thr is not None and vm is not None else (vm if vm is not None else own_thr)
-        if root in doc["hosts"]:
+        if pressure_from in doc["hosts"]:
             # EVERY pressure_from guest is sized from its host's DISCOVERED facts, resolved with the host's own row
             # (count_cores): it is judged on that host's sample, so its capacity is that host's too, like
             # sample_for() and the cpu_saturable inheritance. Its own facts only set vm_cpus above: a 16-vCPU VM on
             # an 8-thread box is never scored as 16 threads of capacity (Prism 8060dffe2210, t_b9ed3796).
             # Never a typed table fact (R2a); with no discovered host row the guest is left out like any host.
-            own_f, f = f, host_facts(root, doc["hosts"][root], inv)
+            own_f, f = f, host_facts(pressure_from, doc["hosts"][pressure_from], inv)
         else:
             own_f = f
         why = None
@@ -657,15 +790,30 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
             ceilings={c: ceiling_of(v) for c, v in h["consumers"].items() if ceiling_of(v) is not None},
             aliases=tuple(h.get("aliases", [])), clock_mhz=float(f.get("clock_mhz", 0.0)),
             default_preference=str(h.get("default_preference", "normal")),
+            yields_overrides=h.get("yields_overrides") is True,
+            points=float(h["points"]) if _num(h.get("points")) else 0.0, fast_core=h.get("fast_core") is True,
             unmeasurable_axes=tuple(h.get("unmeasurable_axes", [])),
             cpu_saturable=hid in saturable, scorer=scorer,
             mt_yield=meas.get("mt_yield", SEED_MT_YIELD_SMT2 if threads == 2 * cores else 1.0),
             st_speed=meas.get("st_speed", 1.0),
             speed_src="measured" if "mt_yield" in meas else "seed",
             st_speed_src="measured" if "st_speed" in meas else "seed",
-            pressure_from=h.get("pressure_from"), vm_cpus=vm_cpus,
+            pressure_from=h.get("pressure_from"), vm_cpus=vm_cpus, power_policy=h.get("power_policy"),
             enrolled=frozenset(c for c, v in h["consumers"].items()
-                               if isinstance(v, dict) and v.get("eligible") is True))
+                               if isinstance(v, dict) and v.get("eligible") is True),
+            ramp_cpus=tuple((job_class_for(c), float(v["ramp_cpus"])) for c, v in h["consumers"].items()
+                            if isinstance(v, dict) and _num(v.get("ramp_cpus")) and v["ramp_cpus"] >= 0),
+            fleet_cap=tuple(sorted((h.get("fleet_cap") or {}).items())))
+    for hid, s in list(hosts.items()):
+        # a guest runs on its source's power: the source's power_policy binds it too, so another venue on the same
+        # machine never bypasses the AC-only gate (Prism ed3ec771df33)
+        src = doc["hosts"].get(s.pressure_from) if s.pressure_from else None
+        if isinstance(src, dict):
+            # A pressure_from guest shares its parent's unsupported-axis contract, even when its own newer
+            # Linux sample wins. This declares platform limits; it neither fabricates PSI nor changes freshness.
+            hosts[hid] = dataclasses.replace(
+                s, power_policy=s.power_policy if s.power_policy is not None else src.get("power_policy"),
+                unmeasurable_axes=tuple(dict.fromkeys((*s.unmeasurable_axes, *src.get("unmeasurable_axes", [])))))
     for hid in [g for g, s in hosts.items() if s.pressure_from and s.pressure_from not in hosts]:
         # the guest is judged on its host's sample and in its host's resource domain: with that host closed it would
         # be its own root, blind to every lease and reservation on the box (Prism 54f435021b7d). Closed with it.
@@ -680,54 +828,13 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
     declared = {hid: (h.get("pressure_from"), tuple(h.get("aliases", []))) for hid, h in doc["hosts"].items()}
     return HostTable(hosts=hosts, footprints=fps, closed_when=cw, path=p, default_first=doc.get("default_first"),
                      saturate_to=float(doc.get("saturate_to", DEFAULT_SATURATE_TO)), profile_footprints=pfps,
-                     scorer=scorer, declared=declared)
+                     scorer=scorer, declared=declared, fast_pick=doc.get("fast_pick", "speed"),
+                     points=_points_dials(doc.get("points_score")))
 
 
 class ExclusionsError(PlacementError):
-    """The exclusions file exists but cannot be read or parsed: admission fails CLOSED (Prism P1 4d6e2458)."""
-
-
-def read_exclusions(path=None, *, now: float) -> Dict[str, str]:
-    """{host: reason} for every LIVE exclusion row (``until`` epoch in the future).
-
-    Document shape, either form: ``{"ace-ai": {"until": 1791900000, "reason": "voice session"}}`` (the operator
-    form the skills document) or ``{"hosts": {...same...}}``. A MISSING file = no exclusions; an unreadable or
-    malformed one raises ExclusionsError so choose() refuses rather than silently admitting."""
-    now = _now(now)
-    p = Path(path) if path is not None else fleet_root() / EXCLUSIONS_REL
-    try:
-        text = p.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    except OSError as exc:
-        raise ExclusionsError(f"{p}: unreadable: {exc}") from exc
-    try:
-        doc = json.loads(text)
-    except ValueError as exc:
-        raise ExclusionsError(f"{p}: unparseable: {exc}") from exc
-    if not isinstance(doc, dict):
-        raise ExclusionsError(f"{p}: not an object")
-    if "hosts" in doc:
-        rows = doc["hosts"]
-        if not isinstance(rows, dict):
-            raise ExclusionsError(f"{p}: \"hosts\" must be an object, not {type(rows).__name__}")
-    else:
-        rows = {k: v for k, v in doc.items() if not k.startswith("_")}
-    out = {}
-    # a malformed row fails CLOSED: skipping it would silently lift the operator's exclusion (Prism 5dd6339f /
-    # hermes-agent#1941 a5504de2)
-    for hid, row in rows.items():
-        if not isinstance(row, dict):
-            raise ExclusionsError(f"{p}: row {hid!r} must be an object, not {type(row).__name__}")
-        until = row.get("until")
-        if not _num(until):
-            raise ExclusionsError(f"{p}: row {hid!r}: until must be a finite epoch number, not {until!r}")
-        reason = row.get("reason")
-        if reason is not None and not isinstance(reason, str):
-            raise ExclusionsError(f"{p}: row {hid!r}: reason must be a string, not {reason!r}")
-        if float(until) > now:
-            out[hid] = reason or "excluded"
-    return out
+    """state/fleet-pause/kinds.json exists but cannot be read or parsed: admission fails CLOSED (Prism P1 4d6e2458).
+    B5-P3 (t_00664b58): var/placement/exclusions.json is no longer read; a pause fence is an fwa hold."""
 
 
 # ── samples ──────────────────────────────────────────────────────────────────────────────────────
@@ -769,6 +876,12 @@ class Sample:
     maxproc: Optional[float] = None
     gpu_free_mib: Optional[float] = None
     slo_breach: Optional[bool] = None         # a latency-SLO guard (ACE-AI voice hub): True = saturated
+    # t_58366dea: the darwin sampler's ``power`` block; read only for a ``power_policy`` host (power_refusal)
+    power_source: Optional[str] = None        # "ac" | "battery" | "ups"; None = unmeasured
+    sleep_disabled: Optional[bool] = None     # pmset SleepDisabled (clamshell stays awake); None = unmeasured
+    # t_31911eb0: the sampler's ``fleet`` block, the MEASURED use of all fleet work on the host (fleet_cap's input)
+    fleet_cpus: Optional[float] = None
+    fleet_ram_gb: Optional[float] = None
 
     @property
     def load(self) -> Optional[float]:
@@ -863,6 +976,8 @@ def samples_from_pressure(doc: Mapping, *, now: float, stale_after_s: Optional[f
             **{k: (row.get(k) if _num(row.get(k)) else None) for k in _UTIL_NUM_AXES},
             os=row.get("os") if isinstance(row.get("os"), str) else None,
             slo_breach=row.get("slo_breach") if isinstance(row.get("slo_breach"), bool) else None,
+            **_power_fields(row.get("power")),
+            **_fleet_fields(row.get("fleet")),
         )
         if row.get("status") not in (None, "fresh"):
             s.status, s.note = "absent", str(row.get("status"))
@@ -883,6 +998,37 @@ def samples_from_pressure(doc: Mapping, *, now: float, stale_after_s: Optional[f
 
 
 _UTIL_NUM_AXES = ("cpu_busy", "ncpu", "mem_total_gb", "psi_io_some10", "procs", "maxproc", "gpu_free_mib")
+
+
+def _power_fields(p) -> dict:
+    """Sample kwargs from a sampler row's ``power`` block ({source, sleep_disabled}); anything malformed = None."""
+    p = p if isinstance(p, dict) else {}
+    src = p.get("source")
+    sd = p.get("sleep_disabled")
+    return {"power_source": src if src in ("ac", "battery", "ups") else None,
+            "sleep_disabled": sd if isinstance(sd, bool) else None}
+
+
+def _fleet_fields(f) -> dict:
+    """Sample kwargs from a sampler row's ``fleet`` block ({cpus, ram_gb}: the MEASURED use of all fleet work on the
+    host, t_31911eb0); a missing or non-finite value is None (unmeasured: a host with a fleet_cap then refuses)."""
+    f = f if isinstance(f, dict) else {}
+    return {"fleet_cpus": float(f["cpus"]) if _num(f.get("cpus")) and f["cpus"] >= 0 else None,
+            "fleet_ram_gb": float(f["ram_gb"]) if _num(f.get("ram_gb")) and f["ram_gb"] >= 0 else None}
+
+
+def power_refusal(spec: HostSpec, sample: Sample) -> Optional[str]:
+    """An intermittent host's power gate (t_58366dea). ``power_policy: ac_only`` -> closed unless the sample says AC
+    and sleep disabled; an unmeasured value is closed, never assumed. headroom() and may_start() both call this after
+    the freshness check, so a laptop that sleeps or leaves the network goes stale and closes on that path instead."""
+    if spec.power_policy != "ac_only":
+        return None
+    if sample.power_source != "ac":
+        return "closed:power " + (sample.power_source or "unmeasured") + " (power_policy ac_only)"
+    if sample.sleep_disabled is not True:
+        return "closed:sleep " + ("enabled" if sample.sleep_disabled is False else "unmeasured") \
+            + " (power_policy ac_only needs SleepDisabled 1)"
+    return None
 
 
 def sample_from_probe(load1: float, memavail_gb: Optional[float], *, load5: Optional[float] = None,
@@ -923,6 +1069,11 @@ class Headroom:
     alpha: Optional[float] = None        # the speed exponent choose() applied
     need: Optional["admission.Estimate"] = None   # utilization: this job's estimate on THIS host (reserved on a pick)
     cpu_busy: Optional[float] = None
+    # the points score (t_b01ab307), set only on a host a points-mode choose() scored (None = not scored)
+    used: Optional[float] = None
+    cost: Optional[float] = None
+    points: Optional[float] = None
+    bonus: Optional[float] = None
 
     def line(self, spec: HostSpec) -> str:
         """`<host> load N / Cc.Tt, avail X GB, headroom Y GB / Z cores (binding axis), score S` or the refusal.
@@ -976,39 +1127,114 @@ def policy_refusal(spec: HostSpec, consumer: str, excluded: Optional[str], admit
     return None
 
 
-def guest_vm_refusal(spec: HostSpec, ctx: "AdmitContext", need_cpus: float,
-                     reservations: Optional[Mapping[str, "Footprint"]] = None) -> Optional[str]:
-    """A ``pressure_from`` guest's own-size cap (Apollo 10-31 08:4x, t_7361659c): the work admitted ON the guest (every
-    live lease and caller reservation booked under any of its names, settled or not: a running job holds its vCPUs)
-    plus this job never exceeds its VM's ``vm_cpus``, whatever headroom the shared domain shows. ``ctx`` is the
-    UNFOLDED context (a folded one attributes the host's own leases to the guest). ``reservations`` ({host: Footprint},
-    UNAGED: admit() passes the ledger's live rows in full) replaces ``ctx.reservations`` for this check, whose threads
-    the scorer ages out once load1 shows them (Prism f01d48b6d5c4). Unmeasured size = closed.
-    -> the refusal reason, or None (not a guest, or it fits)."""
-    if not spec.pressure_from:
-        return None
-    if spec.vm_cpus is None:
-        return "closed:guest vm size unmeasured (var/placement/host-inventory.json vm_cpus)"
-    names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
-    resv = ctx.reservations if reservations is None else tuple(reservations.items())
-    held = sum(float(le.need.cpus) for le in ctx.leases if str(le.host).lower() in names) \
-        + sum(float(f.threads) for h, f in resv if str(h).lower() in names)
-    if held + float(need_cpus) > spec.vm_cpus:
-        return f"no_headroom:vm_cpus {held:g} admitted + {float(need_cpus):g} > {spec.vm_cpus} vCPU on the guest"
-    return None
-
-
-def live_exclusions(table: "HostTable", path=None, *, now: float,
-                    extra: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, str]:
-    """{host id: reason} = the live operator rows (var/placement/exclusions.json, TTL) plus a caller's ``extra`` map.
-    A caller entry never REPLACES an operator row, and an empty reason still excludes (Prism 95afdab6).
-    Raises ExclusionsError on an unreadable/malformed file (callers fail CLOSED)."""
+def caller_exclusions(table: "HostTable", *, extra: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, str]:
+    """{host id: reason} = a caller's ``extra`` map, keyed by table id; an empty reason still excludes (Prism 95afdab6).
+    B5-P3 (t_00664b58, spec §9 P3): the operator rows of var/placement/exclusions.json are no longer read; an operator
+    exclusion is an fwa hold (`fleet-work pause`), read by fwa_hold below."""
     excl: Dict[str, str] = {}
-    for k, v in read_exclusions(path, now=now).items():
-        excl.setdefault(table.resolve(k) or k, str(v) or "excluded")
     for k, v in (extra or {}).items():
         excl.setdefault(table.resolve(k) or k, (str(v) if v is not None else "") or "excluded")
     return excl
+
+
+def fwa_fence(host: str, *, now: float, root=None, memo=None) -> Optional[str]:
+    """B4c (t_fec4e1a6, spec §14.1 a): the why of a live fleet-pause fence hold on ``host``, else None. Consumer-blind
+    (F5: only a fence record, owner prefix `fleet-pause:` and drive false, gets this all-consumer arm; every other hold
+    keeps its lane semantics in fwa_hold) and independent of FWA_READERS (F6). A copy installed without fwa (the
+    remote /usr/local/lib/placement) has no hold files to read: None there. A hold directory that cannot be listed
+    fails CLOSED, like the exclusions file, and so does an unreadable record in it (whatever its owner)."""
+    try:
+        from . import fwa  # noqa: PLC0415  (late: fwa-less remote copies)
+    except ImportError:
+        try:
+            import fwa  # noqa: PLC0415
+        except ImportError:
+            return None
+    r = fleet_root(root=root)
+    try:
+        key = fwa.canon(str(host), r)
+        files = memo.get(key, r, lambda: fwa.read_dir(key, r)) if memo is not None else fwa.read_dir(key, r)
+    except fwa.FwaError:
+        return None
+    except OSError as exc:
+        return f"fwa:unreadable hold directory for {host}: {exc}"
+    for h in files:
+        if h.live(now) and fwa.is_fence(h.doc):
+            return h.why()
+        # c-9bbafb28c8e8f875: cannot prove it is not a fence (bounded at mtime + 24 h, unbounded when a stat failure's
+        # first-failure marker cannot persist: fwa gate_read / covered_lanes hold on the same clause)
+        if h.unreadable_holding(now) or (h.stat_failed and not h.marker_persisted):
+            return f"fwa:unreadable hold {h.id} on {host}: {h.error}"
+    return None
+
+
+def fwa_hold(host: str, consumer: str, *, now: float, root=None, memo=None) -> Optional[str]:
+    """FWA §5.3 (t_d759c539): the why of a live fwa hold on ``host`` covering ``consumer``'s lane, else None. The lane
+    is the consumer's work kind (CONSUMER_KIND: athena is a kanban worker), else the consumer name itself (§5.1: the
+    may_start consumer names ARE fwa lanes). Fails CLOSED on an unreadable hold file, like the exclusions file.
+    Kill switch FWA_READERS=0 (scripts/lib/fwa_readers.py): None, the legacy reads alone decide. A copy installed
+    WITHOUT fwa (fleet/placement/install.sh -> /usr/local/lib/placement on ace-ai/ace-media) is a REMOTE consumer
+    (§5.3: it reads its projections, never a Studio hold file): None there too.
+    B4c (t_fec4e1a6, spec §14.1 F5/F6): a fleet-pause FENCE hold closes the host to every consumer name, read first
+    and independent of FWA_READERS (the exclusions row it replaces ignored the switch too)."""
+    fence = fwa_fence(host, now=now, root=root, memo=memo)
+    if fence:
+        return fence
+    try:
+        from . import fwa_readers
+    except ImportError:
+        try:
+            import fwa_readers
+        except ImportError:
+            return None
+    return fwa_readers.holding(host, CONSUMER_KIND.get(consumer, consumer), now=now,
+                               root=fleet_root(root=root), on_unreadable="hold", memo=memo)
+
+
+def _fwa_memo():
+    """A per-call fwa.Memo (I4: dropped with the call), None when the kill switch is off (fwa never imported)."""
+    try:
+        from . import fwa_readers
+    except ImportError:
+        try:
+            import fwa_readers
+        except ImportError:
+            return None
+    return fwa_readers.memo()
+
+
+def kind_exclusions(table: "HostTable", consumer: str, path=None, *, now: float, root: Optional[Path] = None) -> Dict[str, str]:
+    """{host id: "kind_paused:<kind>@<scope> <id>"} for every live row of state/fleet-pause/kinds.json that pauses
+    ``consumer``'s work kind (CONSUMER_KIND), on its one host or, for scope ``all``, on every table host. A consumer
+    with no kind, or a MISSING file = {}. An unreadable or malformed file raises ExclusionsError (callers fail CLOSED,
+    like the exclusions file): a pause nobody can read is still a pause."""
+    kind = CONSUMER_KIND.get(consumer)
+    if kind is None:
+        return {}
+    now = _now(now)
+    p = Path(path) if path is not None else fleet_root(root=root) / KINDS_REL
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise ExclusionsError(f"{p}: unreadable: {exc}") from exc
+    rows = doc.get("rows") if isinstance(doc, dict) else None
+    if not isinstance(rows, dict):
+        raise ExclusionsError(f"{p}: \"rows\" must be an object")
+    out: Dict[str, str] = {}
+    for key, row in sorted(rows.items()):
+        if (not isinstance(row, dict) or not isinstance(row.get("kind"), str) or not row["kind"].strip()
+                or not isinstance(row.get("scope"), str) or not row["scope"].strip()
+                or not _num(row.get("until"))):
+            raise ExclusionsError(f"{p}: row {key!r} lacks kind/scope/until")
+        if row.get("kind") != kind or float(row["until"]) <= now:
+            continue
+        why = f"kind_paused:{kind}@{row['scope']} {row.get('id') or '?'}"
+        hosts = list(table.hosts) if row["scope"] == "all" else [table.resolve(row["scope"]) or row["scope"]]
+        for hid in hosts:
+            out.setdefault(hid, why)
+    return out
 
 
 def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: str,
@@ -1051,8 +1277,12 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
         if now - float(sample.at) > stale_after_s:
             h.reason = f"closed:stale (sample {now - float(sample.at):.0f}s old at decision time)"
             return h
+    refused = power_refusal(spec, sample)
+    if refused:
+        h.reason = refused
+        return h
     if mode == "utilization":
-        return _headroom_utilization(h, spec, sample, fp, need=need, leases=leases, reserved=reserved)
+        return _headroom_utilization(h, spec, sample, fp, need=need, leases=leases, reserved=reserved, now=now)
     if h.load is None or h.mem_available_gb is None:
         h.reason = "closed:unmeasured " + ("load" if h.load is None else "memory")
         return h
@@ -1153,10 +1383,12 @@ def speed_alpha(job: Optional["Job"]) -> float:
 def _sample_row(spec: HostSpec, sample: Sample) -> dict:
     row = {k: getattr(sample, k) for k in ("at", "os", "ncpu", "cpu_busy", "mem_available_gb", "mem_total_gb",
                                             "psi_cpu_some10", "psi_cpu_some60", "psi_mem_some10", "psi_io_some10",
-                                            "procs", "maxproc", "gpu_free_mib", "slo_breach")}
+                                            "procs", "maxproc", "gpu_free_mib", "slo_breach",
+                                            "fleet_cpus", "fleet_ram_gb")}
     row["host"] = spec.name
     if row["mem_total_gb"] is None:
         row["mem_total_gb"] = spec.mem_total_gb
+        row["mem_total_gb_from_spec"] = True    # not measured: a percent fleet_cap fails closed on it (t_31911eb0)
     return row
 
 
@@ -1165,7 +1397,9 @@ def _limits(spec: HostSpec) -> "admission.Limits":
     # PSI cpu avg10 >= 40 / avg60 >= 25 and a saturated cpu axis REFUSE (FWA F1, t_d456e9cd). scorer v1 restores it.
     return admission.Limits(mem_reserve_gb=spec.mem_reserve_gb,
                             cpu_saturable=spec.cpu_saturable and spec.scorer == "v1", r2c=spec.scorer == "v2",
-                            unmeasurable=tuple(a for a in spec.unmeasurable_axes if a.startswith("psi_")))
+                            unmeasurable=tuple(a for a in spec.unmeasurable_axes if a.startswith("psi_")),
+                            psi_cpu_busy_floor=admission.PSI_CPU_BUSY_FLOOR, ramp_cpus=spec.ramp_cpus,
+                            fleet_cap=spec.fleet_cap)
 
 
 def need_of(fp: Footprint) -> "admission.Estimate":
@@ -1184,6 +1418,8 @@ class AdmitContext:
     leases: tuple
     scratch: tuple = ()     # ((host, GB), ...): the ledger's live scratch, which admit() subtracts (Lease has none)
     reservations: tuple = ()    # ((host, Footprint), ...): a caller's booked reservations (choose()'s ``reservations``)
+    start_cpus: tuple = ()  # ((host, cpus), ...): the class's measured first-90-s CPU there (consumers.<c>.ramp_cpus);
+                            # need() never prices a start below it (t_19ad08c2). Keyed per host, never folded.
 
     # every field above that names a host: for_host() folds each of them over the resource domain, and
     # test_every_host_attributed_context_kind_is_folded_over_the_domain fails on a new one that is not listed here
@@ -1221,8 +1457,121 @@ class AdmitContext:
         return sum(gb for h, gb in self.scratch if h.lower() in names)
 
     def need(self, host: str) -> "admission.Estimate":
-        """The same call choose() makes inline (test_work_estimate's lint reads it there)."""
-        return work_estimate.estimate(self.job_class, host, self.history, seed=self.seed)
+        """The shared estimate for admission and bands, its CPU never below the
+        class's measured first-90-s CPU on ``host`` (t_19ad08c2: the CI allocator's per_runner floor 0.25 let 39 starts
+        through on nas-fleet that used ~0.69 CPU each). A lease's CPU only counts while it is unsettled, so that is
+        the number a start costs."""
+        est = work_estimate.estimate(self.job_class, host, self.history, seed=self.seed)
+        floor = dict(self.start_cpus).get(host)
+        return dataclasses.replace(est, cpus=floor) if floor is not None and est.cpus < floor else est
+
+
+def history_snapshot(root=None) -> tuple:
+    """Estimator observations, NOT capacity authority. Acquire before any ledger/writer lock.
+
+    History writers do not take the reservation lock, so that lock never guaranteed a newer
+    observation. Copy rows to detach from the shared cache; one snapshot feeds verdict AND booking.
+    Keep all timestamps here: the admission window is applied at the post-lock decision clock.
+    ``root`` resolves exactly as admit_context(root=) does (default fleet_root(); Prism b57fa1f567bc).
+    """
+    path = class_usage_path(Path(root) / CLASS_USAGE_REL if root is not None else None, root=root)
+    return admission.read_history_frozen(path)     # t_71ff933a: copied once per row, the same tuple until it grows
+
+
+# t_71ff933a: per-snapshot memos, process-wide (allocd serves each request on a new thread, so the per-thread memo of
+# t_990ca939 never carried over to the next /admit). t_f418e647: one helper, work_estimate.snap_memo.
+_snap_memo = work_estimate.snap_memo
+
+
+def _window_index(history: tuple):
+    """(rows whose ``at`` reads as a float, those floats, non-decreasing?) in history order: history_window's input."""
+    rows, ats = [], []
+    for row in history:
+        try:
+            a = float(row.get("at") or 0)
+        except (TypeError, ValueError):
+            continue
+        rows.append(row)
+        ats.append(a)
+    back = [j for j in range(1, len(ats)) if not ats[j - 1] <= ats[j]]
+    if back:
+        _log_unordered(len(back), len(ats), ats[back[0]], ats[back[0] - 1])
+    return rows, ats, not back
+
+
+# t_f418e647: an unordered snapshot is scanned per call and returns a fresh tuple, so the identity memos downstream
+# miss. Logged once per snapshot (_window_index is memoized per snapshot), at most once per _UNORDERED_LOG_EVERY_S.
+_UNORDERED_LOG_EVERY_S = 600.0
+_unordered_logged_at: Optional[float] = None
+
+
+def _log_unordered(n_back: int, n: int, at: float, prev: float) -> None:
+    global _unordered_logged_at
+    t = time.monotonic()
+    if _unordered_logged_at is not None and t - _unordered_logged_at < _UNORDERED_LOG_EVERY_S:
+        return
+    _unordered_logged_at = t
+    print(f"placement: class-usage snapshot has {n_back} of {n} rows out of order (first at={at:g} after "
+          f"at={prev:g}); history_window scans it per call", file=sys.stderr)
+
+
+def history_window(history: Iterable[Mapping], now: float) -> tuple:
+    """The rows of ``history`` inside CLASS_USAGE_WINDOW_S of ``now``, in order. A snapshot tuple whose ``at`` values
+    never decrease (the ledger is appended in time order) is cut with one bisect and the newest cut is memoized (one
+    per snapshot, t_f418e647), so two calls that keep the same rows return the same tuple object (t_71ff933a); any
+    other input is scanned (an unordered snapshot is logged, _log_unordered)."""
+    if isinstance(history, tuple):
+        rows, ats, ordered = _snap_memo(history, "window_index", lambda: _window_index(history))
+        cutoff = now - CLASS_USAGE_WINDOW_S
+        if ordered:
+            i = bisect.bisect_left(ats, cutoff)
+            return _snap_memo(history, "window", lambda: (i, tuple(rows[i:])), keep=lambda v: v[0] == i)[1]
+        return tuple(r for r, a in zip(rows, ats) if not a < cutoff)
+    rows = []
+    for row in history:
+        try:
+            if float(row.get("at") or 0) < now - CLASS_USAGE_WINDOW_S:
+                continue
+        except (TypeError, ValueError):
+            continue
+        rows.append(row)
+    return tuple(rows)
+
+
+def resource_fit_refusal(job_class: str, consumer: str, rows: Iterable["Headroom"], table: "HostTable",
+                         samples: Mapping[str, Optional["Sample"]]) -> Optional[str]:
+    """The typed refusal for a class NO evaluated host can ever admit (Prism 1ea08e48d747, ruling t_d0c8e8f0 23:1x):
+    each host's ceiling is admission.ceilings(), the same static check admit() refuses with (the host fully idle), and
+    the need is the one that host booked, never lowered. Every candidate falls in one of three classes (ruling
+    t_d0c8e8f0 05:5x, Prism c-8406618bb08f08fb):
+      permanent-closed  not in the table, or the table policy closes it to ``consumer`` for good (policy_refusal with
+                        no exclusion row and nothing admitted: consumer not eligible / ceiling 0, guest not enrolled):
+                        ruled out, counts toward "every host ruled out" whatever its sample says;
+      unknown           no sample, no need or no measured ceiling (a TTL'd exclusion or a paused kind is a sampled host
+                        like any other): proves nothing, so the refusal stays transient (None, Prism 03e79438432e);
+      measured          its ceiling holds the need (a wait, None) or does not (a fit failure).
+    The refusal needs at least one measured fit failure: a fleet that is only permanent-closed stays all_closed."""
+    best = None
+    for r in rows:
+        spec, sample = table.hosts.get(r.host), samples.get(r.host)
+        if spec is None or policy_refusal(spec, consumer, None) is not None:
+            continue
+        if r.need is None or sample is None:
+            return None
+        c = admission.ceilings(_sample_row(spec, sample), _limits(spec))
+        if not c:
+            return None
+        if all(getattr(r.need, ax) <= v for ax, v in c.items()):
+            return None
+        key = (c.get("ram_gb", math.inf), c.get("cpus", math.inf), r.host)
+        if best is None or key > best[0]:
+            best = (key, r, c)
+    if best is None:
+        return None
+    _, r, c = best
+    admits = " ".join(f"{ax}={c[ax]:g}" for ax in ("cpus", "ram_gb") if ax in c)
+    return (f"unschedulable:resource-fit class {job_class} needs cpus={r.need.cpus:g} ram_gb={r.need.ram_gb:g}, "
+            f"largest host admits {r.host} {admits}")
 
 
 def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Job"] = None,
@@ -1235,23 +1584,30 @@ def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Jo
     carries cpu/ram/gpu only; admit() subtracts the ledger's scratch through ``reserved``, t_f64c6d34 r3).
     ``root`` (default fleet_root()) is the state root the ledgers are read from (the collector's --home).
     ``host`` (with ``table``): the context comes back folded over that host's resource domain (AdmitContext.for_host)."""
-    # incremental: allocd runs this under the ledger flock on every admit (t_c9fd9c5e), so parse only the appended rows
-    hist = history if history is not None else admission.read_history_cached(
-        class_usage_path(Path(root) / CLASS_USAGE_REL if root is not None else None), since=now - CLASS_USAGE_WINDOW_S)
+    # Cache validation may re-hash the entire prefix; locked callers must supply a pre-acquired snapshot.
+    hist = history if history is not None else history_window(history_snapshot(root), now)
     ledger = Path(root) / RESERVATIONS_REL if root is not None else None
     # caller-supplied leases are canonicalised like the ledger's: one booked under an alias counts on its host (c6568e9a9850)
     base = ([dataclasses.replace(le, host=table.resolve(le.host) or le.host) if table else le for le in leases]
-            if leases is not None else ledger_leases(ledger, now=now, table=table))
+            if leases is not None else ledger_leases(ledger, now=now, table=table, root=root))
     # caller-supplied leases (admit() under its lock, tests) bring their own ledger: scratch only on the default read
     scratch = () if leases is not None else tuple(
-        (h, f.scratch_gb) for h, f in live_reservations(ledger, now=now, table=table).items() if f.scratch_gb > 0)
-    ctx = AdmitContext(job_class_for(consumer, job), need_of(fp), tuple(hist),
-                       tuple(base + held_leases(held or {}, table)), scratch)
+        (h, f.scratch_gb) for h, f in live_reservations(ledger, now=now, table=table, root=root).items() if f.scratch_gb > 0)
+    klass = job_class_for(consumer, job)
+    start = () if table is None else tuple((h, cpus) for h, spec in table.hosts.items()
+                                           for k, cpus in spec.ramp_cpus if k == klass)
+    # need() is the only reader of history and reads only klass or its base class: keep just those rows (t_990ca939)
+    # t_71ff933a: memoized per snapshot tuple, so admit + _confirm_class and the next /admit filter it once
+    rows = (_snap_memo(hist, ("class", klass), lambda: tuple(work_estimate.class_history(hist, klass)))
+            if isinstance(hist, tuple) else tuple(work_estimate.class_history(hist, klass)))
+    ctx = AdmitContext(klass, need_of(fp), rows,
+                       tuple(base + held_leases(held or {}, table)), scratch,
+                       start_cpus=start)
     return ctx.for_host(table, host) if host is not None else ctx
 
 
 def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footprint, *, need, leases,
-                          reserved: Optional[Footprint]) -> Headroom:
+                          reserved: Optional[Footprint], now: Optional[float] = None) -> Headroom:
     need = need or need_of(fp)
     row, lim = _sample_row(spec, sample), _limits(spec)
     leases = list(leases or ())
@@ -1260,11 +1616,12 @@ def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footp
         h.psi_cpu_some10, h.psi_cpu_some60 = sample.psi_cpu_some10, sample.psi_cpu_some60
         h.occupancy, h.occupancy_src = sample.occupancy
         h.capacity = spec.cpu_capacity
-    v = admission.admit(row, need, leases, host=spec.name, limits=lim)
+    v = admission.admit(row, need, leases, host=spec.name, limits=lim, now=now)
     h.need, h.cpu_busy, h.binding = need, sample.cpu_busy, v.binding
     if "mem_gb" in v.free and "cpu" in v.free and _num(sample.ncpu):
         h.mem_gb, h.cores = v.free["mem_gb"], v.free["cpu"] * float(sample.ncpu)    # cores = CPUs of room left
-    held = admission.live_leases(leases, spec.name, row.get("at"))   # the leases admit() counted (Prism 8e3aa5ad12d5)
+    # the leases admit() counted, at admit()'s price (Prism 8e3aa5ad12d5; ramp t_7566ba56)
+    held = admission.live_leases(leases, spec.name, row.get("at"), ramp=dict(lim.ramp_cpus), now=now)
     h.reserved_gb, h.reserved_threads = held.ram_gb, held.cpus
     if fp.scratch_gb > 0 and _num(sample.scratch_free_gb):
         h.scratch_gb = float(sample.scratch_free_gb) - (reserved.scratch_gb if reserved else 0.0) - fp.scratch_gb
@@ -1278,7 +1635,7 @@ def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footp
     if not v.ok:
         h.reason = f"closed:{v.reason}"
         return h
-    h.score = admission.score(row, need, leases, host=spec.name, limits=lim)
+    h.score = admission.score(row, need, leases, host=spec.name, limits=lim, now=now)
     if spec.scorer == "v2":
         h.fraction = h.score            # choose() multiplies it by st_speed^alpha among the eligible (R2c, D2)
     h.eligible = True
@@ -1302,14 +1659,14 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
     ``line``, 0.90) and the queued demand of every class that outranks this one (var/placement/demand/*.json).
     Read-only: it reserves nothing (placement.admit / allocd /admit book the lease); a caller that only needs the verdict
     (Prism's gate, the CI allocator, test-gate's local wait) calls this. ``root`` = the fleet root the table, ledgers,
-    pressure doc, priority, demand and the operator exclusions are read from (default fleet_root());
-    ``exclusions_path`` overrides the exclusions file only. ``admitted`` = this consumer's live admissions on the host
-    (default: counted from the reservation ledger, as admit() counts them for choose()); a positive
+    pressure doc, priority, demand and the fwa holds are read from (default fleet_root()); ``exclusions_path`` is
+    accepted and ignored (B5-P3 t_00664b58: exclusions.json is no longer read). ``admitted`` = this consumer's live
+    admissions on the host (default: counted from the reservation ledger, as admit() counts them for choose()); a positive
     ``consumers.<c>.ceiling`` caps it (Prism f88f81bb2e24). Demand ``hosts`` restrictions resolve through the same
     HostTable, so a queue restricted to an alias holds work back on its host (Prism 364936434c3d).
     ``stale_after_s`` (REQUIRED, no default): the CALLER's freshness policy for the host sample, so may_start never
     refuses a sample its own caller's scorer calls fresh (Prism 5113510bdb9a: a hardcoded 60 s here dropped kanban
-    hosts its 120 s policy admitted). Kanban passes placement_policy.stale_after_s; CI, batch and test-gate pass theirs.
+    hosts its 120 s policy admitted). Kanban passes allocation_policy.stale_after_s; CI, batch and test-gate pass theirs.
     It also overrides the pressure doc's own ``stale_after_s`` when the samples are read here."""
     try:                             # noqa: PLC0415  (imported like admission / work_estimate above)
         from . import admission_demand as dmd
@@ -1319,20 +1676,23 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
         raise PlacementError("may_start: stale_after_s is required (the caller's sample freshness policy)")
     stale_after_s = float(stale_after_s)
     now = _now(now)
-    base = Path(root) if root is not None else fleet_root()
-    table = table if table is not None else load_hosts(base / TABLE_REL)
+    base = Path(root) if root is not None else fleet_root(root=root)
+    table = table if table is not None else load_hosts(base / TABLE_REL, root=root)
     hid = table.resolve(host)
     if hid is None:
         return False, f"closed:{host} not in config/fleet-hosts.json"
     # operator controls first, through the SAME helper headroom()/choose() use (Prism 26a9b46c6a7b): a drained host or
-    # an ineligible consumer is refused before any measurement; an unreadable exclusions file fails CLOSED
+    # an ineligible consumer is refused before any measurement; an unreadable kinds file fails CLOSED
     try:
-        excl = live_exclusions(table, base / EXCLUSIONS_REL if exclusions_path is None else exclusions_path, now=now)
+        excl = kind_exclusions(table, consumer, base / KINDS_REL, now=now, root=root)
     except ExclusionsError as exc:
         return False, f"closed:exclusions unreadable ({exc})"
+    held = fwa_hold(hid, consumer, now=now, root=base)   # FWA §5.3: the ONE hold record (B5-P3: no exclusions.json)
+    if held:
+        return False, f"closed:fwa {held}"
     if admitted is None:
         try:          # the count admit() hands choose() (live_admissions), so a full allocation refuses here too
-            admitted = live_admissions(consumer, base / RESERVATIONS_REL, now=now, table=table).get(hid, 0)
+            admitted = live_admissions(consumer, base / RESERVATIONS_REL, now=now, table=table, root=root).get(hid, 0)
         except LedgerError as exc:
             return False, f"closed:ledger unreadable ({exc})"
     refused = policy_refusal(table.hosts[hid], consumer, excl.get(hid), admitted)
@@ -1352,13 +1712,13 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
     if not _num(sample.at) or now - float(sample.at) > stale_after_s:
         return False, "closed:stale (sample time missing or older than %gs)" % stale_after_s
     spec = table.hosts[hid]
+    refused = power_refusal(spec, sample)
+    if refused:
+        return False, refused
     fp = table.footprint(consumer, footprint if footprint is not None else (job.footprint if job else None),
                          profile=job.profile if job else None)
     raw = admit_context(consumer, fp, now=now, job=job, history=history, leases=leases, table=table, root=root)
     ctx = raw.for_host(table, hid)       # folded over hid's resource domain: leases AND scratch
-    refused = guest_vm_refusal(spec, raw, ctx.need(hid).cpus)     # the guest's own VM size, apart from the domain
-    if refused:
-        return False, refused
     if fp.scratch_gb > 0 and _num(sample.scratch_free_gb):
         left = float(sample.scratch_free_gb) - ctx.scratch_for({hid.lower(), *(a.lower() for a in spec.aliases)}) \
             - fp.scratch_gb
@@ -1370,7 +1730,7 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
     priority = priority if priority is not None else dmd.load_priority(root=root)
     v = admission.admit_class(_sample_row(spec, sample), dmd.workload_of(consumer), ctx.need(hid),
                               ctx.leases,
-                              demand=demand, priority=priority, limits=_limits(spec), host=hid)
+                              demand=demand, priority=priority, limits=_limits(spec), host=hid, now=now)
     return v.ok, (v.reason or f"ok (binding {v.binding})")
 
 
@@ -1383,52 +1743,15 @@ def band(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: s
          require_axes: Iterable[str] = REQUIRED_AXES, mode: Optional[str] = None, now: Optional[float] = None,
          ctx: Optional[AdmitContext] = None, root=None,
          stale_after_s: Optional[float] = DEFAULT_STALE_AFTER_S, table: Optional["HostTable"] = None) -> tuple:
-    """_band_pressure() (the domain's pressure band, below), then a ``pressure_from`` guest's own VM size: one job
-    over ``vm_cpus`` is hot, a second one over it caps ok at warm, the same guest_vm_refusal() choose() and may_start()
-    apply (Prism 0b6cf97fb659). The check reads the UNFOLDED context (``ctx`` as given, or the one built here)."""
+    """_band_pressure() (the domain's pressure band, below). A guest's own VM size is no longer a separate cap
+    (t_31911eb0): the guest's measured use is its fleet use, bounded by hosts.<id>.fleet_cap inside admit()."""
     util = sample is not None and sample.status == "fresh" and band_basis(mode, root=root) == "utilization"
     if util and ctx is None:
         ctx = admit_context(consumer, fp, now=_now(now), held={spec.name: reserved} if reserved else None,
                             root=root, table=table)
-    b, why = _band_pressure(spec, sample, fp, consumer=consumer, closed_when=closed_when, reserved=reserved,
-                            require_axes=require_axes, mode="utilization" if util else "legacy", now=now, ctx=ctx,
-                            root=root, stale_after_s=stale_after_s, table=table)
-    if not spec.pressure_from or b == "hot" or sample is None or sample.status != "fresh":
-        return b, why
-    if util:
-        raw, cpus = ctx, float(ctx.need(spec.name).cpus)
-    else:
-        # legacy too reads the live guest leases (``ctx`` as given, else the ledger's), never an empty list: a full
-        # guest is hot whether or not ``reserved`` is passed (Prism 3b1a9e851d14, t_b9ed3796)
-        # ``reserved`` is the caller's per-host total (live_reservations), i.e. the same rows the ledger leases
-        # carry: a context built HERE from the ledger already holds it, so it is never appended again (Prism
-        # cadbb61dcd6a); a caller-supplied ``ctx`` (admit() under its lock, tests) brings its own lease set, and
-        # ``reserved`` adds only what that set does not already book on the guest.
-        raw = ctx if ctx is not None else admit_context(consumer, fp, now=_now(now), root=root, table=table)
-        if reserved:
-            # one rule for both branches (Prism 05227baeb76d): the context's leases + reservations on the guest count
-            # first, and only the per-axis shortfall of the explicit total is added, never the whole total on top
-            # and never dropped because the context books part of it (Prism b5bf2173a5b7)
-            names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
-            booked = Footprint(ram_gb=0.0, threads=0.0, scratch_gb=raw.scratch_for(names))
-            for le in raw.leases:
-                if str(le.host).lower() in names:
-                    booked = booked.plus(Footprint(ram_gb=float(le.need.ram_gb), threads=float(le.need.cpus),
-                                                   gpu_mb=float(le.need.gpu_mib)))
-            for h, f in raw.reservations:
-                if str(h).lower() in names:
-                    booked = booked.plus(f)
-            short = Footprint(*(max(0.0, getattr(reserved, k) - getattr(booked, k)) for k in FOOTPRINT_KEYS))
-            if any(getattr(short, k) > 0 for k in FOOTPRINT_KEYS):
-                raw = dataclasses.replace(raw, reservations=tuple(raw.reservations) + ((spec.name, short),))
-        cpus = float(fp.threads)
-    one = guest_vm_refusal(spec, raw, cpus)
-    if one:
-        return "hot", [one]
-    two = guest_vm_refusal(spec, raw, 2 * cpus)
-    if two and b == "ok":
-        return "warm", [f"room for one {consumer} job, not two: {two}"]
-    return b, why
+    return _band_pressure(spec, sample, fp, consumer=consumer, closed_when=closed_when, reserved=reserved,
+                          require_axes=require_axes, mode="utilization" if util else "legacy", now=now, ctx=ctx,
+                          root=root, stale_after_s=stale_after_s, table=table)
 
 
 def _band_pressure(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: str,
@@ -1510,18 +1833,21 @@ def band_basis(mode: Optional[str] = None, root=None) -> str:
     procs_running are not read), "legacy" = the scorer's cores axis (cores x yield - cores_reserve - occupancy -
     reserved threads). ``mode`` (tests) decides outright. Else utilization only while config.yaml kanban.admission is
     utilization (the band names what the admitter does) AND the busy_basis kill switch for reader ``admission-band``
-    (env PLACEMENT_BAND_BASIS, else fleet/placement-policy.json busy_basis.admission-band) is cpu_busy (its default);
-    ``load1`` there restores the legacy band. ``root`` reads that root's config.yaml and fleet/placement-policy.json."""
+    (env PLACEMENT_BAND_BASIS, else fleet/allocation-policy.json busy_basis.admission-band) is cpu_busy (its default);
+    ``load1`` there restores the legacy band. ``root`` reads that root's config.yaml and fleet/allocation-policy.json."""
     if mode is not None:
         return "utilization" if mode == "utilization" else "legacy"
-    if admission_mode(Path(root) / CONFIG_REL if root is not None else None) != "utilization":
+    if admission_mode(Path(root) / CONFIG_REL if root is not None else None, root=root) != "utilization":
         return "legacy"
     try:
-        import busy_basis  # noqa: PLC0415  (scripts/lib sibling; absent in a vendored copy -> env only)
-        # root omitted: BUSY_BASIS_POLICY, else fleet_root()'s (PLACEMENT_HOME) policy, never busy_basis's own
+        if __package__:
+            from . import busy_basis
+        else:
+            import busy_basis  # noqa: PLC0415
+        # root omitted: BUSY_BASIS_POLICY, else fleet_root()'s (ALLOCATION_HOME) policy, never busy_basis's own
         # checkout (Prism a922d9125c6e); an explicit root reads that root's file, as before
-        pol = (Path(root) / "fleet" / "placement-policy.json" if root is not None else
-               os.environ.get("BUSY_BASIS_POLICY") or fleet_root() / "fleet" / "placement-policy.json")
+        pol = (Path(root) / "fleet" / "allocation-policy.json" if root is not None else
+               os.environ.get("BUSY_BASIS_POLICY") or fleet_root(root=root) / "fleet" / "allocation-policy.json")
         basis = busy_basis.basis(BAND_BASIS_READER, BAND_BASIS_ENV, pol)
     except ImportError:
         basis = os.environ.get(BAND_BASIS_ENV) or "cpu_busy"
@@ -1554,7 +1880,7 @@ def _band_class_rule(spec: HostSpec, sample: Sample, consumer: str, leases, *, n
 
     def verdict(need):
         return admission.admit_class(row, workload, need, leases, demand=demand, priority=priority, limits=lim,
-                                     host=spec.name)
+                                     host=spec.name, now=_now(now))
     return verdict
 
 
@@ -1582,7 +1908,7 @@ def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer
                     else Footprint(ram_gb=0.0, threads=0.0, scratch_gb=held_scr))
     busy = f"cpu_busy {sample.cpu_busy:g}" if _num(sample.cpu_busy) else "cpu_busy ?"
     one = headroom(spec, sample, fp, consumer=consumer, closed_when=closed_when, mode="utilization", need=need,
-                   leases=leases, reserved=reserved)
+                   leases=leases, reserved=reserved, now=_now(now))
     rule = _band_class_rule(spec, sample, consumer, leases, now=now, root=root, table=table)
     v1 = rule(need) if rule else None
     if v1 is not None and not v1.ok and not v1.reason.startswith("unmeasured"):
@@ -1592,7 +1918,7 @@ def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer
             return None, [one.reason]
         return "hot", [f"{one.reason} ({busy}, utilization)"]
     two = headroom(spec, sample, fp.plus(fp), consumer=consumer, closed_when=closed_when, mode="utilization",
-                   need=need.plus(need), leases=leases, reserved=reserved)
+                   need=need.plus(need), leases=leases, reserved=reserved, now=_now(now))
     room = f"headroom {one.mem_gb:.1f} GB / {one.cores:.1f} cpus after one job ({busy}, utilization)"
     if v1 is not None and not v1.ok:                 # the class rule cannot measure an axis: unknown, as headroom()
         return None, [f"closed:{v1.reason}"]
@@ -1605,11 +1931,15 @@ def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer
 
 
 def bands_from_pressure(table: HostTable, doc: Mapping, *, now: float,
-                        consumers: Optional[Iterable[str]] = None, home=None) -> Dict[str, dict]:
+                        consumers: Optional[Iterable[str]] = None, home=None, root: Optional[Path] = None) -> Dict[str, dict]:
     """{host: {"band": {consumer: band}, "reason": {consumer: "a; b"}}} for every host row of a fleet-pressure.json
     document that the table knows, over the table's footprints (or ``consumers``). Same sample read and the same
     staleness rule as choose(), so a published band can never say ok where choose() would refuse. ``home`` (default
     fleet_root()) is the collection's root: its mode, kill switch and ledgers name the band (Prism 241f9c71263b)."""
+    if root is not None:
+        if home is not None and Path(home) != Path(root):
+            raise PlacementError("home and root disagree")
+        home = root
     samples = samples_from_pressure(doc, now=now)
     stale = float(doc["stale_after_s"]) if _num(doc.get("stale_after_s")) else DEFAULT_STALE_AFTER_S
     names = [c for c in (consumers or table.footprints) if c in table.footprints]
@@ -1720,6 +2050,14 @@ class Decision:
                                   "headroom_cores": None if r.cores is None else round(r.cores, 1),
                                   "score": None if not r.eligible else round(r.score, 4), "binding": r.binding or None}
                          for r in self.rows}}
+        for r in self.rows:
+            # utilization mode: the cpu_busy the PSI busy-floor exemption read, so a grader can prove it (t_5a9f9e88)
+            if r.cpu_busy is not None:
+                row["hosts"][r.host]["cpu_busy"] = r.cpu_busy
+            # the points score's terms on every host it scored (t_b01ab307); score above is then the points score
+            if r.used is not None:
+                row["hosts"][r.host].update({"used": round(r.used, 4), "cost": round(r.cost, 4),
+                                             "points": r.points, "bonus": r.bonus})
         if self.scorer == "v2":
             # v2 denominators on every host row (doctrine rule 2); a v1 row stays byte for byte what it was
             row["scorer"] = "v2"
@@ -1742,7 +2080,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
            admitted: Optional[Mapping[str, float]] = None, stale_after_s: Optional[float] = DEFAULT_STALE_AFTER_S,
            mode: Optional[str] = None, leases: Optional[Iterable["admission.Lease"]] = None,
            history: Optional[List[dict]] = None,
-           vm_reservations: Optional[Mapping[str, Footprint]] = None) -> Decision:
+           kinds_path=None, root: Optional[Path] = None) -> Decision:
     """The three layers over ``candidates`` (default: every host in the table).
 
     1. gate: a candidate with no sample, a stale/absent one, an unmeasured axis, a tripped closed_when axis,
@@ -1756,7 +2094,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     ``stale_after_s`` (default 60 s) re-checks every sample's age against ``now`` at decision time (Prism fda1ea43);
     pass None only when the caller has just produced the samples itself and vouches for their freshness.
     ``mode`` (default: config.yaml ``kanban.admission``, legacy when unset) "utilization" gates every host with
-    admission.admit(): the job's estimate is work_estimate.estimate() for its class on that host (p75 of the last
+    admission.admit(): the job's estimate is work_estimate.estimate() for its class on that host (p90 of the last
     runs in ``history``, default the class-usage ledger; the declared footprint is the seed), and ``leases``
     (default: the reservation ledger's live rows) stand in for counts until the sample shows them.
     """
@@ -1773,11 +2111,19 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
         if table.hosts[hid].pressure_from:        # mirror only when as new (sample_for; Prism 901e6ec92ac9)
             folded[hid] = sample_for(table, samples, hid)
     now = _now(now)
-    mode = admission_mode() if mode is None else mode     # after the input checks: a refused call reads nothing
+    mode = admission_mode(root=root) if mode is None else mode     # after the input checks: a refused call reads nothing
     require_axes = tuple(require_axes)   # a generator would be exhausted by the first candidate (Prism P1 16d4270a)
-    # live operator exclusions (var/placement/exclusions.json, TTL rows) ALWAYS apply; the caller's map adds to them
-    # (Prism 95afdab6): a caller entry never REPLACES an operator row, and an empty reason still excludes
-    excl = live_exclusions(table, exclusions_path, now=now, extra=exclusions)
+    # the caller's map (an empty reason still excludes, Prism 95afdab6); B5-P3 (t_00664b58): exclusions_path is
+    # ignored, an operator exclusion is an fwa hold (read below)
+    excl = caller_exclusions(table, extra=exclusions)
+    # a paused work kind (state/fleet-pause/kinds.json) closes this consumer like an exclusion row (t_47109d72)
+    for k, v in kind_exclusions(table, consumer, kinds_path, now=now, root=root).items():
+        excl.setdefault(k, v)
+    memo = _fwa_memo()                            # FWA §5.3: an fwa hold closes the host (I4)
+    for hid in table.hosts:
+        held = fwa_hold(hid, consumer, now=now, root=root, memo=memo)
+        if held:
+            excl.setdefault(hid, f"fwa {held}")
     resv: Dict[str, Footprint] = {}
     for k, v in (reservations or {}).items():      # aliases of one host SUM, never overwrite (Prism P1 8b7fd838)
         hid = table.resolve(k) or k
@@ -1790,7 +2136,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     util = mode == "utilization"
     # leases replace ``reservations`` for cpu/ram on the utilization path (a lease ages out of the count once the
     # sample shows its job); both paths read every host-attributed input through ONE per-host fold (for_host)
-    ctx = (admit_context(consumer, fp, now=now, job=job, history=history, leases=leases, table=table) if util
+    ctx = (admit_context(consumer, fp, now=now, job=job, history=history, leases=leases, table=table, root=root) if util
            else AdmitContext("", need_of(fp), (), ()))
     ctx = dataclasses.replace(ctx, reservations=tuple(resv.items()))
     rows: List[Headroom] = []
@@ -1804,7 +2150,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
             continue
         seen.add(hid)
         hc = ctx.for_host(table, hid)
-        need = work_estimate.estimate(ctx.job_class, hid, ctx.history, seed=ctx.seed) if util else ctx.seed
+        need = hc.need(hid) if util else ctx.seed
         if util:
             rows.append(headroom(table.hosts[hid], folded.get(hid), fp, consumer=consumer,
                                  closed_when=table.closed_when, excluded=excl.get(hid), reserved=hc.reserved_on(hid),
@@ -1817,12 +2163,6 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
                                  closed_when=table.closed_when, excluded=excl.get(hid), reserved=hc.reserved_on(hid),
                                  require_axes=require_axes, admitted=used.get(hid, 0.0),
                                  now=now, stale_after_s=stale_after_s))
-        # ``vm_reservations`` (admit(): the ledger's live rows UNAGED) for the guest's own size, never the scorer's
-        # load1-aged ``reservations`` (Prism f01d48b6d5c4); None = the caller's reservations as given
-        vm = guest_vm_refusal(table.hosts[hid], ctx, need.cpus, reservations=vm_reservations) \
-            if rows[-1].eligible else None
-        if vm:                                     # the guest's own VM size caps it apart from the domain (t_7361659c)
-            rows[-1].eligible, rows[-1].reason = False, vm
     eligible = [r for r in rows if r.eligible]
     # speed enters the CHOICE on both paths (R2c, D2; FWA F1 t_d456e9cd): under utilization the fraction is
     # admission.score()'s binding fraction, under legacy the v2 headroom fraction
@@ -1835,6 +2175,8 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
         return done(Decision(None, "no_candidates", rows, consumer, fp))
     if not eligible:
         why = "no_headroom" if any(r.reason.startswith("no_headroom") for r in rows) else "all_closed"
+        if util:    # no host can EVER admit this need: say so by name, never a bare all_closed (Prism 1ea08e48d747)
+            why = resource_fit_refusal(ctx.job_class, consumer, rows, table, folded) or why
         return done(Decision(None, why, rows, consumer, fp))
     by_id = {r.host: r for r in eligible}
     job = job or Job()
@@ -1848,18 +2190,30 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     def pick(row: Headroom, rule: str, kept: bool = False) -> Decision:
         return done(Decision(row.host, "", rows, consumer, fp, kept_previous=kept, rule=rule))
 
-    # layer 3: per-job overrides (an ineligible target falls through; the gate always wins)
+    if table.points.on(consumer):
+        # the points score replaces layers 3-5 for this consumer (t_b01ab307); affinity and core_class wide stay
+        # overrides, continuity is one only under ``continuity: override``. yields_overrides is not consulted.
+        return _choose_points(table, eligible, by_id, job, fp, previous, pick,
+                              lambda why: done(Decision(None, why, rows, consumer, fp)))
+
+    # layer 3: per-job overrides (an ineligible target falls through; the gate always wins). A yields_overrides host
+    # (mbp-2026) never wins by continuity or the fast pick while an unflagged host is eligible (Ace msg
+    # 1573943702118998158, t_6388e879: lower the MacBook's priority); affinity still wins anywhere
+    unflagged = [r for r in eligible if not table.hosts[r.host].yields_overrides]
     for field in ("affinity", "continuity"):
         want = table.resolve(getattr(job, field) or "")
-        if want and want in by_id:
+        if want and want in by_id and not (field == "continuity" and unflagged
+                                           and table.hosts[want].yields_overrides):
             return pick(by_id[want], field)
     core_class = job.core_class or ("fast" if job.priority is not None and job.priority <= 1 else None)
     if core_class == "fast":
         rule = "priority" if job.core_class is None else "core_class:fast"
-        if v2 and any(table.hosts[r.host].st_speed_src == "measured" for r in eligible):
-            # measured st_speed (alpha 1) replaces the lscpu clock; until R2b measures, the clock rule stands
-            return pick(max(eligible, key=lambda r: (r.score, table.hosts[r.host].clock_mhz, r.host)), rule)
-        best = max(eligible, key=lambda r: (table.hosts[r.host].clock_mhz, r.score, r.host))
+        fast = unflagged or eligible
+        if v2 and any(table.hosts[r.host].st_speed_src == "measured" for r in fast):
+            # measured st_speed replaces the lscpu clock as the FIRST key (F5); until R2b measures, the clock rule stands
+            speed = (lambda r: table.hosts[r.host].st_speed) if table.fast_pick == "speed" else (lambda r: 0.0)
+            return pick(max(fast, key=lambda r: (speed(r), r.score, table.hosts[r.host].clock_mhz, r.host)), rule)
+        best = max(fast, key=lambda r: (table.hosts[r.host].clock_mhz, r.score, r.host))
         return pick(best, rule)
     if core_class == "wide":
         best = max(eligible, key=lambda r: (table.hosts[r.host].threads, r.score, r.host))
@@ -1893,6 +2247,62 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
             and table.hosts[prev_id].default_preference == table.hosts[best.host].default_preference:
         return pick(by_id[prev_id], "headroom", kept=True)
     return pick(best, "headroom" if normal else "headroom:low-preference")
+
+
+def points_used(r: Headroom, spec: HostSpec, fp: Footprint) -> float:
+    """The points score's ``used`` for one open host: cpu_busy + (lease threads + this job's threads) / host threads,
+    clamped to 0..POINTS_USED_MAX. CPU only. cpu_busy is the sample's (utilization mode); a legacy-mode row has none,
+    so the gate's load (the larger of load1 and load5) / threads stands in, the same figure the legacy gate reads.
+    This job's threads: its estimate on this host (utilization), else the footprint. An unmeasured host (no
+    cpu_busy AND no load) is never read as idle: it returns POINTS_USED_MAX, so the score
+    does not depend on the gate having closed it."""
+    thr = float(spec.threads) if spec.threads else 1.0
+    if not _num(r.cpu_busy) and not _num(r.load):
+        return POINTS_USED_MAX
+    busy = r.cpu_busy if _num(r.cpu_busy) else float(r.load) / thr
+    mine = float(r.need.cpus) if r.need is not None else float(fp.threads)
+    return min(max(busy + (float(r.reserved_threads or 0.0) + mine) / thr, 0.0), POINTS_USED_MAX)
+
+
+def _choose_points(table: HostTable, eligible: List[Headroom], by_id: Dict[str, Headroom], job: "Job",
+                   fp: Footprint, previous: Optional[str], pick, refuse) -> Decision:
+    """Layers 3-5 under the points score (t_b01ab307). ``eligible`` = the hosts the gate left open."""
+    dials = table.points
+    pool = eligible
+    if job.core_class == "fast-only":
+        # the restriction binds every target, overrides included: a non-fast affinity/continuity host falls through
+        pool = [r for r in eligible if table.hosts[r.host].fast_core]
+        if not pool:
+            return refuse("no_fast_core: core_class fast-only and no fast_core host is open")
+    in_pool = {r.host: r for r in pool}
+    want = table.resolve(job.affinity or "")
+    if want and want in in_pool:
+        return pick(in_pool[want], "affinity")
+    cont = table.resolve(job.continuity or "")
+    if dials.continuity == "override" and cont and cont in in_pool:
+        return pick(in_pool[cont], "continuity")
+    if job.core_class == "wide":
+        return pick(max(eligible, key=lambda r: (table.hosts[r.host].threads, r.score, r.host)), "core_class:wide")
+    bonus: Dict[str, tuple] = {}
+    for r in pool:
+        spec = table.hosts[r.host]
+        bc = dials.bonus_continuity if dials.continuity == "bonus" and r.host == cont else 0.0
+        bf = dials.bonus_fast_core if job.core_class == "fast" and spec.fast_core else 0.0
+        u = points_used(r, spec, fp)
+        r.used, r.cost, r.points, r.bonus = u, POINTS_COST_K * u / (1.0 - u), spec.points, bc + bf
+        r.score, r.alpha = spec.points + bc + bf - r.cost, None
+        bonus[r.host] = (bc, bf)
+
+    def best(minus: int = -1) -> Headroom:
+        # highest score; a tie goes to more points, then the host id (lexically first)
+        return min(pool, key=lambda r: (-(r.score - (bonus[r.host][minus] if minus >= 0 else 0.0)),
+                                        -table.hosts[r.host].points, r.host))
+    win = best()
+    prev_id = table.resolve(previous) if previous else None
+    if prev_id and prev_id != win.host and prev_id in bonus and win.score - by_id[prev_id].score < dials.keep_margin:
+        return pick(by_id[prev_id], "points", kept=True)
+    rule = "points:continuity" if best(0).host != win.host else "points:fast" if best(1).host != win.host else "points"
+    return pick(win, rule)
 
 
 
@@ -1945,10 +2355,10 @@ def _parse_admission(text: str, source: str = "config.yaml") -> str:
     return "legacy"
 
 
-def admission_mode(path=None) -> str:
+def admission_mode(path=None, *, root: Optional[Path] = None) -> str:
     """``kanban.admission`` of config.yaml: "utilization" or "legacy" (the default; absent, unreadable or any other
     value = legacy, so the kill switch fails to today's path). Read per call, cached on (mtime, size)."""
-    p = Path(path) if path is not None else fleet_root() / CONFIG_REL
+    p = Path(path) if path is not None else fleet_root(root=root) / CONFIG_REL
     try:
         st = p.stat()
     except OSError:
@@ -1968,8 +2378,8 @@ def admission_mode(path=None) -> str:
     return mode
 
 
-def class_usage_path(path=None) -> Path:
-    return Path(path) if path is not None else fleet_root() / CLASS_USAGE_REL
+def class_usage_path(path=None, *, root: Optional[Path] = None) -> Path:
+    return Path(path) if path is not None else fleet_root(root=root) / CLASS_USAGE_REL
 
 
 def job_class_for(consumer: str, job: Optional["Job"] = None) -> str:
@@ -1985,12 +2395,12 @@ def held_leases(extra: Mapping[str, Footprint], table: Optional[HostTable] = Non
                             at=float("inf")) for k, v in (extra or {}).items()]
 
 
-def ledger_leases(path=None, *, now: Optional[float] = None, table: Optional[HostTable] = None) -> List["admission.Lease"]:
+def ledger_leases(path=None, *, now: Optional[float] = None, table: Optional[HostTable] = None, root: Optional[Path] = None) -> List["admission.Lease"]:
     """Every LIVE reservation row as an admission.Lease (host canonical with ``table``): admission.admit() counts
     only those younger than the sample (``live_leases``), so a running job is never booked twice."""
     now = _now(now)
     out = []
-    for row in _read_ledger(reservations_path(path))["rows"]:
+    for row in _read_ledger(reservations_path(path, root=root))["rows"]:
         if not _row_live(row, now):
             continue
         host = (table.resolve(row["host"]) or row["host"]) if table else row["host"]
@@ -2011,40 +2421,73 @@ class LockTimeout(PlacementError):
     """The ledger flock was not acquired within ``lock_timeout_s`` (a wedged holder; Router Core t_552773f1)."""
 
 
+_LEDGER_DIRS = contextvars.ContextVar("placement_ledger_directories", default={})
+
+
+def _durability():
+    try:
+        from . import admission_demand
+    except ImportError:
+        import admission_demand
+    return admission_demand
+
+
 @contextlib.contextmanager
-def _locked(path: Path, timeout_s: Optional[float] = None):
+def _ledger_directory(path, *, root=None):
+    path = Path(path).absolute()
+    current = _LEDGER_DIRS.get().get(str(path.parent))
+    if current is not None:
+        yield current
+        return
+    root = fleet_root(root=root).absolute()
+    with _durability().root_directory(root, path.parent.relative_to(root)) as directory:
+        token = _LEDGER_DIRS.set({**_LEDGER_DIRS.get(), str(path.parent): directory})
+        try:
+            yield directory
+        finally:
+            _LEDGER_DIRS.reset(token)
+
+
+@contextlib.contextmanager
+def _locked(path: Path, timeout_s: Optional[float] = None, *, root=None):
     """LOCK_EX on <path>.lock. ``timeout_s`` None = block (every existing caller); a number = LOCK_NB polled until
     the deadline, then LockTimeout (alloc_client's fallback must answer, never hang behind a wedged allocd)."""
     try:
         import fcntl
-    except ImportError:  # pragma: no cover
-        yield
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path) + ".lock", "a+") as fh:
-        if timeout_s is None:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-        else:
-            deadline = time.monotonic() + max(0.0, float(timeout_s))
-            while True:
-                try:
-                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise LockTimeout(f"{path}.lock: held past {timeout_s:.2f}s") from None
-                    time.sleep(0.02)
+    except ImportError as exc:  # pragma: no cover
+        raise LedgerError("durable allocation storage requires flock") from exc
+    with _ledger_directory(path, root=root) as directory, (directory / (path.name + ".lock")).open("a+") as fh:
+        t_wait = time.monotonic()
+        with _durability()._stage("ledger_flock_wait"):   # t_2f30f5b5: only the wait; the caller keeps its label
+            if timeout_s is None:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+            else:
+                deadline = time.monotonic() + max(0.0, float(timeout_s))
+                while True:
+                    try:
+                        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise LockTimeout(f"{path}.lock: held past {timeout_s:.2f}s") from None
+                        time.sleep(0.02)
+        t_held = time.monotonic()
         try:
             yield
+            directory.validate()
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
+            # t_1d801469: name the holder (route, consumer, caller, pid) of every long hold, in any process
+            _durability()._note_hold("ledger_flock", Path(path).absolute().parent / "flock-holds.jsonl",
+                                     t_held - t_wait, time.monotonic() - t_held)
 
 
 def _read_ledger(path: Path) -> dict:
     """The ledger document. A MISSING file is an empty ledger; anything else that fails is LedgerError (a
     reserve()/release() must never replace a ledger it could not read: that drops live reservations)."""
     try:
-        text = path.read_text(encoding="utf-8")
+        bound = _LEDGER_DIRS.get().get(str(Path(path).absolute().parent))
+        text = (bound / path.name).read_text() if bound is not None else path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {"schema": SCHEMA, "rows": []}
     except OSError as exc:
@@ -2087,36 +2530,21 @@ def _ledger_row_error(row) -> str:
     return ""
 
 
-def _write_ledger(path: Path, doc: dict) -> None:
+def _write_ledger(path: Path, doc: dict, *, root=None) -> None:
     """Atomic AND durable: the temp file is fsync'd before the rename and the directory after it, so a power
     loss right after a remote job launched cannot forget the reservation it was launched on (Prism 9da46cee)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
-    with os.fdopen(fd, "w") as fh:
-        json.dump(doc, fh, sort_keys=True)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
-    # a directory fsync that fails is a write we cannot call durable: raise, never report success (Prism f60d925a)
-    try:
-        dfd = os.open(str(path.parent), os.O_RDONLY)
-    except OSError as exc:
-        raise LedgerError(f"{path}: directory not durable: {exc}") from exc
-    try:
-        os.fsync(dfd)
-    except OSError as exc:
-        raise LedgerError(f"{path}: directory fsync failed: {exc}") from exc
-    finally:
-        os.close(dfd)
+    with _ledger_directory(path, root=root) as directory:
+        with _durability()._stage("store_serialize"):
+            data = json.dumps(doc, sort_keys=True)
+        directory.replace(path.name, data)
 
 
 def _row_live(row: Mapping, now: float) -> bool:
     return _num(row.get("until")) and float(row["until"]) > now and not row.get("released")
 
 
-def reservations_path(path=None) -> Path:
-    return Path(path) if path is not None else fleet_root() / RESERVATIONS_REL
+def reservations_path(path=None, *, root: Optional[Path] = None) -> Path:
+    return Path(path) if path is not None else fleet_root(root=root) / RESERVATIONS_REL
 
 
 def admissions_path_for(ledger: Path, admissions_path=None) -> Path:
@@ -2129,19 +2557,23 @@ def _row_footprint(row: Mapping) -> Footprint:
     return Footprint(*(float(row.get(k) or 0.0) for k in FOOTPRINT_KEYS))
 
 
-def _append_admissions(ap: Path, lines: List[dict]) -> None:
+def _append_admissions(ap: Path, lines: List[dict], *, root=None) -> None:
     """Append lifecycle lines DURABLY (fsync, Prism d91b204660f6) right after the fsync'd ledger write they describe.
     A failure is reported on stderr, never raised: the reservation change it describes already committed, and the
     reservation ledger (not this audit journal) is what admission accounting reads."""
     if not lines:
         return
     try:
-        ap.parent.mkdir(parents=True, exist_ok=True)
-        with open(ap, "a") as fh:
-            fh.write("".join(json.dumps(x, sort_keys=True) + "\n" for x in lines))
-            fh.flush()
-            os.fsync(fh.fileno())
-    except OSError as exc:
+        stage = _durability()._stage
+        with _ledger_directory(ap, root=root) as directory, (directory / ap.name).open("a") as fh:
+            # t_2f30f5b5: the append and its fsyncs are their own stages (admissions.jsonl is ~0.5 GB on the Studio)
+            with stage("admissions_write"):
+                fh.write("".join(json.dumps(x, sort_keys=True) + "\n" for x in lines))
+                fh.flush()
+            with stage("admissions_fsync"):
+                os.fsync(fh.fileno())
+                os.fsync(directory.fd)
+    except (OSError, ValueError) as exc:
         sys.stderr.write(f"placement: admissions journal {ap} not written ({len(lines)} line(s) lost): {exc}\n")
 
 
@@ -2169,14 +2601,14 @@ def _prune(rows: List[dict], now: float) -> tuple:
 
 
 def live_reservations(path=None, *, now: Optional[float] = None, table: Optional[HostTable] = None,
-                      cpu_seen_after_s: Optional[float] = None) -> Dict[str, Footprint]:
+                      cpu_seen_after_s: Optional[float] = None, root: Optional[Path] = None) -> Dict[str, Footprint]:
     """{host: summed Footprint} of every reservation whose TTL has not expired and that was not released.
     With ``table`` the keys are canonical host ids (aliases summed). Raises LedgerError on a corrupt ledger.
     ``cpu_seen_after_s`` (the scorer passes LOAD1_WINDOW_S): a row booked at least that long ago contributes
     0 threads, because its process is in the sampled load1 already (t_bfb88c23); a row with no ``at`` keeps
     its threads. Memory, scratch and gpu are never aged. None = every live row in full (the promise)."""
     now = _now(now)
-    doc = _read_ledger(reservations_path(path))
+    doc = _read_ledger(reservations_path(path, root=root))
     out: Dict[str, Footprint] = {}
     for row in doc["rows"]:          # every row validated by _read_ledger
         if _row_live(row, now):
@@ -2190,11 +2622,11 @@ def live_reservations(path=None, *, now: Optional[float] = None, table: Optional
 
 
 def live_admissions(consumer: str, path=None, *, now: Optional[float] = None,
-                    table: Optional[HostTable] = None) -> Dict[str, int]:
+                    table: Optional[HostTable] = None, root: Optional[Path] = None) -> Dict[str, int]:
     """{host: number of LIVE reservations held by ``consumer``}: what a positive ``consumers.<c>.ceiling`` caps
     (Prism 696cce63). Same liveness and alias rules as live_reservations(); a row with no consumer is not counted."""
     now = _now(now)
-    doc = _read_ledger(reservations_path(path))
+    doc = _read_ledger(reservations_path(path, root=root))
     out: Dict[str, int] = {}
     for row in doc["rows"]:
         if _row_live(row, now) and row.get("consumer") == consumer:
@@ -2204,27 +2636,28 @@ def live_admissions(consumer: str, path=None, *, now: Optional[float] = None,
 
 
 def reserve(host: str, consumer: str, fp: Footprint, *, ttl_s: float, job_id: Optional[str] = None,
-            path=None, now: Optional[float] = None, admissions_path=None, decision: Optional[Decision] = None) -> str:
+            path=None, now: Optional[float] = None, admissions_path=None, decision: Optional[Decision] = None, root: Optional[Path] = None) -> str:
     """Record ``fp`` against ``host`` for ``ttl_s`` seconds; returns the reservation id. Expired and released
     rows are pruned on every write. The pick is also appended to the admissions ledger (one line per pick).
     The default ``now`` is taken AFTER the lock is held: a lock wait longer than ``ttl_s`` must not write an
     already-expired row (Prism fe666f92). An explicit ``now`` is kept as given."""
     if not _num(ttl_s) or ttl_s <= 0:
         raise PlacementError(f"ttl_s must be a finite number > 0, not {ttl_s!r}")
-    p = reservations_path(path)
-    with _locked(p):
+    p = reservations_path(path, root=root)
+    with _locked(p, root=root):
         now = _now(now)
         return _reserve_unlocked(p, host, consumer, fp, ttl_s=ttl_s, job_id=job_id, now=now,
-                                 admissions_path=admissions_path, decision=decision)
+                                 admissions_path=admissions_path, decision=decision, root=root)
 
 
 def _reserve_unlocked(p: Path, host: str, consumer: str, fp: Footprint, *, ttl_s: float, job_id, now: float,
-                      admissions_path, decision: Optional[Decision], job_class: Optional[str] = None) -> str:
+                      admissions_path, decision: Optional[Decision], job_class: Optional[str] = None,
+                      reservation_id: Optional[str] = None, root=None, hosts: Optional[dict] = None) -> str:
     if not _num(ttl_s) or ttl_s <= 0:
         raise PlacementError(f"ttl_s must be a finite number > 0, not {ttl_s!r}")
     if not isinstance(fp, Footprint):
         raise PlacementError("fp must be a Footprint")
-    rid = uuid.uuid4().hex[:12]
+    rid = reservation_id or uuid.uuid4().hex[:12]
     doc = _read_ledger(p)
     rows, expired = _prune(doc["rows"], now)
     row = {"id": rid, "host": host, "consumer": consumer, "job_id": job_id, "ram_gb": fp.ram_gb,
@@ -2236,17 +2669,19 @@ def _reserve_unlocked(p: Path, host: str, consumer: str, fp: Footprint, *, ttl_s
         # never write a row the reader would reject: that would wedge every later admit/renew/release (Prism 0824b4b2)
         raise PlacementError(f"invalid reservation ({bad}); ledger left unchanged")
     rows.append(row)
-    _write_ledger(p, {"schema": SCHEMA, "rows": rows})
+    _write_ledger(p, {"schema": SCHEMA, "rows": rows}, root=root)
     chosen = next((r for r in decision.rows if r.host == host), None) if decision else None
     # admission_mode on every decision line, so a readback reads the mode off the ledger (t_f73c65a8); a pin booked
     # without a decision carries None (no mode decided it)
     extra = {"rule": decision.rule, "hosts": decision.as_row()["hosts"]} if decision else {}
+    if hosts is not None and not decision:
+        extra["hosts"] = hosts       # a pin's own reading (allocd door start, t_f8d7c0c2); a decision writes its own
     extra["admission_mode"] = (decision.mode or None) if decision else None
     _append_admissions(admissions_path_for(p, admissions_path), expired + [_ledger_line(
         at=now, host=host, consumer=consumer, job_id=job_id, fp=fp, decision="admitted", reservation=rid,
         band=band_of(chosen, fp) if chosen else None, ttl_s=float(ttl_s),
         reason=(f"{decision.rule}: fits with live reservations" if decision else "booked without a decision (pin)"),
-        **extra)])
+        **extra)], root=root)
     return rid
 
 
@@ -2274,7 +2709,7 @@ def _deferred_line(ap: Path, d: Decision, *, job_id, now: float) -> List[dict]:
 
 def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample]], *, ttl_s: float,
           job_id: Optional[str] = None, path=None, admissions_path=None, now: Optional[float] = None,
-          **choose_kw):
+          root: Optional[Path] = None, **choose_kw):
     """ONE locked transaction: read the live ledger, choose(), reserve() (Prism P1 02405b39 / b7233dbf).
     Two dispatchers admitting concurrently serialize on the ledger lock, so the second sees the first's
     reservation. Returns (Decision, reservation id or None). ``choose_kw`` = choose()'s keyword arguments.
@@ -2292,9 +2727,13 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
     reuse_job = bool(choose_kw.pop("reuse_job", False))
     extra_reserved = choose_kw.pop("extra_reserved", None) or {}
     lock_timeout_s = choose_kw.pop("lock_timeout_s", None)
-    p = reservations_path(path)
-    with _locked(p, lock_timeout_s):
+    mode = choose_kw.pop("mode", None) or admission_mode(root=root)
+    snapshot = history_snapshot(root=root) if mode == "utilization" and choose_kw.get("history") is None else None
+    p = reservations_path(path, root=root)
+    with _locked(p, lock_timeout_s, root=root):
         now = _now(now)
+        if snapshot is not None:
+            choose_kw["history"] = history_window(snapshot, now)
         if reuse_job and job_id is not None:
             for row in _read_ledger(p)["rows"]:
                 # a coordination row (allocd /lease, host _fleet) is never work: a /admit whose job_id equals a fence
@@ -2302,30 +2741,21 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
                 if _row_live(row, now) and row["consumer"] == consumer and row.get("job_id") == job_id \
                         and row["host"] != COORDINATION_HOST:
                     return Decision(row["host"], "", [], consumer, _row_footprint(row), rule="reuse"), row["id"]
-        resv = live_reservations(p, now=now, table=table, cpu_seen_after_s=LOAD1_WINDOW_S)
+        resv = live_reservations(p, now=now, table=table, cpu_seen_after_s=LOAD1_WINDOW_S, root=root)
         for k, v in extra_reserved.items():
             hid = table.resolve(k) or k
             resv[hid] = resv[hid].plus(v) if hid in resv else v
-        used = live_admissions(consumer, p, now=now, table=table)    # positive ceilings count live admissions (696cce63)
-        mode = choose_kw.pop("mode", None) or admission_mode()
+        used = live_admissions(consumer, p, now=now, table=table, root=root)    # positive ceilings count live admissions (696cce63)
         if mode == "utilization":
             # the held-back reserve is a lease whether or not the caller supplied its own (Prism 8d9b939dcb9f)
             base = choose_kw.get("leases")
-            choose_kw["leases"] = (list(base) if base is not None else ledger_leases(p, now=now, table=table)) \
+            choose_kw["leases"] = (list(base) if base is not None else ledger_leases(p, now=now, table=table, root=root)) \
                 + held_leases(extra_reserved, table)
-        # the guest VM cap's own occupancy: every live row in full (a settled job still holds its vCPUs). Under
-        # utilization the leases already carry the ledger and the held-back reserve, so nothing is added twice
-        vm_resv: Dict[str, Footprint] = {}
-        if mode != "utilization":
-            vm_resv = live_reservations(p, now=now, table=table)
-            for k, v in extra_reserved.items():
-                hid = table.resolve(k) or k
-                vm_resv[hid] = vm_resv[hid].plus(v) if hid in vm_resv else v
         d = choose(table, consumer, samples, reservations=resv, admitted=used, now=now,
-                   stale_after_s=stale_after_s, mode=mode, vm_reservations=vm_resv, **choose_kw)
+                   stale_after_s=stale_after_s, mode=mode, **choose_kw, root=root)
         if not d.host:
             ap = admissions_path_for(p, admissions_path)
-            _append_admissions(ap, _deferred_line(ap, d, job_id=job_id, now=now))
+            _append_admissions(ap, _deferred_line(ap, d, job_id=job_id, now=now), root=root)
             return d, None
         fp_res, jclass = d.footprint, None
         row = next((r for r in d.rows if r.host == d.host), None)
@@ -2335,7 +2765,7 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
                                gpu_mb=row.need.gpu_mib)
             jclass = job_class_for(consumer, choose_kw.get("job"))
         rid = _reserve_unlocked(p, d.host, consumer, fp_res, ttl_s=ttl_s, job_id=job_id, now=now,
-                                admissions_path=admissions_path, decision=d, job_class=jclass)
+                                admissions_path=admissions_path, decision=d, job_class=jclass, root=root)
     return d, rid
 
 
@@ -2350,15 +2780,54 @@ def _check_owner(rows: List[dict], reservation_id: str, owner: Optional[str]) ->
             raise OwnerMismatch(f"reservation {reservation_id} belongs to {r.get('consumer')!r}, not {owner!r}")
 
 
+def restore_existing_unlocked(path: Path, authorized: Mapping, *, ttl_s: float, now: float,
+                              sample=None, table=None, root=None):
+    """Caller holds demand writer THEN ledger lock and validates durable authority.
+
+    Existing use is accounted even with zero new-start headroom. Preserve original
+    at (settled CPU age), exact footprint, owner and RID; never mint a new charge ID.
+    """
+    if _ledger_row_error(authorized) or not _num(ttl_s) or not 1 <= ttl_s <= 1800:
+        raise PlacementError('invalid existing-work authority')
+    doc = _read_ledger(path)
+    rows, expired = _prune(doc['rows'], now)
+    matches = [r for r in rows if r['id'] == authorized['id']
+               or (r.get('consumer') == authorized['consumer'] and r.get('job_id') == authorized.get('job_id'))]
+    if len(matches) > 1 or (matches and any(matches[0].get(k) != authorized.get(k)
+            for k in ('id', 'host', 'consumer', 'job_id', 'threads', 'ram_gb', 'gpu_mb', 'scratch_gb'))):
+        raise PlacementError('existing-work ledger identity conflict')
+    row = matches[0] if matches else dict(authorized)
+    if not matches:
+        rows.append(row)
+    row['until'] = max(float(row['until']), now + float(ttl_s))
+    _write_ledger(path, {'schema': SCHEMA, 'rows': rows}, root=root)
+    deficit = {}
+    if sample is not None and table is not None:
+        domain = domain_of(table, row['host'])
+        booked = [r for r in rows if table.declared_id(r['host']) in domain]
+        if _num(sample.mem_available_gb):
+            deficit['ram_gb'] = max(0.0, sum(r['ram_gb'] for r in booked) - sample.mem_available_gb)
+        if _num(sample.scratch_free_gb):
+            deficit['scratch_gb'] = max(0.0, sum(r.get('scratch_gb', 0) for r in booked) - sample.scratch_free_gb)
+        if _num(sample.cpu_busy) and _num(sample.ncpu):
+            deficit['cpus'] = max(0.0, (sample.cpu_busy - admission.HOST_LINE) * sample.ncpu)
+    _append_admissions(admissions_path_for(path), expired + [_ledger_line(
+        at=now, host=row['host'], consumer=row['consumer'], job_id=row.get('job_id'),
+        fp=_row_footprint(row), decision='reconciled', reservation=row['id'],
+        reason='existing-work accounting restored from durable authorization',
+        restored=not bool(matches), deficit=deficit or None)], root=root)
+    return row, bool(matches)
+
+
 def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] = None, admissions_path=None,
-          lock_timeout_s: Optional[float] = None, owner: Optional[str] = None) -> bool:
+          lock_timeout_s: Optional[float] = None, owner: Optional[str] = None, root: Optional[Path] = None) -> bool:
     """Extend a LIVE reservation to ``now + ttl_s`` (a lease the holder keeps renewing while its job runs, so a
     run longer than any fixed TTL stays counted; a holder that dies stops renewing and the row lapses; Prism
     796aae4f). False when the row is gone, expired or released (it is never resurrected)."""
     if not _num(ttl_s) or ttl_s <= 0:
         raise PlacementError(f"ttl_s must be a finite number > 0, not {ttl_s!r}")
-    p = reservations_path(path)
-    with _locked(p, lock_timeout_s):
+    p = reservations_path(path, root=root)
+    with _locked(p, lock_timeout_s, root=root):
         now = _now(now)
         doc = _read_ledger(p)
         _check_owner(doc["rows"], reservation_id, owner)
@@ -2369,24 +2838,122 @@ def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] 
                 r["until"] = max(float(r["until"]), now + float(ttl_s))
                 hit = True
         if hit or expired:
-            _write_ledger(p, {"schema": SCHEMA, "rows": rows})
-            _append_admissions(admissions_path_for(p, admissions_path), expired)
+            _write_ledger(p, {"schema": SCHEMA, "rows": rows}, root=root)
+            _append_admissions(admissions_path_for(p, admissions_path), expired, root=root)
     return hit
+
+
+def renew_many(items: List[tuple], *, path=None, now: Optional[float] = None, admissions_path=None,
+               root: Optional[Path] = None) -> list:
+    """t_2b90a362: renew() for a BATCH of ``(reservation_id, ttl_s, owner)`` under ONE ledger flock: one read, one
+    durable (fsync'd) ledger write and one admissions append for the whole batch, so N concurrent renewals hold the
+    flock once instead of N times. Each item gets exactly what renew() would have answered for it: True / False, or
+    the exception it raised (an OwnerMismatch or a bad ttl_s is that item's alone and changes nothing for it). A
+    ledger fault (LedgerError, OSError) raises for the whole batch, before anything is written."""
+    out: list = [None] * len(items)
+    todo = []
+    for i, (rid, ttl_s, owner) in enumerate(items):
+        if not _num(ttl_s) or ttl_s <= 0:
+            out[i] = PlacementError(f"ttl_s must be a finite number > 0, not {ttl_s!r}")
+        else:
+            todo.append(i)
+    if not todo:
+        return out
+    p = reservations_path(path, root=root)
+    with _locked(p, root=root):
+        now = _now(now)
+        doc = _read_ledger(p)
+        rows, expired = _prune(doc["rows"], now)
+        hit = False
+        for i in todo:
+            rid, ttl_s, owner = items[i]
+            try:
+                _check_owner(doc["rows"], rid, owner)
+            except OwnerMismatch as exc:
+                out[i] = exc
+                continue
+            out[i] = False
+            for r in rows:
+                if r["id"] == rid:
+                    r["until"] = max(float(r["until"]), now + float(ttl_s))
+                    out[i] = hit = True
+        if hit or expired:
+            _write_ledger(p, {"schema": SCHEMA, "rows": rows}, root=root)
+            _append_admissions(admissions_path_for(p, admissions_path), expired, root=root)
+    return out
 
 
 #: FWA instrumentation spec I-9 (plans/2026-10-19_fwa-instrumentation-SPEC.md, D-10): the (consumer, actual_source)
 #: pairs whose producer measures the LEASE host. Anything else is refused: a Studio-side kanban measurement would
-#: poison class-usage.jsonl for a pool-host lease (Momus CB-1). Kanban stays out until Q4 is ruled A.
-ACTUAL_SOURCES = frozenset({("test-gate", "cgroup")})
+#: poison class-usage.jsonl for a pool-host lease (Momus CB-1). t_d0c8e8f0 (FWA gap 4) adds one producer per
+#: consumer, each measured ON the host it ran on: kanban/athena = the worker's cgroup scope or its process-tree sum
+#: sampled there (Q4-A), ci = the runner container's docker stats at exit, prism = the review arm's container.
+ACTUAL_SOURCES = frozenset({("test-gate", "cgroup"),
+                            ("kanban", "cgroup"), ("kanban", "pidtree"), ("athena", "cgroup"), ("athena", "pidtree"),
+                            ("ci", "docker"), ("prism", "docker")})
+#: The t_d0c8e8f0 producers run off the lease's own process (CB-1's shape), so their actual must NAME the host it was
+#: measured on (``actual["host"]``) and that host must be the lease's: a measurement of another box is refused. The
+#: test-gate cgroup producer is the remote agent inside the lease's own scope (I-9 v0.1) and keeps its contract.
+HOST_BOUND_SOURCES = ACTUAL_SOURCES - {("test-gate", "cgroup")}
 
 
 class ActualRefused(PlacementError):
     """release(actual=) with an actual_source the I-9 allow-list does not accept for the row's consumer."""
 
 
-def release(reservation_id: str, *, path=None, now: Optional[float] = None, admissions_path=None,
+def _same_host(measured, lease_host) -> bool:
+    """A host-bound actual names the host it was measured on; it must be the lease's host id (case-insensitive:
+    a Linux hostname reads ACE-MEDIA for the table's ace-media). Absent / not a string = refused."""
+    return isinstance(measured, str) and bool(measured) and measured.strip().lower() == str(lease_host or "").lower()
+
+
+def release(reservation_id: str, *, root: Optional[Path] = None, **kwargs) -> bool:
+    """Fence recoverable CI work before deleting its charge, even after ledger pruning.
+
+    All release callers (HTTP and local fallback) use demand-writer -> ledger order.
+    Fence-first failure leaves a conservative charge; a retry completes deletion.
+    """
+    import inspect
+    inspect.signature(_release_ledger).bind(reservation_id, **kwargs)
+    if kwargs.get('now') is not None:
+        _now(kwargs['now'])  # reject invalid clocks before persisting retirement
+    try:
+        from . import admission_demand as dm
+    except ImportError:
+        import admission_demand as dm
+    canonical = reservations_path(root=root).resolve()
+    if kwargs.get('path') is not None and reservations_path(kwargs['path'], root=root).resolve() != canonical:
+        return _release_ledger(reservation_id, **kwargs, root=root)
+    kwargs['path'] = canonical
+    if not (fleet_root(root=root) / dm.DEMAND_REL / 'ci.json').exists():
+        return _release_ledger(reservation_id, **kwargs, root=root)
+    with dm._writer(fleet_root(root=root), timeout_s=kwargs.get('lock_timeout_s')) as directory:
+        p = directory / 'ci.json'
+        stored = dm._existing(p, 'ci', fleet_root(root=root))
+        records = dm.consumed_units(stored)
+        hit = next((v for v in records.values() if v.get('reservation_id') == reservation_id
+                    and isinstance(v.get('accounting'), dict)), None)
+        if hit is not None:
+            if kwargs.get('owner') != hit['accounting']['consumer']:
+                raise OwnerMismatch('existing-work release requires original owner')
+            if kwargs.get('actual') is not None:
+                consumer = str(hit['accounting']['consumer']).split('@', 1)[0]
+                source = kwargs.get('actual_source') or 'none'
+                pair = (consumer, source)
+                lease_host = hit['accounting'].get('host')
+                if pair not in ACTUAL_SOURCES or (pair in HOST_BOUND_SOURCES
+                                                  and not _same_host(kwargs['actual'].get('host'), lease_host)):
+                    raise ActualRefused(f'actual_source {source} cannot measure host {lease_host} '
+                                        f'for consumer {consumer}')
+            hit['released'] = True
+            stored['consumed'] = records
+            dm._replace(p, stored)
+        return _release_ledger(reservation_id, **kwargs, root=root)
+
+
+def _release_ledger(reservation_id: str, *, path=None, now: Optional[float] = None, admissions_path=None,
             lock_timeout_s: Optional[float] = None, owner: Optional[str] = None, actual: Optional[Mapping] = None,
-            usage_path=None, actual_source: Optional[str] = None) -> bool:
+            usage_path=None, actual_source: Optional[str] = None, root: Optional[Path] = None) -> bool:
     """End a reservation (the job ended); True when it was live. Logged as a ``released`` ledger line.
     ``owner``: refuse (OwnerMismatch) a row booked by another consumer, checked under the lock.
     ``actual`` {cpus, ram_gb, gpu_mib}: the job's MEASURED peak (cgroup / pid tree), appended to the class-usage
@@ -2394,17 +2961,22 @@ def release(reservation_id: str, *, path=None, now: Optional[float] = None, admi
     ``actual_source``: who measured it; (row consumer, source) must be in ACTUAL_SOURCES (I-9), None = "none".
     A refused actual raises ActualRefused before anything is written (callers that must end the lease anyway
     release again without ``actual``: allocd and alloc_client do)."""
-    p = reservations_path(path)
-    with _locked(p, lock_timeout_s):
+    p = reservations_path(path, root=root)
+    with _locked(p, lock_timeout_s, root=root):
         now = _now(now)
         doc = _read_ledger(p)
         _check_owner(doc["rows"], reservation_id, owner)
         if actual is not None:
             src = actual_source or "none"
             for r in doc["rows"]:
-                if r.get("id") == reservation_id and (str(r.get("consumer", "")).split("@", 1)[0], src) not in ACTUAL_SOURCES:
+                if r.get("id") != reservation_id:
+                    continue
+                pair = (str(r.get("consumer", "")).split("@", 1)[0], src)
+                if pair not in ACTUAL_SOURCES or (pair in HOST_BOUND_SOURCES
+                                                  and not _same_host(actual.get("host"), r.get("host"))):
                     raise ActualRefused(f"actual_source {src} cannot measure host {r.get('host')} "
-                                        f"for consumer {r.get('consumer')}")
+                                        f"for consumer {r.get('consumer')}"
+                                        + (f" (measured on {actual.get('host')!r})" if pair in ACTUAL_SOURCES else ""))
         live, lines = _prune(doc["rows"], now)
         rows, done = [], []
         for r in live:
@@ -2415,17 +2987,17 @@ def release(reservation_id: str, *, path=None, now: Optional[float] = None, admi
                 done.append(r)
                 continue
             rows.append(r)
-        _write_ledger(p, {"schema": SCHEMA, "rows": rows})
-        _append_admissions(admissions_path_for(p, admissions_path), lines)
+        _write_ledger(p, {"schema": SCHEMA, "rows": rows}, root=root)
+        _append_admissions(admissions_path_for(p, admissions_path), lines, root=root)
         # the measurement only after the release committed: a failed ledger write must not leave a usage row
         # that a retried release() appends again (Prism ca81355a9fd0 / f5f4e1fe5c62)
         for r in done:
             if actual:
-                record_usage(r, actual, now=now, path=usage_path)
+                record_usage(r, actual, now=now, path=usage_path, root=root)
     return len(rows) < len(live)
 
 
-def record_usage(row: Mapping, actual: Mapping, *, now: float, path=None) -> Optional[dict]:
+def record_usage(row: Mapping, actual: Mapping, *, now: float, path=None, root: Optional[Path] = None) -> Optional[dict]:
     """One measured peak for a ledger row's (class, host), with the row's lease as the estimate. A malformed
     ``actual`` is reported on stderr and skipped: the release it rides on already committed."""
     try:
@@ -2446,24 +3018,26 @@ def record_usage(row: Mapping, actual: Mapping, *, now: float, path=None) -> Opt
         # t_e3260e9f): finite numbers >= 0 only, absent or malformed = not measured
         runs = {k: float(actual[k]) for k in ("cpu_s", "wall_s")
                 if _num(actual.get(k)) and float(actual[k]) >= 0}
-        return admission.record_actual(class_usage_path(path), job_class=str(row.get("job_class") or job_class_for(row["consumer"])),
+        # a door row's consumer is the pair identity <workload>@<host>: its class is the workload's (t_d0c8e8f0)
+        klass = str(row.get("job_class") or job_class_for(str(row["consumer"]).split("@", 1)[0]))
+        return admission.record_actual(class_usage_path(path, root=root), job_class=klass,
                                        host=row["host"], at=now, job_id=row.get("job_id"), estimated=est, **vals, **runs)
     except (OSError, ValueError, TypeError) as exc:
         sys.stderr.write(f"placement: class usage not recorded for {row.get('id')}: {exc}\n")
         return None
 
 
-def reap(*, path=None, now: Optional[float] = None, admissions_path=None) -> int:
+def reap(*, path=None, now: Optional[float] = None, admissions_path=None, root: Optional[Path] = None) -> int:
     """Drop every reservation whose TTL lapsed (its holder died without release) and log each as ``expired``;
     the number reaped. Idle ledgers are reaped by the holder's tick, not only by the next admit."""
-    p = reservations_path(path)
-    with _locked(p):
+    p = reservations_path(path, root=root)
+    with _locked(p, root=root):
         now = _now(now)
         doc = _read_ledger(p)
         rows, expired = _prune(doc["rows"], now)
         if len(rows) != len(doc["rows"]):
-            _write_ledger(p, {"schema": SCHEMA, "rows": rows})
-            _append_admissions(admissions_path_for(p, admissions_path), expired)
+            _write_ledger(p, {"schema": SCHEMA, "rows": rows}, root=root)
+            _append_admissions(admissions_path_for(p, admissions_path), expired, root=root)
     return len(expired)
 
 

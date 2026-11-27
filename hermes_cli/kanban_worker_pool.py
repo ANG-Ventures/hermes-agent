@@ -9,7 +9,11 @@ Hosts come from two files under the fleet root (``<kanban_home>/fleet``):
 * ``kanban-pool.json``: the kanban sidecar (``priority``, ``capacity_pct``,
   ``studio_only`` (deny-list: every other profile is a pool profile) or the
   legacy ``profiles`` allow-list, ``studio_bound_skills``, ``hosts.<id>.{enabled, absence,
-  capacity_pct?, profiles?}``, ``ssh_user`` locked to ``kanbanw``). Written
+  capacity_pct?, profiles?, ssh_user?, ssh_identity?}``, ``ssh_user``: the worker login, a default that a
+  host row may override, never ``root``; t_5e87455b, Option A; ``ssh_identity``: the worker
+  key's private-key path, same default/override). kanbanw is retired (Ace msg 1573287525165043742,
+  t_aad02bc5): a host whose row resolves to no owner login plus key is not placed (one warning).
+  Written
   only by hermes-home ``scripts/fleet-host``.
 
 Drift (PRD §5.1 table): a structural error refuses the whole pool; a per-host
@@ -43,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import subprocess
 import time
@@ -52,12 +57,23 @@ from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Opt
 
 from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
-from hermes_cli import placement_policy as _policy
+from hermes_cli import allocation_policy as _policy
 
 logger = logging.getLogger(__name__)
 
 ROLE = "kanban-worker"
+# The RETIRED worker login (t_aad02bc5): never a placement login. The sidecar's ``ssh_user`` (and
+# ``hosts.<id>.ssh_user``) plus ``ssh_identity`` decide per host (Option A, t_5e87455b); a host that
+# resolves to this login, or to no login or key, is dropped. Kept as a name: hermes-home's writer
+# still stamps it as the top-level ``ssh_user`` and schema-1 reach rows imply it.
 SSH_USER = "kanbanw"
+# A plain POSIX login (it lands in an ssh argv as ``user@host``), and never root.
+_SSH_USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+# The worker key (an absolute path; it lands in an ssh argv as ``-i <path>``). A login other than
+# kanbanw is the host OWNER's account, where the Studio's default key is the owner's own
+# unrestricted key: only a dedicated key, pinned with IdentitiesOnly, reaches the forced-command
+# worker wrapper (Apollo ruling 2026-11-20 03:55, t_911ce504).
+_SSH_IDENTITY_RE = re.compile(r"/[A-Za-z0-9._/~+@-]+")
 ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
 # Roles that are membership only (t_940fc400): ``{}``, or the legacy count object
@@ -101,9 +117,9 @@ _ROLES_ROW = frozenset({"roles", "state"})
 # Optional audit field {by, card, reason, at} the fleet-host CLI stamps on a row (who/why/when of the last state
 # change); validated by the router's registry, never read for placement here.
 _ROLES_ROW_OPTIONAL = frozenset({"last_change"})
-_SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "capacity_pct", "priority",
+_SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "ssh_identity", "capacity_pct", "priority",
                           "profiles", "studio_only", "studio_bound_skills", "hosts"})
-_SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles"})
+_SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles", "ssh_user", "ssh_identity"})
 _ABSENCE = ("required", "optional")
 _STATES = ("active", "draining")
 
@@ -223,6 +239,7 @@ class PoolHost:
     enabled: bool
     priority: int
     ssh_port: int = 22
+    ssh_identity: Optional[str] = None   # the worker key; read_pool never places a host without one
 
     @property
     def target(self) -> str:
@@ -260,6 +277,9 @@ class PoolConfig:
     # ``{host: needs it covers}`` from fresh reach-matrix rows (t_aea826a9).
     # A host with no row or no ``caps`` covers nothing: fail closed.
     caps: Mapping[str, frozenset] = field(default_factory=dict)
+    # ``{host: {alias: user}}``: the login ``ssh -G <alias>`` resolves to for
+    # the worker user on that host (:func:`read_reach_logins`, t_8c580b20).
+    reach_logins: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
 
 # -- registry ---------------------------------------------------------------
@@ -314,6 +334,26 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
     return out
 
 
+def _ssh_identity_ok(path) -> bool:
+    return isinstance(path, str) and bool(_SSH_IDENTITY_RE.fullmatch(path)) and ".." not in path.split("/")
+
+
+def _ssh_user_ok(user) -> bool:
+    return (isinstance(user, str) and bool(_SSH_USER_RE.fullmatch(user))
+            and user != "root")
+
+
+def worker_login(sidecar: Mapping, hid: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(login, key)`` a worker on ``hid`` uses: the row's value, else the top-level one. A login that
+    is absent or the retired kanbanw is None, as is an absent key: the caller does not place the host
+    (t_aad02bc5). Never returns kanbanw."""
+    row = (sidecar.get("hosts") or {}).get(hid) or {}
+    user = row.get("ssh_user", sidecar.get("ssh_user"))
+    ident = row.get("ssh_identity", sidecar.get("ssh_identity"))
+    return (user if _ssh_user_ok(user) and user != SSH_USER else None,
+            ident if _ssh_identity_ok(ident) else None)
+
+
 def validate_sidecar(doc) -> List[str]:
     """Structural errors of ``kanban-pool.json`` (any error refuses it whole)."""
     if not isinstance(doc, dict):
@@ -323,8 +363,10 @@ def validate_sidecar(doc) -> List[str]:
         errs.append(f"unknown top-level keys {sorted(set(doc) - _SIDECAR_TOP)}")
     if isinstance(doc.get("schema"), bool) or doc.get("schema") != 1:
         errs.append(f"schema must be 1, not {doc.get('schema')!r}")
-    if doc.get("ssh_user") != SSH_USER:
-        errs.append(f"ssh_user must be {SSH_USER!r} (locked), not {doc.get('ssh_user')!r}")
+    if "ssh_user" in doc and not _ssh_user_ok(doc["ssh_user"]):
+        errs.append(f"ssh_user must be a plain login other than root, not {doc.get('ssh_user')!r}")
+    if "ssh_identity" in doc and not _ssh_identity_ok(doc["ssh_identity"]):
+        errs.append(f"ssh_identity must be an absolute key path, not {doc['ssh_identity']!r}")
     if "capacity_pct" in doc and not _pct(doc["capacity_pct"]):
         errs.append(f"capacity_pct must be in (0, 1], not {doc['capacity_pct']!r}")
     for key in ("profiles", "studio_only", "studio_bound_skills"):
@@ -342,10 +384,12 @@ def validate_sidecar(doc) -> List[str]:
         if not isinstance(hid, str) or not _PLAIN_RE.fullmatch(hid) or not isinstance(row, dict):
             errs.append(f"hosts.{hid!r} is not a plain id with an object row")
             continue
-        if "ssh_user" in row:
-            errs.append(f"hosts.{hid}.ssh_user: per-host override refused (locked {SSH_USER})")
-        if set(row) - _SIDECAR_ROW - {"ssh_user"}:
-            errs.append(f"hosts.{hid}: unknown keys {sorted(set(row) - _SIDECAR_ROW - {'ssh_user'})}")
+        if "ssh_user" in row and not _ssh_user_ok(row["ssh_user"]):
+            errs.append(f"hosts.{hid}.ssh_user must be a plain login other than root, not {row['ssh_user']!r}")
+        if "ssh_identity" in row and not _ssh_identity_ok(row["ssh_identity"]):
+            errs.append(f"hosts.{hid}.ssh_identity must be an absolute key path, not {row['ssh_identity']!r}")
+        if set(row) - _SIDECAR_ROW:
+            errs.append(f"hosts.{hid}: unknown keys {sorted(set(row) - _SIDECAR_ROW)}")
         if not isinstance(row.get("enabled"), bool):
             errs.append(f"hosts.{hid}.enabled must be true|false")
         if row.get("absence") not in _ABSENCE:
@@ -386,8 +430,19 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     except (OSError, ValueError) as exc:
         return PoolConfig(warnings=(f"kanban pool: unreadable pool file: {exc}",),
                           refused="unreadable")
+    warnings: List[str] = []
     try:
-        roles = parse_roles(roles_doc) if roles_doc is not None else {}
+        roles = {}
+        if roles_doc is not None:
+            # Validate the envelope strictly before isolating individual host rows.
+            if not isinstance(roles_doc, dict) or not isinstance(roles_doc.get("hosts"), dict):
+                parse_roles(roles_doc)  # raises the canonical structural error
+            parse_roles({**roles_doc, "hosts": {}})
+            for hid, row in roles_doc["hosts"].items():
+                try:
+                    roles.update(parse_roles({**roles_doc, "hosts": {hid: row}}))
+                except PoolError as exc:
+                    warnings.append(f"kanban pool: {exc} (host dropped)")
     except PoolError as exc:
         return PoolConfig(warnings=(f"kanban pool: roles refused: {exc}",), refused="roles")
     with_role = {h for h, (r, _s) in roles.items() if ROLE in r}
@@ -404,7 +459,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             f"{ROLE} role in {ROLES_FILE}, so nothing spills (register hosts with "
             "`fleet-host kanban-enable`)",))
     if sidecar is None:
-        return PoolConfig(warnings=tuple(
+        return PoolConfig(warnings=tuple(warnings) + tuple(
             f"kanban pool: {h} has a {ROLE} role but {SIDECAR_FILE} is absent (host dropped)"
             for h in sorted(with_role)))
     errs = validate_sidecar(sidecar)
@@ -422,7 +477,6 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         # sidecar keeps it on the Studio, so a new profile never lands Studio-bound.
         gprofiles = derived_profiles(fleet_dir.parent / "profiles", sidecar["studio_only"])
     gcap = float(sidecar.get("capacity_pct", DEFAULT_CAPACITY))
-    warnings: List[str] = []
     hosts: List[PoolHost] = []
     disabled: List[str] = []
     policy = _policy.load(fleet_dir)
@@ -436,15 +490,22 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             continue
         if not policy.targets(hid):
             # Placement PRD I-1: the runtime assertion, not only the lint.
-            warnings.append(f"kanban pool: {hid} is targets:false in placement-policy.json "
+            warnings.append(f"kanban pool: {hid} is targets:false in allocation-policy.json "
                             "(never a placement target; host dropped)")
             continue
         if hid not in with_role:
             warnings.append(f"kanban pool: {hid} is enabled but has no {ROLE} role (host dropped)")
             continue
+        user, ident = worker_login(sidecar, hid)
+        if user is None or ident is None:
+            missing = ", ".join(f for f, v in (("ssh_user", user), ("ssh_identity", ident)) if v is None)
+            warnings.append(f"kanban pool: {hid} has no owner login and key (missing {missing}; "
+                            f"{SSH_USER} is retired; host not placed)")
+            continue
         role_slots, state = roles[hid]
         hosts.append(PoolHost(
-            name=hid, ssh_host=hid, ssh_user=SSH_USER, slots=role_slots[ROLE],
+            name=hid, ssh_host=hid, ssh_user=user, ssh_identity=ident,
+            slots=role_slots[ROLE],
             capacity_pct=float(row.get("capacity_pct", gcap)), absence=row["absence"],
             profiles=tuple(p for p in row.get("profiles", gprofiles) if p.lower() not in deny),
             state=state, enabled=True,
@@ -461,6 +522,23 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     # Not a pool-drift warning: a missing matrix is the normal pre-cron state
     # and the classifier is fail-closed without it (reach_status carries it).
     reach, aliases, reach_status = read_reach(fleet_dir)
+    caps, reach_logins = read_caps(fleet_dir), read_reach_logins(fleet_dir)
+    # A row probed under another login (the kanbanw row of a host just cut over
+    # to its owner, t_5e87455b) proves nothing for the new login: drop its
+    # reach, caps and logins until the matrix cron re-probes it (fail closed).
+    # A row with no ``user`` (schema 1) is the kanbanw-era cron's: it counts
+    # only for the legacy kanbanw login (Prism e315557dce42).
+    probed = read_reach_users(fleet_dir)
+    for h in hosts:
+        key = h.name.lower()
+        was = probed.get(key, SSH_USER)
+        if was != h.ssh_user and any(key in t for t in (reach, caps, reach_logins)):
+            warnings.append(f"kanban pool: reach row for {h.name} was probed as {was}, "
+                            f"worker login is {h.ssh_user} (row ignored until re-probed)")
+            for table in (reach, caps, reach_logins):
+                table.pop(h.name.lower(), None)
+    if reach_status == "ok" and not reach:
+        reach_status = "stale"
     # ``hosts`` is every host the pool files KNOW, placement-eligible or not:
     # a pin on a dropped host (role but no row, row not in priority) must
     # still resolve as a pin and wait at take(), never fall back (Prism 4271004b).
@@ -472,7 +550,8 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         reach=reach, reach_aliases=aliases, reach_status=reach_status,
         ssh_hosts=known_ssh_hosts(fleet_dir),
         pin_aliases=pin_aliases(fleet_dir),
-        caps=read_caps(fleet_dir),
+        caps=caps,
+        reach_logins=reach_logins,
     )
 
 
@@ -523,21 +602,37 @@ def declares_requirements(body: Optional[str]) -> bool:
 
 
 def needs_allowed_hosts(body: Optional[str], pool, *,
-                        honor_declared: bool = False) -> Optional[Tuple[str, ...]]:
+                        honor_declared: bool = False,
+                        prose_advisory: bool = False) -> Optional[Tuple[str, ...]]:
     """None when the body names no Studio-only resource; else the enabled
     pool hosts whose fresh reach-matrix ``caps`` cover every need (``()`` =
     none: the card runs on the Studio or waits, never spills).
     ``honor_declared`` (the capability layer enforces this tick): a body with
     an explicit ``requires:`` line is judged by that line, not by prose
-    (None, t_6d9e7d90)."""
+    (None, t_6d9e7d90). ``prose_advisory`` (t_c82eded0,
+    ``kanban.placement.prose_pins_advisory``): a need no pool host covers is
+    advice, never a hold (None); a covering set still narrows the take."""
     if honor_declared and declares_requirements(body):
         return None
     needs = card_needs(body)
     if not needs:
         return None
     caps = getattr(pool, "caps", None) or {}
-    return tuple(h.name for h in (getattr(pool, "pool_hosts", ()) or ())
-                 if needs <= caps.get(h.name.lower(), frozenset()))
+    hosts = tuple(h.name for h in (getattr(pool, "pool_hosts", ()) or ())
+                  if needs <= caps.get(h.name.lower(), frozenset()))
+    return None if prose_advisory and not hosts else hosts
+
+
+def card_need_evidence(body: Optional[str]) -> Dict[str, str]:
+    """``{need: the text that matched}`` for :func:`card_needs` (the advisory a
+    prose-only need leaves on the placement event, t_c82eded0)."""
+    work = without_header_lines(body)
+    out: Dict[str, str] = {}
+    for name, rx in CARD_NEEDS:
+        m = rx.search(work)
+        if m:
+            out[name] = m.group(0).strip()[:120]
+    return out
 
 
 def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
@@ -588,6 +683,37 @@ def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
     return reach, vocab, "ok"
 
 
+def read_reach_logins(fleet_dir: Path) -> Dict[str, Dict[str, str]]:
+    """``{host: {alias: user}}`` from each matrix row's ``logins`` (the ``user``
+    line of ``ssh -G <alias>`` as the worker on that host; with no ``User`` set
+    that is the worker account itself). Absent or malformed: ``{}``, and
+    :func:`reaching_hosts` then grants no self-reach (fail closed, t_8c580b20)."""
+    try:
+        doc = _read_json(Path(fleet_dir) / REACH_FILE)
+    except (OSError, ValueError):
+        return {}
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    out: Dict[str, Dict[str, str]] = {}
+    for hid, row in (hosts or {}).items() if isinstance(hosts, dict) else ():
+        table = row.get("logins") if isinstance(hid, str) and isinstance(row, dict) else None
+        if isinstance(table, dict):
+            out[hid.lower()] = {a.lower(): u for a, u in table.items()
+                                if isinstance(a, str) and a and isinstance(u, str) and u}
+    return out
+
+
+def read_reach_users(fleet_dir: Path) -> Dict[str, str]:
+    """``{host: login the matrix row was probed as}`` (each row's ``user``).
+    Rows without one are left out."""
+    try:
+        doc = _read_json(Path(fleet_dir) / REACH_FILE)
+    except (OSError, ValueError):
+        return {}
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    return {hid.lower(): row["user"] for hid, row in (hosts.items() if isinstance(hosts, dict) else ())
+            if isinstance(hid, str) and isinstance(row, dict) and isinstance(row.get("user"), str)}
+
+
 _HOST_TOKEN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 # The ssh-shaped ways a body drives a host (t_696a9a06, t_f1b135a8). A bare
 # word is prose: "ci-box burst 2/6" or "the ci-box build sheet" drive nothing,
@@ -629,16 +755,24 @@ def _strip_token(tok: str) -> str:
 
 def _ssh_target(rest: str, verb: str = "ssh") -> Optional[str]:
     """``[user@]host`` of the first non-option operand of ssh/sftp/mosh."""
+    return _ssh_target_login(rest, verb)[0]
+
+
+def _ssh_target_login(rest: str, verb: str = "ssh") -> Tuple[Optional[str], Optional[str]]:
+    """``(host, login)`` of the first non-option operand of ssh/sftp/mosh. The
+    login is the ``user@`` prefix, else an ``-l user`` before the operand, else
+    None (t_8c580b20: self-reach must know whose account the line logs in as)."""
     short_args, long_args = _VERB_ARG_OPTS[verb]
     toks = rest.split()
     i = 0
+    login: Optional[str] = None
     while i < len(toks):
         tok = _strip_token(toks[i])
         i += 1
         if not tok:
             continue
         if tok in _CMD_BREAK:
-            return None
+            return None, None
         if tok == "--":
             continue
         if tok.startswith("--"):
@@ -649,16 +783,51 @@ def _ssh_target(rest: str, verb: str = "ssh") -> Optional[str]:
             flags = tok[1:]
             for j, ch in enumerate(flags):
                 if ch in short_args:
+                    val = flags[j + 1:]
                     if j == len(flags) - 1:
+                        val = _strip_token(toks[i]) if i < len(toks) else ""
                         i += 1     # value is the next token
+                    if ch == "l" and val:
+                        login = val
+                    elif ch == "o":    # -o User=ace / -oUser=ace / -o "User ace" (Prism 5ffa30ab3a7a)
+                        key, eq, opt = val.partition("=")
+                        if key.lower() == "user" and not eq and i < len(toks):
+                            opt = _strip_token(toks[i])
+                            i += 1
+                        if key.lower() == "user" and opt:
+                            login = opt
                     break          # else the value is attached (-p22, -oX=y)
             continue
         if tok.lower().startswith("ssh://"):
             tok = tok[6:]
-        tok = tok.rsplit("@", 1)[-1]
-        m = re.match(_HOST_TOKEN, tok)
-        return m.group(0) if m else None
-    return None
+        user, at, host = tok.rpartition("@")
+        m = re.match(_HOST_TOKEN, host)
+        return (m.group(0) if m else None), ((user if at and user else login) if m else None)
+    return None, None
+
+
+_USER_AT_HOST_RE = re.compile(rf"(?<![\w.@-])([A-Za-z_][\w.-]*)@({_HOST_TOKEN})")
+
+
+def ssh_target_logins(body: Optional[str]) -> Dict[str, frozenset]:
+    """``{target: logins}``: every login a body names for an ssh target, keyed by
+    the lower-cased target (``ssh ace@ci.ace`` -> ``{"ci.ace": {"ace"}}``). Read
+    from ``user@host`` anywhere (ssh, scp, rsync, ``-H``) and from ``-l user`` on
+    ssh/sftp. Over-reading only narrows self-reach, never widens it."""
+    out: Dict[str, set] = {}
+    for line in (body or "").splitlines():
+        for m in _USER_AT_HOST_RE.finditer(line):
+            out.setdefault(m.group(2).lower().rstrip("._-"), set()).add(m.group(1))
+        verbs = list(_SSH_VERB_RE.finditer(line))
+        for k, v in enumerate(verbs):
+            verb = v.group(1).lower()
+            if verb not in ("ssh", "sftp"):
+                continue
+            rest = line[v.end():verbs[k + 1].start() if k + 1 < len(verbs) else len(line)]
+            host, login = _ssh_target_login(rest, verb)
+            if host and login:
+                out.setdefault(host.lower().rstrip("._-"), set()).add(login)
+    return {h: frozenset(ls) for h, ls in out.items()}
 
 
 def _remote_operands(rest: str) -> List[str]:
@@ -794,6 +963,38 @@ def known_ssh_hosts(fleet_dir: Path, *, ssh_config: Optional[Path] = None) -> Op
     return cfg | frozenset(reached)
 
 
+# A declared reach target (t_efd1497a): ``reach: dell-rugged`` / ``reach: ci-box, nas-fleet``. Only this line (or a
+# HOST_BOUND_SKILLS skill / a manifest target) binds host_reach in :func:`reach_allowed_hosts`. An ssh example in prose
+# (what :func:`host_bound_targets` reads) is reported by :func:`host_reach_prose` and does not pin (Apollo 2026-11-19:
+# t_a0f9580e, a design-only card, was held on host_reach for quoting ``ssh root@dell-rugged true``).
+REACH_LINE_RE = re.compile(r"^[ \t]*reach:[ \t]*(.*?)[ \t]*\r?$", re.IGNORECASE | re.MULTILINE)
+_REACH_NOTE_RE = re.compile(r"\s(?:\u2014|\u2013|--|#)|[(#]")
+
+
+def declared_reach(body: Optional[str], aliases: Iterable[str]) -> Tuple[str, ...]:
+    """Aliases named on line-anchored ``reach:`` lines, in order; a word the vocabulary lacks is dropped (a trailing
+    note after `` -- ``, ``#`` or ``(`` is not a word)."""
+    alias_set = {a.lower() for a in (aliases or ()) if a}
+    out: List[str] = []
+    for m in REACH_LINE_RE.finditer(body or ""):
+        value = _REACH_NOTE_RE.split(m.group(1), maxsplit=1)[0]
+        for w in re.split(r"[,\s]+", value.strip().strip("`")):
+            w = w.strip("`'\".;").lower().rstrip("._-")
+            if w in alias_set and w not in out:
+                out.append(w)
+    return tuple(out)
+
+
+def host_reach_prose(body: Optional[str], aliases: Iterable[str], *, pin_hosts: Iterable[str] = (),
+                     ssh_hosts: Optional[Collection[str]] = None) -> Tuple[str, ...]:
+    """Aliases the body addresses in an ssh shape that no ``reach:`` line declares: what used to bind host_reach
+    and no longer does (t_efd1497a). Empty when every such alias is declared."""
+    alias_set = tuple(a.lower() for a in (aliases or ()) if a)
+    declared = set(declared_reach(body, alias_set))
+    _bound, named = host_bound_targets(body, (), alias_set, pin_hosts=pin_hosts, ssh_hosts=ssh_hosts)
+    return tuple(a for a in named if a not in declared)
+
+
 def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iterable[str],
                        *, pin_hosts: Iterable[str] = (),
                        ssh_hosts: Optional[Collection[str]] = None,
@@ -846,11 +1047,23 @@ def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iter
 # the whole ssh-root trigger (Q9 recommendation (a)); a root-only verb list
 # would be a lint, never a rule. control-plane-read binds on a PATH-shaped
 # mention only (Momus pass 2 R-F): "the kanban.db schema" is prose, while
-# ``~/.hermes/kanban.db`` or ``fleet/kanban-pool.json`` is a file the work opens.
+# ``~/.hermes/kanban.db`` or ``~/.hermes/fleet/kanban-pool.json`` is a file the work opens.
 _SUDO_RE = re.compile(r"(?<![\w-])sudo(?![\w-])")
 _CONTROL_PLANE_PATH_RE = re.compile(
-    r"(?:^|(?<=[\s`'\"(=:,]))(?:~|\.\.?|[\w.@*${}-]+)?(?:/[\w.@*${}-]+)*/"
+    r"(?:^|(?<=[\s`'\"(=:,]))((?:~|\.\.?|[\w.@*${}-]+)?(?:/[\w.@*${}-]+)*)/"
     r"(kanban\.db|gateway\.log|load_gate\.json|kanban-pool\.json)(?![\w-])")
+# Only a LIVE path binds (t_e7c03f48): rooted at ``~``, an env var (``$HOME``, ``$HERMES_HOME``) or ``/``,
+# dot-relative (``./``, ``../``, ``.hermes/``), or under the live ``state/`` / ``logs/`` dirs. A repo-relative
+# path (``fleet/kanban-pool.json``, ``scripts/...``, ``tests/...``, a PR file list) names the TRACKED copy a PR
+# edits, which every pool host has in its clone: t_e32e34f0 was held Studio-only for editing it.
+_LIVE_CONTROL_PLANE_DIRS = frozenset({"state", "logs"})
+
+
+def _live_control_plane_path(prefix: str) -> bool:
+    """True when the directory part of a matched control-plane path names the live file, not a repo copy."""
+    if not prefix or prefix[0] in "~$/.":
+        return True
+    return prefix.split("/", 1)[0] in _LIVE_CONTROL_PLANE_DIRS
 
 
 def _sudo_before_break(remote: str) -> bool:
@@ -880,9 +1093,15 @@ def _sudo_before_break(remote: str) -> bool:
 def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
                      pin_hosts: Iterable[str] = (),
                      ssh_hosts: Optional[Collection[str]] = None,
-                     canon: Optional[Mapping[str, str]] = None) -> Optional[str]:
+                     canon: Optional[Mapping[str, str]] = None,
+                     served: Collection[str] = ()) -> Optional[str]:
     """The Studio-only ACCESS the card needs, or None: ``ssh-root:<host>`` or
     ``control-plane-read`` (first hit; ssh-root wins on a tie).
+
+    ``served`` (t_79c2259b): ssh aliases whose root access a capability of the
+    map serves on pool hosts (``capabilities.<cap>.ssh_root``, enforced this
+    tick). Such an ``ssh-root:<alias>`` is not Studio-only; the capability
+    layer judges it as a HARD requirement, so the scan moves on to the next hit.
 
     ``ssh-root:<host>``: a body line ``ssh [opts] [user@]<alias> ... sudo ...``
     for a probed alias, with :func:`host_bound_targets`' discipline: only the
@@ -890,16 +1109,20 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
     known ssh host, a ``host:<pin>`` line is never a target. ``<host>`` is the
     canonical pin of the alias when ``canon`` names one (``ci`` -> ``ci-box``).
 
-    ``control-plane-read``: a path-shaped mention of kanban.db, gateway.log,
-    load_gate.json or kanban-pool.json, or an explicit
-    ``requires: control-plane-read`` line. A bare word never binds.
+    ``control-plane-read``: an explicit ``requires: control-plane-read`` line only
+    (t_b720fdea). A LIVE path-shaped mention of kanban.db, gateway.log,
+    load_gate.json or kanban-pool.json no longer binds: every pool host reads those
+    files over the ``ssh studio`` door (studio-state, t_b0290889), and 5 of the 6
+    control-plane-read Studio overrides in the 30 days to 2026-11-19 were bodies
+    that only named the file. :func:`control_plane_prose` reports such a mention at
+    create time instead.
     """
     from hermes_cli import kanban_host_capabilities as _khc
     alias_set = {a.lower() for a in (aliases or ()) if a}
     pins = {PIN_ANY, PIN_STUDIO, *(h.lower() for h in (pin_hosts or ()))}
     known = None if ssh_hosts is None else {h.lower() for h in ssh_hosts}
     canon = {k.lower(): v for k, v in (canon or {}).items()}
-    cp_read = False
+    served_set = {s.lower() for s in (served or ()) if s}
     for line in (body or "").splitlines():
         m = HOST_PIN_RE.match(line)
         if m and m.group(1).lower() in pins:
@@ -919,24 +1142,92 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
                 continue
             at = re.search(rf"(?<![\w.-]){re.escape(target)}(?![\w-])", rest)
             if at and _sudo_before_break(rest[at.end():]):
+                if w in served_set:
+                    continue
                 return _reasons.ssh_root(canon.get(w, w))
-        if not cp_read and _CONTROL_PLANE_PATH_RE.search(line):
-            cp_read = True
-    if cp_read or _reasons.ACCESS_CONTROL_PLANE_READ in _khc.declared_words(body):
+    if _reasons.ACCESS_CONTROL_PLANE_READ in _khc.declared_words(body):
         return _reasons.ACCESS_CONTROL_PLANE_READ
     return None
 
 
+def control_plane_prose(body: Optional[str]) -> Tuple[str, ...]:
+    """The live control-plane paths a body names (``~/.hermes/kanban.db``, ``logs/gateway.log`` ...) while it
+    declares no ``requires: control-plane-read``: what used to pin the card to the Studio and no longer does
+    (t_b720fdea). Empty when the body declares the word or names no live path."""
+    from hermes_cli import kanban_host_capabilities as _khc
+    if _reasons.ACCESS_CONTROL_PLANE_READ in _khc.declared_words(body):
+        return ()
+    found = []
+    for line in (body or "").splitlines():
+        for m in _CONTROL_PLANE_PATH_RE.finditer(line):
+            if _live_control_plane_path(m.group(1)):
+                found.append(m.group(1) + "/" + m.group(2))
+    return tuple(dict.fromkeys(found))
+
+
 def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str],
-                   aliases: Iterable[str]) -> Tuple[str, ...]:
+                   aliases: Iterable[str], canon: Optional[Mapping[str, str]] = None,
+                   logins: Optional[Mapping[str, Collection[str]]] = None,
+                   self_user: str = SSH_USER,
+                   host_users: Optional[Mapping[str, str]] = None,
+                   config_logins: Optional[Mapping[str, Mapping[str, str]]] = None,
+                   body_aliases: Iterable[str] = ()) -> Tuple[str, ...]:
     """Worker hosts whose fresh row shows ``rc == 0`` for EVERY target (or,
     with no named target, for every alias the matrix knows). Empty when the
     matrix is empty: fail closed.
+
+    A host reaches ITSELF (t_8c580b20): a target that is the row's own host id,
+    or an alias ``canon`` (``{alias: canonical pin}``, :func:`pin_aliases`)
+    resolves to it, counts as reached. The writer records rc 255 there (a host
+    has no ssh alias to itself), which kept a card reading ci-box state off
+    ci-box (t_b58d9b08). Only a fresh row counts, as for every other target.
+
+    The self rule holds only for the worker's own account, judged on the
+    EFFECTIVE login (operator ruling, Apollo 2026-11-20): the logins the body
+    names for the target (``logins``, :func:`ssh_target_logins`: ``user@``,
+    ``-l``, ``-o User=``), else the user the alias resolves to in that host's
+    ssh config (``config_logins[host][alias]``, :func:`read_reach_logins`).
+    Every one must be that host's worker login: ``host_users[host]``
+    (:func:`worker_logins`, the sidecar's per-host ``ssh_user``), else ``self_user``. ``ssh ace@ci.ace`` is user ace, and a bare
+    ``ssh ci.ace`` whose config sets ``User fleetw`` is fleetw: a worker placed
+    on ci-box is kanbanw, so neither self-reaches; a peer whose fresh row
+    proves the alias takes the card. No recorded config login: no self-reach.
+    The rule covers EVERY alias of that host the body names, not only the
+    targets (``body_aliases`` plus the ``logins`` keys): ``reach: ci-box`` as
+    kanbanw next to ``ssh ace@ci.ace ...`` is a step as ace on ci-box, so
+    ci-box needs a real rc 0 (round-4 reader repro, Apollo 2026-11-20).
     """
     want = tuple(targets) or tuple(aliases)
     if not want:
         return ()
-    return tuple(h for h, row in reach.items() if all(row.get(a) == 0 for a in want))
+    canon = {k.lower(): v.lower() for k, v in (canon or {}).items() if isinstance(v, str)}
+    named = {k.lower(): set(v) for k, v in (logins or {}).items()}
+    config = {k.lower(): {a.lower(): u for a, u in v.items() if isinstance(a, str)}
+              for k, v in (config_logins or {}).items() if isinstance(v, Mapping)}
+
+    mentioned = {a.lower() for a in (*want, *body_aliases, *named)}
+
+    users = {k.lower(): v for k, v in (host_users or {}).items()}
+
+    def as_worker(host: str, t: str) -> bool:
+        return (named.get(t) or {config.get(host, {}).get(t)}) == {users.get(host, self_user)}
+
+    def reached(host: str, row: Mapping[str, int], a: str) -> bool:
+        if row.get(a) == 0:
+            return True
+        t = a.lower()
+        if not (t == host or canon.get(t) == host):
+            return False
+        # Every alias of this host the body names logs in as the worker, or this row probes it (rc 0).
+        return all(row.get(b) == 0 or as_worker(host, b)
+                   for b in mentioned if b == host or canon.get(b) == host)
+
+    return tuple(h for h, row in reach.items() if all(reached(h.lower(), row, a) for a in want))
+
+
+def worker_logins(pool) -> Dict[str, str]:
+    """``{host id: worker ssh login}`` of the pool's enabled hosts (t_5e87455b)."""
+    return {h.name.lower(): h.ssh_user for h in (getattr(pool, "pool_hosts", ()) or ())}
 
 
 def load_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> Tuple[List[PoolHost], List[str]]:
@@ -983,6 +1274,97 @@ def resolve_pin(body: Optional[str], known_hosts: Iterable[str],
     return None, ignored
 
 
+def studio_pin_reasons(caps) -> Optional[frozenset]:
+    """The ``requires:`` words that justify a ``host: studio`` pin (t_e604c0f9): every capability the capability
+    map's Studio row serves (browser-session, studio-state, control-plane, docker identity-only, ...) plus the
+    Studio-only access word ``control-plane-read``. None (= every Studio pin is honoured, the pre-t_e604c0f9
+    behaviour) when the capability layer is off this tick, its map is absent or malformed, or the Studio row
+    lists nothing: an unreadable vocabulary must not move Studio work."""
+    return studio_map_reasons(getattr(caps, "cmap", None))
+
+
+def studio_map_reasons(cmap) -> Optional[frozenset]:
+    """:func:`studio_pin_reasons` from a ``CapabilityMap`` (``kanban create`` has no tick)."""
+    if cmap is None or not getattr(cmap, "valid", False):
+        return None
+    from hermes_cli import kanban_host_capabilities as _khc
+    studio = (getattr(cmap, "hosts", None) or {}).get(_khc.STUDIO_ROW)
+    if not studio:
+        return None
+    return frozenset(studio) | {_reasons.ACCESS_CONTROL_PLANE_READ}
+
+
+def studio_pin_justified(body: Optional[str], reasons: Optional[frozenset]) -> bool:
+    """Does the card's ``requires:`` line name a reason the Studio pin needs? ``reasons`` None = always."""
+    if reasons is None:
+        return True
+    from hermes_cli import kanban_host_capabilities as _khc
+    return any(w in reasons for w in _khc.declared_words(body))
+
+
+def skills_need_studio(skills: Optional[Iterable[Any]], cmap, reasons: Optional[frozenset]) -> bool:
+    """Does an ATTACHED skill need a capability the Studio row serves (Prism f5bbe97bc028)? The capability index
+    maps skill -> capabilities (identity-only docker included), and the verdict enforces those; a `host: studio`
+    pin such a card carries is justified even with no ``requires:`` line. False when the map or index is
+    unreadable (``reasons`` is then None anyway, or the index cannot say)."""
+    if not reasons or cmap is None or getattr(cmap, "index_error", None) is not None:
+        return False
+    from hermes_cli import kanban_host_capabilities as _khc
+    index = getattr(cmap, "index", None) or {}
+    return any(c in reasons for s in (skills or ()) if isinstance(s, str)
+               for c in index.get(_khc.skill_key(s), ()))
+
+
+def effective_pin(body: Optional[str], known_hosts: Iterable[str],
+                  aliases: Optional[Mapping[str, str]] = None,
+                  studio_reasons: Optional[frozenset] = None) -> Tuple[Optional[str], Optional[str], bool]:
+    """:func:`resolve_pin` plus the Studio last-resort rule (Ace 2026-11-08 16:38, t_e604c0f9): a bare
+    ``host: studio`` line with no ``requires:`` reason the Studio serves is DROPPED (not a pin, not an unknown
+    word: the card is placed by FWA like any unpinned card). ``(pin, ignored, dropped)``."""
+    pin, ignored = resolve_pin(body, known_hosts, aliases)
+    if pin == PIN_STUDIO and not studio_pin_justified(body, studio_reasons):
+        return None, None, True
+    return pin, ignored, False
+
+
+def note_dropped_studio_pin(card_id: str) -> None:
+    """One WARNING per card per 5 minutes for a dropped bare ``host: studio`` pin."""
+    now = time.monotonic()
+    key = f"studio-pin:{card_id}"
+    last = _ignored_pin_warned.get(key)
+    if last is None or now - last >= IGNORED_PIN_WARN_SECONDS:
+        _ignored_pin_warned[key] = now
+        _log.warning("kanban pool: card %s: bare `host: studio` dropped (no requires: reason the Studio serves); "
+                  "placed by FWA", card_id)
+
+
+def mint_studio_pin_note(body: Optional[str], fleet_dir: Path,
+                         skills: Optional[Iterable[Any]] = None) -> Optional[str]:
+    """``kanban create``'s line for a bare ``host: studio`` the dispatcher will drop (t_e604c0f9), else None. The
+    same predicate as dispatch: the host_preference switch (t_c2fce87e), the capability map's Studio row, the
+    card's ``requires:`` words."""
+    try:
+        from hermes_cli import allocation_policy as _ppol
+        if not _ppol.load(fleet_dir).is_last_resort(STUDIO_HOST):
+            return None
+        pin, _ignored = resolve_pin(body, known_host_ids(fleet_dir), pin_aliases(fleet_dir))
+        if pin != PIN_STUDIO:
+            return None
+        from hermes_cli import kanban_host_capabilities as _khc
+        cmap = _khc.load_map(fleet_dir)
+        from hermes_cli import kanban_studio_capability as _ksc
+        reasons = _ksc.create_reasons(cmap)  # dispatch's vocabulary (t_9965b8d5)
+        if skills_need_studio(skills, cmap, reasons):
+            return None
+    except Exception:
+        return None
+    if reasons is None or studio_pin_justified(body, reasons):
+        return None
+    return ("`host: studio` will be DROPPED at dispatch: no `requires:` line names a reason the Studio serves "
+            f"({', '.join(sorted(reasons))}); FWA places this card like any other. Add the requires: line if "
+            "it must run on the Studio.")
+
+
 def _studio_words() -> frozenset:
     """Words for the dispatcher's own machine: the constants plus the live
     ``socket.gethostname()`` short form, lower-cased."""
@@ -994,7 +1376,7 @@ def _studio_words() -> frozenset:
     return _STUDIO_PIN_WORDS | ({short} if short else set())
 
 
-def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
+def pin_aliases(fleet_dir: Path, *, strict: bool = False) -> Dict[str, str]:
     """``{alias: canonical pin}`` from the registry (t_cb2b888d), the ONE
     alias source. For every host the pool files know (:func:`known_host_ids`)
     and every ``ci-hosts.json`` row: the id, its ``ssh_alias`` and
@@ -1004,11 +1386,14 @@ def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
     A row with ``transport: local`` is the Studio (``studio``). A row that is
     neither a known pool host nor local adds nothing. An alias two hosts
     claim is dropped (ambiguous: it stays unknown, never guesses). Matching
-    is case-insensitive. Unreadable files add nothing."""
-    known = set(known_host_ids(fleet_dir))
+    is case-insensitive. Unreadable files add nothing unless strict=True,
+    used by pause enforcement to reject incomplete pin vocabularies."""
+    known = set(known_host_ids(fleet_dir, strict=strict))
     try:
         ci = _read_json(Path(fleet_dir) / CI_HOSTS_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         ci = None
     claims: Dict[str, set] = {}
 
@@ -1037,6 +1422,8 @@ def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
     try:
         table = _read_json(Path(fleet_dir).parent / "config" / FLEET_HOSTS_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         table = None
     rows = table.get("hosts") if isinstance(table, dict) else None
     for hid, row in (rows.items() if isinstance(rows, dict) else ()):
@@ -1077,19 +1464,24 @@ def note_ignored_pin(card_id: str, word: str) -> None:
                      card_id, word)
 
 
-def known_host_ids(fleet_dir: Path) -> Tuple[str, ...]:
+def known_host_ids(fleet_dir: Path, *, strict: bool = False) -> Tuple[str, ...]:
     """Every host id the pool files name (roles hosts with the kanban-worker
     role, sidecar rows, priority), read WITHOUT validation: a disabled or
     refused pool still knows its hosts, so a real pin stays fail-closed
-    while prose never becomes one. Unreadable files name nothing."""
+    while prose never becomes one. Unreadable files name nothing unless
+    strict=True, which propagates registry I/O and JSON errors."""
     out: List[str] = []
     try:
         roles = _read_json(Path(fleet_dir) / ROLES_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         roles = None
     try:
         side = _read_json(Path(fleet_dir) / SIDECAR_FILE)
     except (OSError, ValueError):
+        if strict:
+            raise
         side = None
     if isinstance(roles, dict) and isinstance(roles.get("hosts"), dict):
         for hid, row in roles["hosts"].items():
@@ -1113,7 +1505,10 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
              targets: Optional[Mapping[str, str]] = None,
              requires: Optional[Tuple[Optional[str], Optional[str]]] = None,
              body_signals: bool = True,
-             worktree_hosts: Optional[Tuple[str, ...]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
+             worktree_hosts: Optional[Tuple[str, ...]] = None,
+             studio_reasons: Optional[frozenset] = None,
+             prose_advisory: bool = False,
+             access_served: Collection[str] = ()) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -1149,6 +1544,15 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     hosts holding a git mirror of a ``worktree`` card's repo. Non-empty, the
     card is judged like a scratch card (the dispatcher clones it on the
     chosen host); a pin to a host outside that set keeps it local.
+
+    ``studio_reasons`` (t_e604c0f9, :func:`studio_pin_reasons`): a ``host:
+    studio`` pin holds only when the card's ``requires:`` line names one of
+    them; a bare one is dropped and the card is judged unpinned. None = every
+    Studio pin holds (kill switch, or no capability map this tick).
+
+    ``prose_advisory`` (t_c82eded0, ``kanban.placement.prose_pins_advisory``):
+    the body word lists (``STUDIO_BODY_RE``, :data:`CARD_NEEDS`) never keep the
+    card on the Studio; the caller records them as an advisory.
     """
     kind = workspace_kind or "scratch"
     if kind != "scratch" and not (kind == "worktree" and worktree_hosts):
@@ -1178,10 +1582,13 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     # no pin and no reach matrix can move it. Decided before host_reach (Momus
     # pass 2 R-F: a stale matrix must not decide the name) and before every pin
     # branch (a pool pin is a contradiction the dispatcher parks needs_input).
-    access = access_bound_for(body, pool)
+    # ``access_served`` (t_79c2259b): ssh-root aliases a pool capability serves; ``requires`` above
+    # already carries that capability as a HARD requirement when no candidate host has it.
+    access = access_bound_for(body, pool, served=access_served)
     if access is not None:
         return False, _reasons.access_bound(access), None
-    pin, ignored = resolve_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None))
+    pin, ignored, _dropped = effective_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None),
+                                           studio_reasons)
     if bind_rule:
         # The bind is the pin; a body pin may only agree with it (spec §5).
         if pin not in (None, PIN_ANY, bind_host.lower()):
@@ -1205,7 +1612,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
             return False, _reasons.HOST_REACH, None
         if pin in (None, PIN_ANY) and not allowed:
             return False, _reasons.HOST_REACH, None
-    need_hosts = needs_allowed_hosts(body, pool, honor_declared=not body_signals)
+    need_hosts = needs_allowed_hosts(body, pool, honor_declared=not body_signals,
+                                     prose_advisory=prose_advisory)
     if need_hosts is not None:
         if pin not in (None, PIN_ANY) and pin not in need_hosts:
             return False, STUDIO_NEEDS_RULE, None
@@ -1222,13 +1630,14 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
         return True, None, "pin"
     if soft_rule:
         return False, soft_rule, None
-    affinity = studio_affinity(body, skills, pool, manifest=manifest, body_signals=body_signals)
+    affinity = studio_affinity(body, skills, pool, manifest=manifest, body_signals=body_signals,
+                               prose_advisory=prose_advisory)
     if affinity is not None:
         return False, affinity[0], None
     return True, None, "policy"
 
 
-def access_bound_for(body: Optional[str], pool) -> Optional[str]:
+def access_bound_for(body: Optional[str], pool, *, served: Collection[str] = ()) -> Optional[str]:
     """:func:`access_bound_cap` against this pool's alias vocabulary: the
     reach-matrix aliases plus every known pool host (the same set
     :func:`reach_allowed_hosts` binds on), canonicalised by ``pin_aliases``."""
@@ -1236,7 +1645,7 @@ def access_bound_for(body: Optional[str], pool) -> Optional[str]:
     aliases = (*(getattr(pool, "reach_aliases", ()) or ()), *(h.lower() for h in pool_hosts))
     return access_bound_cap(body, aliases, pin_hosts=pool_hosts,
                             ssh_hosts=getattr(pool, "ssh_hosts", None),
-                            canon=getattr(pool, "pin_aliases", None))
+                            canon=getattr(pool, "pin_aliases", None), served=served)
 
 
 def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
@@ -1258,8 +1667,17 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     pool_hosts = tuple(getattr(pool, "hosts", ()) or ())
     aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
                                    *(h.lower() for h in pool_hosts)]))
-    bound, named = host_bound_targets(body, skills, aliases, pin_hosts=pool_hosts,
-                                      ssh_hosts=getattr(pool, "ssh_hosts", None))
+    # A declared ``reach:`` line binds (t_efd1497a); ssh-shaped prose alone is reported, never bound. A card a
+    # HOST_BOUND skill already binds still reads its ssh-shaped targets: without them an alias nobody reaches
+    # would drop out of the fallback and the card would spill to a host with no route (Prism ac47bd4b21d9).
+    skill_bound = any(s.rsplit("/", 1)[-1] in HOST_BOUND_SKILLS for s in (skills or ()))
+    named = declared_reach(body, aliases)
+    if skill_bound:
+        # The ``reach:`` line (and its note) is a declaration, not ssh prose (Prism ac47bd4b21d9).
+        _b, prose = host_bound_targets(REACH_LINE_RE.sub("", body or ""), (), aliases, pin_hosts=pool_hosts,
+                                       ssh_hosts=getattr(pool, "ssh_hosts", None))
+        named = tuple(dict.fromkeys([*named, *prose]))
+    bound = skill_bound or bool(named)
     wanted = tuple(dict.fromkeys(h.lower() for h in (targets or {}).values() if h))
     if not bound and not wanted:
         return None
@@ -1276,7 +1694,39 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     # Manifest targets always join (an unprobed one still fails closed,
     # Prism bf503f94e81a).
     named = tuple(dict.fromkeys([*base, *wanted]))
-    return reaching_hosts(reach, named, aliases)
+    _b, prose = host_bound_targets(REACH_LINE_RE.sub("", body or ""), (), aliases, pin_hosts=pool_hosts,
+                                   ssh_hosts=getattr(pool, "ssh_hosts", None))
+    return reaching_hosts(reach, named, aliases, getattr(pool, "pin_aliases", None),
+                          logins=ssh_target_logins(body), host_users=worker_logins(pool),
+                          config_logins=getattr(pool, "reach_logins", None), body_aliases=prose)
+
+
+def prose_reach_preference(*, body: Optional[str], skills: Iterable[str], pool,
+                           targets: Optional[Mapping[str, str]] = None) -> Optional[Tuple[str, ...]]:
+    """Soft narrowing for a card whose ssh-shaped PROSE names fleet aliases (Apollo 2026-11-20, t_efd1497a): the
+    enabled pool hosts whose fresh row reaches every such alias, or None (place anywhere). Never a hold: None when
+    no enabled host reaches them, and None whenever :func:`reach_allowed_hosts` already binds the card (a
+    ``reach:`` line, a HOST_BOUND skill or a manifest target decide then). Only ``_portable_only`` reads it, so
+    prose can never make :func:`portable` return HOST_REACH."""
+    if reach_allowed_hosts(body=body, skills=skills, pool=pool, targets=targets) is not None:
+        return None
+    pool_hosts = tuple(getattr(pool, "hosts", ()) or ())
+    aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
+                                   *(h.lower() for h in pool_hosts)]))
+    _b, named = host_bound_targets(body, (), aliases, pin_hosts=pool_hosts,
+                                   ssh_hosts=getattr(pool, "ssh_hosts", None))
+    if not named:
+        return None
+    live = getattr(pool, "pool_hosts", ()) or ()
+    enabled = ({h.name.lower() for h in live} if live
+               else {h.lower() for h in pool_hosts} - {d.lower() for d in (getattr(pool, "disabled", ()) or ())})
+    # Same self-reach and login rules as a declared target (t_8c580b20).
+    out = tuple(h for h in reaching_hosts(getattr(pool, "reach", {}) or {}, named, aliases,
+                                          getattr(pool, "pin_aliases", None), logins=ssh_target_logins(body),
+                                          host_users=worker_logins(pool),
+                                          config_logins=getattr(pool, "reach_logins", None))
+                if h.lower() in enabled)
+    return out or None
 
 
 def body_host_targets(body: Optional[str], pool) -> Tuple[str, ...]:
@@ -1318,7 +1768,8 @@ def reached_aliases(reach: Mapping[str, Mapping[str, int]], aliases: Iterable[st
 
 def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
                     manifest: Optional[Mapping[str, str]] = None,
-                    body_signals: bool = True) -> Optional[Tuple[str, str]]:
+                    body_signals: bool = True,
+                    prose_advisory: bool = False) -> Optional[Tuple[str, str]]:
     """``(rule, matched_by)`` when the card's WORK is bound to the Studio's state
     (signed-in browsers, Messages.app, a macOS GUI session), else None.
 
@@ -1328,7 +1779,8 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
     ``studio_manifest``), the card body (rule ``studio_body``), and the
     Studio-only resources the body names that no pool host covers (rule
     ``studio_needs``, :func:`card_needs`). An explicit
-    ``host:`` pin is decided before this and wins.
+    ``host:`` pin is decided before this and wins. ``prose_advisory``
+    (t_c82eded0): the two body sources never bind; attached skills still do.
     """
     names = [s for s in (skills or ()) if isinstance(s, str)]
     bound = set(pool.studio_bound_skills or ())
@@ -1345,12 +1797,13 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
         # outrank it (t_6d9e7d90). With the layer off the declaration is
         # enforced by nothing, so the prose signals stay (Prism cf1b3bd689e8).
         return None
-    m = STUDIO_BODY_RE.search(body or "") if body_signals else None
+    m = STUDIO_BODY_RE.search(body or "") if body_signals and not prose_advisory else None
     if m:
         return "studio_body", f"body:{m.group(0)}"
     # Studio-only resources the body names (t_aea826a9): bound unless some
     # pool host's fresh reach-matrix caps cover every one of them.
-    if needs_allowed_hosts(body, pool, honor_declared=not body_signals) == ():
+    if needs_allowed_hosts(body, pool, honor_declared=not body_signals,
+                           prose_advisory=prose_advisory) == ():
         return STUDIO_NEEDS_RULE, "needs:" + ",".join(sorted(card_needs(body)))
     return None
 
@@ -1366,7 +1819,46 @@ def _ssh_argv(host: PoolHost, remote_cmd: str) -> List[str]:
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
     if host.ssh_port != 22:
         argv += ["-p", str(host.ssh_port)]
-    return argv + [host.target, remote_cmd]
+    ident = getattr(host, "ssh_identity", None)
+    return argv + identity_args(ident) + [host.target, worker_guarded(ident, remote_cmd)]
+
+
+# The remote half of the pinned-key fence (t_3911e84c fb4485599af6): ssh still lists the ssh_config
+# IdentityFile (the owner's key) after the worker key, so a server that refuses the worker key logs the
+# owner in. Only the forced command fleet-worker-shell exports FLEET_WORKER_SESSION=1, so every command
+# sent with a worker key exits WORKER_GUARD_RC on any other session.
+WORKER_GUARD_RC = 97
+WORKER_SESSION_GUARD = ('[ "${FLEET_WORKER_SESSION:-}" = 1 ] || '
+                        '{ echo "not a fleet worker session" >&2; exit 97; }; ')
+
+
+def worker_guarded(path: Optional[str], remote_cmd: str) -> str:
+    """``remote_cmd`` behind :data:`WORKER_SESSION_GUARD` for a pinned worker key, else unchanged."""
+    return WORKER_SESSION_GUARD + remote_cmd if path else remote_cmd
+
+
+def identity_args(path: Optional[str]) -> List[str]:
+    """``-i <key> -o IdentitiesOnly=yes`` for a pinned worker key, else nothing: without
+    IdentitiesOnly ssh still offers the agent's and the default keys, and the owner's own key
+    would log in past the worker wrapper. A keyed connection also opts out of any ControlMaster
+    (t_3911e84c): one that reuses a master never authenticates, so on an owner login it would ride
+    the operator's own ~/.ssh/cm master past the wrapper, or open the master the operator's own
+    ssh then rides as a worker. A direct handshake measured 0.13 s Studio -> ace-ai.
+    An unreadable key turns every auth method off: ssh would warn and log in with the
+    IdentityFile the user's ssh_config names for the host, i.e. the owner's own key
+    (measured Studio -> ace@192.168.1.216: FLEET_WORKER_SESSION unset, rc 0)."""
+    if not path:
+        return []
+    path = os.path.expanduser(path)  # os.access() reads a literal "~/..." as missing (a04c57100fc5)
+    # IdentityAgent=none: no agent key (the owner's, if loaded) is ever offered (fb4485599af6)
+    argv = ["-i", path, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+            "-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    return argv if os.access(path, os.R_OK) else argv + NO_AUTH_ARGS
+
+
+# every client auth method off: the fail-closed tail for a pinned key that is not readable
+NO_AUTH_ARGS = ["-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no",
+                "-o", "KbdInteractiveAuthentication=no"]
 
 
 @dataclass(frozen=True)
@@ -1390,6 +1882,7 @@ class HostSample:
 # task on the host, while ``nproc`` honours the probing user's cgroup quota
 # (kanbanw's user-1001.slice CPUQuota=800% made it print 8 on 24/32 cores,
 # t_2dc3be98), which shrank the v0.1 refuse line to 0.8 x 8 = 6.4 load1.
+# getconf reads the host, not the login, so it holds for any worker ssh_user.
 _NCPU_CMD = "getconf _NPROCESSORS_ONLN"
 
 
@@ -1399,7 +1892,7 @@ BOARDS_MARKER = "@@hermes-hostable-boards"
 
 def _boards_cmd(workspaces_root: str) -> str:
     """The board dirs under ``workspaces_root`` that exist AND that the probing
-    uid (the worker's ``kanbanw``) can create a workspace in."""
+    uid (the host's worker login, ``PoolHost.ssh_user``) can create a workspace in."""
     import shlex
     root = shlex.quote(str(workspaces_root).rstrip("/") or "/")
     return (f"echo {BOARDS_MARKER}; for d in {root}/*/; do "
@@ -1440,12 +1933,26 @@ def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = No
     tail = f"; {_boards_cmd(workspaces_root)}" if workspaces_root else ""
     if workspace_paths:
         tail += f"; {_states_cmd(workspace_paths)}"
-    if pressure_path is None:
-        return f"cat /proc/loadavg; {_NCPU_CMD}{tail}"
     import shlex
-    # ONE round-trip (RC9): the age is remote_now - at, both from this host.
-    return (f"cat /proc/loadavg; {_NCPU_CMD}; date +%s; cat {shlex.quote(pressure_path)} 2>/dev/null; true"
-            f"{tail}")
+    # Python's native APIs work on Linux and Darwin. A single JSON envelope
+    # prevents missing commands/files from shifting CPU/clock/pressure fields.
+    script = (
+        "import json,os,sys,time\n"
+        "load=os.getloadavg()\n"  # admission-lint: not-a-decider remote telemetry capture only; admission occurs in the shared predicate
+        "pressure=''\n"
+        "if len(sys.argv)>1:\n"
+        " path=sys.argv[1]\n"
+        " if sys.platform=='darwin' and path=='/var/lib/placement/host-pressure.json':\n"
+        "  path=os.path.expanduser('~/.local/share/placement/host-pressure.json')\n"
+        " try:\n"
+        "  with open(path, encoding='utf-8-sig', errors='replace') as f: pressure=f.read()\n"
+        " except OSError: pass\n"
+        "print('@@hermes-probe-v1')\n"
+        "print(json.dumps(dict(schema=1,load1=load[0],load5=load[1],"
+        "ncpu=os.sysconf('SC_NPROCESSORS_ONLN'),remote_now=time.time(),pressure_text=pressure)))\n"
+    )
+    args = " " + shlex.quote(pressure_path) if pressure_path is not None else ""
+    return f"python3 -c {shlex.quote(script)}{args}{tail}"
 
 
 def _probe_once(h: PoolHost, runner: Callable, *,
@@ -1510,6 +2017,27 @@ def _probe_once(h: PoolHost, runner: Callable, *,
         if not sep:
             return None, "probe output missing board list"  # fail closed
         boards = frozenset(b.strip() for b in listed.split("\n") if b.strip())
+    if out.startswith("@@hermes-probe-v1\n"):
+        import math
+        try:
+            doc = json.loads(out.split("\n", 1)[1])
+            if doc.get("schema") != 1:
+                raise ValueError("schema")
+            load1, load5 = doc["load1"], doc["load5"]
+            ncpu, remote_now = doc["ncpu"], doc["remote_now"]
+            if (type(ncpu) is not int or ncpu <= 0
+                    or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0
+                           for v in (load1, load5, remote_now))
+                    or not isinstance(doc["pressure_text"], str)):
+                raise ValueError("axes")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, "invalid structured probe output"
+        if pressure_path is None and boards is None and states is None:
+            return (load1, ncpu), ""
+        return HostSample(load1, ncpu, remote_now, doc["pressure_text"], boards,
+                          load5=load5, workspace_states=states), ""
+    # Compatibility for cached/injected legacy probes. New commands always
+    # emit the versioned envelope; never interpret a damaged envelope as lines.
     lines = out.split("\n")
     try:
         load1 = float(lines[0].split()[0])
@@ -1618,7 +2146,11 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     kw = dict(pressure_path=pressure_path, workspaces_root=workspaces_root,
               workspace_paths=workspace_paths)
     got, err = _probe_once(h, runner, **kw)
-    if got is None:
+    refused = err.startswith(f"ssh rc={WORKER_GUARD_RC}") and bool(getattr(h, "ssh_identity", None))
+    if refused:
+        # the guard answered: the session is not a worker one; never healthy, never a reused sample
+        err = f"not a fleet worker session (ssh rc={WORKER_GUARD_RC})"
+    elif got is None:
         direct, derr = _probe_once(h, runner, direct=True, **kw)
         if direct is not None:
             got, err = direct, ""
@@ -1636,7 +2168,7 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
         return got
     rec.fails += 1
     rec.last_error = err
-    rec.reused = (rec.last_sample is not None and rec.last_ok_at is not None
+    rec.reused = (not refused and rec.last_sample is not None and rec.last_ok_at is not None
                   and rec.fails <= PROBE_GRACE_FAILS
                   and rec.last_tried_at - rec.last_ok_at <= PROBE_GRACE_SECONDS)
     logger.warning("kanban pool: %s", probe_note(h, memory))
@@ -1652,7 +2184,10 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
 def _drop_stale_master(h: PoolHost) -> None:
     """The muxed probe failed and a direct one answered: the ControlMaster is
     stale (ace-media 2026-11-06). Ask it to exit so the next tick re-masters;
-    best effort, bounded."""
+    best effort, bounded. A keyed host never used a master, and the one at its
+    user@host is the operator's own session (t_3911e84c): leave it alone."""
+    if h.ssh_identity:
+        return
     argv = ["ssh", "-O", "exit"] + (["-p", str(h.ssh_port)] if h.ssh_port != 22 else []) + [h.target]
     try:
         subprocess.run(argv, capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
@@ -1705,7 +2240,7 @@ def _kanban_unified_admit(signal: Any = None) -> bool:
 class TargetSignal:
     """What ``plan()`` needs to read target pressure (read_signal = true)."""
 
-    policy: Any                       # placement_policy.PlacementPolicy
+    policy: Any                       # allocation_policy.PlacementPolicy
     ledger_dir: Path                  # <root>/var/placement
     cpu_est: Optional[float] = None   # kanban's measured slope; None = policy prior
     clock: Callable[[], float] = time.time
@@ -1781,9 +2316,9 @@ def running_by_host(conn) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for row in conn.execute(
         "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
-        "WHERE t.status = 'running' AND e.kind = ? "
+        f"WHERE t.status = 'running' AND e.kind IN ({_reasons.kind_marks(PLACED_EVENT)}) "
         "AND e.run_id IS NOT NULL AND e.run_id = t.current_run_id",
-        (PLACED_EVENT,),
+        _reasons.kind_names(PLACED_EVENT),
     ).fetchall():
         try:
             name = json.loads(row[0] or "{}").get("host")
@@ -1937,7 +2472,8 @@ class SpilloverPlan:
     def take(self, assignee: Optional[str], pin: Optional[str] = None,
              only: Optional[Collection[str]] = None,
              board: Optional[str] = None, job: Any = None,
-             job_id: Optional[str] = None, skip_admission: bool = False) -> Optional[PoolHost]:
+             job_id: Optional[str] = None, skip_admission: bool = False,
+             prefer: Optional[Collection[str]] = None) -> Optional[PoolHost]:
         """Reserve one slot: on ``pin`` only, else (signal + placement table)
         ``placement.choose()`` over the hosts that serve ``assignee`` with
         ``job`` overrides (t_d6ce856e); without a table the band pick. ``only``
@@ -1945,7 +2481,18 @@ class SpilloverPlan:
         hosts; an empty ``only`` takes nothing (``host_reach``). ``board`` drops
         every host that cannot host that board (:meth:`board_refusal`) before
         the pick: the card spills to another host or waits ``board_unhostable``.
+        ``prefer`` (unpinned only; the prose reach preference, t_efd1497a /
+        Prism 77c519869eff) is tried first, within ``only``; when those hosts
+        cannot take the card the pick falls back to all of ``only``.
         None sets ``refusal``."""
+        if prefer is not None and pin is None:
+            want = {n.lower() for n in prefer}
+            pref = [n for n in (self.hosts if only is None else only) if n.lower() in want]
+            if pref:
+                host = self.take(assignee, only=pref, board=board, job=job, job_id=job_id,
+                                 skip_admission=skip_admission)
+                if host is not None:
+                    return host
         self.refusal = None
         self.last_decision = None
         self.last_reservation = None
@@ -2312,10 +2859,14 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     probed: Dict[str, dict] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
-        sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
+        active = h.enabled and h.state == "active"
+        free = count_free(h, running) if active else 0
+        # allocd on: probe a host past its count too, so _take_allocd (structural_free) can ask allocd for it.
+        # `free` stays the real count for every take that does not ask allocd (t_2158f095, Prism cba00e400ff4).
+        ask = free > 0 or (active and signal.allocd == "on")
+        sample = _probe_states(probe, h, ask, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "band_reason": "", "why": "", "probed": free > 0, "boards": None}
+               "band": None, "band_reason": "", "why": "", "probed": ask, "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             if signal.placement_table is not None:

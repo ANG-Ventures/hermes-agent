@@ -8,6 +8,7 @@ import logging
 import json
 import math
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime
 from gateway.config import Platform
@@ -410,6 +411,7 @@ class SessionRecoveryMixin:
                     "open and may win restart recovery until the next successful peer refresh",
                     end_session_id, session_key, during, e),
             )
+            self._retire_replaced_goal_and_loop(session_key, end_session_id, end_reason)
         if self._db_for_key(session_key) and create_kwargs:
             self._create_session_row(
                 session_key, create_kwargs, origin, display_name,
@@ -418,6 +420,25 @@ class SessionRecoveryMixin:
                     "self-healing peer refresh on the next turn",
                     create_kwargs.get("session_id"), session_key, during, e),
             )
+
+    def _retire_replaced_goal_and_loop(self, session_key: str, old_session_id: str, end_reason: str) -> None:
+        """Every caller of this transition DROPS the old transcript (/new, /reset, an auto-reset):
+        a fresh start, which never carried the /goal or /loop (transcript-preserving compression
+        migrates them in the agent). Left alone they stayed ``active`` on an id no key routes, so
+        they never woke anyone and every idle-wake scan reloaded them (t_92fc3ff0: 190 of 205).
+        Retire them ``superseded`` (``/goal resume`` / ``/loop resume`` restores). Best-effort."""
+        db = self._db_for_key(session_key)
+        if db is None or not old_session_id:
+            return
+        try:
+            from hermes_cli.goals import retire_goal
+            from hermes_cli.loops import retire_loop
+
+            reason = f"superseded: session replaced ({end_reason}) on {time.strftime('%Y-%m-%d')}"
+            retire_goal(old_session_id, "superseded", reason, db=db)
+            retire_loop(old_session_id, "superseded", reason, db=db)
+        except Exception as exc:
+            logger.debug("Retiring goal/loop of replaced session %s failed: %s", old_session_id, exc)
 
     @staticmethod
     def _session_create_kwargs(

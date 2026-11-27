@@ -9,6 +9,7 @@ files via ``env.execute()``.
 import base64
 import json
 import logging
+import queue
 import secrets
 import shlex
 import socket
@@ -84,6 +85,42 @@ def _rpc_token_ok(request: dict, rpc_token: str) -> bool:
     )
 
 
+def _refusal(tool_name, allowed_tools: frozenset, tool_call_counter: list, max_tool_calls: int) -> str:
+    """The allow-list / budget refusal for one call, or ``""`` when it may run."""
+    if tool_name not in allowed_tools:
+        return tool_error(f"Tool '{tool_name}' is not available in execute_code. "
+                          f"Available: {', '.join(sorted(allowed_tools))}")
+    if tool_call_counter[0] >= max_tool_calls:
+        return tool_error(f"Tool call limit reached ({max_tool_calls}). "
+                          "No more tool calls allowed in this execution.")
+    return ""
+
+
+def _strip_blocked_params(tool_name, tool_args) -> None:
+    if tool_name == "terminal" and isinstance(tool_args, dict):
+        for param in _TERMINAL_BLOCKED_PARAMS:
+            tool_args.pop(param, None)
+
+
+def _dispatch_one(dispatch, tool_name, tool_args, where: str) -> str:
+    # Silence handler status prints so they don't leak into the CLI spinner.
+    try:
+        with thread_scoped_silence():
+            return dispatch(tool_name, tool_args)
+    except Exception as exc:
+        logger.error("Tool call failed in %s: %s", where, exc, exc_info=True)
+        return tool_error(str(exc))
+
+
+def _log_entry(tool_name, tool_args, result, call_start: float) -> dict:
+    entry = {"tool": tool_name, "args_preview": str(tool_args)[:80],
+             "duration": round(time.monotonic() - call_start, 2)}
+    error = _result_error(result)
+    if error:
+        entry["error"] = error
+    return entry
+
+
 def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_counter: list,
                         max_tool_calls: int, dispatch, tool_call_log: list, call_start: float,
                         where: str) -> str:
@@ -91,29 +128,13 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
     call consumes budget and is logged; refusals are free."""
     tool_name = request.get("tool", "")
     tool_args = request.get("args", {})
-    if tool_name not in allowed_tools:
-        return tool_error(f"Tool '{tool_name}' is not available in execute_code. "
-                          f"Available: {', '.join(sorted(allowed_tools))}")
-    if tool_call_counter[0] >= max_tool_calls:
-        return tool_error(f"Tool call limit reached ({max_tool_calls}). "
-                          "No more tool calls allowed in this execution.")
-    if tool_name == "terminal" and isinstance(tool_args, dict):
-        for param in _TERMINAL_BLOCKED_PARAMS:
-            tool_args.pop(param, None)
-    # Silence handler status prints so they don't leak into the CLI spinner.
-    try:
-        with thread_scoped_silence():
-            result = dispatch(tool_name, tool_args)
-    except Exception as exc:
-        logger.error("Tool call failed in %s: %s", where, exc, exc_info=True)
-        result = tool_error(str(exc))
+    refusal = _refusal(tool_name, allowed_tools, tool_call_counter, max_tool_calls)
+    if refusal:
+        return refusal
+    _strip_blocked_params(tool_name, tool_args)
+    result = _dispatch_one(dispatch, tool_name, tool_args, where)
     tool_call_counter[0] += 1
-    entry = {"tool": tool_name, "args_preview": str(tool_args)[:80],
-             "duration": round(time.monotonic() - call_start, 2)}
-    error = _result_error(result)
-    if error:
-        entry["error"] = error
-    tool_call_log.append(entry)
+    tool_call_log.append(_log_entry(tool_name, tool_args, result, call_start))
     return result
 
 
@@ -136,13 +157,122 @@ def tool_errors_since(tool_call_log: list, start: int = 0) -> list:
     return [{"tool": e["tool"], "error": e["error"]} for e in tool_call_log[start:] if e.get("error")][:5]
 
 
+class CallPool:
+    """``size`` daemon workers draining one queue: the per-kernel in-flight cap. Shared by every
+    connection of the kernel, so calls still running from a dropped connection count against it,
+    and a queued request holds no thread."""
+
+    def __init__(self, size: int):
+        self._q: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._size = size
+        for _ in range(size):
+            threading.Thread(target=self._work, daemon=True, name="hermes-rpc-call").start()
+
+    def _work(self) -> None:
+        while (job := self._q.get()) is not None:
+            job()
+
+    def submit(self, job) -> None:
+        self._q.put(job)
+
+    def close(self) -> None:
+        for _ in range(self._size):
+            self._q.put(None)
+
+
+def _serve_parallel(conn: socket.socket, *, allowed_tools: frozenset, tool_call_counter: list,
+                    max_tool_calls: int, tool_call_log: list, rpc_token: str, pool: CallPool,
+                    bind, budget_lock) -> None:
+    """Serve id-tagged requests ``{"id", "tool", "args", "token"}`` concurrently; each reply is
+    ``{"id", "result"}`` and may arrive in any order, preceded by ``{"id", "started": true}`` when
+    a worker takes the call off the queue. Token, allow-list and budget are decided
+    on this reader thread, in arrival order; the budget slot is reserved under ``budget_lock``
+    together with ``bind()``, which snapshots the dispatch target (session kernels: the cell
+    authority current at ARRIVAL) and a ``current()`` predicate. ``pool`` runs the dispatches. A call whose binding is no longer current when it finishes is not logged,
+    so a late call never shows up in a later cell's ``tool_errors``."""
+    send_lock, inflight = threading.Lock(), [0]
+
+    def reply(req_id, resp: str) -> None:
+        line = json.dumps({"id": req_id, "result": resp}, ensure_ascii=False) + "\n"
+        with send_lock:
+            try:
+                conn.sendall(line.encode())
+            except OSError as exc:  # client gone (kernel killed): nothing to deliver to
+                logger.debug("RPC reply dropped: %s", exc)
+
+    def work(req_id, tool_name, tool_args, dispatch, current, call_start) -> None:
+        try:
+            # Tell the stub the call left the queue: its reply timer starts here, as it did
+            # once a call held the serial wire's lock, so slot wait never times a call out.
+            with send_lock:
+                try:
+                    conn.sendall((json.dumps({"id": req_id, "started": True}) + "\n").encode())
+                except OSError as exc:
+                    logger.debug("RPC start notice dropped: %s", exc)
+            result = _dispatch_one(dispatch, tool_name, tool_args, "sandbox")
+            with budget_lock:
+                if current():
+                    tool_call_log.append(_log_entry(tool_name, tool_args, result, call_start))
+            reply(req_id, result)
+        finally:
+            with budget_lock:
+                inflight[0] -= 1
+
+    buf = b""
+    while True:
+        try:
+            chunk = conn.recv(65536)
+        except socket.timeout:
+            with budget_lock:
+                busy = inflight[0] > 0
+            if busy:  # a long call is not an idle client
+                continue
+            return
+        if not chunk:
+            return
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            call_start = time.monotonic()
+            try:
+                request = json.loads(line.decode())
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                reply(None, tool_error(f"Invalid RPC request: {exc}"))
+                continue
+            if not isinstance(request, dict):
+                reply(None, tool_error("Invalid RPC request: not a JSON object"))
+                continue
+            req_id = request.get("id")
+            if not _rpc_token_ok(request, rpc_token):
+                reply(req_id, tool_error("Unauthorized RPC request"))
+                continue
+            tool_name, tool_args = request.get("tool", ""), request.get("args", {})
+            with budget_lock:
+                dispatch, current = bind()
+                refusal = _refusal(tool_name, allowed_tools, tool_call_counter, max_tool_calls)
+                if not refusal:
+                    tool_call_counter[0] += 1
+                    inflight[0] += 1
+            if refusal:
+                reply(req_id, refusal)
+                continue
+            _strip_blocked_params(tool_name, tool_args)
+            pool.submit(lambda job=(req_id, tool_name, tool_args, dispatch, current, call_start): work(*job))
+
+
 def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: list,
                      tool_call_counter: list, max_tool_calls: int, allowed_tools: frozenset,
-                     stop_event: threading.Event, rpc_token: str, dispatch=None):
+                     stop_event: threading.Event, rpc_token: str, dispatch=None, *,
+                     pool: "CallPool | None" = None, bind=None, budget_lock=None):
     """Accept one client and serve newline-delimited JSON requests until it disconnects, idles
     300s, or the call limit is reached. ``tool_call_counter`` is a mutable ``[int]``. ``dispatch``
     overrides how an allowed, budgeted call runs: per-call sandboxes use the default (the thread
     carries the cell's context); session kernels rebind each call to the CURRENT cell's authority.
+    A ``pool`` (with ``bind`` and ``budget_lock``) switches to the id-tagged concurrent protocol
+    (``_serve_parallel``); without one this is the original one-request-at-a-time wire.
     """
     if dispatch is None:
         dispatch = _default_dispatch(task_id)
@@ -158,6 +288,11 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
         if conn is None:
             return
         conn.settimeout(300)
+        if pool is not None:
+            _serve_parallel(conn, allowed_tools=allowed_tools, tool_call_counter=tool_call_counter,
+                            max_tool_calls=max_tool_calls, tool_call_log=tool_call_log,
+                            rpc_token=rpc_token, pool=pool, bind=bind, budget_lock=budget_lock)
+            return
         buf = b""
         while True:
             try:

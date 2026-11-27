@@ -59,7 +59,7 @@ def _host(name, prio=0, slots=4, profiles=("alpha",)):
 ALIASES = ("ace-ai", "ace-media", "ci-box")
 REACH = {"ace-ai": {"ace-media": 255, "ace-ai": 0, "ci-box": 0},
          "ci-box": {"ace-media": 0, "ace-ai": 0, "ci-box": 0}}
-REACH_BOUND_TO_B = "Sync the build: rsync -a ./out ace-media:/srv/drop/ and verify."
+REACH_BOUND_TO_B = "reach: ace-media\nSync the build: rsync -a ./out ace-media:/srv/drop/ and verify."
 PORTABLE = "Refactor the parser and add tests."
 
 
@@ -92,7 +92,7 @@ def _cards(conn, body, n=1):
 
 def _placements(conn, tid):
     return [json.loads(r[0]) for r in conn.execute(
-        "SELECT payload FROM task_events WHERE task_id=? AND kind='placement'", (tid,))]
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='allocation'", (tid,))]
 
 
 # -- AC-9: flag off is today's route ---------------------------------------------
@@ -152,7 +152,7 @@ def test_plan_pool_reads_the_flag_per_tick(home, monkeypatch):
     (fleet / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
         "ace-ai": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}}}))
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-ai"], "profiles": ["alpha"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "priority": ["ace-ai"], "profiles": ["alpha"],
         "hosts": {"ace-ai": {"enabled": True, "absence": "optional"}}}))
     cfg = {"placement": {"read_signal": False}, "worker_pool": {"overflow": False}}
     gate = SimpleNamespace(band="admitting", spill_reason=None, remote_allowed=True, pool=None)
@@ -263,7 +263,7 @@ def test_dry_run_reports_the_take_refusal(home):
 
 # -- AC-2 / I-1 query (R4) --------------------------------------------------------
 
-def _event(conn, tid, payload, kind="placement", at=None):
+def _event(conn, tid, payload, kind="allocation", at=None):
     conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
                  (tid, kind, json.dumps(payload), int(at or time.time())))
     conn.commit()
@@ -466,7 +466,7 @@ def _run(conn, tid, *, outcome, summary="", event=None, host="ace-ai", ended=Non
                        "VALUES (?,?,?,?,?,?)", (tid, "done", ended - 60, ended, outcome, summary))
     rid = cur.lastrowid
     conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
-                 (tid, rid, "worker_placed", json.dumps({"host": host}), ended - 60))
+                 (tid, rid, "worker_allocated", json.dumps({"host": host}), ended - 60))
     if event:
         conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
                      "VALUES (?,?,?,?,?)", (tid, rid, event, "{}", ended - 30))
@@ -539,7 +539,7 @@ def _builder(home, cfg, connect):
     (fleet / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
         "ace-ai": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}}}))
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-ai"], "profiles": ["alpha"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "priority": ["ace-ai"], "profiles": ["alpha"],
         "hosts": {"ace-ai": {"enabled": True, "absence": "optional"}}}))
     gate = SimpleNamespace(band="admitting", spill_reason=None, remote_allowed=True, pool=None)
     return kgt.GateTickBuilder(gate, fleet_dir=lambda: fleet, kanban_cfg=lambda: cfg,
@@ -554,7 +554,7 @@ def test_a_scheduled_card_woken_inside_dispatch_gets_the_plan(home, remote):
     places it on the pool; t_82b4db80: a retired `local` value changes nothing."""
     with kb.connect_closing() as conn:
         (tid,) = _cards(conn, PORTABLE)
-        assert kb.schedule_task(conn, tid, reason="later")
+        assert kb.schedule_task(conn, tid, reason="later", wake_at=2_000_000_000)
         conn.execute("UPDATE tasks SET next_eligible_at = ? WHERE id = ?", (int(time.time()) - 5, tid))
         conn.commit()
         assert conn.execute("SELECT count(*) FROM tasks WHERE status='ready'").fetchone()[0] == 0

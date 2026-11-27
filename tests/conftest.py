@@ -292,6 +292,13 @@ os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 #: even with this block removed.
 HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
 
+# Runtime identity used to be warmed by the guard's eager state/auth imports.
+# Resolve it explicitly before tests install subprocess doubles; plugin metadata
+# must not run git through a fake meant for a player, worker, or updater child.
+from hermes_cli.version_info import get_version_info as _test_runtime_version
+_test_runtime_version()
+
+
 # ── Host-rendezvous isolation ───────────────────────────────────────────────
 # ``gateway/host_rendezvous.py`` publishes ONE record per role per OS USER, in
 # ``$HERMES_GATEWAY_LOCK_DIR`` else ``$XDG_STATE_HOME/hermes/gateway-locks`` —
@@ -379,6 +386,12 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # (test-gate exported ~/.hermes) made tests rewrite the LIVE config/fleet-hosts.json
     # (t_dbacd1f2). Tests of PLACEMENT_HOME precedence set it themselves.
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
+    # ALLOCATION_HOME is the canonical name and wins over PLACEMENT_HOME (t_fc257547,
+    # Prism 8655eeb51c54): an inherited one would override every test's own root.
+    monkeypatch.delenv("ALLOCATION_HOME", raising=False)
+    # Same for the root receipt the vendored admission_demand requires (hermes-home #9789): an inherited one names
+    # the LIVE fleet root. _provisioned_placement_roots below provisions each test's own root instead.
+    monkeypatch.delenv("PLACEMENT_ROOT_RECEIPT", raising=False)
 
     # Honcho's fallback host/config resolution legitimately reads the user's
     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
@@ -473,6 +486,9 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # from a checkout, often one under /Volumes/fleet-scratch. Disarm the
     # shadow-cwd boot guard; its own tests delete this.
     monkeypatch.setenv("HERMES_ALLOW_SHADOW_CWD", "1")
+    # t_969164a0: the port clone script asks the host's installed `hermes` whether the
+    # worktree cache is on; tests never start that CLI. The cache's own tests delete this.
+    monkeypatch.setenv("HERMES_WORKTREE_CACHE", "0")
 
     # 3a-GUARD (2026-07-24 WAL incident): hermeticity canary — after the
     # redirect, the resolved state.db path must live under the sandbox. If it
@@ -707,6 +723,22 @@ def _isolate_wall_budget_registry():
     _wb.clear_registry()
     yield
     _wb.clear_registry()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_relay_capacity(monkeypatch):
+    """No test reads a LIVE relay's /health or /eligibility through the wait-notice
+    capacity probe (the fleet's relays listen on the same loopback ports the tests
+    use). Tests that want an answer set ``relay_capacity.fetch_json`` themselves."""
+    try:
+        from agent.fork_ext import relay_capacity as _rc
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    _rc.clear_cache()
+    monkeypatch.setattr(_rc, "fetch_json", lambda url, timeout: None)
+    yield
+    _rc.clear_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -1277,6 +1309,55 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
         )
 
     monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
+
+
+# ── Provisioned placement roots (t_77aa2e0e) ────────────────────────────────
+# The vendored hermes_cli/fleet_placement/admission_demand.py (hermes-home #9789) refuses every ledger, demand and
+# protected-marker write under a fleet root that has no operator-provisioned receipt (PLACEMENT_ROOT_RECEIPT, outside
+# the root). Production gets the receipt from the operator; a test's root is a fresh tempdir, so this fixture
+# provisions it on first use with the canonical provision_root (anchor = the nearest existing ancestor, receipt in that
+# anchor) and hands that receipt to the call. A test that sets PLACEMENT_ROOT_RECEIPT itself keeps it. A root under
+# the REAL kanban root is never provisioned (the write guard above owns that refusal).
+# TEST_PLACEMENT_ROOT_RECEIPT is the placeholder the gateway suite sets so the dispatcher's boot check
+# (root_receipt_missing, logged at ERROR) stays quiet in tests; it names no real receipt, so this fixture treats it as
+# unset and still provisions each test's own root.
+TEST_PLACEMENT_ROOT_RECEIPT = "/nonexistent/hermes-tests/placement-root-receipt"
+
+
+@pytest.fixture(autouse=True)
+def _provisioned_placement_roots(_hermetic_environment, monkeypatch):
+    pkg = sys.modules.get("hermes_cli.fleet_placement")
+    if pkg is None:
+        return
+    try:
+        dm = getattr(pkg, "admission_demand")  # binds the adapter's root, as production does
+    except ImportError:  # POSIX-only module (fcntl): nothing to provision on Windows
+        return
+    orig = getattr(dm, "_receipt_path", None)
+    if orig is None or getattr(orig, "_t77_provisioning", False):
+        return
+
+    def _receipt_path(root, receipt=None, *, canonical=False):
+        env_receipt = os.environ.get("PLACEMENT_ROOT_RECEIPT")
+        if receipt is not None or (env_receipt and env_receipt != TEST_PLACEMENT_ROOT_RECEIPT):
+            return orig(root, receipt)
+        root = Path(root).absolute()
+        try:
+            root.resolve().relative_to(_REAL_KANBAN_ROOT)
+        except ValueError:
+            pass
+        else:
+            return orig(root, receipt)
+        anchor = root.parent
+        while not anchor.exists() and anchor != anchor.parent:
+            anchor = anchor.parent
+        path = anchor / f".placement-root-receipt-{abs(hash(str(root))):x}"
+        if not path.exists():
+            dm.provision_root(root, anchor=anchor, receipt=path)
+        return orig(root, path)
+
+    _receipt_path._t77_provisioning = True
+    monkeypatch.setattr(dm, "_receipt_path", _receipt_path)
 
 
 # ── Live state.db write guard ───────────────────────────────────────────────

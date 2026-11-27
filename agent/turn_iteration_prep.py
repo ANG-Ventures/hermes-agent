@@ -295,7 +295,7 @@ def _inject_steer_after_newest_tool_result(
     _si = _current_turn_tail_tool_index(messages, current_turn_user_idx)
     if _si is not None:
         from agent.prompt_builder import steer_user_row
-        messages.insert(_si + 1, steer_user_row(steer_text))
+        messages.insert(_si + 1, steer_user_row(steer_text, agent=agent))
         # Fork #1585/#1595: delivered only once a model reads it (delegate steer ledger settles
         # on note_steer_consumed after the next response; agents without a sink note it now).
         from agent.agent_runtime_helpers import note_steer_injected

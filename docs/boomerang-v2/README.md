@@ -23,6 +23,47 @@ A boomerang child inherits the parent conversation in one of two modes (D-14):
 `summary` instead and the gateway logs `boomerang.fork_ineligible reason=<reason>` (INV-2).
 A forked child never ships a near-fork that silently writes cold.
 
+### Routing is independent of context mode
+
+The [parent-routing contract](parent-routing-inheritance-spec.md) applies to fork,
+branch, explicit summary and automatic summary downgrade. Without an explicit
+call-level child model/provider/credential override, a boomerang takes its parent's
+active route and effective fallback chain, not `delegation.model/provider` defaults.
+An explicit empty parent chain remains disabled. Ordinary delegations retain their
+existing configuration precedence. A deliberately different child route uses summary
+context rather than claiming a byte-identical fork.
+
+A busy parent's route is snapshotted separately from its database transcript; it is
+not reset to its configured primary. With no live parent, the gateway restores the
+resolved owner's session `/model` preference, then channel overrides, then defaults,
+using the normal gateway fallback policy. Unreadable persisted preferences or missing
+credentials fail closed. No historical transient fallback is guessed after restart.
+
+Existing durable delegation records carry per-task non-secret routing provenance,
+identity, selected safe endpoint, protocol and fallback policy. An explicit selected
+endpoint wins over a provider's current default during recovery. Userinfo/credential
+query URLs are refused, never persisted. Malformed persisted chains (including null,
+strings and non-route rungs) fail before credential lookup; `[]` remains disabled.
+Execution resolves credentials again within the owning
+profile. Credential-bearing request headers or non-symbolic fallback secrets cannot
+be serialized: durable launch refuses that policy rather than silently widening or
+erasing it. Legacy records without a resolved fallback policy report routing-unavailable.
+`boomerang.route` logs requested/effective mode, owner/child sessions, route source,
+provider/model and fallback count; it excludes endpoints, headers and credentials.
+
+The synthetic-provider HTTP acceptance suites are
+`tests/integration/test_boomerang_parent_routing_http.py`,
+`tests/integration/test_boomerang_auto_routing.py` and
+`tests/integration/test_boomerang_detached_profiles.py`. They drive real
+notifier/owner-wake dispatch, scratch claim/board executor receipts, busy/cold
+session reconstruction, child retry/fallback and two separate profile subprocesses.
+The auto-wake primary/same-vendor lanes speak Anthropic Messages and the permitted
+cross-vendor lane speaks CPA-shaped OpenAI chat/SSE; each uses synthetic credentials.
+Plugin/MCP startup and model probes are suppressed; retry timing alone is shortened.
+External platform delivery is an in-memory adapter. Socket tripwires reject non-loopback
+connections. This proves routing integration, not real vendor availability or deployed activation.
+See [build receipts and remaining limits](build-review-status.md) before landing.
+
 ## 1. Which mode each entry point uses (spec §5.6)
 
 | Entry point | `inherit_context` | Mode you get |
@@ -122,7 +163,31 @@ Each `auto` row may carry `mode: fork|summary` (default `fork`, subject to §2 e
 Retries (D-13): a crash-class event gets one automatic retry. The count is persisted per card in
 `kanban_boomerang_wake.json` (`retries[task_id]`), survives restarts, and resets when the card
 reaches `completed`/`archived` or when Ace surfaces-and-acts on it. The second occurrence
-surfaces.
+surfaces. The crash-class budget is per card lifetime; the restart budget below is per wake.
+
+Three budgets live in that file, one per kind of automatic second try (t_5701751b):
+
+| Budget | Spent by | Cleared by |
+|---|---|---|
+| `retries[task_id]` | a crash-class retry (D-13) | the card reaching `completed`/`archived`, or Ace surfacing-and-acting. Per card lifetime. |
+| `blocked_spent[task_id]` | a blocked assessment (`blocked_assess` claim) | any claim on the card going terminal with a handled outcome (list below), except the blocked assessment's own `retry` verdict. Also the `retries` resets. |
+| `restart_spent[task_id]` | a gateway-restart redispatch | any claim on the card going terminal with a handled outcome. Also the `retries` resets. |
+
+A card gets one automatic blocked assessment without a handled wake in between. Any handled wake
+clears the budget, the assessment's own included: an assessment that surfaces to the owner (or ends
+stale/superseded) is itself a handled wake, so the next block is assessed again. The one case that
+stays spent has no owner in the loop: the assessment says `retry` and the worker blocks again, which
+ends at the owner (`blocked assessment budget exhausted; owner assessment required`) rather than
+looping on worker runs. An assessment that fails or is lost also stays spent. A `#restartN`
+redispatch of a blocked assessment spends none of the three. A state file from before this change
+(no `blocked_spent`) is migrated on first read: at most one count per card with a spending
+`blocked_assess` claim on file leaves `retries` (the old code spent it only at 0). The card starts
+cleared when a claim at or after its newest assessment, that assessment included, ended with a
+clearing outcome (same rule as above), else at `blocked_spent=1`. Crash spends stay, and a blocked
+spend whose claim was already pruned (7 days) cannot be told apart from one and stays in `retries`.
+A card that also has a `crash_first_occurrence` claim on file is not moved at all: its count cannot
+be attributed, so it stays a crash spend and the card gets no `blocked_spent` entry.
+The next write persists it.
 
 ## 4. The boomerang wake level
 
@@ -135,16 +200,25 @@ session `/autohandle` toggle and no board default (Ace 2026-10-22, t_7be18632).
 | `wake` | `notify+wake` / `wake` | Passive line + a turn in the subscribed session. |
 | `boomerang wake` | `notify+wake` / `wake` (+ `tasks.boomerang_wake = 1`) | Mechanical events go to a background boomerang child (§3 `auto`); everything else wakes as `wake`. |
 
-`kanban.auto_subscribe_boomerang` defaults to `true`: new operator-created cards with an
-originating gateway auto-subscription use boomerang wake. The tool's `boomerang_wake: false`
-or `kanban create --no-boomerang-wake` opts out for one card. Set the config knob to `false`
-to restore plain notify+wake for future cards; existing cards are unchanged. Worker-created
-cards do not inherit this default. A CLI create (`hermes kanban create`, which scripts and
-cron also drive) inherits it only when `kanban.cli_auto_subscribe` (default `false`) would
-subscribe it, or when it names an explicit home (`--session <sid>`; tool `session_id`) whose
-session has a routable origin chat: then the card gets the level AND that home chat's
-`notify+wake` row even with no gateway identity in env (Ace 2026-11-06; scripts and cron mint
-most cards this way). Operator pseudo-homes and CLI/unknown sessions stay unsubscribed.
+`kanban.auto_subscribe_boomerang` defaults to `true`. The LEVEL and the SUBSCRIPTION are
+decided separately:
+
+- Level (`tasks.boomerang_wake`): every new card gets the knob's value at birth, whoever mints
+  it: CLI, tool, cron/script, worker child, swarm, dashboard API, triage decomposition (children
+  take the root's stored value). `kanban_db.create_task` applies it
+  (`hermes_cli/kanban_boomerang_default.py`, t_c24b1cc7). An explicit
+  `--no-boomerang-wake` / tool `boomerang_wake: false` is stored as given, and a retried create
+  (same idempotency key) returns that card unchanged. The `created` event records
+  `boomerang_wake_source` (`explicit` | `default` | `inherited`).
+- Subscription (who is woken): unchanged. A gateway create subscribes its chat; a CLI create
+  subscribes only when `kanban.cli_auto_subscribe` (default `false`) would, or when it names an
+  explicit home (`--session <sid>`; tool `session_id`) with a routable origin chat (Ace
+  2026-11-06). Worker creates, operator pseudo-homes and CLI/unknown sessions get no row.
+
+The level never invents a recipient. A card at boomerang level with no waker row wakes nobody;
+`kanban create --json` and the `kanban_create` tool return `wake_route` (`level`, `waker`, and a
+`note` when nothing holds the wake), and a plain CLI create prints that note on stderr. Set the
+knob to `false` to restore plain notify+wake for future cards; existing cards are unchanged.
 `--boomerang-wake` still sets it explicitly. The knob is read on create;
 once this code is loaded, flipping it needs no restart. Loading this code into a running
 gateway does require a restart.
@@ -166,17 +240,26 @@ path: every wake surfaces to the home session as a plain `wake`.
 |---|---|---|
 | file `<HERMES_HOME>/state/boomerang-wake.disabled` | absent (on) | Present: no card is boomerang-woken; every wake surfaces as `wake`. One #logs line on each on/off transition. `touch` to stop, `rm` to resume. |
 | `delegation.boomerang.fork_enabled` | on (unset = forks allowed) | Disables fork mode (P2). Every boomerang, including boomerang-wake children, runs `summary`; logs `reason=fork_enabled`. |
+| card body line `wake-model: <slot>` | absent (the parent's model) | Overrides the wake child's model for that card (t_54bbaca0). A model-routing slot name only (a worker can edit a card body). Wins over the two keys below. |
+| `delegation.boomerang.wake_child.sessions.<home session id>` | unset | Same override for every wake homed to that (resolved) session; a slot, a bare id or `provider/model`. |
+| `delegation.boomerang.wake_child.model` / `.provider` | unset (the parent's model and lane) | Global override. A slot or bare id keeps the parent's lane unless `provider` is set. An overridden child runs `summary` (no fork: a different model cannot read the parent's cache) and its surfaced line names the model. Any non-success outcome (failed, timeout, error, interrupted, refused, empty final, an exception) reruns the wake on the parent's model and chain, except a gateway restart or a claim cancelled for its budget (no second child; a restart leaves the claim open for the next boot), and the surfaced line says `wake-model <x> failed (<why>), ran on parent <provider/model>`. An override that cannot be used (unknown, not on the lane, unreadable, a `wake_child` section that is not a mapping, or any model override while any `provider_routing` filter is configured (`models` included, or a filter on the parent) or the routing config cannot be read) runs on the parent and the line says `wake-model <x> not usable (<why>)`. |
+| card body line `wake-effort: <level>`, `wake_child.effort_sessions.<home session id>`, `wake_child.effort` | unset (the home's effort) | Reasoning effort of the wake child, same precedence. `none` or a `VALID_REASONING_EFFORTS` level; anything else is `not usable` and runs at the parent's effort. Alone it keeps the parent's model and lane; a level different from the parent's runs as a summary fold (a changed effort changes the request fingerprint, so it cannot fork) and the surfaced line says `summary`; the parent's own level keeps the fork. With `wake-model` it rides the summary pin. The surfaced line names the effort. |
 
 Scope: boomerang wake is armed for the `default` (Apollo) profile only (spec §2).
 
 ## 5. Lines you will see in the origin chat
 
 **`boomerang handled <card> (<row>): <summary>`**
-One passive line when a child resolves or surfaces a wake, plus a card comment
-`boomerang: <row> <summary>`. This is not a deadman page or a system wake. A `surface` verdict
-also delivers the child's finding to the home session as a turn (`[boomerang-wake] child
-surfaced ...`). If the operator already commented since review began, only the card breadcrumb
-is written; chat stays silent.
+The handled receipt when a child resolves or surfaces a wake, plus a card comment
+`boomerang: <row> <summary>`. This is not a deadman page or a system wake. Since hermes-agent#439
+(t_8ab5557d) it is an agent receipt, **not a chat line**: a handled-only verdict writes it as a
+row in the fleet agent log (`state/agent-logs/<UTC day>.jsonl`, `producer: boomerang-wake`,
+`task_id: <card>`), and posts it to the origin chat only when no agent log is available. A
+`surface` verdict delivers the child's finding to the home session as a turn (`[boomerang-wake]
+child surfaced ...`) and posts no handled line (the turn is the message; the receipt row is
+best-effort); a refused turn still posts the line. The file `<HERMES_HOME>/state/boomerang-handled-line-chat.enabled`
+restores the old behaviour (the line posts to the origin chat). If the operator already commented
+since review began, only the card breadcrumb is written.
 
 Delivery is durable: the gateway writes a pending handback (`handbacks[<delegation>]` in
 `gateway/kanban_boomerang_wake.json`) before any send. A line counts as delivered only on the
@@ -201,16 +284,29 @@ The original wake is re-surfaced through the normal path, once. What to do: hand
 wake. Re-surfacing happens at most once per entry; after that it is an ordinary wake.
 
 **Restart behaviour (t_870c1fba).** A gateway restart kills every in-flight child. On the new
-boot the reconciler spends the card's D-13 retry on it instead of surfacing: when the card's
-status still equals the status recorded at claim time, `retries[task_id] < MAX_AUTO_RETRIES` and
+boot the reconciler spends the wake's restart retry on it instead of surfacing: when the card's
+status still equals the status recorded at claim time, `restart_spent[task_id] < MAX_AUTO_RETRIES` and
 the claim is within `max_minutes` of `claimed_at`, it bumps the retry, marks the old claim
 `terminal` with `outcome: redispatched_after_restart` (`redispatched_as` names the new claim key,
 `<old key>#restart<n>`), and dispatches a fresh child for the same card and wake (new delegation
 id and nonce, the same row and fork/summary decision). It posts nothing to chat; the gateway log
 gets one INFO line `kanban boomerang-wake: <card> redispatched after gateway restart (retry 1/1)
 delegation=<new>`. Otherwise the entry is lost as above, with the reason saying which condition
-failed. The restart spent the budget, so the redispatched child's own failure, a second restart,
-or a later crash-class event on the card surfaces (no second automatic retry).
+failed. The restart spent the wake's restart budget, so the redispatched child's own failure or a
+second restart surfaces (no second automatic redispatch).
+
+**The restart budget is per wake and separate (t_a256e37c).** A restart redispatch spends
+`restart_spent[task_id]`, not `retries[task_id]`, and the reconciler decides on `restart_spent` alone
+(`>= MAX_AUTO_RETRIES` means `retry spent`). When any claim on the card goes terminal with a handled
+outcome (`complete`, `request_changes`, `redispatch`, `retry`, `handled`,
+`acknowledge`, `comment_why_waits`, `surfaced`, `stale`, `superseded`, `superseded-by-terminal`),
+`restart_spent` is cleared, so the next restart cut on the card is redispatched quietly again.
+`failed`, `lost`, `stopped` and `dispatch_failed` clear nothing. `retries` stays the
+per-card-lifetime budget of the crash-class retry (D-13); the blocked assessment has its own
+`blocked_spent` (table in §3). A restart neither reads nor spends either, so a block-spent card still
+gets its quiet restart redispatch and a restart redispatch never exhausts the next blocked assessment. A state file from before this change
+(no `restart_spent`) is migrated on first read: the count a card's `<key>#restartN` claims account
+for (capped by its `retries`) moves from `retries` to `restart_spent`, and the next write persists it.
 
 **`[boomerang-wake cancelled; ignored]`**
 A handoff that arrived from a child after the reconciler cancelled it. It is tagged and not
@@ -228,7 +324,7 @@ Instead, the child ends its final message with ONE verdict block:
 
 ```
 <<<BOOMERANG-VERDICT nonce=<hex16>>>>
-{"action": "complete" | "request_changes" | "redispatch" | "retry" | "land_inherited" | "surface",
+{"action": "complete" | "request_changes" | "redispatch" | "retry" | "surface",
  "evidence": ["<command + result>", ...], "findings": ["..."], "summary": "<line>"}
 <<<END-VERDICT>>>
 ```
@@ -241,25 +337,13 @@ board write for it:
   board, so a worker cannot pre-forge a verdict.
 - **Only allowed actions.** The action must be allowed for the wake row recorded at claim time:
   - `completed`: complete, request_changes or surface.
-  - `own_repo_review_red`: request_changes, redispatch, land_inherited or surface.
+  - `own_repo_review_red` (a dirty, conflicted PR only since t_88864f95; an unconflicted red takes
+    no fork, like green): request_changes, redispatch or surface.
   - `changes_requested`: redispatch or surface.
   - `crash_first_occurrence`: retry or surface.
   The executor never merges, approves a PR, stamps coverage, edits config or touches another card.
-- **`land_inherited` (t_47d1968c), own-repo red row only.** The child claims the PR's red is main's and adds
-  an `inherited` proof `{family, job, anchor_or_test, main_sha, pr_files, proof}`. The executor
-  (`gateway/kanban_boomerang_land_inherited.py`) treats it as a pointer and re-checks from GitHub:
-  (a) the PR's files (`pulls/N/files`) do not touch the red's owning paths. For a mutation-anchor red these
-  are the anchored source and its `mutate_*.sh` harness, both owned by the family. Otherwise they are
-  the family's `suites.json` / `main-gate-set.json` paths at main's tip. (b) the red is main's: the anchor is
-  present at the PR head, absent at main, and still named by main's harness; or the family is red in main's
-  newest grade (`state/main-green-streak.json`, fresh). It also needs an operator `review_coverage` APPROVE at
-  the head on the card, zero open Prism P0/P1 at the head, and no `--accept-open-p1` / `--bypass-fleetreview` /
-  `--break-glass` on the queue row. Any miss degrades to `surface` with the reason, and nothing is written. On
-  a pass the one write is `scripts/lib/landing_queue.py enqueue` with the row's existing fm_args plus
-  `--allow-red-ci "inherited: <family> red on main at <sha10> (...)"`. fleet-merge still refuses a NEW red
-  (rc 9) at land time. Records: a `[boomerang-wake] land_inherited` card comment with the proof, a row in
-  `state/boomerang-wake.jsonl`, and one #logs line. Kill switch: `state/boomerang-wake-land-inherited.disabled`,
-  read on every verdict.
+- **`land_inherited` is retired (t_88864f95, Ace 2026-11-14).** A red check has not held a merge since
+  2026-11-09, so no child proves a red is main's. A verdict carrying it is refused as an unknown action.
 - **Card, PR and assignee come from the board, never from the child.** If the card moved since
   the claim, nothing is written and the wake is re-surfaced (`reason: state moved`). Moved means a
   newer event other than the child's own comment, a status change, or a new PR head. Redispatch

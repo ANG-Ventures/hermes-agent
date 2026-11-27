@@ -39,6 +39,39 @@ class WakeNotAccepted(RuntimeError):
     """No adapter admission: retry without treating a healthy chat as dead."""
 
 
+WAKE_REFUSAL_PRODUCER = "gateway-busy-queue"
+
+
+def record_wake_refusal(session_key: str, depth: int, cap: int, event: Any) -> Optional[str]:
+    """File ONE agent-inbox item for a session whose busy queue is at its cap and refuses wakes
+    (t_4a891379). The caller latches it per episode; its sender still gets ``WakeNotAccepted``.
+    The fault key makes it one item per session. Loads ``scripts/lib/agent_inbox.py`` from the fleet
+    root the way the cron #alerts gate does; no fleet root or any error only logs (fail open)."""
+    try:
+        from pathlib import Path
+        from cron.fork_ext.alerts_audience_gate import _fleet_root, _load_lib
+        from hermes_constants import get_hermes_home
+        root = _fleet_root(Path(get_hermes_home()))
+        lib = _load_lib(root) if root is not None else None
+        if lib is None:
+            logger.warning("wake refusal for %s not filed: no agent inbox library", session_key)
+            return None
+        meta = getattr(event, "metadata", None) or {}
+        what = " ".join(str(v) for v in (getattr(event, "wake_kind", None) or "internal",
+                                         meta.get("wake_sub"), meta.get("wake_name"), meta.get("card_id")) if v)
+        text = (f"gateway: session {session_key} cannot take wakes: busy queue at cap ({depth}/{cap})\n"
+                f"Refused a wake ({what}) with WakeNotAccepted; its sender retries, and every further wake "
+                "is refused until the session's running turn drains the queue. The session is the fault, "
+                "not the sender.\n"
+                f"-# fault={lib.stamp_key(session_key)}\n-# family=gateway:busy-queue-wake-refused")
+        item = lib.Inbox(lib.inbox_dir(root)).record(WAKE_REFUSAL_PRODUCER, "warn", text)
+        logger.warning("wake refused at cap for %s: agent inbox item %s", session_key, item.get("id"))
+        return item.get("id")
+    except Exception as exc:
+        logger.warning("wake refusal for %s not filed in the agent inbox: %r", session_key, exc)
+        return None
+
+
 def session_owned_by_profile(config: Any, profile: Optional[str], session_id: Any) -> bool:
     """True when a stateless (``api_server``) destination's raw session id is canonically owned by
     served *profile*'s own session store.
@@ -90,18 +123,21 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
                        notification_category: str = "result", profile: Optional[str] = None,
-                       metadata: Optional[dict] = None) -> None:
+                       metadata: Optional[dict] = None, wake_kind: Optional[str] = None) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
     names the served profile that canonically owns a non-push destination; a non-default value is
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
-    Raises on failure so the caller can rewind/retry."""
+    ``wake_kind`` (``gateway.wake_kind``) names the wake for its progress header; detail rides
+    ``metadata`` (``wake_sub`` / ``wake_name`` / ``card_id``). Raises on failure so the caller can
+    rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
         from gateway.platforms.event import MessageEvent, MessageType
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
+                                   wake_kind=wake_kind,
                                    metadata={**(metadata or {}),
                                              "notification_category": notification_category})
         await admit_internal_event(adapter, synth_event)

@@ -10,7 +10,7 @@ def test_asap_is_explicit_persisted_and_never_inherited(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     # the door state root resolves PLACEMENT_HOME first (same pin as test_kanban_priority_door.board; reader rv70e)
-    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path / "fleet-root"))
+    monkeypatch.setenv("ALLOCATION_HOME", str(tmp_path / "fleet-root"))
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     kb.init_db()
@@ -99,3 +99,34 @@ def test_binding_verdict_has_no_fictional_cpu_deficit():
             verdict = verdicts_for_plan(plan)["ai"]
         assert verdict["binding"] == binding
         assert verdict["deficit_cpu"] == deficit
+
+
+def test_waiting_treats_the_prose_preference_as_soft(monkeypatch):
+    """Since t_efd1497a the prose host preference is soft: a card whose preferred hosts are full waits on any
+    other eligible host, not only the preferred ones; with room, the preferred host is chosen first (t_8c580b20,
+    Prism 77c519869eff). A hard set under the preference still bounds it.
+    Mutation: read _ProsePreferred as the hard set in waiting_by_host -> the card waits nowhere (RED)."""
+    from types import SimpleNamespace
+    from hermes_cli.kanban_db_dispatch import _ProsePreferred
+    from hermes_cli.kanban_priority import waiting_by_host
+
+    def host():
+        return SimpleNamespace(slots=1, enabled=True, state="active", profiles=("coder",))
+
+    plan = SimpleNamespace(hosts={"ai": host(), "media": host(), "nas": host()}, slots={}, taken={}, disabled=(),
+                           detail={"ai": {"running": 1}, "media": {"running": 0}, "nas": {"running": 0}},
+                           board_refusal=lambda h, b: None)
+    cards = [{"id": "drop", "assignee": "coder", "asap": False}]
+    routes = {"drop": ("portable", None)}
+
+    def wait(pref, hard):
+        monkeypatch.setattr("hermes_cli.kanban_db_dispatch._portable_only",
+                            lambda *a: (_ProsePreferred(pref, hard), None))
+        monkeypatch.setattr("hermes_cli.kanban_db_dispatch._portable_goes_remote", lambda *a, **k: True)
+        w = waiting_by_host(cards, plan, routes=routes, local_host="studio", conn=object())
+        return [h for h, rows in w.items() if rows]
+
+    assert wait(("ai",), None) == ["media"]                  # preferred host full: any eligible host
+    assert wait(("nas",), None) == ["nas"]                   # preferred host has room: it goes first
+    assert wait(("ai",), ("ai", "nas")) == ["nas"]           # the hard set still bounds the fallback
+    assert wait(("ai",), ("ai",)) == []                      # nothing eligible with room: no host

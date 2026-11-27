@@ -127,9 +127,9 @@ def test_kanban_db_body_routes_local_with_a_healthy_pool(home):
     with kb.connect_closing() as conn:
         tid = _card(conn, "Count blocked runs: sqlite3 -readonly ~/.hermes/kanban.db 'select ...'")
         (route, aff, _out) = _route(conn, tid)
-        # A kanban.db PATH is access-bound (traceability spec §2.6, t_e99ef75c):
-        # the more specific name wins over the studio-state soft rule.
-        assert route == ("local", "access_bound:control-plane-read")
+        # A kanban.db PATH alone no longer binds access_bound:control-plane-read (t_b720fdea): the
+        # studio-state rule judges it, and this fixture map gives no pool host studio-state.
+        assert route == ("local", "studio_affinity:requires:studio-state")
         res, spawned = _tick(conn)
         assert spawned == [(tid, "studio")]
         assert not res.placed
@@ -137,7 +137,7 @@ def test_kanban_db_body_routes_local_with_a_healthy_pool(home):
 
 def test_studio_state_soft_true_spills(home):
     """Kill switch / negative: a studio-state body under `soft: true` routes portable.
-    (turns.db: studio-state, not access-bound; a kanban.db path stays access-bound.)"""
+    (turns.db: studio-state, not access-bound; since t_b720fdea a kanban.db path is not access-bound either.)"""
     _map(home, lambda d: d["capabilities"]["studio-state"].update(soft=True))
     with kb.connect_closing() as conn:
         tid = _card(conn, "Count turns: sqlite3 -readonly ~/.hermes/turns.db 'select ...'")
@@ -170,7 +170,7 @@ def test_fleet_ssh_soft_true_leaves_only_the_matrix(home):
     _map(home, lambda d: d["capabilities"]["fleet-ssh"].update(soft=True))
     with kb.connect_closing() as conn:
         # No sudo: fleet-ssh + matrix only (a sudo body is access-bound, §2.6).
-        tid = _card(conn, "Step 1: ssh ci 'lspci -vv -s 80:01.1'")
+        tid = _card(conn, "reach: ci\nStep 1: ssh ci 'lspci -vv -s 80:01.1'")
         (route, _aff, out) = _route(conn, tid)
         assert route == ("local", None) and tid not in out.get("reasons", {})
 
@@ -272,6 +272,33 @@ def test_identity_only_waits_with_no_pool_plan(home):
                                 spillover=None, reconcile_orphans=False)
         assert spawned == [pinned]
         assert res.placement_waits[tid] == "requires_unsatisfied:docker"
+
+
+# -- t_c82eded0: prose_pins_advisory on never drops a HARD class ----------------------
+
+def _prose_on(monkeypatch):
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {
+        "capabilities": "enforce", "body_requires_mode": "enforce", khc.PROSE_KNOB: True}})
+
+
+def test_prose_knob_on_body_sniffed_docker_still_waits(home, monkeypatch):
+    """Apollo review of #255 F1/F3: docker is `soft: false`; prose may not drop it to an advisory."""
+    _prose_on(monkeypatch)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, DOCKER)
+        res, spawned = _tick(conn)
+        assert spawned == [] and not res.placed
+        assert res.placement_waits[tid] == "requires_unsatisfied:docker"
+
+
+def test_prose_knob_on_ssh_sudo_stays_access_bound(home, monkeypatch):
+    _prose_on(monkeypatch)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, "Step 1: ssh ci sudo setpci -s 80:01.1 CAP_EXP+30.w=0003:000f")
+        (route, _aff, out) = _route(conn, tid)
+        assert route[0] == "local"
+        assert "access_bound:ssh-root:ci" in out["reasons"][tid]
+        assert "requires:fleet-ssh" in out["reasons"][tid]
 
 
 def test_worker_env_honours_the_map_hardness(home):

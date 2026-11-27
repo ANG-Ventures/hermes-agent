@@ -63,7 +63,10 @@ def fleet(home):
 
 
 def _mode(monkeypatch, mode="enforce", **extra):
-    pl = {"capabilities": mode, **extra}
+    # These cases pin the prose-derived holds (body sniff, named skill, CARD_NEEDS); they run with
+    # t_c82eded0's kill switch off, which keeps those routes byte-identical. The default (on) is
+    # covered in test_kanban_prose_pins_advisory.py.
+    pl = {"capabilities": mode, khc.PROSE_KNOB: False, **extra}
     monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": pl})
 
 
@@ -189,6 +192,45 @@ def test_body_sniff_pins_and_comments(home, fleet, monkeypatch):
 
 
 # -- 4: overrides and the rule order (F3) ----------------------------------------
+
+@pytest.mark.parametrize("cap,body", [
+    ("browser-session", "add these to the cart on :9222"),
+    # The live case (t_2a81d813): studio-state carries ``"soft": false`` in the map.
+    ("studio-state", "scripts/fleet-merge.sh must refuse when queue detection is unreadable"),
+])
+@pytest.mark.parametrize("override", ["host: any", "requires: none", ""])
+def test_held_body_sniff_rechecked_next_tick(home, fleet, monkeypatch, override, cap, body):
+    _mode(monkeypatch)
+    held = f"studio_affinity:requires:{cap}"
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=body)
+        res, spawned = _tick(conn)
+        assert spawned == []
+        assert res.placement_waits[tid] == held
+        from hermes_cli import kanban_placement_view as pv
+        assert not any("body edited" in line for line in pv.format_task(pv.task_block(conn, tid)))
+        kb.edit_task(conn, tid, body=override + "\n" + body)
+        # Before the next routing tick the view says the hold predates the edit.
+        view = pv.format_task(pv.task_block(conn, tid))
+        assert any(line.startswith(f"  held: {held}") for line in view), view
+        assert any("body edited after this hold" in line for line in view), view
+    # Reopen the DB to exclude in-memory routing state from the proof.
+    with kb.connect_closing() as conn:
+        res, spawned = _tick(conn)
+        if override:
+            assert spawned == [(tid, "ace-ai")]
+            assert tid not in res.placement_waits
+            assert _events(conn, tid, "placement_affinity")[-1] == {"cleared": True}
+            released = _comments(conn, tid, prefix="auto-pin released:")
+            assert len(released) == 1
+            assert "current body and skills" in released[0]
+            # A later tick must not repeat the release confirmation.
+            _tick(conn)
+            assert _comments(conn, tid, prefix="auto-pin released:") == released
+        else:
+            assert spawned == []
+            assert res.placement_waits[tid] == held
+
 
 def test_body_sniff_overridden_by_host_any(home, fleet, monkeypatch):
     _mode(monkeypatch)

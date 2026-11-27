@@ -603,3 +603,94 @@ def test_e2e_close_record_sha_on_the_default_branch_still_closes(board, monkeypa
         assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by=f"{SHA} {SHA_B}", summary="x") is True
         ev = [e for e in kb.list_events(conn, tid) if e.kind == "routed_pr_superseded"]
         assert ev and ev[0].payload["close_record_sha"] == {f"{REPO}#4736": SHA}
+
+
+# --- t_1b2322fe: supersession by DELETION (hermes-home#9919: main deleted skill-ceiling.yml in 8856835e72) ------
+WF = ".github/workflows/skill-ceiling.yml"
+EDIT = {"filename": WF, "status": "modified", "patch": "@@ -1 +1,2 @@\n jobs:\n+    if: guard\n"}
+
+
+def _fake_deletion(monkeypatch, tree, files=(EDIT,), descends=True):
+    """``_fake_github`` plus the merge-base -> requested-sha ancestry read the deletion path makes."""
+    _fake_github(monkeypatch, list(files), tree)
+    inner = sc._json
+
+    def fake_json(args):
+        if args[0].startswith(f"repos/{REPO}/compare/{MB_SHA}..."):
+            return {"status": "ahead" if descends else "behind"}
+        return inner(args)
+    monkeypatch.setattr(sc, "_json", fake_json)
+
+
+DELETED_TREE = {MB_SHA: {WF: b"jobs:\n"}, HEAD_SHA: {WF: b"jobs:\n    if: guard\n"}, OLD: {}, TIP: {}}
+
+
+def test_file_deleted_at_the_named_sha_is_carried(monkeypatch):
+    _fake_deletion(monkeypatch, DELETED_TREE)
+    out = sc.pr_content_check(REPO, 7, OLD)
+    assert out["differs"] == [] and out["sha"] == OLD and out["deleted"] == [WF]
+
+
+@pytest.mark.parametrize("tree,descends", [
+    ({**DELETED_TREE, OLD: {WF: b"jobs:\n"}, TIP: {WF: b"jobs:\n"}}, True),   # file still exists without the edit
+    ({**DELETED_TREE, TIP: {WF: b"jobs:\n"}}, True),                         # deleted, then re-added on main
+    (DELETED_TREE, False),                                                    # named sha predates the merge-base
+])
+def test_deletion_mutants_still_differ(monkeypatch, tree, descends):
+    _fake_deletion(monkeypatch, tree, descends=descends)
+    out = sc.pr_content_check(REPO, 7, OLD)
+    assert out["differs"] == [WF] and "deleted" not in out
+
+
+def test_an_added_file_absent_on_main_is_not_a_deletion(monkeypatch):
+    _fake_deletion(monkeypatch, {HEAD_SHA: HEAD_TREE, OLD: {}, TIP: {}}, files=(ADDED,))
+    assert sc.pr_content_check(REPO, 7, OLD)["differs"] == ["new.py"]
+
+
+def test_deletion_does_not_excuse_the_other_files(monkeypatch):
+    tree = {**DELETED_TREE, HEAD_SHA: {**DELETED_TREE[HEAD_SHA], **HEAD_TREE}}
+    _fake_deletion(monkeypatch, tree, files=(EDIT, ADDED))
+    assert sc.pr_content_check(REPO, 7, OLD)["differs"] == ["new.py"]
+
+
+def _contract_card(conn):
+    """t_b2a11622's shape: a PR-contract card whose own PR closed unmerged."""
+    tid = kb.create_task(conn, title="guard", assignee="worker", completion_contract=PR_URL)
+    kb.claim_task(conn, tid)
+    run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+    conn.execute("UPDATE task_runs SET metadata=? WHERE id=?",
+                 ('{"pr_url": "%s", "changed_files": ["%s"]}' % (PR_URL, WF), run))
+    conn.commit()
+    return tid, run
+
+
+def test_e2e_card_whose_file_main_deleted_closes_naming_the_deleting_sha(board, monkeypatch):
+    _gate_stubs(monkeypatch, sc.pr_content_check)
+    _fake_deletion(monkeypatch, DELETED_TREE)
+    from hermes_cli import kanban_pr_acceptance_store as store
+
+    def no_read(*_a, **_k):
+        raise AssertionError("a verified superseder needs no read of the closed PR's checks")
+    monkeypatch.setattr(store, "collect_acceptance", no_read)
+    with kb.connect() as conn:
+        tid, run = _contract_card(conn)
+        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by=OLD,
+                                summary="main deleted the workflow") is True
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "done"
+        meta = kb.list_runs(conn, tid)[-1].metadata
+        assert meta["superseded_by"] == OLD
+        assert meta["superseded_content"][0]["sha"] == OLD
+        receipt = [e.payload for e in kb.list_events(conn, tid) if e.kind == "pr_acceptance"][-1]
+        assert receipt["ok"] is True and receipt["classification"] == "superseded"
+        assert receipt["superseded_by"] == OLD
+
+
+def test_e2e_card_whose_file_still_exists_is_refused(board, monkeypatch):
+    _gate_stubs(monkeypatch, sc.pr_content_check)
+    _fake_deletion(monkeypatch, {**DELETED_TREE, OLD: {WF: b"jobs:\n"}, TIP: {WF: b"jobs:\n"}})
+    with kb.connect() as conn:
+        tid, run = _contract_card(conn)
+        with pytest.raises(sc.SupersededContentError, match="skill-ceiling.yml"):
+            kb.complete_task(conn, tid, expected_run_id=run, superseded_by=OLD, summary="x")
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+        assert "pr_acceptance" not in [e.kind for e in kb.list_events(conn, tid)]

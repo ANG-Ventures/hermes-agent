@@ -1,6 +1,7 @@
 """Tests for the dashboard-managed file browser API."""
 
 import base64
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -458,3 +459,124 @@ def test_git_branch_decodes_utf8_under_a_gbk_default_codec(tmp_path, monkeypatch
     monkeypatch.setattr(subprocess, "_text_encoding", lambda: "gbk")
 
     assert _rt_files._fs_git_branch(str(tmp_path)) == branch
+
+
+def _listed(client, root):
+    listing = client.get("/api/files", params={"path": str(root)})
+    assert listing.status_code == 200, listing.text
+    return {e["name"]: e for e in listing.json()["entries"]}
+
+
+@pytest.mark.parametrize("client_fixture", ["local_files_client", "forced_files_client"])
+def test_listing_survives_a_dangling_symlink(client_fixture, request):
+    """One dangling symlink used to 500 the whole listing (Bombadil trial, t_58581647)."""
+    client, root = request.getfixturevalue(client_fixture)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "a.txt").write_text("hi")
+    (root / "broken").symlink_to("/nonexistent/target")
+
+    entries = _listed(client, root)
+
+    assert entries["a.txt"]["size"] == 2
+    assert "broken" not in entries["a.txt"]
+    broken = entries["broken"]
+    assert broken["path"] == str(root.resolve() / "broken")
+    assert broken["type"] == "link"
+    assert broken["broken"] is True
+    assert broken["is_directory"] is False
+    assert broken["size"] is None
+
+
+@pytest.mark.parametrize("client_fixture", ["local_files_client", "forced_files_client"])
+def test_listing_survives_a_symlink_loop(client_fixture, request):
+    client, root = request.getfixturevalue(client_fixture)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "a.txt").write_text("hi")
+    (root / "loop1").symlink_to(root / "loop2")
+    (root / "loop2").symlink_to(root / "loop1")
+
+    entries = _listed(client, root)
+
+    assert entries["a.txt"]["size"] == 2
+    for name in ("loop1", "loop2"):
+        assert entries[name]["broken"] is True
+        assert entries[name]["size"] is None
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads any directory")
+def test_unreadable_directory_still_errors(forced_files_client):
+    client, root = forced_files_client
+    locked = root / "locked"
+    locked.mkdir(parents=True)
+    (locked / "a.txt").write_text("hi")
+    locked.chmod(0)
+    try:
+        listing = client.get("/api/files", params={"path": str(locked)})
+    finally:
+        locked.chmod(0o755)
+    assert listing.status_code == 403
+    assert listing.json()["detail"] == "Directory is not readable"
+
+
+def test_link_inside_locked_root_pointing_outside_is_one_broken_entry(forced_files_client, tmp_path):
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret-name.txt").write_text("secret")
+    (root / "a.txt").write_text("hi")
+    (root / "out").symlink_to(outside / "secret-name.txt")
+
+    listing = client.get("/api/files", params={"path": str(root)})
+
+    assert listing.status_code == 200, listing.text
+    entries = {e["name"]: e for e in listing.json()["entries"]}
+    assert set(entries) == {"a.txt", "out"}
+    assert entries["out"]["broken"] is True
+    assert entries["out"]["path"] == str(root.resolve() / "out")
+    assert "secret-name" not in listing.text
+    assert str(outside) not in listing.text
+
+
+def test_listed_directory_swapped_for_outside_link_still_403s(forced_files_client, tmp_path, monkeypatch):
+    """The listed dir replaced by a link to an outside dir between validation and
+    scandir must not list the outside dir (Prism 6beec0bd4d34)."""
+    client, root = forced_files_client
+    listed = root / "sub"
+    listed.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "plain-outside.txt").write_text("secret")
+    (outside / "link-outside").symlink_to(outside / "plain-outside.txt")
+
+    real_scandir = os.scandir
+    listed_real = str(listed.resolve())
+
+    def swapping_scandir(path=None):
+        if str(path) == listed_real:
+            os.rmdir(listed_real)
+            os.symlink(str(outside), listed_real)
+        return real_scandir(path)
+
+    monkeypatch.setattr(_rt_files.os, "scandir", swapping_scandir)
+    listing = client.get("/api/files", params={"path": str(listed)})
+
+    assert listing.status_code == 403, listing.text
+    assert "plain-outside" not in listing.text
+    assert "link-outside" not in listing.text
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads any directory")
+def test_non_link_whose_stat_fails_is_not_returned_as_a_link(forced_files_client):
+    client, root = forced_files_client
+    noexec = root / "noexec"
+    noexec.mkdir(parents=True)
+    (noexec / "plain.txt").write_text("hi")
+    (noexec / "child").mkdir()
+    noexec.chmod(0o444)
+    try:
+        listing = client.get("/api/files", params={"path": str(noexec)})
+    finally:
+        noexec.chmod(0o755)
+    assert listing.status_code != 200, listing.text
+    assert '"link"' not in listing.text

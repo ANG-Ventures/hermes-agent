@@ -159,6 +159,21 @@ def flush_before_selecting() -> None:
         sync()
 
 
+def _checkout_venv(project_root: Path) -> Path | None:
+    """External ownership applies only to this checkout's own interpreter."""
+    import sys
+
+    owned = os.environ.get("HERMES_CHECKOUT_VENV")
+    if owned:
+        root = Path(project_root).resolve()
+        environment = Path(owned).absolute()
+        if ((root / ".git").exists() and environment == root / "venv"
+                and Path(sys.prefix).absolute() == environment
+                and (environment / "pyvenv.cfg").is_file()):
+            return environment
+    return None
+
+
 def selected_venv(project_root: Path) -> Path:
     """Use the committed environment, or the original install before first sync.
 
@@ -168,17 +183,17 @@ def selected_venv(project_root: Path) -> Path:
     ``flush_before_selecting``, so the ``pyvenv.cfg`` probe below is a sanity
     check against a vanished tree, not the durability guarantee.
     """
-    return _recorded_venv(project_root) or base_venv(project_root)
+    return _checkout_venv(project_root) or _recorded_venv(project_root) or base_venv(project_root)
 
 
 def committed_venv(project_root: Path) -> Path | None:
     """The environment PM committed for this install (or a sealed payload's own), else ``None``.
 
-    Unlike ``selected_venv`` this never answers with the in-tree ``venv``/``.venv``: that tree
-    predates PM and is built for whichever interpreter created it, so loading it from PM's store
-    Python mixes ABIs (compiled modules vanish) and PM deletes it once a generation is committed.
+    An external checkout contract takes precedence only for its own interpreter.
+    Otherwise, unlike ``selected_venv``, this never falls back to an in-tree venv:
+    loading that tree from PM's store Python would mix ABIs.
     """
-    return _recorded_venv(project_root) or payload_venv(project_root)
+    return _checkout_venv(project_root) or _recorded_venv(project_root) or payload_venv(project_root)
 
 
 def _recorded_venv(project_root: Path) -> Path | None:
@@ -309,6 +324,34 @@ def activate_dependencies(project_root: Path) -> None:
     Already-running processes are never switched after a dependency install.
     """
     import sys
+
+    # Supervised external deployers own this checkout venv, including its lock sync.
+    # Lazy-install suppression alone does not opt out of PM's import-path selection.
+    owned = os.environ.get("HERMES_CHECKOUT_VENV")
+    if owned:
+        root = Path(project_root).resolve()
+        environment = _checkout_venv(project_root)
+        if environment is not None:
+            # A parent launcher's checkout root is as stale as its site-packages.
+            selected = site_packages(environment)
+            inherited = {Path(p).resolve() for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p}
+            keep = {root, selected.resolve()}
+            sys.path[:] = [str(root), str(selected), *[
+                entry for entry in sys.path
+                if Path(entry).resolve() not in inherited | keep
+                and Path(entry).name not in ("site-packages", "dist-packages")]]
+            os.environ["PYTHONPATH"] = os.pathsep.join([str(root), str(selected)])
+            return
+        # Workers, cron and terminal children may deliberately use another Python.
+        # The supervisor's contract does not own that interpreter or its children.
+        os.environ.pop("HERMES_CHECKOUT_VENV", None)
+        supervisor = Path(owned).absolute()
+        if supervisor.name == "venv":
+            rejected = {supervisor.parent.resolve(), site_packages(supervisor).resolve()}
+            inherited = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+            os.environ["PYTHONPATH"] = os.pathsep.join(
+                entry for entry in inherited if entry and Path(entry).resolve() not in rejected)
+            sys.path[:] = [entry for entry in sys.path if Path(entry).resolve() not in rejected]
 
     state = install_state_dir(project_root)
     if state.is_dir():

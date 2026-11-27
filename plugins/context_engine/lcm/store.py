@@ -31,6 +31,7 @@ from .db_bootstrap import (
     run_versioned_migrations,
 )
 from .config import LCMConfig
+from .tail_check import maybe_check_store_tail
 from .ingest_protection import (
     protect_message_for_ingest,
     protect_messages_for_ingest,
@@ -58,15 +59,9 @@ from .search_query import (
 from .message_content import normalize_content_value as _normalize_content_value
 from .storage_security import RowCipher, ensure_lcm_file_permissions
 from .tokens import count_message_tokens
+from .sqlite_util import StoreClosed, guard_connection  # noqa: F401  (StoreClosed re-exported)
 
 logger = logging.getLogger(__name__)
-
-
-class StoreClosed(sqlite3.Error):
-    """The store's connection was closed; the call never touched SQLite.
-
-    Subclasses ``sqlite3.Error`` so existing fail-open ``except sqlite3.Error`` callers keep working.
-    """
 
 
 def _open_conn(method):
@@ -372,6 +367,8 @@ class MessageStore:
             db_path=self.db_path,
         )
         self._conn: Optional[sqlite3.Connection] = None
+        # Open-time tail check verdict (tail_check.py); None when no check was due.
+        self.tail_health: Optional[Dict[str, Any]] = None
         # ``self._conn`` is shared across threads (the connection is opened with
         # ``check_same_thread=False``). SQLite's own C-level mutex serializes
         # statements at the engine layer, but the Python ``sqlite3`` module
@@ -392,9 +389,20 @@ class MessageStore:
         self._init_db()
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = guard_connection(sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
+        # Fork (t_ba5a93d0): keep this connection's temp storage in RAM. Every ingest INSERT runs
+        # the msg_fts_insert trigger inside the batch transaction, so SQLite gives it a statement
+        # journal, and past 64 KiB that journal spilled to an etilqs_* file: ~10.6 GB/day of SSD
+        # writes from the Studio's default gateway. Bound, measured replaying 3,000 real rows on a
+        # copy of the 14 GB lcm.db: largest single statement journal 0.44 MB; WAL bytes unchanged.
+        # Searches on this connection now sort in RAM as well: at most 75 MB per call over 24 real
+        # queries (with temp files they wrote up to 8.2 GB per call); results identical.
+        self._conn.execute("PRAGMA temp_store = MEMORY")
+        # After an unclean gateway exit, read back the tail the last checkpoints
+        # wrote before any schema write touches it (t_6314cc2f). Bounded, never raises.
+        self.tail_health = maybe_check_store_tail(self._conn, self.db_path, self._hermes_home)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,

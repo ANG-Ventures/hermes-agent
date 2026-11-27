@@ -241,6 +241,33 @@ def test_provider_only_entry_missing_runtime_provider_stays_undeclared():
     assert sched._fallback_was_declared(job, "", "claude-opus-4-8") is False
 
 
+# t_1fbc5271: review-disposition-failsafe (pinned claude-dtlr/claude-opus-5-5, no fallback list)
+# paged #alerts for claude-dtlr/claude-fable-5-1 -> claude-dtlr/claude-opus-5-5: it ended on its
+# own primary. Only a run that ends on a provider/model the job never named pages.
+
+def test_return_to_own_pinned_primary_is_declared(monkeypatch):
+    calls = _capture_deliver(monkeypatch)
+    job = {"id": "rdf", "name": "review-disposition-failsafe", "deliver": "discord:LOGS",
+           "provider": "claude-dtlr", "model": "claude-opus-5-5"}
+    event = {"old_provider": "claude-dtlr", "old_model": "claude-fable-5-1",
+             "new_provider": "claude-dtlr", "new_model": "claude-opus-5-5",
+             "reason_label": "connection dropped"}
+    sched._emit_cron_fallback_alert(job, _FakeAgent(event))
+    assert len(calls) == 1
+    assert "🚨" not in calls[0]["content"]
+    assert calls[0]["job"]["deliver"] == sched._DEFAULT_FALLBACK_LOG_DELIVER
+
+
+@pytest.mark.parametrize("new_provider,new_model", [
+    ("claude-app", "claude-opus-5-5"),      # same model, provider the job never named
+    ("claude-dtlr", "claude-fable-5-1"),    # own provider, model the job never named
+    ("", "claude-opus-5-5"),                # provider unrecorded: cannot vouch, stay loud
+])
+def test_ending_off_own_primary_stays_undeclared(new_provider, new_model):
+    job = {"id": "rdf", "provider": "claude-dtlr", "model": "claude-opus-5-5"}
+    assert sched._fallback_was_declared(job, new_provider, new_model) is False
+
+
 # --- one declared notice per job per day (t_2efae1cd) -----------------------
 # 10-06: xai-oauth was walled all day; morning-digest's declared codex fallback fired on
 # every run and retry and #logs got the same "Cron fallback used" line 3x.

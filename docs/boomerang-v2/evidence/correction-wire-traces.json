@@ -1,0 +1,108 @@
+[
+  {
+    "scenario": "busy",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "claude-pin",
+        "path": "/primary/anthropic/v1/messages"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "claude-second",
+        "path": "/second/anthropic/v1/messages"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cpa-sol",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "claim": {
+      "action": "complete",
+      "assignee": "worker",
+      "board": null,
+      "child_session": "20261108_093738_a08b20",
+      "claimed_at": 1794130658.3193212,
+      "cursor_event_id": 1,
+      "delegation_id": "del-20261108-093738-e996",
+      "event_id": 1,
+      "event_ts": 1,
+      "finished_at": 1794130661.011585,
+      "head": null,
+      "home_sid": "20261108_093736_b8000cc7",
+      "inherit_mode": "summary",
+      "key": "default|t_dd1a58f2|1",
+      "kind": "completed",
+      "max_minutes": 45,
+      "mode": "fork",
+      "outcome": "complete",
+      "path": "notifier",
+      "pr": null,
+      "resurfaced": false,
+      "route": {
+        "chat_id": "scratch",
+        "platform": "discord",
+        "profile": null,
+        "thread_id": ""
+      },
+      "row": "completed",
+      "state": "terminal",
+      "status": "done",
+      "subagent_id": "sa-0-396eac84",
+      "task_id": "t_dd1a58f2",
+      "title": "isolated routing",
+      "verdict_nonce": "6870258d94156f15",
+      "wake_text": "original owner obligation"
+    },
+    "sent": [
+      "boomerang handled t_dd1a58f2 (completed): AUTO-WIRE-4973c510435d4517981025e0ab6b3e9a"
+    ]
+  },
+  {
+    "scenario": "snapshot-timeout",
+    "trace": [],
+    "claim": {
+      "assignee": "worker",
+      "board": null,
+      "child_session": null,
+      "claimed_at": 1794130661.754907,
+      "cursor_event_id": 1,
+      "delegation_id": "del-20261108-093741-d829",
+      "event_id": 1,
+      "event_ts": 1,
+      "head": null,
+      "home_sid": "20261108_093741_bb86b256",
+      "key": "default|t_9e22b742|1",
+      "kind": "completed",
+      "max_minutes": 45,
+      "mode": "fork",
+      "outcome": "failed",
+      "path": "notifier",
+      "pr": null,
+      "reason": "child failed: dispatch failed: boomerang routing-unavailable: parent route activation is still in progress",
+      "resurface_delivered": false,
+      "resurfaced": true,
+      "route": {
+        "chat_id": "scratch",
+        "platform": "discord",
+        "profile": null,
+        "thread_id": ""
+      },
+      "row": "completed",
+      "state": "terminal",
+      "status": "done",
+      "subagent_id": null,
+      "task_id": "t_9e22b742",
+      "title": "isolated routing",
+      "verdict_nonce": "acffdccbfa3b7398",
+      "wake_text": "original owner obligation"
+    },
+    "sent": [
+      "\u26a0\ufe0f boomerang-wake failed t_9e22b742: child failed: dispatch failed: boomerang routing-unavailable: parent route activation is still in progress"
+    ]
+  }
+]

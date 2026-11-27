@@ -71,6 +71,10 @@ class _FakeGateway:
 
     # -- shutdown collaborators the real stop() reaches into ---------------
 
+    # Use the real lease lifecycle even though this fixture starts with no claims.
+    _preserve_pending_session_claims = gw_mod.GatewayRunner._preserve_pending_session_claims
+    _drain_active_session_releases = gw_mod.GatewayRunner._drain_active_session_releases
+
     def _running_agent_count(self):
         return len(self._running_agents)
 

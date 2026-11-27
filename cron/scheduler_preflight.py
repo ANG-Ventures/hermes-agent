@@ -99,6 +99,8 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     requested = (
         job.get("provider") or str((_cron_cfg or {}).get("model_provider") or "").strip() or None)
     model = job.get("model") or cron_env_setting("HERMES_MODEL") or ""
+    from hermes_cli.model_registry import slot_resolve  # preflight the id the run will use
+    model = slot_resolve(model)[0] if isinstance(model, str) else model
 
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     try:

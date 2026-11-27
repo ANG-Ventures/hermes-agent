@@ -211,7 +211,8 @@ def test_parentless_dependency_on_unblockable_card_returns_false(kanban_home: Pa
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="worker")
         with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+            conn.execute("UPDATE tasks SET status=?, next_eligible_at=? WHERE id=?",
+                         (status, 2_000_000_000 if status == "scheduled" else None, tid))
         assert kb.block_task(conn, tid, reason="x", kind="dependency") is False
         assert kb.get_task(conn, tid).status == status
 
@@ -238,10 +239,10 @@ def test_schedule_wake_refuses_unrenderable_wake(kanban_home: Path) -> None:
     """Same class on the ``schedule --at`` writer."""
     with kb.connect_closing() as conn:
         child = _running_task(conn)
-        assert kb.schedule_task(conn, child, reason="gate")
+        assert kb.schedule_task(conn, child, reason="gate", wake_at=2_000_000_000)
         ok, err = kb.set_schedule_wake(conn, child, wake_at=_UNRENDERABLE_WAKE, actor="t")
         assert not ok and "representable" in err
-        assert kb.get_task(conn, child).next_eligible_at is None
+        assert kb.get_task(conn, child).next_eligible_at == 2_000_000_000
 
 
 def test_format_deferred_until_survives_a_stored_unrenderable_wake() -> None:
@@ -269,7 +270,7 @@ def test_parking_a_claimed_review_wakes_back_into_review(kanban_home: Path, park
             assert kb.block_task(conn, tid, reason="wait", kind="deferred",
                                  until=2_000_000_000, expected_run_id=run_id)
         else:
-            assert kb.schedule_task(conn, tid, reason="wait", expected_run_id=run_id)
+            assert kb.schedule_task(conn, tid, reason="wait", expected_run_id=run_id, wake_at=2_000_000_000)
             ok, _ = kb.set_schedule_wake(conn, tid, wake_at=2_000_000_000, actor="t")
             assert ok
         parked = [e for e in kb.list_events(conn, tid) if e.kind == "scheduled"][-1].payload
@@ -291,7 +292,7 @@ def test_parking_an_unclaimed_review_wakes_back_into_review(kanban_home: Path, p
         if park == "deferred_block":
             assert kb.block_task(conn, tid, reason="monday", kind="deferred", until=2_000_000_000)
         else:
-            assert kb.schedule_task(conn, tid, reason="monday")
+            assert kb.schedule_task(conn, tid, reason="monday", wake_at=2_000_000_000)
             ok, _ = kb.set_schedule_wake(conn, tid, wake_at=2_000_000_000, actor="t")
             assert ok
         assert kb.get_task(conn, tid).status == "scheduled"

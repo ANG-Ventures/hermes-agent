@@ -643,7 +643,7 @@ class SessionPersistenceMixin:
 
     def _save_entry(
         self, session_key: str, *, entry_data: Optional[Dict[str, Any]] = None,
-        lock_held: bool = False) -> Optional[int]:
+        lock_held: bool = False, timings: Optional[Dict[str, float]] = None) -> Optional[int]:
         """Persist ONE routing entry via UPSERT — the per-turn fast path (a full rewrite fsyncs a
         multi-MB sessions.json). Returns the routing revision allocated to this write (``None``
         when the key vanished before capture). The key -> session_id mapping never changes here:
@@ -678,7 +678,8 @@ class SessionPersistenceMixin:
             return None
         entry_json, revision, candidate_entry = captured
         persist = lambda inline_lock_held=False: self._persist_captured_entry(  # noqa: E731
-            session_key, entry_json, revision, candidate_entry, lock_held=inline_lock_held)
+            session_key, entry_json, revision, candidate_entry, lock_held=inline_lock_held,
+            **({"timings": timings} if timings is not None else {}))
         if not self._defer_while_locked(persist):
             # Reached with the lock still held only for a non-``_StoreLock`` test double; keep
             # the old in-place fallback snapshot there.

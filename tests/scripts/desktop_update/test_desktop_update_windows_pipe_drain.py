@@ -56,6 +56,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 WINDOWS_PS1 = REPO_ROOT / "scripts" / "desktop-update" / "windows.ps1"
 
 
+@pytest.mark.slow_test(300, reason="Runs the real multi-arm PowerShell pipe/stall fixture with a 300s subprocess bound")
 @pytest.mark.platforms("windows")
 def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
     tmp_path: Path,

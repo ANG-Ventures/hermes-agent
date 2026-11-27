@@ -89,7 +89,16 @@ STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-CODEX_OAUTH_USER_AGENT = f"hermes-cli/{get_version_info().base_version}"
+def codex_oauth_user_agent() -> str:
+    """Resolve runtime identity when constructing an OAuth request."""
+    return f"hermes-cli/{get_version_info().base_version}"
+
+
+def __getattr__(name: str):
+    if name == "CODEX_OAUTH_USER_AGENT":
+        return codex_oauth_user_agent()
+    raise AttributeError(name)
+
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 XAI_OAUTH_ISSUER = "https://auth.x.ai"
 XAI_OAUTH_DISCOVERY_URL = f"{XAI_OAUTH_ISSUER}/.well-known/openid-configuration"

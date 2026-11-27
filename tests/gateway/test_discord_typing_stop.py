@@ -52,7 +52,7 @@ class _FakeRateLimit(Exception):
 def _make_adapter(request_side_effect):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     http = SimpleNamespace(request=AsyncMock(side_effect=request_side_effect))
-    adapter._client = SimpleNamespace(http=http)
+    adapter._client = SimpleNamespace(http=http, is_closed=lambda: False, is_ready=lambda: True)
     return adapter
 
 
@@ -128,9 +128,81 @@ async def test_successful_post_resets_failure_counter(monkeypatch):
 
     # After enough ticks to pass the original 5-failure window, the loop is
     # still running because the success at call 4 reset the counter. (The
-    # 12s post-success sleep is interruptible, so the loop parks there.)
+    # post-success refresh sleep is interruptible, so the loop parks there.)
     await asyncio.sleep(0.2)
     assert not task.done()
 
     await asyncio.wait_for(adapter.stop_typing("chan-3"), timeout=2.0)
     assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_typing_refresh_precedes_discord_expiry(monkeypatch, caplog):
+    """Exercise real loop with fake HTTP latency/time, not real Discord traffic."""
+    clock = 0.0
+    starts = []
+    completions = []
+    delays = []
+    parked = asyncio.Event()
+    real_wait_for = asyncio.wait_for
+
+    async def request(*_a, **_k):
+        nonlocal clock
+        starts.append(clock)
+        clock += 0.4  # transport latency also consumes indicator lifetime
+        completions.append(clock)
+
+    async def fake_wait_for(awaitable, *, timeout):
+        nonlocal clock
+        delays.append(timeout)
+        if len(delays) == 4:
+            parked.set()
+            return await real_wait_for(awaitable, timeout=2.0)
+        awaitable.close()
+        clock += timeout
+        raise asyncio.TimeoutError
+
+    # Replace ONLY the adapter's asyncio reference, not pytest's event loop.
+    monkeypatch.setattr(
+        discord_platform, "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "wait_for": fake_wait_for}),
+    )
+    caplog.set_level("DEBUG", logger=discord_platform.__name__)
+    adapter = _make_adapter(request)
+    chat = "cadence-thread"
+    token = adapter._issue_typing_token(chat)
+    await adapter.send_typing(chat, token=token)
+    task = adapter._typing_tasks[chat]
+    await adapter.send_typing(chat, token=token)
+    assert adapter._typing_tasks[chat] is task  # base refresher must not duplicate
+    try:
+        await real_wait_for(parked.wait(), timeout=2.0)
+        assert len(starts) == 4
+        assert all(0 < b - a < 10 for a, b in zip(starts, starts[1:])), starts
+        assert all(b - a < 10 for a, b in zip(completions, completions[1:]))
+        assert len(set(delays)) == 1  # stable success cadence, not failure backoff
+    finally:
+        await real_wait_for(adapter.stop_typing(chat, token=token), timeout=2.0)
+    assert task.done()
+    assert chat not in adapter._typing_tasks
+    assert chat not in adapter._typing_stop_events
+    assert chat not in adapter._typing_loop_token
+    assert adapter._typing_owner[chat] == token  # stop never mutates owner tokens
+    assert "Discord typing loop started" in caplog.text
+    assert "Discord typing loop ended" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_typing_failure_is_visible_without_logging_response_body(caplog):
+    adapter = _make_adapter(RuntimeError("sensitive response body"))
+    caplog.set_level("INFO", logger=discord_platform.__name__)
+    await adapter.send_typing("failed-channel")
+    task = adapter._typing_tasks["failed-channel"]
+    await asyncio.wait_for(task, timeout=2.0)
+    assert adapter._client.http.request.await_count == 1
+    assert not adapter._typing_tasks
+    assert not adapter._typing_stop_events
+    assert not adapter._typing_loop_token
+    assert "Discord typing indicator failed for failed-channel" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "sensitive response body" not in caplog.text

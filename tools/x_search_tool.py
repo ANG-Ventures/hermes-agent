@@ -236,8 +236,10 @@ def x_search_tool(
         return tool_error(str(exc))
 
     try:
+        from hermes_cli.model_registry import slot_resolve  # x_search.model may name a slot
         payload = {
-            "model": str(_load_x_search_config().get("model") or "").strip() or DEFAULT_X_SEARCH_MODEL,
+            "model": slot_resolve(
+                str(_load_x_search_config().get("model") or "").strip() or DEFAULT_X_SEARCH_MODEL)[0],
             "input": [{"role": "user", "content": query.strip()}],
             "tools": [tool_def],
             "store": False,

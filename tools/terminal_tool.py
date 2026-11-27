@@ -324,6 +324,14 @@ _container_aliases: Dict[str, str] = {}
 _container_alias_lock = threading.Lock()
 
 
+def _cwd_record_key(session_key: Optional[str]) -> str:
+    """Store key for a cwd record. A pool-placed delegate child (delegation.pool_placement) runs in its own
+    remote workspace but inherits the parent's approval session key, so while its lease is bound every read
+    and write goes to the lease's own key; otherwise sibling children share one record (live t_30537365)."""
+    from tools.delegate_pool_placement import bound_env_key
+    return _qualify_task_key(bound_env_key() or str(session_key or "default"))
+
+
 def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """Record *cwd* as *session_key*'s working directory (after a completed
     command, or on workspace-override registration). None/empty keys collapse
@@ -331,7 +339,7 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     qualified (:func:`_qualify_task_key`); the read/clear side qualifies identically."""
     if not isinstance(cwd, str) or not cwd.strip():
         return
-    key = _qualify_task_key(str(session_key or "default"))
+    key = _cwd_record_key(session_key)
     with _session_cwd_lock:
         if _session_cwd.get(key) != cwd:
             _session_cwd[key] = cwd
@@ -340,8 +348,9 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
 def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
     """Recorded cwd for *session_key*, or None. No fallback chain on purpose:
     callers decide what an absent record means. None/empty keys read ``"default"``."""
+    key = _cwd_record_key(session_key)
     with _session_cwd_lock:
-        return _session_cwd.get(_qualify_task_key(str(session_key or "default")))
+        return _session_cwd.get(key)
 
 
 def clear_session_cwd(session_key: str) -> None:
@@ -657,6 +666,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
        keys its own home (``profile:<name>`` under persistent Docker, matching branch 3);
        else ``"default"``, which subagent ids collapse onto to share the parent's container.
     """
+    # A pool-placed delegate child (delegation.pool_placement) owns its own remote env, bound only inside its
+    # own turn: it must never share the parent's ``session:<key>`` env, nor the parent its.
+    from tools.delegate_pool_placement import bound_env_key
+    pool_key = bound_env_key()
+    if pool_key:
+        return pool_key
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
@@ -1084,7 +1099,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
-    gateway_lifecycle_block, home_deletion_block, self_repo_block,
+    gateway_lifecycle_block, home_deletion_block, pkill_argorder_block, self_repo_block,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
 from tools.terminal_tool_result import finalize_foreground_result
@@ -1579,8 +1594,8 @@ def _pre_exec_block(
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
     Order matters: gateway lifecycle first (protects the running gateway),
-    then the dangerous-workdir check, then the protected-home delete guard and the
-    self-repo guard (both local only).
+    then the dangerous-workdir check, then the protected-home delete guard, the
+    pkill/pgrep argument-order guard (any backend), and the self-repo guard (local only).
     """
     blocked = gateway_lifecycle_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
@@ -1597,6 +1612,9 @@ def _pre_exec_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
         background=background,
     )
+    if blocked:
+        raise _Rejected(blocked)
+    blocked = pkill_argorder_block(command=command)
     if blocked:
         raise _Rejected(blocked)
     if env_type == "local":
@@ -1718,8 +1736,8 @@ def terminal_tool(
             acting_for_tid.reset(_acting_token)
         if bounded_guard.timed_out:
             raise _Rejected(_error_json(
-                f"Terminal pre-execution guard did not finish within {guard_timeout}s "
-                "(process-identity probe wedged); the command was not run. Retry the call.",
+                f"Terminal pre-execution safety checks did not finish within {guard_timeout}s; "
+                "the command was not run. Retry the call.",
                 status="error",
             ))
         # Pre-exec security checks (tirith + dangerous command detection);

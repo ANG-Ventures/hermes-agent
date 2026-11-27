@@ -489,6 +489,58 @@ def test_bare_typed_token_is_the_refresh_candidate():
     assert ("typed", "some-model") not in seen
 
 
+def test_refresh_returns_the_first_refusal_and_skips_a_failing_callback():
+    # t_f1cd7951: a callback may name a typed provider it will not serve.
+    provider_seam.register_refresh(lambda reason, name: None)
+    assert provider_seam.refresh("typed", "seam-nobody") is None
+
+    def boom(reason, name):
+        raise RuntimeError("callback failure")
+
+    provider_seam.register_refresh(boom)
+    provider_seam.register_refresh(lambda reason, name: "  " if name == "seam-refused" else None)
+    provider_seam.register_refresh(lambda reason, name: "no row declares it" if name == "seam-refused" else None)
+    provider_seam.register_refresh(lambda reason, name: "second" if name == "seam-refused" else None)
+    assert provider_seam.refresh("typed", "seam-refused") == "no row declares it"
+    assert provider_seam.refresh("typed", "seam-other") is None
+
+
+def test_switch_model_refuses_a_typed_name_a_plugin_refuses():
+    # t_f1cd7951: `/model claude-alx-0` (grammar-legal, undeclared) used to "succeed" as a model
+    # id on the current provider. A refusal from the refresh callback must stop the switch,
+    # bare or provider-qualified, before any routing.
+    from hermes_cli.model_switch import switch_model
+
+    provider_seam.register_refresh(
+        lambda reason, name: "no row declares this face" if name == "seam-undeclared-0" else None)
+    for raw in ("seam-undeclared-0", "seam-undeclared-0/some-model"):
+        res = switch_model(raw, "openrouter", "x", probe_catalog=False)
+        assert res.success is False, raw
+        assert "seam-undeclared-0" in res.error_message and "no row declares this face" in res.error_message
+        assert "No model switch was made" in res.error_message
+    res = switch_model("some-model", "openrouter", "x", explicit_provider="seam-undeclared-0",
+                       probe_catalog=False)
+    assert res.success is False and "no row declares this face" in res.error_message
+
+
+def test_resolve_runtime_provider_refuses_a_requested_name_a_plugin_refuses(monkeypatch):
+    # t_5d8a357f: `--provider claude-dtlx-99` (an unserved seat) fell to AuthError "Unknown provider"
+    # and the CLI walked fallback_providers onto another provider. A plugin refusal on the request
+    # refresh is a ValueError: no fallback chain (CLI, gateway, oneshot) walks it.
+    from hermes_cli import fallback_config, runtime_provider
+
+    provider_seam.register_refresh(
+        lambda reason, name: "no seat serves it" if name == "seam-unserved-99" else None)
+    with pytest.raises(ValueError, match=r"Unknown provider 'seam-unserved-99': no seat serves it\. No fallback"):
+        runtime_provider.resolve_runtime_provider(requested="seam-unserved-99")
+    walked = []
+    monkeypatch.setattr(fallback_config, "get_fallback_chain",
+                        lambda cfg: walked.append(cfg) or [{"provider": "openrouter", "model": "x"}])
+    with pytest.raises(ValueError, match="no seat serves it"):
+        runtime_provider.resolve_runtime_with_fallback({}, requested="seam-unserved-99")
+    assert walked == []
+
+
 # ---------------------------------------------------------------------------
 # providers.list_providers per-generation memo (RC-E2)
 # ---------------------------------------------------------------------------

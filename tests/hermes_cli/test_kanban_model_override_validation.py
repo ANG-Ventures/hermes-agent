@@ -168,12 +168,16 @@ def test_cron_create_and_fallback_chain_refuse_dead_id(kanban_home, lane_catalog
         cron_jobs.create_job(prompt="p", schedule="every 1h", model=DEAD_ID, provider=LANE)
     job = cron_jobs.create_job(prompt="p", schedule="every 1h",
                                model="claude-sonnet-5-5", provider=LANE)
+    # An A-lane create carries the dtlr->btpr default chain (t_6c0138c7); the refused update
+    # must leave whatever chain the job had untouched.
+    before = cron_jobs.get_job(job["id"]).get("fallback")
     with pytest.raises(ValueError, match=DEAD_ID):
         cron_jobs.update_job(job["id"], {"fallback": [
             {"provider": LANE, "model": "claude-sonnet-5-5"},
             {"provider": LANE, "model": DEAD_ID},
         ]})
-    assert cron_jobs.get_job(job["id"]).get("fallback") is None
+    assert cron_jobs.get_job(job["id"]).get("fallback") == before
+    assert all(rung["model"] != DEAD_ID for rung in before or [])
     updated = cron_jobs.update_job(job["id"], {
         "fallback": [{"provider": LANE, "model": DEAD_ID}], "force_model_reason": "testing"})
     assert updated["fallback"][0]["model"] == DEAD_ID

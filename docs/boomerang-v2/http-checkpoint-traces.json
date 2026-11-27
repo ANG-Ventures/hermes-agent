@@ -1,0 +1,200 @@
+{
+  "scope": "synthetic providers; run_entry executor/delivery mocked; detached reconstruction in-process",
+  "cases": [
+    {
+      "scenario": "summary",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "primary",
+          "model": "parent-pin"
+        },
+        {
+          "ordinal": 2,
+          "lane": "second",
+          "model": "second-model"
+        },
+        {
+          "ordinal": 3,
+          "lane": "cross-vendor",
+          "model": "cross-model"
+        }
+      ],
+      "status": "completed",
+      "sentinel": "BOOMERANG-WIRE-c0c8b975379d4b0aa128c80bf114b9e6",
+      "final": "BOOMERANG-WIRE-c0c8b975379d4b0aa128c80bf114b9e6"
+    },
+    {
+      "scenario": "downgrade",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "primary",
+          "model": "parent-pin"
+        },
+        {
+          "ordinal": 2,
+          "lane": "second",
+          "model": "second-model"
+        },
+        {
+          "ordinal": 3,
+          "lane": "cross-vendor",
+          "model": "cross-model"
+        }
+      ],
+      "status": "completed",
+      "sentinel": "BOOMERANG-WIRE-b0e3b9c1a66c417492288191fd97e33d",
+      "final": "BOOMERANG-WIRE-b0e3b9c1a66c417492288191fd97e33d"
+    },
+    {
+      "scenario": "busy",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "primary",
+          "model": "parent-pin"
+        },
+        {
+          "ordinal": 2,
+          "lane": "second",
+          "model": "second-model"
+        },
+        {
+          "ordinal": 3,
+          "lane": "cross-vendor",
+          "model": "cross-model"
+        }
+      ],
+      "status": "completed",
+      "sentinel": "BOOMERANG-WIRE-5d2506966c6246b7a55537c45544ec72",
+      "final": "BOOMERANG-WIRE-5d2506966c6246b7a55537c45544ec72"
+    },
+    {
+      "scenario": "cold",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "primary",
+          "model": "parent-pin"
+        },
+        {
+          "ordinal": 2,
+          "lane": "second",
+          "model": "second-model"
+        },
+        {
+          "ordinal": 3,
+          "lane": "cross-vendor",
+          "model": "cross-model"
+        }
+      ],
+      "status": "completed",
+      "sentinel": "BOOMERANG-WIRE-b7064b0b3fd34358a87f71a43d323b8a",
+      "final": "BOOMERANG-WIRE-b7064b0b3fd34358a87f71a43d323b8a"
+    },
+    {
+      "scenario": "detached",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "primary",
+          "model": "parent-pin"
+        },
+        {
+          "ordinal": 2,
+          "lane": "second",
+          "model": "second-model"
+        },
+        {
+          "ordinal": 3,
+          "lane": "cross-vendor",
+          "model": "cross-model"
+        }
+      ],
+      "status": "completed",
+      "sentinel": "BOOMERANG-WIRE-6bfd0a6dc77d4eed95eb3d4cc5bb3526",
+      "final": "BOOMERANG-WIRE-6bfd0a6dc77d4eed95eb3d4cc5bb3526"
+    },
+    {
+      "scenario": "active-fallback",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "second",
+          "model": "second-model"
+        },
+        {
+          "ordinal": 2,
+          "lane": "cross-vendor",
+          "model": "cross-model"
+        }
+      ],
+      "status": "completed",
+      "sentinel": "BOOMERANG-WIRE-609506b5598641bbb8df7281a5667ce8",
+      "final": "BOOMERANG-WIRE-609506b5598641bbb8df7281a5667ce8"
+    },
+    {
+      "scenario": "disabled",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "primary",
+          "model": "parent-pin"
+        }
+      ],
+      "status": "failed",
+      "sentinel": "BOOMERANG-WIRE-f16922e531e74a1787d87ae7496117ea",
+      "final": "Billing or credits exhausted: HTTP 429: insufficient_quota: synthetic provider exhausted\n\nOpenRouter reported that billing, credits, or account entitlement is exhausted for parent-pin.\nAdd credits or update billing with that provider, then retry.\nOpenRouter billing: https://openrouter.ai/settings/credits\nYou can switch providers temporarily with /model <model> --provider <provider>."
+    },
+    {
+      "scenario": "auto-wake",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "primary",
+          "model": "parent-pin"
+        },
+        {
+          "ordinal": 2,
+          "lane": "second",
+          "model": "second-model"
+        },
+        {
+          "ordinal": 3,
+          "lane": "cross-vendor",
+          "model": "cross-model"
+        }
+      ],
+      "status": "completed",
+      "sentinel": "BOOMERANG-WIRE-04a2b8da52ae484193f7d42beb15e729",
+      "final": "BOOMERANG-WIRE-04a2b8da52ae484193f7d42beb15e729"
+    },
+    {
+      "scenario": "downgrade",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "primary",
+          "model": "parent-pin"
+        }
+      ],
+      "status": "failed",
+      "sentinel": "BOOMERANG-WIRE-93fa6ff901524230997b94e91a06234a",
+      "final": "Billing or credits exhausted: HTTP 429: insufficient_quota: synthetic provider exhausted\n\nOpenRouter reported that billing, credits, or account entitlement is exhausted for parent-pin.\nAdd credits or update billing with that provider, then retry.\nOpenRouter billing: https://openrouter.ai/settings/credits\nYou can switch providers temporarily with /model <model> --provider <provider>."
+    },
+    {
+      "scenario": "downgrade",
+      "trace": [
+        {
+          "ordinal": 1,
+          "lane": "primary",
+          "model": "parent-pin"
+        }
+      ],
+      "status": "failed",
+      "sentinel": "BOOMERANG-WIRE-22101afc1990431b9e4fc0ae81fd7a05",
+      "final": "Billing or credits exhausted: HTTP 429: insufficient_quota: synthetic provider exhausted\n\nOpenRouter reported that billing, credits, or account entitlement is exhausted for parent-pin.\nAdd credits or update billing with that provider, then retry.\nOpenRouter billing: https://openrouter.ai/settings/credits\nYou can switch providers temporarily with /model <model> --provider <provider>."
+    }
+  ]
+}

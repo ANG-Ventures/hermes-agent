@@ -90,7 +90,8 @@ def _tree_size_mb(path: Path, timeout: int = 30) -> Optional[int]:
 def _dirty_split(path: str) -> tuple[bool, List[str]]:
     """(has_tracked_modifications, untracked_paths) — tracked = real work, untracked = archivable."""
     try:
-        result = _git(["status", "--porcelain"], cwd=path, timeout=10)
+        # --no-optional-locks: a timeout kill must not leave index.lock behind (t_fbeea95b)
+        result = _git(["--no-optional-locks", "status", "--porcelain"], cwd=path, timeout=10)
         if result.returncode != 0:
             return True, []  # fail safe: treat as real work
         lines = [line for line in result.stdout.splitlines() if line.strip()]

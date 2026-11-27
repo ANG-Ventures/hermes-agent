@@ -38,6 +38,19 @@ logger = logging.getLogger("gateway.run")
 
 DEFAULT_HUMAN_DELAY_RANGE_MS: tuple[int, int] = (800, 2500)
 
+
+def provider_routing_agent_kwargs(pr: dict) -> dict:
+    """``provider_routing`` config block -> the ``AIAgent`` routing-filter kwargs.
+
+    The one mapping shared by every gateway-built agent: live turns, /background, and the cold
+    boomerang parent rebuilt after a restart (which carried none of them before t_a9bbc4ad)."""
+    return {
+        "providers_allowed": pr.get("only"), "providers_ignored": pr.get("ignore"),
+        "providers_order": pr.get("order"), "provider_sort": pr.get("sort"),
+        "provider_require_parameters": pr.get("require_parameters", False),
+        "provider_data_collection": pr.get("data_collection"),
+    }
+
 _BUSY_INPUT_MODES = {"interrupt", "queue", "steer"}
 
 
@@ -103,6 +116,8 @@ class GatewayConfigLoadersMixin:
         """``channel_overrides`` entry for this channel/thread, or None (also when no config is bound)."""
         from gateway.run import _get_channel_override
         config = getattr(self, "config", None)
+        if config:
+            config = self._channel_overrides_config()  # bound runtime scope names the profile
         if not config:
             return None
         return _get_channel_override(config, platform, chat_id, thread_id=thread_id, parent_id=parent_id)
@@ -569,6 +584,24 @@ class GatewayConfigLoadersMixin:
             return _load_gateway_config().get("provider_routing", {}) or {}
         except Exception:
             return {}
+
+    @staticmethod
+    def _provider_routing_read_error() -> str | None:
+        """Why ``provider_routing`` could not be read, or None (absent block or a mapping).
+
+        ``_load_provider_routing`` is fail-open: an unreadable config.yaml and a config with no block
+        both give ``{}``. Callers that must not run unfiltered on a read error (the cold boomerang
+        parent, t_a9bbc4ad) check this instead."""
+        from gateway.run import _gateway_config_home
+        try:
+            from hermes_cli.config_effective import load_user_config_effective
+            cfg = load_user_config_effective(_gateway_config_home() / "config.yaml", fail_closed=True)
+        except Exception as exc:
+            return f"config.yaml read failed ({type(exc).__name__})"
+        pr = cfg.get("provider_routing") if isinstance(cfg, dict) else None
+        if pr is not None and not isinstance(pr, dict):
+            return f"provider_routing is a {type(pr).__name__}, not a mapping"
+        return None
 
     @staticmethod
     def _load_fallback_model() -> list | None:

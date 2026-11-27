@@ -1170,12 +1170,41 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `cli_auto_subscribe` | `false` | Same auto-subscribe, but for `hermes kanban create` run on the CLI. Off by default because scripts and cron jobs also drive the CLI. When on, only a create carrying a full gateway session identity (`HERMES_SESSION_PLATFORM` + `HERMES_SESSION_CHAT_ID`, which the gateway exports into terminal subprocesses) subscribes; a bare CLI/cron/script create stays silent either way. |
 | `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
-| `lifecycle_channel` | `""` | `platform:chat_id` that receives the notifier's done / ready-for-review / blocked lines instead of the subscriber's chat (e.g. a log channel). The subscriber's agent is still woken. A `needs_input` block on a priority >= 100 card, failure lines, review change requests and triage routing stay in the subscriber's chat. Empty = unchanged. |
-| `lifecycle_digest_seconds` | `0` | With `lifecycle_channel` set: hold its lines and post them as ONE digest message (bounded to one Discord message; overflow folds into a "+N more" tally) once the oldest held line is this many seconds old (`14400` = one post per 4 h). The subscriber's wake is not delayed. `0` = one post per line. |
+| `lifecycle_channel` | `""` | `platform:chat_id` that receives the notifier's done / ready-for-review / blocked lines instead of the subscriber's chat (e.g. a log channel). The subscriber's agent is still woken. A `needs_input` block on a priority >= 100 card, failure lines, review change requests and triage routing stay in the subscriber's chat. Empty = unchanged. `file:<path>` (e.g. `file:state/kanban-lifecycle-digest.jsonl`, relative to `HERMES_HOME`) keeps them off chat: each line or digest is appended to that file as one JSON line `{ts, family, text}`. |
+| `lifecycle_digest_seconds` | `1800` | With `lifecycle_channel` set: hold its lines and post them as ONE digest message (bounded to one Discord message; overflow folds into a "+N more" tally) once the oldest held line is this many seconds old (`14400` = one post per 4 h). A card that re-enters the same state several times in one window is one line, tagged `×N`. The subscriber's wake is not delayed. `0` = one post per line. |
 | `lifecycle_route` | `"channel"` | With `lifecycle_channel` set: `channel` (default) sends every done / ready-for-review / blocked line to `lifecycle_channel`; review hand-offs still wake the owner and changes-requested stays in the subscriber's chat. `home` (opt-in) posts done / ready-for-review / blocked / changes-requested lines in the card's HOME chat (the origin chat of its home session); `lifecycle_channel` gets a line only when the card has no home (`[no-home]`) or the home cannot be reached (`[home-unreachable:<reason>]`). Re-home a card with `hermes kanban rehome <id> --session <sid>`. |
 | `lifecycle_home_digest_seconds` | `120` | Fold home-chat lines into one post per home chat once the oldest is this old. `0` = one post per line. |
 | `wake_owner_session` | `true` | A card event that needs its owner enqueues a handoff TURN into the card's home session when that session is live in an operator gateway: a `needs_input` block, a block whose reason names a time or precondition, a stalled/crashed/gave-up/timed-out worker, the last blocker of open children going done, or a review handback whose PR is red or dirty. One wake per card per 10 min; all cards due for one session go in one turn. The lifecycle line still posts. A card body line `wake: off` opts that card out. |
 | `wake_owner_profiles` | `["default", "aegis"]` | Gateway profiles whose sessions count as operator sessions for `wake_owner_session`. |
+
+Cards opted into `boomerang_wake` route blocked events (including `needs_input`
+and `capability`) through a bounded child assessment before waking the owner.
+The child reads the block and probes its prerequisite; a label alone does not
+establish that human input is needed. It may request the existing retry action
+only with observed resolution evidence and existing authority. Restricted
+`spend`, `outbound`, and `irreversible` cards can be assessed but cannot be
+unblocked by this handler. Unresolved blocks, missing access, refused verdicts,
+and exhausted attempts return to the owner for assessment, not directly to Ace.
+The owner decides whether human input is required. The persisted claim spends
+one attempt atomically; repeated blocks share the existing per-card retry budget
+until completion/archive or explicit operator reset. Escalation handbacks are
+persisted for delivery retries. No new privileged actions are granted.
+If the owner cannot resolve to a supported chat origin (for example, an API or
+CLI session), blocked events retain native subscription wake delivery instead
+of being claimed by a child whose unresolved handback cannot be delivered.
+Restriction-bearing title/body text is checked again atomically with unblock;
+a concurrent edit refuses the retry and returns the obligation to the owner.
+
+Operator rollout: merge and deploy through the normal runtime lane, then obtain
+fresh per-instance approval before any gateway restart. Verify an opted-in
+transient block is assessed without an owner turn, and an unresolved block
+reaches its owner once. This is a live acceptance step, not proven by unit tests.
+Rollback: use the existing boomerang-wake emergency stop file to restore direct
+wake handling; alternatively revert the change through normal review/deployment.
+Do not delete claims or retry state during rollback (that can replay events).
+
+| Key | Default | Description |
+| --- | --- | --- |
 | `wake_defer_ceiling_s` | `1200` | A wake the contention gate (`wake_load_gate`) downgrades for a HUMAN-owned card (a `human:*` assignee or reviewer; kinds `review_requested`, `blocked`, `block_loop_detected`) is DEFERRED, never dropped: the passive line posts as usual and a pending-wake row (`<HERMES_HOME>/gateway/kanban_pending_wakes.json`, survives restart) is re-evaluated every notifier poll. The wake fires with its original handoff text plus `(deferred Nm under <reason>)` when the gate clears or after this many seconds, whichever comes first; a row whose owner acted on the card meanwhile, or whose card went done/archived, is dropped with a `kanban wake deferred dropped` log line. For a human-owned wake the HOST half of the gate is the dispatcher LoadGate's `proc_paused` state, not load1 alone; the lane-headroom probe still applies. |
 | `notify_suppress` | `{enabled: true, kinds: [completed, archived], self_window_min: 30, closers: [...]}` | Redundant-notification filter on both the subscription notifier and the owner wake. An event whose kind is in `kinds` is withheld from the chat (no line, no wake) when the receiving side caused it itself: the event's `actor_session_id` is the card's home / subscriber session, its `actor_profile` is the home session's operator profile (`default`/`apollo` are one operator), or it was written by one of `closers` (the review-card merge pass) within `self_window_min` minutes after that operator's own `review_coverage` APPROVE on the card. A `notify_suppressed` task event (`event_id`, `kind`, `reason`, `actor`, `path`) records every withheld event, and with `lifecycle_channel` set the line still posts there tagged `[suppressed:<reason>]`. `review_requested`, `changes_requested`, `blocked`, `block_loop_detected`, `crashed`, `timed_out`, `gave_up`, `stalled`, `skipped_nonspawnable` and the last-blocker-done owner wake are never suppressed, whatever `kinds` says; an event with no resolvable actor or operator is delivered (fails open to noise). Subscriptions whose only delivery is the wake (`delivery_mode: wake`, `api_server`) are exempt. `actionable_only` (default `true`) also withholds the WAKE, never the line, when it carries no decision for the owner: a red handback whose every red is inherited from main, a red already woken at the same (card, PR, head, red-set), a handback whose card left `review` before the wake ran, the home session's own `changes_requested`/`review_requested`/`blocked`/`archived` echoed to the home chat, and a `changes_requested` a closer stamped (`actor_profile` exactly one of `closers`). Every withheld event is listed by `kanban show` under "Withheld notifications" (`withheld_notifications` in `--json`). `enabled: false` is the kill switch. |
 
@@ -1279,6 +1308,37 @@ To disable without removing: add `dashboard.plugins.kanban.enabled: false` to `c
 ### Scope boundary
 
 The GUI is deliberately thin. Everything the plugin does is reachable from the CLI; the plugin just makes it comfortable for humans. Auto-assignment, budgets, governance gates, and org-chart views remain user-space — a router profile, another plugin, or a reuse of `tools/approval.py` — exactly as listed in the out-of-scope section of the design spec.
+
+## Studio placement pins
+
+A first-line `host: studio` or `host: mac-studio*` needs a `requires:` line
+naming a Studio-served capability. By default, create and body edits accept an
+unjustified pin unchanged, print a warning listing accepted words, and persist
+one placement notice shared with dispatch. The words come from
+`fleet/host-capabilities.json` (the Studio row plus `control-plane-read`). Add `requires: studio-state` only when the task
+needs that state; otherwise remove the pin. When `CARD_NEEDS` already identifies
+Studio relay, launchd, Obsidian vault, skills tree or live Studio tree work, the
+entry path adds `requires: studio-state` and create reports the derivation.
+`kanban.studio_pin_requires_reason` accepts `notice` (default), `refuse` (opt-in
+rejection), or `off` (no entry warning, notice, or derivation). Legacy booleans
+remain supported: `true` means `refuse`, `false` means `off`. Refusal is not armed
+by default. An absent or invalid capability map retains the existing safe-local behavior.
+
+Card prose alone never pins a card to the Studio
+(`kanban.placement.prose_pins_advisory`, root config, read per tick, default
+`true`). A `CARD_NEEDS` match, a body-sniffed capability or a skill named in the
+body is recorded as the `placement` event's `advisory` list plus one card comment
+starting `placement advisory:`, and the card starts on a pool host. If the work
+really needs the Studio, the worker blocks with `kind=capability` and the
+dispatcher re-routes it once to `host: studio` with a `requires:` word. A
+`requires:` line, an attached skill, a `host:` pin or a structural fact still
+holds a card. `false` restores the old prose holds.
+
+Legacy bare pins can still reach dispatch. The dispatcher logs their removal at
+WARNING (rate-limited per card) and persists one card comment beginning
+`[placement] bare host: studio dropped: add requires:`. Repeated ticks and
+restarts do not duplicate that comment. Placement policy and admission bands
+are unchanged.
 
 ## CLI command reference
 

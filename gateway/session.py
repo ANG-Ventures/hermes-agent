@@ -1975,8 +1975,12 @@ class SessionStore(
         candidate_entry: Optional[Dict[str, Any]],
         *,
         lock_held: bool = False,
+        timings: Optional[Dict[str, float]] = None,
     ) -> None:
-        """Write one captured routing entry; the I/O half of ``_save_entry``."""
+        """Write one captured routing entry; the I/O half of ``_save_entry``.
+
+        ``timings`` receives ``save_lock_s`` / ``upsert_s`` / ``fallback_s`` (see
+        ``mark_user_stopped``)."""
         saver = self._routing_db_method("save_gateway_routing_entry")
         if saver is not None:
             from gateway.routing_identity import SessionKeyConflict
@@ -1985,7 +1989,10 @@ class SessionStore(
                 save_lock = threading.Lock()
                 self._save_lock = save_lock
             try:
+                _t_save_lock = time.monotonic()
                 with save_lock:
+                    if timings is not None:
+                        timings["save_lock_s"] = time.monotonic() - _t_save_lock
                     if getattr(self, "_persisted_routing_generation", 0) >= revision:
                         return
                     fast_persisted = getattr(self, "_fast_persisted_entries", None)
@@ -1995,7 +2002,16 @@ class SessionStore(
                     persisted = fast_persisted.get(session_key)
                     if persisted is not None and persisted[0] >= revision:
                         return
-                    saver(session_key, entry_json, scope=self._routing_scope())
+                    _t_upsert = time.monotonic()
+                    try:
+                        from agent.interrupt_compat import _accepts_keyword
+                        kwargs = {"scope": self._routing_scope()}
+                        if timings is not None and _accepts_keyword(saver, "timings"):
+                            kwargs["timings"] = timings
+                        saver(session_key, entry_json, **kwargs)
+                    finally:
+                        if timings is not None:
+                            timings["upsert_s"] = time.monotonic() - _t_upsert
                     fast_persisted[session_key] = (revision, entry_json)
                     self._valid_routing_keys.add(session_key)
                 return
@@ -2007,6 +2023,18 @@ class SessionStore(
                     "(%s); falling back to full index rewrite",
                     session_key, exc,
                 )
+        _t_fallback = time.monotonic()
+        try:
+            self._persist_captured_entry_fallback(session_key, revision, candidate_entry, lock_held)
+        finally:
+            if timings is not None:
+                timings["fallback_s"] = time.monotonic() - _t_fallback
+
+    def _persist_captured_entry_fallback(
+        self, session_key: str, revision: int, candidate_entry: Optional[Dict[str, Any]],
+        lock_held: bool,
+    ) -> None:
+        """Full-rewrite fallback of ``_persist_captured_entry`` (no DB, or the upsert failed)."""
         if candidate_entry is not None:
             # DB upsert failed (or no DB): build the full snapshot now, carrying
             # the candidate entry so the fallback persists the intended
@@ -2323,8 +2351,14 @@ class SessionStore(
         boot_id: Optional[str] = None,
         last_message_id: Optional[int] = None,
         generation: Optional[int] = None,
+        timings: Optional[Dict[str, float]] = None,
+        expected_session_id: Optional[str] = None,
     ) -> bool:
         """Persist "the user ended this turn with /stop" and retire the hedge.
+
+        ``expected_session_id`` binds the write to the session /stop saw: if the key now
+        routes to another session (``/new`` landed first), the write is skipped. The
+        compression tip of that session counts as the same conversation.
 
         ``generation`` is the gateway run generation this stop claimed. If a resume already
         cleared at that generation or later, this stop lost the race and is skipped, so a stop
@@ -2333,9 +2367,8 @@ class SessionStore(
         Durability is the whole point: the marker must be on disk before
         ``/stop`` acknowledges, or a SIGKILL in that window leaves a stopped
         turn looking exactly like an interrupted one and the next boot
-        re-prompts it. ``_save`` writes state.db (and the sessions.json
-        mirror) synchronously here, so the write happens before the caller
-        can reply.
+        re-prompts it. ``_save_entry`` writes state.db synchronously here, so
+        the write happens before the caller can reply.
 
         ``resume_pending`` is cleared in the same critical section: a stop
         consumes restart-recovery intent, and leaving the two markers to be
@@ -2343,12 +2376,31 @@ class SessionStore(
         resume-pending session with no stop marker.
 
         Returns True when a session existed and was marked.
+
+        ``timings`` (optional dict) receives the sub-stages of this call in seconds:
+        ``lock_s`` (wait for ``_lock``), and from the single-row write ``save_lock_s`` (wait for
+        ``_save_lock``, held by whole-index rewrites), ``upsert_s`` (the SQLite UPSERT) and
+        ``fallback_s`` (full rewrite after a failed upsert).
         """
+        _t_lock = time.monotonic()
         with self._lock:
+            if timings is not None:
+                timings["lock_s"] = time.monotonic() - _t_lock
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
+            if (expected_session_id is not None
+                    and not self._stop_applies_to_entry_locked(entry, expected_session_id)):
+                logger.info(
+                    "Skipping user_stopped write for %s: key now routes to session %s, /stop "
+                    "was for %s", session_key, entry.session_id, expected_session_id)
+                return False
+            if expected_session_id is not None and entry.session_id != expected_session_id:
+                # Compression continuation: the rowid was read from the pre-compression session,
+                # and the continuation's rows all sit above it, so it would read as "the user
+                # spoke after the stop". Stamp None, which the boot gate treats as fail-closed.
+                last_message_id = None
             fence = self._user_stop_fence_locked(session_key)
             if generation is not None:
                 if generation <= fence[1]:
@@ -2359,7 +2411,7 @@ class SessionStore(
                     # boot gate, so the late write changes nothing in memory. Its caller still
                     # acknowledges /stop, so persist the newer marker first: that write may be
                     # deferred behind the save lock or may have failed.
-                    self._save()
+                    self._save_entry(session_key, lock_held=True, timings=timings)
                     return True
                 fence[0] = int(generation)
             # An untracked stop (no generation) leaves the fence as is: never lowered.
@@ -2373,8 +2425,25 @@ class SessionStore(
                 else None
             )
             self._clear_resume_pending_entry(entry)
-            self._save()
+            # One-row UPSERT, not the whole-index rewrite: only this entry's marker fields changed
+            # and the key -> session_id mapping did not. The write still runs (deferred to the
+            # lock release in this thread) before this method returns, so the marker is on disk
+            # before /stop acknowledges; a failed upsert falls back to the full rewrite. Live
+            # 2026-11-08: the full _save made /stop wait 0.6-5.5 s behind other sessions' saves.
+            self._save_entry(session_key, lock_held=True, timings=timings)
         return True
+
+    def _stop_applies_to_entry_locked(self, entry: "SessionEntry", stopped_session_id: str) -> bool:
+        """True when ``entry`` is the conversation a /stop for ``stopped_session_id`` ended.
+
+        Compression rotates the session id (``advance_compression_session`` / compression-tip
+        healing), so the compression tip of the stopped id is the same conversation (Prism r3
+        c-d9f504b2a0758b66). ``/new`` or ``/resume`` routes to an unrelated id: not the same.
+        """
+        if entry.session_id == stopped_session_id:
+            return True
+        tip = self._compression_tip_for_session_id(stopped_session_id)
+        return bool(tip) and tip != stopped_session_id and tip == entry.session_id
 
     def clear_stale_resume_pending(self, max_age_seconds: float) -> int:
         """Clear stale recovery markers without dropping session entries.
@@ -2892,7 +2961,7 @@ class SessionStore(
             entry.user_stopped_at = None
             entry.user_stopped_boot_id = None
             entry.user_stopped_message_id = None
-            self._save()
+            self._save_entry(session_key, lock_held=True)  # one-row write, see mark_user_stopped
             return True
 
     def _reject_session_key_conflict(self, conflict) -> None:

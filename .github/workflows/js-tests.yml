@@ -112,6 +112,13 @@ jobs:
         with:
           command: npm ci
 
+      # A tsc on a solution-style tsconfig ("files": [] plus references) with
+      # -p and no -b checks no file and exits 0. web's typecheck did that and
+      # passed a tree whose dashboard build failed (#514). This lists the files
+      # each typecheck tsc command would check and fails on a command with 0.
+      - name: Every typecheck command checks at least one file
+        run: node .github/scripts/check-typecheck-files.mjs
+
       # Every check runs at the same time. The step fails only after all of
       # them finish. There are two reasons this is not ``npm run --ws check``.
       #

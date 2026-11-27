@@ -1201,6 +1201,9 @@ def _action_create(a: Dict[str, Any]) -> str:
     _admission_warnings = _admission_warnings_for(job, a["model_spec_warning"])
     if _admission_warnings:
         _create_message = f"{_create_message} {' '.join(_admission_warnings)}"
+    _canon = _model_canonicalised(a["model"], job)
+    if _canon:
+        _create_message = f"{_create_message} Model {_canon}."
     # The builtin ticker lives in the gateway process: with no gateway running the job is stored
     # but never fires — tell the model (the CLI already warns).
     _result = {
@@ -1208,8 +1211,17 @@ def _action_create(a: Dict[str, Any]) -> str:
         "skills": job.get("skills", []), "schedule": job["schedule_display"], "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"), "next_run_at": job["next_run_at"], "job": _format_job(job),
         "warnings": _admission_warnings, "message": _create_message, **_gateway_liveness_notice(),
+        **({"model_canonicalised": _canon} if _canon else {}),
     }
     return _dumps(_with_guidance(_result, job, deliver))
+
+
+def _model_canonicalised(requested: Any, job: Dict[str, Any]) -> Optional[str]:
+    """``stored as slot X, currently id Y`` when the store kept the slot for the id asked for
+    (t_efde9d1a), else None."""
+    from hermes_cli.model_registry import slot_store_note
+
+    return slot_store_note(requested if isinstance(requested, str) else None, job.get("model"))
 
 
 def _action_list(a: Dict[str, Any]) -> str:
@@ -1475,9 +1487,13 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
     _update_message = f"Cron job '{updated['name']}' updated."
     if _admission_warnings:
         _update_message = f"{_update_message} {' '.join(_admission_warnings)}"
+    _canon = _model_canonicalised(updates.get("model"), updated)
+    if _canon:
+        _update_message = f"{_update_message} Model {_canon}."
     # An update can switch modes or delivery — echo the same guidance as create.
     return _dumps(_with_guidance(
-        {"success": True, "job": _format_job(updated), "warnings": _admission_warnings, "message": _update_message},
+        {"success": True, "job": _format_job(updated), "warnings": _admission_warnings, "message": _update_message,
+         **({"model_canonicalised": _canon} if _canon else {})},
         updated, _normalize_deliver_param(a["deliver"])))
 
 

@@ -109,6 +109,13 @@ def test_direct_endpoint_spec_persists_credential_reference_not_secret():
                     "api_key": "OLD-MUST-NOT-PERSIST",
                 },
                 parent_agent=parent,
+                children=[SimpleNamespace(
+                    _boomerang_route_source="delegation-default", _fallback_chain=[],
+                    _boomerang_parent_route={"source": "parent", "provider": "custom", "model": "child-model",
+                        "base_url": "https://direct.invalid/v1", "api_mode": "chat_completions",
+                        "fallback_chain": "auto", "request_overrides": {}},
+                    prefill_messages=None,
+                )],
                 session_key="agent:main:telegram:dm:123",
                 parent_session_id="sess-parent",
                 origin_ui_session_id="",
@@ -124,6 +131,8 @@ def test_direct_endpoint_spec_persists_credential_reference_not_secret():
         "parent_provider": "openrouter",
     }
     assert "OLD-MUST-NOT-PERSIST" not in json.dumps(spec)
+    assert spec["source"]["tasks"][0]["credential_ref"] == {"source": "delegation_config"}
+    assert spec["source"]["tasks"][0]["parent_route"]["fallback_chain"] == []
 
 
 def test_recovered_runner_reuses_delegate_task_with_continuation(monkeypatch):

@@ -1,14 +1,16 @@
 """The internal ``delegations`` board (option C, docs/dev/delegate-background-on-kanban-runtime.md §6).
 
 One background ``delegate_task`` unit = one card on this board. Its behaviour differs from every
-other board in four places, all keyed on the slug constant below and never on ``board.json``
+other board in five places, all keyed on the slug constant below and never on ``board.json``
 (a writable file must not switch a board to a different runner or respawn policy, RD-9):
 
 * K1 the worker argv is the delegation-unit runner (``kanban_db_dispatch._default_spawn``);
 * K2 a run that ends without its own terminal call parks the card ``blocked``, never ``ready``
   (no automatic re-run, I3, Ace 2026-10-21 Q1 = a);
 * K4 its running cards are not counted against kanban capacity (Q2 = a);
-* K5 ``create_task`` skips the same-incident overlap gate.
+* K5 ``create_task`` skips the same-incident overlap gate;
+* K6 ``create_task`` skips the per-creator mint cap and the ruling-citation lint: the card is the
+  container of a delegate_task call already made, not a minted work item (t_49e02567).
 """
 from __future__ import annotations
 

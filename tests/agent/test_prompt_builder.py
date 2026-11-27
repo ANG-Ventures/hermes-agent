@@ -742,7 +742,36 @@ class TestEnvironmentHints:
         _pb._BACKEND_PROBE_CACHE.clear()
         assert "Bot Screen" not in _pb.build_environment_hints()
 
+    def test_kanban_worker_placed_on_a_pool_host_is_told_to_run_its_commands_locally(self, monkeypatch):
+        """t_8c580b20: a card naming ace-ai can now be placed ON ace-ai, whose worker
+        has no ssh route to itself (rc 255). The prompt must say so, or the literal
+        `ssh ace-ai '...'` step fails and the worker blocks kind=capability.
+        Mutation: drop the kanban_placement_hint() append -> no line (RED)."""
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
+        _pb._BACKEND_PROBE_CACHE.clear()
+        from hermes_cli import kanban_worker_hosts as kwh
+        from hermes_cli.kanban_worker_pool import PoolHost
+        env: dict = {}
+        host = PoolHost(name="ace-ai", ssh_host="ace-ai", ssh_user="kanbanw", slots=1, capacity_pct=100.0,
+                        absence="", profiles=(), state="", enabled=True, priority=0)
+        kwh.apply_placement(env, host, "/Volumes/fleet-scratch/workspaces/default/t_x", run_id=7)
+        monkeypatch.setenv(kwh.PLACEMENT_ENV, env[kwh.PLACEMENT_ENV])
+        hints = _pb.build_environment_hints()
+        assert "Kanban placement: you are on pool host `ace-ai`" in hints
+        assert "runs ON ace-ai as `kanbanw`" in hints and "Do not `ssh ace-ai`" in hints
+        # Prism 00a13cae6047: a bare alias runs here as kanbanw, not as the alias's configured User.
+        assert "but as kanbanw, NOT as the account that alias logs into" in hints
+        assert "`-o User=<user>`" in hints and "kind=capability" in hints
 
+    @pytest.mark.parametrize("raw", [None, "", "not json", '{"host": "ace-ai", "env": {"TERMINAL_ENV": "local"}}',
+                                     '{"env": {"TERMINAL_ENV": "ssh"}}', '["ace-ai"]'])
+    def test_no_placement_hint_without_a_pool_placement(self, raw):
+        import agent.prompt_builder as _pb
+        env = {} if raw is None else {"KANBAN_WORKER_PLACEMENT": raw}
+        assert _pb.kanban_placement_hint(env) == ""
 
     def test_remote_backend_probe_carries_no_user_home_cwd(self, monkeypatch):
         """#117262: the sandbox's user, $HOME and cwd are user-identifying metadata that

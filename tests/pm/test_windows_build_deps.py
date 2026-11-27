@@ -45,6 +45,7 @@ def _github_environment(path):
     return values
 
 
+@pytest.mark.slow_test(540, reason="Three real PowerShell entrypoint invocations, each bounded to 180s")
 def test_entrypoint_exports_child_environment_and_only_github_deltas(tmp_path):
     """The file protocol preserves Unicode, multiline SDK values and PATH order."""
     entry = tmp_path / "scripts" / "build" / ENTRYPOINT.name

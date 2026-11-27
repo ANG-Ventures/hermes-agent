@@ -482,7 +482,7 @@ class TestBackendCdpResolution:
         result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
         assert result["success"] is True
         assert seen == ["bu-named-r7k2"]
-        assert "bu:r7k2" in result["output"]
+        assert "bu:hermes-" in result["output"]
         assert "ws:wss://browser.example/cdp/bu-named-r7k2" in result["output"]
 
     def test_named_session_key_stable_across_tasks(self, monkeypatch):
@@ -927,7 +927,7 @@ class TestBrowserExec:
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
-        assert "bu:r7k2" in result["output"]
+        assert "bu:hermes-" in result["output"]
         assert result["session"] == "r7k2"
 
     def test_invalid_session_name_rejected(self, monkeypatch, tmp_path):

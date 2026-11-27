@@ -84,6 +84,47 @@ def test_dispatcher_times_out_one_hook_without_holding_the_others(hook_dir: Path
     assert rows[1]["rc"] == 0 and rows[1]["elapsed"] < 1
 
 
+@pytest.mark.parametrize("transient", ["BlockingIOError", "InterruptedError"])
+def test_dispatcher_retries_transient_stdin_write(tmp_path: Path, transient: str) -> None:
+    """A short write followed by EAGAIN/EINTR must not give a security hook truncated JSON."""
+    hook = tmp_path / "read_payload.py"
+    hook.write_text(
+        'import hashlib, json, sys\n'
+        'raw = sys.stdin.buffer.read()\n'
+        'json.loads(raw)\n'
+        'print(hashlib.sha256(raw).hexdigest())\n', encoding="utf-8",
+    )
+    payload = json.dumps({"tool_input": {"command": "é" * 10000}}, ensure_ascii=False)
+    # Inject on the real dispatcher's pipe writes, not a model of its selector loop.
+    bootstrap = '''
+import errno, os
+from agent import shell_hook_dispatcher as dispatcher
+real_write = os.write
+calls = 0
+def write(fd, data):
+    global calls
+    calls += 1
+    if calls == 1:
+        return real_write(fd, data[:512])
+    if calls in (2, 3):
+        raise TRANSIENT(errno.EAGAIN if TRANSIENT is BlockingIOError else errno.EINTR, "injected")
+    return real_write(fd, data)
+os.write = write
+dispatcher.main()
+'''.replace("TRANSIENT", transient)
+    proc = subprocess.run(
+        [sys.executable, "-c", bootstrap],
+        input=json.dumps({"hooks": [{"script": str(hook), "timeout": 5}], "stdin": payload}).encode(),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)
+    assert row["rc"] == 0, base64.b64decode(row["err"])
+    import hashlib
+    assert base64.b64decode(row["out"]).strip().decode() == hashlib.sha256(payload.encode()).hexdigest()
+    assert row["timed_out"] is False
+
+
 def test_dispatcher_reports_an_absent_script_as_missing(hook_dir: Path) -> None:
     rows = _dispatch([{"script": str(hook_dir / "absent.py"), "timeout": 5}])
     assert rows[0] == {"i": 0, "missing": True}

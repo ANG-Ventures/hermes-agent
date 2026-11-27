@@ -26,6 +26,7 @@ def lane(monkeypatch):
     getattr(pt, "_logged_sources", set()).clear()
     state = {"providers": {}, "registry": {}}
     monkeypatch.setattr(pt, "_load_providers_config", lambda: state["providers"])
+    monkeypatch.setattr(pt, "_load_window_default", lambda: None)
     import providers as reg
     monkeypatch.setattr(reg, "get_provider_profile", lambda name: state["registry"].get(name))
     return state

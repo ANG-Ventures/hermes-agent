@@ -99,7 +99,7 @@ def _make_runner():
     runner._is_telegram_topic_root_lobby = lambda _source: False
     runner._should_send_telegram_lobby_reminder = lambda _source: False
     runner._check_slash_access = lambda _source, _command: None
-    runner._begin_session_run_generation = lambda _key: 1
+    # Keep the real generation writer: admission rechecks ownership after offload.
     runner._release_running_agent_state = lambda key, run_generation=None: runner._running_agents.pop(key, None)
     return runner, adapter
 

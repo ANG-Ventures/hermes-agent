@@ -47,7 +47,7 @@ def _worker_card(session_id) -> str:
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="worker card", assignee="worker",
+            conn, boomerang_wake=False, title="worker card", assignee="worker",
             session_id=session_id,
         )
         kbn.add_notify_sub(

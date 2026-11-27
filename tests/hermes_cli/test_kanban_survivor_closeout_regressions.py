@@ -134,6 +134,28 @@ def test_survivor_none_refuses_missing_followup(board):
                          metadata={"changed_files": ["/host/tool"]})
 
 
+@pytest.mark.parametrize("spelling", ["follow-up {card}", "follow-up ops:{card}"])
+def test_survivor_none_accepts_followup_on_another_board(board, spelling):
+    """pc-d96e13d5: the follow-up is often minted on the board that owns the work."""
+    kb.create_board("ops")
+    with kb.connect_closing(board="ops") as other:
+        followup = kb.create_task(other, title="land it on the ops board")
+    tid = kb.create_task(board, title="deployed directly on host")
+    assert kb.complete_task(board, tid, survivor_none=True,
+                            survivor_reason=spelling.format(card=followup))
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert saved["follow_up_card"] == followup
+    assert saved["follow_up_board"] == "ops"
+
+
+def test_survivor_none_still_refuses_a_followup_on_no_board(board):
+    kb.create_board("ops")
+    tid = kb.create_task(board, title="deployed directly on host")
+    with pytest.raises(survivor.SurvivorUnavailable, match="on any board"):
+        kb.complete_task(board, tid, survivor_none=True, survivor_reason="follow-up ops:t_0badc0de")
+    assert kb.get_task(board, tid).status != "done"
+
+
 def test_cli_survivor_none_roundtrip(board, monkeypatch):
     followup = kb.create_task(board, title="repo landing")
     tid = kb.create_task(board, title="host deployment")

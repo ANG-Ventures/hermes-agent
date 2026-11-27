@@ -28,6 +28,7 @@ from tools.environments.local_env_policy import (  # noqa: F401 — _HERMES_PROV
     strip_profile_gate_env)
 from tools.environments.local_pythonpath import (
     _build_hermes_repo_root_aliases, _strip_hermes_owned_pythonpath_and_runtime_markers)
+from tools.spawn_nofork import spawn_popen
 
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -1038,14 +1039,21 @@ class LocalEnvironment(BaseEnvironment):
         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
         if login:
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
-        args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+        from tools.environments.delegated_child_qos import background_prefix
+        # A delegated child's shell starts under darwin background QoS, inherited by its whole tree (t_ba9c58b0).
+        args = [*background_prefix(), bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
-        proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+        popen_kwargs = dict(
+            text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True, cwd=self.cwd,
-            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL, cwd=self.cwd)
+        if _IS_WINDOWS:
+            proc = subprocess.Popen(args, start_new_session=True,
+                                    creationflags=windows_hide_flags(), **popen_kwargs)
+        else:
+            # On macOS Popen(cwd=, start_new_session=) forks the whole gateway under the
+            # GIL (t_afc525a2); spawn_popen posix_spawns there and is plain Popen elsewhere.
+            proc = spawn_popen(args, new_session=True, **popen_kwargs)
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)

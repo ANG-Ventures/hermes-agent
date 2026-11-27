@@ -136,7 +136,7 @@ def worker_session(board, monkeypatch):
 def _foreign_card(conn, assignee):
     tid = kb.create_task(conn, title="foreign", assignee=assignee,
                          session_id="20260927_999999_home")
-    assert kb.block_task(conn, tid, reason="needs input")
+    assert kb.block_task(conn, tid, reason="needs input", kind="needs_input")
     return tid
 
 

@@ -429,3 +429,57 @@ def test_backfill_never_collapses_an_ordinary_comment_into_a_granted_one(journal
     rows = rc.execute("SELECT session_ref, run_id, grant_id FROM task_comments ORDER BY id").fetchall()
     rc.close()
     assert rows == [("sr-other", None, None), ("sr-child", 7, GID)]
+
+
+
+def _journal_at(kanban_journal, monkeypatch, ts, *args, **kw):
+    monkeypatch.setattr(kanban_journal.time, "time", lambda: ts)
+    assert kanban_journal.append(*args, **kw) is True
+
+
+@pytest.mark.parametrize("gap", [0, 7], ids=["same-second", "different-second"])
+def test_replay_upserts_a_replaced_placement_by_run(journal_env, tmp_path, monkeypatch, gap):
+    """t_4b313c15 / Prism 12234d70b060: ``_write_placement`` replaces a worker's ``unrecorded`` placeholder in
+    place and journals the replacement as a plain ``placement`` record. Replay must end with ONE row for the
+    run carrying the launcher's full record: not the placeholder (same second), not two rows (later second)."""
+    kanban_journal, _ = journal_env
+    from hermes_cli import kanban_journal_replay
+
+    snapshot = tmp_path / "snap.db"
+    conn = _make_board_db(snapshot)
+    base = int(time.time()) - 500
+    conn.execute("INSERT INTO tasks VALUES (?,?,?,?)", ("t_p", "t", "running", base))
+    conn.execute("INSERT INTO tasks VALUES (?,?,?,?)", ("t_q", "q", "running", base))
+    conn.commit()
+    conn.close()
+
+    placeholder = {"run_id": 34, "host": "ci-box", "route_class": None, "reason": "unrecorded",
+                   "entry": "worker_registered"}
+    full = {"run_id": 34, "host": "ci-box", "route": "remote-policy", "rule": "policy"}
+    _journal_at(kanban_journal, monkeypatch, base + 10.1, "bp", "t_p", "placement", placeholder, run_id=34)
+    _journal_at(kanban_journal, monkeypatch, base + 10.6 + gap, "bp", "t_p", "placement", full, run_id=34)
+    # A repeated full record for the same run never appends (mirrors _write_placement).
+    _journal_at(kanban_journal, monkeypatch, base + 20, "bp", "t_p", "placement", dict(full, rule="again"),
+                run_id=34)
+    # A run with no prior row still inserts.
+    _journal_at(kanban_journal, monkeypatch, base + 21, "bp", "t_p", "placement", {"run_id": 35, "host": "x"},
+                run_id=35)
+    # Another card's record that carries the same run id never matches t_p's row (lookup keyed by task + run).
+    _journal_at(kanban_journal, monkeypatch, base + 22, "bp", "t_q", "placement", {"run_id": 34, "host": "y"},
+                run_id=34)
+
+    out = tmp_path / "out.db"
+    kanban_journal_replay.replay_into("bp", snapshot, out, since=base)
+    again = tmp_path / "out2.db"
+    kanban_journal_replay.replay_into("bp", out, again, since=base)
+
+    for db in (out, again):
+        rc = sqlite3.connect(str(db))
+        rows = rc.execute("SELECT run_id, payload FROM task_events WHERE kind = 'placement' AND task_id = 't_p' "
+                          "ORDER BY run_id, id").fetchall()
+        other = rc.execute("SELECT run_id, payload FROM task_events WHERE kind = 'placement' AND task_id = 't_q'"
+                           ).fetchall()
+        rc.close()
+        assert [r[0] for r in rows] == [34, 35], rows
+        assert [(r[0], json.loads(r[1])["host"]) for r in other] == [(34, "y")], other
+        assert json.loads(rows[0][1]) == full

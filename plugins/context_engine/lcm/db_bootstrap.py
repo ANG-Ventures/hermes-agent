@@ -105,10 +105,21 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                              end mark.
     - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
                                               readers cache WAL pages in RAM.
+    - checkpoint_fullfsync=ON : on macOS ``fsync(2)`` does not flush the drive
+                                cache, so a checkpoint's writes to the main file
+                                can be lost by a panic/power cut AFTER the WAL
+                                that held them was reset (2026-11-11 Studio
+                                panic: 58 torn pages at the tail of lcm.db).
+                                This uses ``F_FULLFSYNC`` only for the checkpoint
+                                syncs (main file before the WAL reset), not for
+                                every commit; ``fullfsync`` stays OFF. A no-op
+                                on non-Apple platforms. Same setting state.db
+                                uses (hermes_state_wal._apply_macos_checkpoint_barrier).
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA checkpoint_fullfsync=ON")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA mmap_size=268435456")
@@ -2812,6 +2823,7 @@ def _run_background_integrity_scan(
         scan_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
         try:
             scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            scan_conn.execute("PRAGMA checkpoint_fullfsync=ON")
             # Persist the scan-started stamp on this DB so a crash mid-scan is
             # detectable cross-process via the staleness window above.
             _record_scan_started(scan_conn, spec, now=started_at)
@@ -2837,6 +2849,7 @@ def _run_background_integrity_scan(
         meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
         try:
             meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            meta_conn.execute("PRAGMA checkpoint_fullfsync=ON")
             status = result.get("status")
             if parity and status in ("pass", "parity_pass", "fail"):
                 _record_parity_checked(meta_conn, spec, now=started_at)
@@ -2875,6 +2888,7 @@ def _run_background_integrity_scan(
         try:
             cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
             try:
+                cleanup.execute("PRAGMA checkpoint_fullfsync=ON")
                 _clear_scan_started(cleanup, spec, expected=started_at)
                 cleanup.commit()
             finally:
@@ -2938,6 +2952,7 @@ def _dispatch_background_integrity_scan(
             )
             try:
                 claim_conn.execute(f"PRAGMA busy_timeout={INTEGRITY_CLAIM_BUSY_TIMEOUT_MS}")
+                claim_conn.execute("PRAGMA checkpoint_fullfsync=ON")
                 claim_conn.execute("BEGIN IMMEDIATE")
                 _record_scan_started(claim_conn, spec, now=current)
                 claim_conn.commit()
@@ -3491,6 +3506,7 @@ def _run_background_fts_rebuild(
         try:
             rebuild_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             rebuild_conn.execute("PRAGMA synchronous=FULL")
+            rebuild_conn.execute("PRAGMA checkpoint_fullfsync=ON")
             rebuild_conn.execute("BEGIN IMMEDIATE")
             try:
                 # Re-check under the write lock: another process may have

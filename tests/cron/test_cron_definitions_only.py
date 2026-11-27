@@ -80,6 +80,72 @@ def test_definitions_only_mirror(temp_home):
     assert cj.get_job(jid)["last_status"] == "ok"
 
 
+def test_b4_actual_tick_keeps_definitions_byte_stable(temp_home, monkeypatch):
+    """B4: real tick/scan/advance/submit plus real claim/mark; execution boundary only is fake."""
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timedelta, timezone
+    from cron import jobs as cj, scheduler as sched, runtime_state as rs
+    from hermes_cli import backend_retirement
+
+    monkeypatch.setattr(backend_retirement, "retirement", backend_retirement.RetirementFence())
+    monkeypatch.setattr(sched, "_should_yield_tick_to_fresh_gateway", lambda: None)
+    job = cj.create_job(prompt="x", schedule="every 5m", name="b4-tick",
+                        script="fixture-not-executed.py", no_agent=True)
+    due = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+    rs.write_rows(temp_home / "cron", {job["id"]: {"next_run_at": due}})
+    cj.maybe_flush_runtime_mirror(force=True)
+    before = _jobs(temp_home).read_bytes()
+    assert not rs.file_has_runtime(json.loads(before))
+    ran = []
+
+    def execute(rec, *args):
+        assert cj.claim_job_for_fire(rec["id"])
+        claimed = cj.get_job(rec["id"])
+        assert claimed is not None
+        owner = claimed["fire_claim"]["by"]
+        assert cj.mark_job_run(rec["id"], True, expected_fire_owner=owner)
+        ran.append(rec["id"])
+        return True
+
+    monkeypatch.setattr(sched, "_process_due_job", execute)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(sched, "_get_parallel_pool", lambda *args: pool)
+        assert sched.tick(verbose=False, sync=True, lane="script") == 1
+    cj.maybe_flush_runtime_mirror(force=True)
+    assert ran == [job["id"]]
+    assert _jobs(temp_home).read_bytes() == before
+    row = rs.read_all(temp_home / "cron")[job["id"]]
+    assert row["last_status"] == "ok"
+    assert row["next_run_at"] != due
+    merged = cj.get_job(job["id"])
+    assert merged is not None
+    assert merged["next_run_at"] == row["next_run_at"]
+    assert _load(_mirror(temp_home))["jobs"][0]["last_status"] == "ok"
+
+
+def test_b4_migration_preserves_every_next_run(temp_home):
+    """Forty distinct next_run values survive adoption, stripping, DB and consumer mirror."""
+    from datetime import datetime, timedelta, timezone
+    from cron import jobs as cj, runtime_state as rs
+
+    originals = []
+    for i in range(40):
+        originals.append({"id": f"b4job{i:04d}", "name": f"fixture-{i}", "prompt": "x",
+                          "enabled": True, "schedule": {"kind": "interval", "minutes": 5},
+                          "repeat": {"times": None, "completed": i},
+                          "next_run_at": (datetime(2099, 1, 1, tzinfo=timezone.utc)
+                                          + timedelta(minutes=i)).isoformat()})
+    expected = {j["id"]: j["next_run_at"] for j in originals}
+    _jobs(temp_home).write_text(json.dumps({"jobs": originals, "updated_at": "legacy"}))
+    loaded = cj.load_jobs()
+    cj.maybe_flush_runtime_mirror(force=True)
+    _assert_definitions_only(_load(_jobs(temp_home)))
+    assert {j["id"]: j["next_run_at"] for j in loaded} == expected
+    assert {jid: row["next_run_at"] for jid, row in rs.read_all(temp_home / "cron").items()} == expected
+    assert {j["id"]: j["next_run_at"] for j in _load(_mirror(temp_home))["jobs"]} == expected
+    assert {j["id"]: j["next_run_at"] for j in cj.load_jobs()} == expected
+
+
 def test_definition_save_strips_runtime_and_refreshes_mirror(temp_home):
     """A definition edit rewrites jobs.json (definitions only, no updated_at) and the runtime
     mirror carries the new definition at once."""

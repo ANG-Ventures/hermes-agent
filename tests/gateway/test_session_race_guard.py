@@ -9,6 +9,7 @@ duplicate agent.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -235,47 +236,102 @@ async def test_active_session_bypass_commands_dispatch_without_interrupt(
 # Test 6: /stop during sentinel force-cleans and unlocks session
 # ------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_stop_during_sentinel_force_cleans_session():
-    """If /stop arrives while the sentinel is set (agent still starting),
-    it should force-clean the sentinel and unlock the session."""
+@pytest.mark.parametrize("stop_before_inner", [True, False])
+async def test_stop_during_sentinel_force_cleans_session(
+    tmp_path, monkeypatch, stop_before_inner,
+):
+    """/stop unlocks both admission and setup without leaking the stopped lease."""
+    from hermes_cli import active_sessions
+    from tests.gateway.test_max_concurrent_sessions import _silence_global_gateway_hooks
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _silence_global_gateway_hooks(monkeypatch)
     runner = _make_runner()
+    runner.config.max_concurrent_sessions = 1
+    runner._persist_active_agents = MagicMock()
+    runner._mark_user_stopped = AsyncMock()
+    runner._clear_durable_active_turn = AsyncMock()
+    runner._post_turn_hooks_after_delivery = AsyncMock()
     event1 = _make_event(text="hello")
     session_key = build_session_key(event1.source)
-
+    path = tmp_path / "runtime" / "active_sessions.json"
+    entered = asyncio.Event()
+    inner_entered = asyncio.Event()
+    proceed = threading.Event()
     barrier = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    acquire = runner._claim_active_session_slot
+    acquired = []
+    released = []
+    real_release = active_sessions.ActiveSessionLease.release
+
+    def delayed_claim(*args):
+        if stop_before_inner:
+            assert threading.get_ident() != loop_thread
+            loop.call_soon_threadsafe(entered.set)
+            assert proceed.wait(10), "admission barrier was not released"
+        result = acquire(*args)
+        if result[0] is not None:
+            acquired.append(result[0].lease_id)
+        return result
+
+    def release(lease):
+        released.append(lease.lease_id)
+        return real_release(lease)
+
+    monkeypatch.setattr(runner, "_claim_active_session_slot", delayed_claim)
+    monkeypatch.setattr(active_sessions.ActiveSessionLease, "release", release)
 
     async def slow_inner(self_inner, ev, src, qk, generation):
+        inner_entered.set()
         await barrier.wait()
         return "ok"
 
     with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
         task1 = asyncio.create_task(runner._handle_message(event1))
-        for _ in range(50):
-            await asyncio.sleep(0)
-            if runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL:
-                break
+        try:
+            async with asyncio.timeout(10):
+                await (entered if stop_before_inner else inner_entered).wait()
+                assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
+                result = await runner._handle_message(_make_event(text="/stop"))
+                assert result is not None
+                assert "stopp" in result.lower()
+                assert session_key not in runner._running_agents
+                adapter = runner.adapters[Platform.TELEGRAM]
+                assert session_key not in adapter._pending_messages
+                proceed.set()
+                barrier.set()
+                if stop_before_inner:
+                    # /stop invalidated admission; a late lease must not start setup.
+                    with pytest.raises(asyncio.CancelledError):
+                        await task1
+                    assert task1.cancelled()
+                    assert not inner_entered.is_set()
+                else:
+                    # This fake adapter interrupts activity but does not cancel the task.
+                    assert await task1 == "ok"
+                await runner._drain_active_session_releases()
+                assert len(acquired) == 1
+                assert released == acquired
+                assert not active_sessions._read_entries(path)
+                assert session_key not in runner._running_agents
 
-        # Sentinel should be set
-        assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
-
-        # Send /stop — should force-clean the sentinel
-        stop_event = _make_event(text="/stop")
-        result = await runner._handle_message(stop_event)
-        assert result is not None, "/stop during sentinel should return a message"
-        # /stop now confirms with present-progressive "Stopping" wording
-        # (honest: the turn may still be finishing its current step). Match the
-        # "stopp" stem so it accepts both "stopped" and "stopping".
-        assert "stopp" in result.lower()
-        assert session_key not in runner._running_agents, (
-            "/stop must remove sentinel so the session is unlocked"
-        )
-
-        # Should NOT be queued as pending
-        adapter = runner.adapters[Platform.TELEGRAM]
-        assert session_key not in adapter._pending_messages
-
-        barrier.set()
-        await task1
+                # The real cap must admit a successor after the stopped owner drains.
+                assert await runner._handle_message(_make_event(text="successor")) == "ok"
+                await runner._drain_active_session_releases()
+                assert len(acquired) == 2
+                assert acquired[0] != acquired[1]
+                assert released == acquired
+                assert not active_sessions._read_entries(path)
+                assert session_key not in runner._running_agents
+        finally:
+            proceed.set()
+            barrier.set()
+            if not task1.done():
+                task1.cancel()
+            await asyncio.gather(task1, return_exceptions=True)
+            await runner._drain_active_session_releases()
 
 
 # ------------------------------------------------------------------

@@ -1778,14 +1778,14 @@ class TestRestartLoopGuard:
 class TestTerminalToolGatewayLifecycleGuardRemote:
     """Remote-backend and two-session cwd regression coverage."""
 
-    def _patch_env(self, monkeypatch, fake_env, *, inside_gateway: bool):
+    def _patch_env(self, monkeypatch, fake_env, *, inside_gateway: bool, env_type: str = "local"):
         import tools.terminal_tool as tt
         from tools import process_registry
         eid = "default"
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
-        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": env_type, "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
         monkeypatch.setattr(
             process_registry, "_is_supervised_gateway_process",
             lambda: inside_gateway,
@@ -1810,7 +1810,8 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
 
         fake_env = _RemoteEnv()
         fake_env.cwd = "/remote/workspace"
-        self._patch_env(monkeypatch, fake_env, inside_gateway=True)
+        # A real remote backend: the local backend reads in-process and never shells out.
+        self._patch_env(monkeypatch, fake_env, inside_gateway=True, env_type="ssh")
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
 

@@ -132,6 +132,12 @@ class TestInheritContextIntegration:
         parent.providers_ignored = None
         parent.providers_order = None
         parent.provider_sort = None
+        parent.provider_require_parameters = False
+        parent.provider_data_collection = ""
+        parent.requested_provider = "openrouter"
+        parent.request_overrides = {}
+        parent._fallback_chain = []
+        parent._client_kwargs = {}
         parent._session_db = None
         parent._delegate_depth = 0
         parent._active_children = []

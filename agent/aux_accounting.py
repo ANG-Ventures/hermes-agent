@@ -11,10 +11,51 @@ to worker threads via ``tools.thread_context`` and to asyncio tasks automaticall
 from __future__ import annotations
 
 import logging
+import json
+from contextlib import contextmanager
 from contextvars import ContextVar
+from types import SimpleNamespace
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+_capture: ContextVar[Optional[list]] = ContextVar('aux_accounting_capture', default=None)
+
+
+@contextmanager
+def capture_aux_accounting():
+    """Collect usage-only events for a request-owned subprocess to return to its caller."""
+    events = []
+    token = _capture.set(events)
+    try:
+        yield events
+    finally:
+        _capture.reset(token)
+
+
+def _capture_event(kind, response, task, **metadata):
+    events = _capture.get()
+    if events is None:
+        return False
+    raw = getattr(response, 'usage', None)
+    usage = json.loads(json.dumps(raw, default=lambda value: (
+        value.model_dump() if hasattr(value, 'model_dump') else vars(value)
+    )))
+    events.append(dict(kind=kind, task=task, usage=usage,
+                       model=getattr(response, 'model', '') or '',
+                       service_tier=getattr(response, 'service_tier', None), **metadata))
+    return True
+
+
+def replay_aux_accounting(events):
+    """Record each completed child call exactly once in the caller's ambient contexts."""
+    for event in events:
+        response = SimpleNamespace(usage=event['usage'], model=event['model'],
+                                   service_tier=event.get('service_tier'))
+        if event['kind'] == 'usage':
+            record_aux_usage(response, event['task'], provider=event['provider'], base_url=event['base_url'])
+        elif event['kind'] == 'api_call':
+            record_aux_api_call(response, event['task'], event['route_info'],
+                                route_id=event['route_id'], pool_headers=event['pool_headers'])
 
 # (session_db, session_id) for the active agent turn, or None outside one.
 _accounting: ContextVar[Optional[tuple]] = ContextVar("aux_accounting_context", default=None)
@@ -107,6 +148,9 @@ def record_aux_api_call(
     try:
         if response is None or task in _EXCLUDED_TASKS:
             return
+        if _capture_event('api_call', response, task, route_info=route_info,
+                          route_id=route_id, pool_headers=pool_headers):
+            return
         binding = _blackbox_turn.get()
         if binding is None:
             return
@@ -153,6 +197,8 @@ def record_aux_usage(
     """
     try:
         if not task or task in _EXCLUDED_TASKS:
+            return
+        if _capture_event('usage', response, task, provider=provider, base_url=base_url):
             return
         ctx = _accounting.get()
         if ctx is None:

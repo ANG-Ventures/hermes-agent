@@ -206,8 +206,10 @@ PLACEMENT_OUTCOMES = {
 
 
 def _ctx(event, placement, runner_labels, enabled=False):
-    return {"github": {"event_name": event, "run_attempt": RUN_ATTEMPT}, "vars": {"CI_RUNNER_LABELS": runner_labels,
-                                                       "CI_OVERFLOW_PLACEMENT_ENABLED": "true" if enabled else ""},
+    github = {"event_name": event, "run_attempt": RUN_ATTEMPT, "repository": "o/r",
+              "event": {"pull_request": {"head": {"repo": {"full_name": "o/r"}}}}}
+    return {"github": github, "vars": {"CI_RUNNER_LABELS": runner_labels,
+                                     "CI_OVERFLOW_PLACEMENT_ENABLED": "true" if enabled else ""},
             "inputs": {"e2e": True, "e2e_upgrade": True},  # every slow lane requested (ci.yaml on push)
             "needs": {"generate": {"result": "success",
                                    "outputs": {"matrix": json.dumps(GEN_MATRIX),
@@ -327,10 +329,10 @@ def test_mutating_no_plan_fallback_to_local_matrix_fails_integration():
 def test_mutating_no_plan_e2e_fallback_to_local_pool_fails_integration():
     doc = _tests_yml()
     expr = doc["jobs"]["e2e"]["runs-on"]
-    static_tail = "|| '[\"ubuntu-latest\"]')) }}"
+    static_tail = "|| '[\"ubuntu-latest\"]'))) || 'ubuntu-latest' }}"
     assert expr.rstrip().endswith(static_tail)
     doc["jobs"]["e2e"]["runs-on"] = (expr.rstrip()[:-len(static_tail)]
-                                     + "|| '[\"ubuntu-latest\"]') && '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]') }}")
+                                     + "|| '[\"ubuntu-latest\"]') && '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]')) || 'ubuntu-latest' }}")
     assert any("invalid/labels=None: e2e runs-on" in e for e in check_fallback(doc)), check_fallback(doc)
 
 
@@ -528,6 +530,13 @@ def test_fromjson_never_fed_a_possibly_missing_output():
         assert "needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt)" in expr
         assert "local_matrix" not in expr and "hermes-ci" not in expr
         node = _Parser(expr.strip()[3:-2]).parse()
+        if expr == jobs["e2e"]["runs-on"]:
+            # Trust guard short-circuits before parsing any configurable JSON.
+            assert node[:2] == ("op", "||") and node[3] == ("lit", "ubuntu-latest"), expr
+            guarded = node[2]
+            assert guarded[:2] == ("op", "&&"), expr
+            assert "github.event_name" in _refs(guarded[2]), expr
+            node = guarded[3]
         assert node[0] == "call" and node[1] == "fromJSON", expr
         arg = node[2][0]
         assert arg[0] == "op" and arg[1] == "||", expr

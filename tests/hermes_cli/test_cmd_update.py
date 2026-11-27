@@ -106,6 +106,21 @@ class TestGitTrampolineSelfHeal:
         assert result == git_cmd
         run.assert_not_called()
 
+    def test_locator_finds_git_core_beside_path_git(self, tmp_path, monkeypatch):
+        import hermes_cli.update_cmd_git as plumbing
+
+        root = tmp_path / "pm tools" / "git-version"
+        shim = root / "cmd" / "git.exe"
+        core = root / "mingw64" / "libexec" / "git-core" / "git.exe"
+        shim.parent.mkdir(parents=True)
+        core.parent.mkdir(parents=True)
+        shim.touch()
+        core.touch()
+        monkeypatch.setattr("shutil.which", lambda name: str(shim))
+        monkeypatch.setattr(plumbing, "_portable_git_candidates", lambda: [])
+        monkeypatch.setattr(plumbing, "_probe_fork_bomb", lambda argv: False if argv == [str(core)] else None)
+        assert plumbing._locate_real_git() == core
+
     def test_portable_git_candidates_check_shared_root_first(self, tmp_path, monkeypatch):
         # Profile-scoped layout: HERMES_HOME = <root>/profiles/foo, but the
         # PortableGit tree lives under the SHARED root (monerostar review on

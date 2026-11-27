@@ -180,7 +180,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             served_subs_json TEXT,
             attribution TEXT,
             terminal_error TEXT,
-            reasoning_effort TEXT
+            reasoning_effort TEXT,
+            placement_host TEXT,
+            model_slot TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -551,7 +553,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # `reasoning_effort` (t_09a1e42a): the resolved effort label the turn ran
     # at (`xhigh`, `none`, ...), distinct from the `reasoning` TOKEN count.
     # NULL on rows written before the column existed.
-    for _col in ("served_subs_json", "attribution", "terminal_error", "reasoning_effort"):
+    # `placement_host` (t_c9fc6c9f): the box that ran a kanban worker's tools
+    # (pool host name, or `studio-local`); NULL for non-worker turns and for
+    # rows written before the column existed.
+    # `model_slot` (t_5c87d313): the slot the turn asked for (`sol`), `''` for a
+    # literal id; `model` holds the id it resolved to. NULL on older rows.
+    for _col in ("served_subs_json", "attribution", "terminal_error", "reasoning_effort",
+                 "placement_host", "model_slot"):
         if _col not in _existing:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} TEXT")
@@ -920,6 +928,8 @@ _INSERT_TURN_COLUMNS = (
     "terminal_error",
     "lane_family", "vendor", "served_provider",
     "reasoning_effort",
+    "placement_host",
+    "model_slot",
 )
 
 _INSERT_TURN_SQL = (
@@ -1139,6 +1149,10 @@ def insert_turn(
                     (str(record.reasoning_effort).strip() or None)
                     if record.reasoning_effort is not None
                     else None,
+                    (str(record.placement_host).strip() or None)
+                    if record.placement_host is not None
+                    else None,
+                    str(record.model_slot).strip() if record.model_slot is not None else None,
                 ),
             )
             if provisional and cur.rowcount == 0:
@@ -1819,6 +1833,25 @@ _PURE_BILLING_MODES = frozenset({"official_docs_snapshot", "subscription_include
 _ZERO_PERCLASS = {"uncached": 0.0, "cache_read": 0.0, "cache_write": 0.0, "output": 0.0}
 
 
+def _unresolved_slot_row(model: Any, model_slot: Any) -> bool:
+    """True when a row written with the model_slot column still carries a slot name as its model.
+
+    Either the recorded slot itself, or (only for ``model_slot`` ``''``) a model that is a slot name
+    in today's view (t_a8fd1cfa). Only pre-column rows (``model_slot`` NULL) are read through the view.
+    """
+    if model_slot is None:
+        return False
+    slot = str(model_slot).strip().lower()
+    if slot:  # a recorded slot already decides; today's view is not consulted
+        return str(model or "").strip().lower().rsplit("/", 1)[-1] == slot.rsplit("/", 1)[-1]
+    try:
+        from hermes_cli.model_registry import slot_resolve
+
+        return bool(slot_resolve(model)[1])
+    except Exception:
+        return False
+
+
 def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = None) -> dict:
     """Re-price turns whose cost_usd is NULL. Returns the pinned status schema
     ``{scanned, repriced, zeroed, still_unknown}`` (RC-F).
@@ -1839,7 +1872,7 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
     try:
         conn.execute("PRAGMA busy_timeout=5000")  # INV-8: wait, don't error, on a live writer
         sel = (
-            "SELECT turn_id, model, provider, "
+            "SELECT turn_id, model, provider, model_slot, "
             "COALESCE(input_tokens,0) AS i, COALESCE(output_tokens,0) AS o, "
             "COALESCE(cache_read,0) AS cr, COALESCE(cache_write,0) AS cw, "
             "COALESCE(output_tokens_unknown,0) AS ou, "
@@ -1859,8 +1892,17 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
         # (turn_id, cost, status, perclass, is_zero)
         candidates: list[tuple[str, float, str, dict, bool]] = []
         for r in rows:
-            route = resolve_billing_route(r["model"], provider=r["provider"])
             usage_unknown = any(bool(r[key]) for key in ("ou", "iu", "cru", "cwu", "uu"))
+            if _unresolved_slot_row(r["model"], r["model_slot"]):
+                # A row written with the model_slot column holds the id the turn ran on; when it
+                # still holds the slot name, the view could not resolve it at turn time and no id
+                # was observed. Pricing it from today's view would book a model the turn never ran
+                # on (t_5c87d313). The same holds for model_slot '' with a model that is a slot
+                # name today (t_a8fd1cfa). Pre-column rows (model_slot NULL) keep the legacy heal.
+                if not usage_unknown and r["i"] + r["o"] + r["cr"] + r["cw"] == 0:
+                    candidates.append((r["turn_id"], 0.0, "priced_zero", dict(_ZERO_PERCLASS), True))
+                continue
+            route = resolve_billing_route(r["model"], provider=r["provider"])
             if usage_unknown:
                 # Missing counts cannot be repriced from their integer-zero
                 # placeholders. The one exception is a route whose marginal

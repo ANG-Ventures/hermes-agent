@@ -140,7 +140,7 @@ def _cronjob_effect(args: Dict[str, Any]) -> str:
 _R, _W = TURN_EFFECT_READ, TURN_EFFECT_WRITE
 TOOL_EFFECTS: Dict[str, Union[str, Callable[[Dict[str, Any]], str]]] = {
     # board
-    "kanban_show": _R, "kanban_list": _R, "kanban_attachments": _R, "kanban_heartbeat": _R,
+    "kanban_show": _R, "kanban_list": _R, "kanban_attachments": _R, "kanban_attachment_read": _R, "kanban_heartbeat": _R,
     "kanban_create": _W, "kanban_comment": _W, "kanban_complete": _W, "kanban_block": _W,
     "kanban_unblock": _W, "kanban_request_changes": _W, "kanban_request_review": _W,
     "kanban_link": _W, "kanban_attach": _W, "kanban_attach_url": _W,

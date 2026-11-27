@@ -84,7 +84,7 @@ def test_successful_tool_block_posts_no_refusal(running_card):
     from tools import kanban_tools  # noqa: F401
     from tools.registry import registry
 
-    ok = json.loads(registry.dispatch("kanban_block", {"reason": "need input", "kind": "needs_input"}))
+    ok = json.loads(registry.dispatch("kanban_block", {"reason": "Need: x. Why: y. How to reply: z.", "kind": "needs_input"}))
     assert ok.get("ok"), ok
     _task, comments = _card(tid)
     assert not [c for c in comments if "REFUSED" in c], comments

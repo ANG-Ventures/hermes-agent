@@ -45,6 +45,16 @@ intervals of that wait post nothing until the condition changes (lane switch, th
 fired, back to solo). At 3+ slow sessions one line goes to #logs (never #alerts), and
 one more when the lane has no slow waiter left; at most one such pair per lane per
 30 min. ``fallback_wall_budget.cross_session_dedupe: false`` turns all of it off.
+
+Model with no capacity (Ace 2026-11-13 20:50 PT). ``⏳ 12 sessions waiting on
+claude-dtlr/claude-fable-5-2 (oldest 2429s); this turn 120s, cut at 600s`` read like a
+normal queue while the Fable weekly allowance was used up on 23 of 25 seats: the relay
+kept retrying drained seats and every turn sat out the full 600 s. On a pool relay the
+notice now names the relay's own capacity answer (``agent.fork_ext.relay_capacity``),
+and once a wait passes :data:`EXHAUSTED_PROBE_AFTER_S` with the relay stating the model
+has no capacity (allowance used up on every seat, or no seat eligible) the attempt is
+cut at once as ``RelayModelExhausted`` (a relay ``quota_model``), once per lane, when a
+usable lane is ahead. The 600 s budget is unchanged for everything else.
 """
 
 from __future__ import annotations
@@ -59,6 +69,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BUDGET_S = 600.0
 DEFAULT_NOTICE_S = 120.0
+#: A wait this old asks the relay whether it can serve the model at all (cached, so a
+#: healthy call that answers sooner never probes).
+EXHAUSTED_PROBE_AFTER_S = 10.0
 
 # --- cross-session registry (t_78b5a5bb) -------------------------------------------
 #: Waiters at or above this many on one lane open a #logs slow window.
@@ -272,6 +285,36 @@ class FallbackWallBudgetExceeded(RuntimeError):
         self.lane = lane
         self.elapsed_s = elapsed_s
         self.pool_headers = dict(pool_headers or {})
+
+
+class RelayModelExhausted(FallbackWallBudgetExceeded):
+    """The attempt was cut early: the relay states it has no capacity for the model
+    (every Fable seat's allowance used up, or no seat eligible). Same recovery as the
+    budget cut (fall back now), but classified as the relay's ``quota_model`` so the
+    fallback banner names the quota and the sticky policy holds the session off the
+    model until the relay says it can serve it again. ``relay_headers`` carries the
+    relay's capacity answer in its refusal-header form (``x-pool-fable-allowance``)."""
+
+    def __init__(self, message: str = "", *, capacity: Optional[dict] = None, **kw: Any) -> None:
+        super().__init__(message, **kw)
+        from agent.fork_ext.relay_capacity import relay_headers
+        self.capacity = dict(capacity or {})
+        self.relay_headers = relay_headers(self.capacity)
+
+
+def cut_exception(agent: Any, model: Any, **evidence: Any) -> FallbackWallBudgetExceeded:
+    """The exception for the cut :func:`should_cut_attempt` just ordered."""
+    st = _state(agent) or {}
+    cap = st.pop("cut_capacity", None)
+    if cap is not None:
+        from agent.fork_ext.relay_capacity import capacity_phrase
+        why = capacity_phrase(cap) or "no capacity"
+        return RelayModelExhausted(
+            f"relay has no capacity for {model or 'the model'} ({why}); moving to the next lane",
+            capacity=cap, **evidence)
+    return FallbackWallBudgetExceeded(
+        f"no first byte from {model or 'the provider'} within the turn's fallback wall budget "
+        "(fallback.no_first_byte_budget_seconds); moving to the next lane", **evidence)
 
 
 def _knobs() -> tuple[float, float]:
@@ -490,6 +533,13 @@ def _viable(agent: Any, fb: dict) -> bool:
         return False
     if provider in (getattr(agent, "_quota_gate_skipped_providers", None) or ()):
         return False
+    if model in (getattr(agent, "_pool_exhausted_models", None) or ()):
+        from agent.relay_lanes import is_relay_backed
+        if is_relay_backed(provider):
+            return False
+    from agent.context_ceilings import request_tokens, too_large_for
+    if too_large_for(provider, model, fb.get("base_url"), request_tokens(agent)):
+        return False
     try:
         from agent.fallback_cooldown import _is_entitlement_rejected
         if _is_entitlement_rejected(agent, provider, model):
@@ -507,13 +557,52 @@ def _lane_ahead(agent: Any) -> bool:
     return any(_viable(agent, fb) for fb in _remaining_entries(agent))
 
 
+def _capacity(agent: Any) -> Optional[dict]:
+    """The relay's capacity answer for the agent's current pool lane, else None."""
+    try:
+        from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS
+        if (getattr(agent, "provider", "") or "").strip().lower() not in _POOL_CAPABILITY_PROVIDERS:
+            return None
+        from agent.fork_ext.relay_capacity import model_capacity
+        return model_capacity(getattr(agent, "base_url", "") or "", getattr(agent, "model", "") or "")
+    except Exception:
+        logger.debug("wall budget: relay capacity probe failed", exc_info=True)
+        return None
+
+
+def _exhausted_cut_due(agent: Any, st: dict, now: Optional[float]) -> bool:
+    """The relay says this lane cannot serve its model and a usable lane is ahead: cut
+    now instead of sitting out the budget. Once per lane per wait."""
+    if (st.get("budget_s") or 0) <= 0 or (elapsed(agent, now) or 0.0) < EXHAUSTED_PROBE_AFTER_S:
+        return False
+    lane = _lane_key(agent)
+    done = st.setdefault("exhausted_cut_lanes", [])
+    if lane in done:
+        return False
+    from agent.fork_ext.relay_capacity import exhausted
+    cap = _capacity(agent)
+    if not exhausted(cap) or not _lane_ahead(agent):
+        return False
+    done.append(lane)
+    st["cut_capacity"] = cap
+    logger.warning("Relay reports no capacity for %s/%s (%s); cutting the attempt to fall back now.",
+                   lane[0], lane[1], cap)
+    return True
+
+
 def should_cut_attempt(agent: Any, now: Optional[float] = None) -> bool:
     """Cut the in-flight attempt: budget spent and a lane is still ahead to walk to.
     Fires once per wait, so the lane the cut moves to gets its own clocks instead of
-    an instant cut. With nothing ahead the native per-lane timers keep the attempt."""
+    an instant cut. With nothing ahead the native per-lane timers keep the attempt.
+    Also cuts early, once per lane, when the relay states the model has no capacity."""
     st = _state(agent)
-    if st is None or st.get("fired") or not spent(agent, now) or not _lane_ahead(agent):
+    if st is None:
         return False
+    if _exhausted_cut_due(agent, st, now):
+        return True
+    if st.get("fired") or not spent(agent, now) or not _lane_ahead(agent):
+        return False
+    st.pop("cut_capacity", None)
     st["fired"] = True
     return True
 
@@ -545,6 +634,13 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
         return f"{waiting}; {int(waited)}s elapsed{_ahead_suffix(agent)}"
     tried = f", {lanes} lanes tried" if lanes != 1 else ""
     failed = _failure_text(st)
+    capacity = _capacity_stage(agent)   # reads /inflight only under capacity pressure
+    if capacity:
+        # 2026-11-13: never read like a normal queue when the relay says the model is
+        # (nearly) out of capacity; say so, with the relay's own counts.
+        return (f"⏳ waiting on {route}: {capacity}; {int(waited)}s elapsed{tried}"
+                f"{'; ' + failed if failed else ''}"
+                f"{_cut_suffix(agent, st, waited) or _ahead_suffix(agent)}")
     if failed:
         # t_b0a117bd: this wait has seen a failure on an earlier attempt; name it
         # and the stage it failed at instead of a bare lane count (wins over the buffering wording too:
@@ -607,6 +703,40 @@ def _allowance_phrase(info: dict, *, shared: bool) -> Optional[str]:
     return text
 
 
+def _inflight(agent: Any) -> Optional[dict]:
+    """The relay's ``/inflight`` answer for this session (one GET, <= 300 ms), else None."""
+    from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS, fetch_relay_stage
+    if (getattr(agent, "provider", "") or "").strip().lower() not in _POOL_CAPABILITY_PROVIDERS:
+        return None
+    return fetch_relay_stage(getattr(agent, "base_url", "") or "",
+                             getattr(agent, "session_id", None))
+
+
+def _relay_retrying(info: Optional[dict]) -> bool:
+    """The relay's current attempt started well after the request did: it already
+    gave up on at least one seat for this request."""
+    if not isinstance(info, dict):
+        return False
+    req, att = info.get("request_ms"), info.get("attempt_ms")
+    ok = all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+             for v in (req, att))
+    return bool(ok and req - att >= 1000)
+
+
+def _capacity_stage(agent: Any) -> Optional[str]:
+    """``relay retrying seats (Fable allowance used up on 23/25 seats, 2 eligible, resets
+    Sun 10:59)`` when the relay states capacity pressure on the lane's model, else None.
+    A producer-stamped per-seat allowance on ``/inflight`` keeps its own wording."""
+    from agent.fork_ext.relay_capacity import capacity_phrase
+    text = capacity_phrase(_capacity(agent))
+    if not text:
+        return None
+    info = _inflight(agent)
+    if isinstance(info, dict) and _allowance_phrase(info, shared=False):
+        return None
+    return f"relay retrying seats ({text})" if _relay_retrying(info) else text
+
+
 def _relay_stage_phrase(agent: Any, *, shared: bool = False) -> Optional[str]:
     """Which hop a pool-relay wait is on, in plain words (t_9a635fbd), else None.
 
@@ -614,11 +744,7 @@ def _relay_stage_phrase(agent: Any, *, shared: bool = False) -> Optional[str]:
     p90 while the provider's ttfb stayed 13-19 s, and the notice could not say so.
     The relay's ``GET /inflight`` is read once per notice (<= 300 ms). Stages that
     say nothing new (streaming, a buffered body read, unknown) keep today's wording."""
-    from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS, fetch_relay_stage
-    if (getattr(agent, "provider", "") or "").strip().lower() not in _POOL_CAPABILITY_PROVIDERS:
-        return None
-    info = fetch_relay_stage(getattr(agent, "base_url", "") or "",
-                             getattr(agent, "session_id", None))
+    info = _inflight(agent)
     if not info:
         return None
     seat = info.get("seat") if isinstance(info.get("seat"), str) and info.get("seat") else None
@@ -660,7 +786,8 @@ def _shared_notice(agent: Any, st: dict, waited: float, now: float) -> Optional[
     if st.get("shared") == key:
         return ""
     st["shared"] = key
-    stage = _slow_stage(agent) or _relay_stage_phrase(agent, shared=True)
+    stage = (_capacity_stage(agent) or _slow_stage(agent)
+             or _relay_stage_phrase(agent, shared=True))
     return (f"⏳ {len(slow)} sessions waiting on {_lane_label(lane)} "
             f"(oldest {int(max(slow.values()))}s){': ' + stage if stage else ''}; "
             f"this turn {int(waited)}s, cut at {int(st['budget_s'])}s{_ahead_suffix(agent)}")

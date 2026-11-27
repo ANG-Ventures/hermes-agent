@@ -427,7 +427,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         assert task.last_heartbeat_at is None
 
         assert kbd.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
-        assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
+        assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id, kind="needs_input")
         assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()
@@ -1038,6 +1038,8 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
 
     messages = [record.getMessage() for record in caplog.records]
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
+    # t_48b850de: the same line names the -wal/-shm identity (here: neither exists).
+    assert sum("sidecars: -wal absent; -shm absent" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
     # One tick reaches the stop threshold: auto-decompose triage scan, the

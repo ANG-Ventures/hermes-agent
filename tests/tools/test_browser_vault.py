@@ -23,6 +23,17 @@ from unittest.mock import patch
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def unbound_unit_subject(monkeypatch):
+    """These classifier/backend unit tests stub page IO. The real document
+    binding contract is exercised with Chromium in test_browser_vault_target.
+    Keep these tests below the new binding boundary, not a fake owned page.
+    """
+    from tools import browser_vault_tool as vault
+    for name in ("browser_vault_fill", "browser_vault_save_login", "browser_vault_enter_code"):
+        monkeypatch.setattr(vault, name, getattr(vault, name).__wrapped__)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from agent.vault_login_classifier import (  # noqa: E402
@@ -235,7 +246,7 @@ class TestClassifier:
         assert "elements[f.index]" not in js
         assert "[data-hermes-vault-slot=" in js and "nonce + ':' + f.index" in js
         assert 'f.token === "current-password" && el.type !== "password"' in js  # a password fill never lands in a text box
-        assert js.index('removeAttribute("data-hermes-vault-slot")') > js.index("setter.set.call")
+        assert js.rindex("strip();") > js.index("setter.set.call")  # every stamp stripped after the writes
 
     def test_build_fill_js_asserts_origin_before_any_write(self):
         # P1-2: the origin assert must run inside the SAME script, before
@@ -764,7 +775,6 @@ class TestTwoFactor:
             return {"success": True, "result": json.dumps({"filled": 1})}
 
         with patch("agent.vault_store.get_vault_store", return_value=store), \
-             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
              patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
             raw = browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t")
@@ -789,7 +799,6 @@ class TestTwoFactor:
             return {"success": True, "result": json.dumps({"filled": 6})}
 
         with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
-             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
              patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
@@ -822,7 +831,7 @@ class TestTwoFactor:
         from tools import browser_vault_tool
 
         fake_eval = lambda t, e: {"success": True, "result": json.dumps([{"index": 0, "type": "text", "name": "q", "label": "Search", "autocomplete": ""}]) if "querySelectorAll" in e else "https://acme.test/approve"}
-        with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+        with patch.object(browser_vault_tool, "_current_page_origin", return_value="https://example.com"), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
         assert out["error_type"] == "no_code_field"

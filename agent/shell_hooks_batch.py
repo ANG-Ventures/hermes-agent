@@ -15,6 +15,14 @@ the missing-hook self-heal stay as they were.
 
 Eligible: ``<python...> <script>.py [args]`` on POSIX with no interpreter flags, fired inside an
 ``invoke_hook`` call. Kill switch: ``hooks.batch_python_hooks: false`` (one process per hook).
+
+Per-hook timing (t_492356b3): every dispatcher run that ends normally appends one line to
+``<hermes home>/logs/hook-dispatch/<YYYYMMDDHH>.tsv`` (UTC hour, one O_APPEND write, files older
+than 48 h pruned by the first writer of a new hour):
+``<epoch> <total_ms> <slowest hook|-> <hook>=<ms|skip|timeout|missing>,...``. The first three
+fields have the shape of ``logs/hook-latency`` rows, which worker-tool-policy writes for its own
+phases; this is a separate directory so that hook's readers (``hook-latency-p99.py``, which reads
+exactly three fields from every ``*.tsv`` there) see nothing new.
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -69,6 +78,63 @@ def _result(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"returncode": row.get("rc"), "stdout": decode(row.get("out")), "stderr": decode(row.get("err")),
             "timed_out": bool(row.get("timed_out")), "elapsed_seconds": float(row.get("elapsed") or 0.0),
             "error": None, "error_detail": None, "infra_failure": None}
+
+
+_LATENCY_KEEP_S = 48 * 3600
+
+
+def _latency_dir() -> str:
+    from hermes_constants import get_hermes_home
+    return str(get_hermes_home() / "logs" / "hook-dispatch")
+
+
+def _hook_label(script: str) -> str:
+    name = os.path.basename(script)
+    if name.lower().endswith(".py"):
+        name = name[:-3]
+    return "".join("_" if ch.isspace() or ch in "=," else ch for ch in name) or "-"
+
+
+def _log_latency(dirpath: Optional[str], items: List[Tuple[Any, str, List[str]]], rows: Dict[int, Dict[str, Any]],
+                 total_s: float) -> None:
+    """Append one per-hook timing line for a finished dispatcher run into ``dirpath``, resolved by the
+    caller in the owning profile's scope (the reader thread does not inherit its ContextVars).
+    Never raises: timing must not change a verdict."""
+    try:
+        cells = []
+        slowest, slowest_s = "-", -1.0
+        for i, (_spec, script, _args) in enumerate(items):
+            label, row = _hook_label(script), rows.get(i)
+            if row is None or row.get("missing"):
+                cells.append(label + "=missing")
+            elif row.get("skipped"):
+                cells.append(label + "=skip")
+            elif row.get("timed_out"):
+                cells.append(label + "=timeout")
+            else:
+                s = float(row.get("elapsed") or 0.0)
+                cells.append("%s=%d" % (label, int(round(s * 1000))))
+                if s > slowest_s:
+                    slowest, slowest_s = label, s
+        now = time.time()
+        line = "%d %d %s %s\n" % (int(now), int(round(total_s * 1000)), slowest, ",".join(cells) or "-")
+        if not dirpath:
+            return
+        path = os.path.join(dirpath, time.strftime("%Y%m%d%H", time.gmtime(now)) + ".tsv")
+        fresh = not os.path.exists(path)
+        os.makedirs(dirpath, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+        if fresh:
+            for name in os.listdir(dirpath):
+                full = os.path.join(dirpath, name)
+                if name.endswith(".tsv") and now - os.stat(full).st_mtime > _LATENCY_KEEP_S:
+                    os.unlink(full)
+    except Exception as exc:
+        logger.debug("shell hook dispatch timing log: %s", type(exc).__name__)
 
 
 def _timed_out(budget: float) -> Dict[str, Any]:
@@ -201,6 +267,10 @@ def _start_dispatcher(python: str, items: List[Tuple[Any, str, List[str]]], slot
         release_all()
         return
     proc = d.proc
+    try:
+        logdir: Optional[str] = _latency_dir()  # here, in the calling profile's scope
+    except Exception:
+        logdir = None
     killed = threading.Event()
 
     def kill_on_budget() -> None:
@@ -212,6 +282,8 @@ def _start_dispatcher(python: str, items: List[Tuple[Any, str, List[str]]], slot
 
     def run() -> None:
         ended = False
+        rows: Dict[int, Dict[str, Any]] = {}
+        t0 = time.monotonic()
         try:
             try:
                 # The dispatcher reads the whole line before it writes anything, so one thread can
@@ -227,6 +299,7 @@ def _start_dispatcher(python: str, items: List[Tuple[Any, str, List[str]]], slot
                         ended = True
                         break
                     spec = items[int(row["i"])][0]
+                    rows[int(row["i"])] = row
                 except (ValueError, KeyError, IndexError, TypeError, AttributeError):
                     continue
                 slot = slots[id(spec)]
@@ -251,6 +324,8 @@ def _start_dispatcher(python: str, items: List[Tuple[Any, str, List[str]]], slot
             else:
                 d.close()
             release_all()
+            if ended:
+                _log_latency(logdir, items, rows, time.monotonic() - t0)  # after the callbacks are released
 
     timer.start()
     threading.Thread(target=run, name="hermes-hook-dispatch", daemon=True).start()

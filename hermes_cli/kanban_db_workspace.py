@@ -16,6 +16,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
 from hermes_cli.worktree_ops import release_lsp_clients
+from hermes_cli import kanban_worktree_add as _kwa
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 _REMOVABLE_KINDS = ("scratch", "worktree")
@@ -266,10 +267,10 @@ def bind_host(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     import json
     from hermes_cli import kanban_placement_reasons as _pr
     row = conn.execute(
-        "SELECT e.payload FROM task_events e WHERE e.task_id = ? AND e.kind = ? "
+        f"SELECT e.payload FROM task_events e WHERE e.task_id = ? AND e.kind IN ({_pr.kind_marks(_pr.WORKER_PLACED_EVENT)}) "
         "AND e.run_id = (SELECT MAX(id) FROM task_runs WHERE task_id = ?) "
         "ORDER BY e.id DESC LIMIT 1",
-        (task_id, _pr.WORKER_PLACED_EVENT, task_id),
+        (task_id, *_pr.kind_names(_pr.WORKER_PLACED_EVENT), task_id),
     ).fetchone()
     if row is None:
         return None
@@ -887,6 +888,9 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         target.exists() and repo_common is not None
         and _path_key(_git_common_dir(target)) == _path_key(repo_common)
     ):
+        # ruling:t_f609a5a0-cut-plus-proven-usable-gate: a linked tree is reused only when proven finished; a
+        # group-killed add's half-built tree is held, never handed over (or checked out into).
+        _kwa.hold_unless_proven(target)
         if _git_current_branch(target) == branch_name:
             return
         # Reused worktree is on the wrong branch — realign it.
@@ -926,7 +930,17 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
     if target_occupied(repo_root, target):
         raise dead_stub_hold(repo_root, target)
-    result = _git(repo_root, *args, timeout=60)
+    # t_f609a5a0: own process group, killed whole on timeout, so no git child outlives the spawn. Nothing is removed
+    # after a timed-out add (ruling:t_f609a5a0-no-automatic-deletion): what git left is logged with its path.
+    try:
+        result = _kwa.run_git_group(["git", "-C", str(repo_root), *args], timeout=_kwa.ADD_TIMEOUT_S)
+    except _kwa.WorktreeAddTimeout as exc:
+        _kb._log.warning(
+            "PHASE=kanban_worktree_add_timeout %s (branch %s): %s; left as git left it, path exists: %s",
+            target, branch_name, exc, os.path.lexists(str(target)),
+        )
+        raise RuntimeError(f"git worktree add for {target} on branch {branch_name}: {exc}; "
+                           f"nothing removed, operator: inspect {target} before removing") from None
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
@@ -985,6 +999,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            _kwa.hold_unless_proven(requested)  # t_f609a5a0: handed over only when proven finished
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
@@ -999,6 +1014,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
+        _kwa.hold_unless_proven(requested)  # t_f609a5a0: handed over only when proven finished
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
@@ -1081,19 +1097,37 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     return p
 
 
-def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str) -> None:
+# The only columns _set_task_column may write. None is home-session guarded
+# (status/assignee/priority/session_id); tests/hermes_cli/test_kanban_home_session.py
+# checks the set stays disjoint from those and that the function enforces it.
+_SET_TASK_COLUMN_ALLOWED = frozenset({"workspace_path", "branch_name"})
+
+
+def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value: str,
+                     run_id: Optional[int] = None) -> None:
+    """``run_id``: write only while that run still owns the card (same transaction), else raise ClaimLost."""
+    if column not in _SET_TASK_COLUMN_ALLOWED:
+        raise ValueError(f"_set_task_column: {column!r} is not in _SET_TASK_COLUMN_ALLOWED")
     with _kb.write_txn(conn):
-        conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
+        if run_id is None:
+            conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, task_id))
+            return
+        cur = conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ? AND status = 'running' "
+                           "AND current_run_id = ?", (value, task_id, int(run_id)))
+        if cur.rowcount == 0:
+            raise _kb.ClaimLost(f"{task_id}: run {run_id} no longer owns the card")
 
 
-def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str) -> None:
-    _set_task_column(conn, task_id, "workspace_path", str(path))
+def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str, *,
+                       run_id: Optional[int] = None) -> None:
+    _set_task_column(conn, task_id, "workspace_path", str(path), run_id)
     from hermes_cli.kanban_survivor import record_baseline
-    record_baseline(conn, task_id, path)
+    record_baseline(conn, task_id, path, run_id=run_id)   # fenced too: the lock is handed back (t_89e3e083)
 
 
-def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
-    _set_task_column(conn, task_id, "branch_name", str(branch_name))
+def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str, *,
+                    run_id: Optional[int] = None) -> None:
+    _set_task_column(conn, task_id, "branch_name", str(branch_name), run_id)
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.

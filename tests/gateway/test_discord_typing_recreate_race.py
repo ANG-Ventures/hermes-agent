@@ -60,7 +60,7 @@ def _make_adapter():
         return None  # success — no 429 anywhere in this file
 
     http = SimpleNamespace(request=AsyncMock(side_effect=_count_post))
-    adapter._client = SimpleNamespace(http=http)
+    adapter._client = SimpleNamespace(http=http, is_closed=lambda: False, is_ready=lambda: True)
     return adapter, posts
 
 

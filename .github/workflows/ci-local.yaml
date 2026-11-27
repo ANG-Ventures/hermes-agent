@@ -236,6 +236,11 @@ jobs:
           # behind it (Ace 2026-11-01, t_38da7416). push:main and merge_group still run them.
           if os.environ['EVENT_NAME'] == 'pull_request' and os.environ.get('PR_E2E_UPGRADE') == 'off':
               values['e2e_upgrade'] = 'false'
+          # CI_PR_E2E_UPGRADE=on is the kill switch for the main-only narrowing (t_4897b522):
+          # the classifier now starts e2e_upgrade on a PR only when the diff touches the upgrade
+          # path itself; `on` runs it on every pull request again. push:main always runs it.
+          if os.environ['EVENT_NAME'] == 'pull_request' and os.environ.get('PR_E2E_UPGRADE') == 'on':
+              values['e2e_upgrade'] = 'true'
           if not release and os.environ['DESKTOP_JOBS'] != 'on':
               values['desktop'] = 'false'
           # macOS + Windows unit lanes: path-gated on pull_request only

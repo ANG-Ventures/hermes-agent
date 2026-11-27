@@ -108,6 +108,23 @@ def test_tests_skipped_while_python_changed_fails():
     assert "detect.outputs.python == 'true'" in violations["tests"]
 
 
+def test_tests_os_all_children_unselected_passes():
+    # A reusable workflow reports skipped when every child job is legitimately skipped.
+    assert evaluate_needs(_needs(
+        results={"tests-os": "skipped"},
+        detect_outputs={"python": "true", "hosted_os": "true", "desktop_updater": "true"},
+    )) == {}
+
+
+@pytest.mark.parametrize("lane", ["os_tests", "e2e", "e2e_upgrade"])
+def test_tests_os_selected_child_cannot_disappear(lane):
+    violations = evaluate_needs(_needs(
+        results={"tests-os": "skipped"},
+        detect_outputs={"python": "true", "hosted_os": "true", lane: "true"},
+    ))
+    assert set(violations) == {"tests-os"}
+
+
 def test_tests_skipped_while_python_unchanged_passes():
     assert evaluate_needs(_needs(results={"tests": "skipped"})) == {}
 
@@ -124,7 +141,7 @@ def test_tests_skipped_while_python_unchanged_passes():
         ),
         pytest.param(
             "tests-os",
-            {"python": "true", "hosted_os": "true"},
+            {"python": "true", "hosted_os": "true", "os_tests": "true"},
             {},
             "detect.outputs.python == 'true' and detect.outputs.hosted_os == 'true'",
             id="tests-os-python-hosted-os",

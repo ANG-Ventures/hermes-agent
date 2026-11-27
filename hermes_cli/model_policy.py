@@ -92,12 +92,17 @@ def flagship_model_match(
     model: Optional[str],
     config: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    """Return the banned substring matched by ``model``, if any."""
+    """Return the banned substring matched by ``model``, if any.
+
+    A slot name (``opus``) is also matched as the id it resolves to, so a slot pin cannot step
+    around the ban."""
     folded = (model or "").casefold()
     if not folded:
         return None
+    from hermes_cli.model_registry import slot_resolve
+    names = (folded, str(slot_resolve(model)[0] or "").casefold())
     return next(
-        (part for part in banned_worker_model_substrings(config) if part in folded),
+        (part for part in banned_worker_model_substrings(config) if any(part in n for n in names)),
         None,
     )
 

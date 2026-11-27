@@ -30,6 +30,14 @@ def _result(**overrides):
 
 
 class TestWriteUsageFile:
+    def test_served_model_is_retained_without_route_substitution(self, tmp_path):
+        path = tmp_path / "usage.json"
+        _write_usage_file(str(path), _result(model="requested-alias", served_model="upstream-model"))
+        report = json.loads(path.read_text())
+        assert report["served_model"] == "upstream-model"
+        _write_usage_file(str(path), _result(model="requested-alias"))
+        assert json.loads(path.read_text())["served_model"] is None
+
     def test_writes_report_with_cost_and_tokens(self, tmp_path):
         path = tmp_path / "usage.json"
         _write_usage_file(str(path), _result())

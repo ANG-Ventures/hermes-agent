@@ -348,6 +348,25 @@ _suppress_mouse_residue_early()
 
 _startup_fast.ensure_project_root_on_path()
 
+# ``hermes --run-module <mod> [args]``: the store launcher's verb, also served by the venv console
+# script. Service hooks (systemd ExecStop/ExecStopPost, the launchd stderr wrapper) persist it, and a
+# unit repointed at ``<checkout>/venv/bin/hermes`` (ACE-AI single-venv contract) used to fail every
+# stop with "'gateway.systemd_stop_mark' is not a `hermes` command" (t_d9e5d1c2). Before profile
+# resolution and heavy imports, exactly as ``_launchers._launcher_script`` does it.
+if sys.argv[1:2] == ["--run-module"]:
+    import runpy
+
+    if len(sys.argv) < 3:
+        sys.exit("hermes: --run-module needs a module")
+    _run_module_name = sys.argv.pop(2)
+    del sys.argv[1]
+    if not os.environ.get("HERMES_HOME"):
+        from hermes_constants import get_default_hermes_root
+
+        os.environ["HERMES_HOME"] = str(get_default_hermes_root())
+    runpy.run_module(_run_module_name, run_name="__main__", alter_sys=True)
+    sys.exit(0)
+
 # ``hermes --version`` is answered before config/logging imports.
 if _startup_fast.try_fast_version():
     raise SystemExit(0)
@@ -414,6 +433,7 @@ from hermes_cli.subcommands.browser import build_browser_parser
 from hermes_cli.subcommands.secrets import build_secrets_parser
 from hermes_cli.subcommands.codex_runtime import build_codex_runtime_parser
 from hermes_cli.subcommands.egress import build_egress_parser
+from hermes_cli.subcommands.worktree_cache import build_worktree_cache_parser
 from hermes_cli.subcommands.migrate import build_migrate_parser
 from hermes_cli.subcommands.checkpoints import build_checkpoints_parser
 from hermes_cli.subcommands.bundles import build_bundles_parser
@@ -2953,7 +2973,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
         "usage", "vault",
-        "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
+        "webhook", "whatsapp", "whatsapp-cloud", "worktree", "worktree-cache", "chat", "secrets", "security",
         "browser",
         "verify",
         # Plugin commands missing from top-level --help is an accepted trade-off.
@@ -3524,6 +3544,7 @@ def _build_cli_parser():
     build_moa_parser(subparsers)
     build_fallback_parser(subparsers)
     build_worktree_parser(subparsers)
+    build_worktree_cache_parser(subparsers)
     build_browser_parser(subparsers)
     build_secrets_parser(subparsers)
     # OUTBOUND egress firewall; ``hermes proxy`` (gateway group) is the INBOUND one.
@@ -3712,7 +3733,7 @@ def main():
 
     # Dependency recovery already ran before imports. Report any fleet restart
     # still owed by a previous update without restarting services here.
-    if "update" not in sys.argv[1:]:
+    if "update" not in sys.argv[1:] and _first_positional_argv() != "kanban":
         try:
             from hermes_cli.update_cmd_fleet import _warn_pending_fleet_restart_on_startup
 
@@ -3720,7 +3741,7 @@ def main():
         except Exception:
             pass
 
-    if _first_positional_argv() != "update":
+    if _first_positional_argv() not in {"update", "kanban"}:
         from hermes_cli.boot_bootstrap import maybe_run_boot_bootstrap
         from pm.paths import install_root
         maybe_run_boot_bootstrap(install_root())

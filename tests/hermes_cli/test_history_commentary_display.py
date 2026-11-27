@@ -64,7 +64,7 @@ def test_gateway_history_uses_same_display_projection():
 def test_rest_history_shows_a_steer_as_the_users_own_words():
     from agent.prompt_builder import steer_user_row
 
-    row = steer_user_row("fix the header too")
+    row = steer_user_row("fix the header too", agent=None)
     projected = _project_for_display([row])[0]
 
     # Same words session.resume shows; the model-facing marker stays in the source.

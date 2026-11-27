@@ -244,7 +244,7 @@ _BASELINE: dict[str, int] = {
     "docs/sync/2026-07-10-hermes-parity-SPEC.md": 2,
     "docs/sync/PARITY-TOOL-ROUND2-BRIEF.md": 1,
     "docs/sync/TRIAGE-BRIEF-2026-07-15.md": 1,
-    "docs/sync/fork-features.json": 12,
+    "docs/sync/fork-features.json": 8,
     "docs/sync/review/ABSORPTION-CENSUS-2026-08-29.md": 1,
     "docs/sync/review/ACK-REVIEW-2026-08-30.md": 1,
     "docs/sync/review/FIXPASS-CI-2026-08-30.md": 2,

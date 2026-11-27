@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from gateway.status import recorded_gateway_home_conflicts
+from tests import rig_parent_watch
 
 
 def _spawn_gateway_lookalike(bin_dir: Path, lock_path: Path) -> subprocess.Popen:
@@ -43,9 +44,14 @@ def _spawn_gateway_lookalike(bin_dir: Path, lock_path: Path) -> subprocess.Popen
         cmd = [str(script), "gateway", "run"]
     else:
         cmd = [sys.executable, str(script), "gateway", "run"]
+    # Own session + parent-death watch: a pytest killed before ``finally`` must not leave a
+    # ``hermes gateway run`` lookalike at ppid 1 (t_c791d60f). Stops still signal it by PID.
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=sys.platform != "win32",
     )
+    if sys.platform != "win32":
+        rig_parent_watch.track(proc.pid)
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline and not lock_path.exists():
         if proc.poll() is not None:
@@ -137,6 +143,7 @@ class TestCrossProfileStopRefusal:
         finally:
             proc.kill()
             proc.wait(timeout=10)
+            rig_parent_watch.untrack(proc.pid)
 
     def test_stop_profile_gateway_still_stops_own_gateway(
         self, tmp_path, monkeypatch
@@ -164,6 +171,7 @@ class TestCrossProfileStopRefusal:
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=10)
+            rig_parent_watch.untrack(proc.pid)
 
 
 @pytest.mark.spawns_gateway_lookalike
@@ -196,6 +204,7 @@ class TestProfileDeleteStopRefusal:
         finally:
             proc.kill()
             proc.wait(timeout=10)
+            rig_parent_watch.untrack(proc.pid)
 
     def test_stop_gateway_process_still_stops_own_gateway(self, tmp_path):
         tim_home = tmp_path / "profiles" / "tim"
@@ -219,3 +228,4 @@ class TestProfileDeleteStopRefusal:
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=10)
+            rig_parent_watch.untrack(proc.pid)

@@ -120,7 +120,9 @@ MAX_DESCRIPTION_LENGTH = 1024
 MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')  # filesystem-safe, URL-friendly
-ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}  # for write_file/remove_file
+# sites/: browser-access site cards (sites/<domain>/SITE.md) that agents update after a browser task.
+# The exec-tier refusal is by path tier, not by subdir, so this adds no code-write path.
+ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets", "sites"}  # for write_file/remove_file/patch
 _FRONTMATTER_END_RE = re.compile(r'\n---\s*\n')
 _NAME_RULE = "Use lowercase letters, numbers, hyphens, dots, and underscores."
 
@@ -386,6 +388,60 @@ def _find_existing_skill_anywhere(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# Ops that may reach a skill in a shared group this profile does not mount. Not delete, not
+# create (create already scans every group), and nothing about which skills a profile LOADS.
+_LIBRARY_WRITE_ACTIONS = frozenset({"edit", "patch", "write_file", "remove_file"})
+
+
+def find_library_skill(name: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Look ``name`` up in the WHOLE shared library (``skills-shared/<group>/<name>/``), mounted
+    or not -> ``(skill_dir, None)`` | ``(None, error)`` when ambiguous | ``(None, None)``.
+
+    The fallback for ops on a skill the profile's own dirs do not hold: skills-shared is a
+    library, not a loadout. A bare name with matches in more than one group refuses and lists
+    each ``<group>/<name>``; that qualified form names exactly one."""
+    shared = _shared_skills_root()
+    try:
+        if not shared.is_dir():
+            return None, None
+    except OSError:
+        return None, None
+    parts = name.replace("\\", "/").split("/")
+    bare = parts[-1]
+    if len(parts) > 2 or _validate_name(bare):
+        return None, None
+    # `_`-prefixed dirs (_bindings, _registry) are tree plumbing, not skill groups.
+    groups = [g for g in _valid_shared_groups()
+              if not g.startswith("_") and (len(parts) == 1 or g == parts[0])]
+    from agent.skill_utils import is_excluded_skill_path
+    shared_r = shared.resolve()
+    hits = []
+    for group in groups:
+        skill_md = shared / group / bare / "SKILL.md"
+        with suppress(OSError, ValueError):
+            # resolve(): a symlinked package or SKILL.md must not lead out of the library.
+            if (skill_md.is_file() and not is_excluded_skill_path(skill_md)
+                    and skill_md.resolve().is_relative_to(shared_r)
+                    and skill_md.parent.resolve().is_relative_to(shared_r)):
+                hits.append((group, skill_md.parent))
+    if len(hits) > 1:
+        qualified = ", ".join(f"'{g}/{bare}'" for g, _ in hits)
+        return None, (f"Skill '{name}' is in {len(hits)} shared groups: {qualified}. Refusing to "
+                      "guess; pass the qualified name '<group>/<name>'.")
+    return (hits[0][1], None) if hits else (None, None)
+
+
+def _find_write_target(name: str) -> Optional[Dict[str, Any]]:
+    """``_find_skill``, then an unambiguous shared-library hit: the skill a library-reaching op
+    would write (batch snapshot/rollback and the audit ledger must see the same dir)."""
+    if existing := _find_skill(name):
+        return existing
+    if _is_background_review():  # same rule as _locate_for_write: the fork never touches an unmounted package
+        return None
+    skill_dir, _ambiguous = find_library_skill(name)
+    return {"path": skill_dir} if skill_dir is not None else None
+
+
 def _iter_skill_dirs(root: Path):
     from agent.skill_utils import is_excluded_skill_path
     for skill_md in root.rglob("SKILL.md"):
@@ -393,7 +449,7 @@ def _iter_skill_dirs(root: Path):
             yield skill_md.parent
 
 
-def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+def _discover_skill(name: str) -> Optional[Dict[str, Any]]:
     """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
 
     Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
@@ -421,6 +477,39 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
                         and resolved.relative_to(local_root).as_posix() == name):  # POSIX form
                     return {"path": skill_dir}
     return None
+
+
+class _OperationMemo(dict):
+    """name -> discovery answer for ONE public skill_manage call, owned by the calling thread."""
+    __slots__ = ("thread", "closed")
+
+    def __init__(self):
+        super().__init__()
+        self.thread, self.closed = threading.get_ident(), False
+
+
+# A context copied into another thread (the sync-push Timer) carries the memo object along;
+# the owner/closed check keeps it from answering there or after its call has returned.
+_SKILL_OPERATION_MEMO = _ctxvars.ContextVar("skill_operation_memo", default=None)
+
+
+def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+    """``_discover_skill`` with a per-call memo: one public skill_manage call resolves a name in
+    preflight, ledger capture, the handler and post-capture. The memo is emptied on entering the
+    per-skill mutation lock (so nothing taken before the lock is reused under it), after the
+    handler (a mutation can change which copy wins for ANY name)
+    and never outlives the call, so no answer is reused across calls, threads or sessions."""
+    memo = _SKILL_OPERATION_MEMO.get()
+    if memo is None or memo.closed or memo.thread != threading.get_ident():
+        return _discover_skill(name)
+    if name not in memo:
+        memo[name] = _discover_skill(name)
+    return memo[name]
+
+
+def _clear_skill_memo() -> None:
+    if (memo := _SKILL_OPERATION_MEMO.get()) is not None:
+        memo.clear()
 
 
 def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
@@ -515,13 +604,44 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
                       org_guard: bool = True):
     """Find the skill; run the org-mirror (unless ``org_guard=False``) and background-review
     write guards -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
-    existing = _find_skill(name)
+    pins = _BATCH_SKILL_DIRS.get()
+    pinned = pins.get(name) if pins is not None else None
+    if pinned is not None and (pinned / "SKILL.md").is_file():
+        # Inside a batch: the dir resolved once at batch start, never a fresh name lookup.
+        existing = {"path": pinned}
+    else:
+        existing = _locate_by_name(name, action)
+        if isinstance(existing, dict) and "error" in existing:
+            return None, existing
+        if existing and pins is not None and name in pins:
+            # The name now resolves to a dir it did not name at batch start (an earlier op
+            # removed a twin's SKILL.md): that dir was never snapshotted, so refuse.
+            return None, _err(f"Skill '{name}' now resolves to '{existing['path']}', not the skill "
+                              "it named when this batch started; pass the qualified name "
+                              "'<group>/<name>'.")
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
     guard = ((org_guard and _org_mirror_write_guard(name, skill_dir, action))
              or _background_review_write_guard(name, skill_dir, action))
     return (None, guard) if guard else (skill_dir, None)
+
+
+# Set by a skill_manage batch while its ops run: name -> the dir resolved for it at batch start
+# (None: it named no single skill then). _locate_for_write writes only into these dirs.
+_BATCH_SKILL_DIRS = _ctxvars.ContextVar("skill_batch_dirs", default=None)
+
+
+def _locate_by_name(name: str, action: str):
+    """The name lookup: ``{"path": dir}`` | None | an ambiguity error dict."""
+    existing = _find_skill(name)
+    # The autonomous curator keeps its existing scope: no library fallback in the review fork.
+    if not existing and action in _LIBRARY_WRITE_ACTIONS and not _is_background_review():
+        library_dir, ambiguous = find_library_skill(name)
+        if ambiguous:
+            return _err(ambiguous)
+        existing = {"path": library_dir} if library_dir is not None else None
+    return existing
 
 
 def _load_tier_module(root: Path):
@@ -658,6 +778,38 @@ def _attach_lint_findings(result: Dict[str, Any], skill_md: Path, before: Option
         "— fix them with skill_manage(action='patch') to match Hermes skill standards.")
 
 
+# The prose lane that carries a skills-shared/ edit to hermes-skills main (hermes-home); its --check grades one
+# file against the local origin ref with no fetch, lock or state (~0.2-0.4 s on the Studio, t_0fc9949e).
+_LANE_SCRIPT = ("scripts", "skills-prose-lane.py")
+
+
+def _attach_lane_check(result: Dict[str, Any], target: Path) -> Dict[str, Any]:
+    """ADVISORY: for a write under skills-shared/, attach the line the root's skills-prose-lane --check prints when
+    the lane will REFUSE the file (portability, load-notation, skill-bindings, refpath, ...), so the author fixes it
+    now instead of the lane holding it on disk. No script, a check that cannot run, or a pass: nothing attached."""
+    shared = _shared_skills_root()
+    script = shared.parent.joinpath(*_LANE_SCRIPT)
+    if not _is_within(target, shared) or not script.is_file():
+        return result
+    import subprocess
+    import sys
+    try:
+        r = subprocess.run([sys.executable, str(script), "--home", str(shared.parent), "--clone", str(shared),
+                            "--check", str(target)], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=20,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("skills-prose-lane --check not run for %s: %s", target, e)
+        return result
+    if r.returncode == 1 and r.stdout.strip():
+        result["lane_warning"] = r.stdout.strip().splitlines()[-1]
+        result["lane_hint"] = ("The write succeeded, but the skills prose lane will not push this file to "
+                               "hermes-skills main until the reason above is fixed; it stays on this disk only.")
+    elif r.returncode not in (0, 1):
+        logger.debug("skills-prose-lane --check rc %s for %s: %s", r.returncode, target, r.stderr[-300:])
+    return result
+
+
 def _clip(text: str, n: int, ellipsis: str) -> str:
     return text[:n] + (ellipsis if len(text) > n else "")
 
@@ -745,7 +897,7 @@ def _create_skill_locked(name: str, content: str, category: str = None, *, local
             "local-skill-leak guard will flag it on its next run."
         )
     _attach_lint_findings(_add_description_prompt_preview(result, content), skill_md)
-    return result
+    return _attach_lane_check(result, skill_md)
 
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
@@ -759,7 +911,8 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     result = {
         "success": True, "message": f"Skill '{name}' updated (full rewrite).",
         "path": str(skill_dir), "_change": {"description": _description_preview(content)}}
-    return _add_description_prompt_preview(_attach_org_note(result, name, skill_dir), content)
+    return _attach_lane_check(_add_description_prompt_preview(_attach_org_note(result, name, skill_dir), content),
+                              skill_dir / "SKILL.md")
 
 
 def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = None,
@@ -811,7 +964,7 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
     # (oversized-body, incident-log-shape) — a clean patch attaches nothing and stays quiet.
     if not file_path:
         _attach_lint_findings(result, target, before=content)
-    return result
+    return _attach_lane_check(result, target)
 
 
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
@@ -879,7 +1032,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     # that crosses the line so the review fork sees it in the same turn.
     if file_path.startswith("references/") and (skill_dir / "SKILL.md").exists():
         _attach_lint_findings(result, skill_dir / "SKILL.md")
-    return result
+    return _attach_lane_check(result, target)
 
 
 def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
@@ -1033,7 +1186,7 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
     clear, curator telemetry, debounced sync push."""
     with suppress(Exception):
         from tools import skill_ledger as _ledger
-        _post = _find_skill(name)
+        _post = _find_write_target(name) if action in _LIBRARY_WRITE_ACTIONS else _find_skill(name)
         # delete: consolidation vs prune, and whether the recoverable archive handled it
         _evidence = ({"absorbed_into": absorbed_into, "archived": bool(result.get("_archived"))}
                      if action == "delete" else {})
@@ -1067,6 +1220,25 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         _maybe_debounced_sync_push(name)
 
 
+def _per_call_skill_memo(fn):
+    from functools import wraps
+
+    @wraps(fn)
+    def bound(*args, **kwargs):
+        if kwargs.get("operations") is not None:
+            return fn(*args, **kwargs)  # each batch op is its own flat call with its own memo
+        memo = _OperationMemo()
+        token = _SKILL_OPERATION_MEMO.set(memo)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            memo.closed = True
+            memo.clear()
+            _SKILL_OPERATION_MEMO.reset(token)
+    return bound
+
+
+@_per_call_skill_memo
 def skill_manage(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
@@ -1097,6 +1269,7 @@ def skill_manage(
     # to a helper: guards, ledger capture, patch matching, validation, rollback,
     # and the atomic replacement all belong to the same ownership window.
     with _skill_mutation_lock(name):
+        _clear_skill_memo()  # never reuse an answer taken before the lock (the preflight's)
         # Ledger pre-capture: telemetry, not a gate — failures must NEVER block the mutation. delete
         # destroys the whole package (consolidation may have re-homed support files first), so
         # complete it from the newest curator backup or a restore is hollow.
@@ -1105,12 +1278,13 @@ def skill_manage(
         _ledger_before = None
         with suppress(Exception):
             from tools import skill_ledger as _ledger
-            _pre = _find_skill(name)
+            _pre = _find_write_target(name) if action in _LIBRARY_WRITE_ACTIONS else _find_skill(name)
             _ledger_before = _ledger.capture_before(
                 _pre["path"] if _pre else None, complete_package=(action == "delete"), skill=name)
         handler = _ACTION_HANDLERS.get(action, lambda a: _err(
             f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
         result = handler({"name": name, **args})
+        _clear_skill_memo()  # the handler may have mutated: post-capture rediscovers
         if isinstance(result, str):
             return result  # tool_error JSON for argument-shape problems (patch)
         if result.get("success"):
@@ -1153,7 +1327,7 @@ _FILE_PATH = {
     "type": "string",
     "description": (
         "Path RELATIVE to the skill's own directory, e.g. 'references/api.md' — no leading "
-        "slash, never absolute; first segment references/, templates/, scripts/, or assets/."
+        "slash, never absolute; first segment references/, templates/, scripts/, assets/ or sites/."
     ),
 }  # stated once (write_file); patch/remove_file point at it
 

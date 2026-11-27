@@ -27,6 +27,10 @@ class TurnState:
     started_ts: float = 0.0  # 0.0 = not running
     lease: Any = None  # cross-process active-session slot lease
     busy_ack_ts: float = 0.0  # debounce; 0.0 = never acked
+    # True from the moment /stop (or /new) starts tearing this turn down until the slot is released.
+    # The slot is freed only at the END of that teardown (durable marker write, adapter interrupt),
+    # so a command the busy path would reject waits on this instead of bouncing.
+    stopping: bool = False
     # Last INFO log of PHASE=lease_flush_queued. Not reset by clear(): the slot clears BEFORE the
     # flush it debounces, and the requeue back-off re-queues the same wake about once a second.
     flush_log_ts: float = 0.0
@@ -39,6 +43,7 @@ class TurnState:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
         self.agent = self.lease = self.event = self.ctx = None
         self.started_ts = self.busy_ack_ts = 0.0
+        self.stopping = False
 
 
 @dataclass
@@ -56,6 +61,8 @@ class ConversationState:
     # User /queue items held by /stop: no drain/rescue/promotion reads this; only /queue run|clear
     # or a session boundary empties it (gateway/queue_mgmt.py, spec 2026-10-12 D14).
     held_queue: List[Any] = field(default_factory=list)
+    # Follow-up the drain popped that no turn has claimed yet (queue_mgmt.mark_inflight).
+    inflight_followup: Any = None
     automatic_turns_paused: Optional[bool] = None  # None: hydrate the durable /stop marker
     sidecar_notes: List[str] = field(default_factory=list)  # one-shot must-deliver notes
     ephemeral_pin: Optional[Tuple[Any, ...]] = None  # pinned session-context (change_key, text, redact_pii)

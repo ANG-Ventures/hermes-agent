@@ -359,6 +359,35 @@ def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason:
         return False
 
 
+def _retired_loop_json(raw: Optional[str], *, session_id: str, status: str, reason: str) -> Optional[str]:
+    """*raw* re-stamped *status* / *reason*, or None when it is not an ACTIVE loop (t_92fc3ff0)."""
+    state = _parse_state(raw, session_id) if raw else None
+    if state is None or state.status != "active":
+        return None
+    state.status, state.paused_reason, state.awaiting_response = status, reason, False
+    return state.to_json()
+
+
+def retire_loop(session_id: str, status: str, reason: str, *, db: Any = None) -> bool:
+    """Flip an ACTIVE loop row to *status* (``superseded``) with ``paused_reason`` *reason*,
+    compare-and-set against the row read here; never touches a non-active row. Same contract as
+    ``goals.retire_goal`` (t_92fc3ff0): retire, never delete, so ``/loop resume`` restores it.
+    Best-effort, never raises; True when this call retired it."""
+    if not session_id:
+        return False
+    db = db if db is not None else _get_session_db()
+    if db is None:
+        return False
+    key = _meta_key(session_id)
+    try:
+        raw = db.get_meta_committed(key)
+        new = _retired_loop_json(raw, session_id=session_id, status=status, reason=reason)
+        return new is not None and bool(db.compare_and_set_meta(key, raw, new))
+    except Exception as exc:
+        logger.debug("LoopManager: retiring loop %s failed: %s", session_id, exc)
+        return False
+
+
 def _ticks_label(n: int) -> str:
     return f"{n} tick{'s' if n != 1 else ''}"
 

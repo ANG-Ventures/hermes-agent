@@ -40,6 +40,7 @@ def rig(tmp_path, monkeypatch):
 
     async def handler(event):
         received.append(event)
+        event._goal_execution_started = True
         return None
 
     adapter.set_message_handler(handler)
@@ -81,6 +82,267 @@ async def test_timer_parked_goal_is_woken_when_the_deadline_passes(rig):
     assert received[0].internal
     assert received[0].text.startswith("[Continuing toward your standing goal]")
     assert goals.load_goal("goal-sess").waiting_until == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edit", [False, True])
+@pytest.mark.parametrize("boundary", ["claim", "recheck", "admission"])
+async def test_cancelled_retry_wake_is_refunded(rig, monkeypatch, boundary, edit):
+    runner, adapter, received, key = rig
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more", False, None, False))
+    mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=2)  # the arming failure spends one
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
+    clock = mgr.state.waiting_until
+    before = mgr.idle_wake_snapshot()
+    reached, release = asyncio.Event(), asyncio.Event()
+    real_hop = runner._run_in_executor_with_context
+    real_handle = adapter.handle_message
+
+    async def hop(fn, *args):
+        result = await real_hop(fn, *args)
+        if (boundary == "claim" and fn.__name__ == "_wake") or (
+                boundary == "recheck" and fn.__name__ == "_still_active"):
+            reached.set()
+            await release.wait()
+        return result
+
+    async def handle(event):
+        reached.set()  # Discord's awaited channel lookup before the base admission check
+        await release.wait()
+        return await real_handle(event)
+
+    runner._run_in_executor_with_context = hop
+    if boundary == "admission":
+        adapter.handle_message = handle
+    entry = runner.session_store.list_sessions()[0]
+    task = asyncio.create_task(runner._goal_idle_wake_one(entry, 0, 3))
+    try:
+        await asyncio.wait_for(reached.wait(), 5)
+        if edit:
+            def add_criterion():
+                goals.GoalManager("goal-sess").add_subgoal("keep this criterion")
+            await asyncio.to_thread(add_criterion)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+    # Drain a shielded off-loop claim/refund, if cancellation happened during the write.
+    for _ in range(100):
+        restored = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+        if restored.state.incomplete_retry_wait:
+            break
+        await asyncio.sleep(0.01)
+    assert restored.state.incomplete_retry_wait
+    assert restored.state.waiting_until == before["waiting_until"]
+    assert received == []
+    runner._run_in_executor_with_context = real_hop
+    adapter.handle_message = real_handle
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    await _drain(adapter)
+    assert len(received) == 1
+    assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
+
+
+@pytest.mark.asyncio
+async def test_retry_wake_rejected_before_admission_is_refunded(rig, monkeypatch):
+    runner, adapter, received, key = rig
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more", False, None, False))
+    mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=2)  # the arming failure spends one
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
+    clock = mgr.state.waiting_until
+    before = mgr.idle_wake_snapshot()
+    entry = runner.session_store.list_sessions()[0]
+    entry.session_key = key + ":stale-route"
+    events = []
+    real_handle = adapter.handle_message
+
+    async def handle(event):
+        events.append(event)
+        await real_handle(event)
+
+    adapter.handle_message = handle
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    assert len(events) == 1
+    assert events[0]._gateway_accepted is False
+    assert events[0]._admission_check is not None  # real adapter returned before admission
+    assert received == []
+    restored = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    for field, value in before.items():
+        if field != "_row":  # refund persists a new revision, not the old serialized row
+            assert restored.idle_wake_snapshot()[field] == value
+    assert restored.state.incomplete_retry_wait
+
+    entry.session_key = key  # routing repaired; checkins remain disabled
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    await _drain(adapter)
+    assert len(received) == 1
+    assert events[-1]._gateway_accepted is True
+    assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    await _drain(adapter)
+    assert len(received) == 1  # accepted retries are not refunded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edit", [False, True])
+@pytest.mark.parametrize("outcome", ["cap", "cancel", "execute", "route"])
+async def test_retry_wake_tracks_execution_not_adapter_acceptance(rig, monkeypatch, outcome, edit):
+    from unittest.mock import AsyncMock, Mock
+
+    runner, adapter, received, key = rig
+    judge = Mock(return_value=("continue", "more", False, None, False))
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    mgr = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    await asyncio.to_thread(mgr.set, "ship it", max_turns=2)  # the arming failure spends one
+    clock = mgr.state.created_at
+    monkeypatch.setattr(goals.time, "time", lambda: clock)
+    await asyncio.to_thread(mgr.evaluate_after_turn, "", turn_completed=False, max_incomplete_turns=1)
+    clock = mgr.state.waiting_until
+    before = mgr.idle_wake_snapshot()
+    entry = runner.session_store.list_sessions()[0]
+    runner.config = {"max_concurrent_sessions": 1}
+    runner.session_store.lookup_by_session_key = lambda key: None
+    runner._hm_admit_event = AsyncMock(side_effect=lambda e: (e, e.source, True))
+    runner._hm_estop_gate = lambda *a: None
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_evict_idle_stale_agent = lambda *a: None
+    runner._hm_queue_during_lease_flush = AsyncMock(return_value=None)
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    # Another session occupies the sole slot; exercise the real inbound cap rejection.
+    runner._running_agents["other-session"] = object()
+    runner._running_agent_count = lambda: len(runner._running_agents)
+    reached, release = asyncio.Event(), asyncio.Event()
+
+    async def handler(event):
+        received.append(event)
+        if outcome == "cap":
+            reply = await runner._handle_message(event)
+            assert reply == runner._active_session_limit_message(key)
+            assert reply is not None
+            reached.set()
+            return reply
+        reached.set()
+        await release.wait()
+        if edit:
+            await asyncio.to_thread(lambda: goals.GoalManager("goal-sess").add_subgoal("keep criterion"))
+        runner.hooks = SimpleNamespace(emit=AsyncMock())
+        runner._hmwa_resolve_session = AsyncMock(return_value=(event.source, entry, key))
+        if outcome == "route":
+            runner._persisted_session_route_identity = lambda k: SimpleNamespace(state="unavailable")
+            runner._async_session_store = SimpleNamespace(
+                _store=runner.session_store, get_or_create_session=AsyncMock(return_value=entry))
+            runner._defer_goal_status_notice_after_delivery = AsyncMock()
+            reply = await runner._handle_message_with_agent_admitted(event, event.source, key, 1)
+            assert "No provider request" in reply
+            await runner._run_post_turn_hooks(agent_result=reply, source=event.source,
+                                             is_internal=True, event=event, parts=("goal continuation",))
+            return reply
+        runner._hmwa_check_persisted_route = AsyncMock(return_value=None)
+        runner._hmwa_prepare_turn = AsyncMock(return_value=(
+            runner._PreparedTurn([], "", "retry", "retry", None, None), {}))
+        runner._pinned_channel_inputs = lambda *a, **kw: ("", event.source)
+        runner._clear_session_env = lambda tokens: None
+
+        async def model(**kwargs):
+            assert event._goal_execution_started is True
+            raise asyncio.CancelledError  # execution began; settlement must not refund it
+
+        runner._run_agent = model
+        return await runner._handle_message_with_agent_admitted(event, event.source, key, 1)
+
+    adapter.set_message_handler(handler)
+    await runner._goal_idle_wake_one(entry, 0, 3)
+    processing = adapter._session_tasks[key]
+    if outcome != "cap":
+        await asyncio.wait_for(reached.wait(), 5)
+        # An accepted turn that has not settled must not be refunded prematurely.
+        assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
+        if outcome == "cancel":
+            if edit:
+                await asyncio.to_thread(lambda: goals.GoalManager("goal-sess").add_subgoal("keep criterion"))
+            processing.cancel()
+        else:
+            release.set()
+    await asyncio.gather(processing, return_exceptions=True)
+    assert reached.is_set()  # cap path reached the real rejection, not an earlier fixture error
+    # Settlement may launch the persisted compare-and-refund as a tracked adapter task.
+    while adapter._background_tasks:
+        await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
+    assert received[0]._gateway_accepted is True
+    restored = await asyncio.to_thread(goals.GoalManager, "goal-sess")
+    judge.assert_not_called()
+    # Only the executed arming failure is charged; an unexecuted wake would exhaust 2/2 and pause.
+    assert restored.state.status == "active" and restored.state.turns_used == 1
+    if edit and outcome != "cap":
+        assert restored.state.subgoals == ["keep criterion"]
+    assert restored.state.incomplete_retry_wait is (outcome != "execute")
+    if outcome != "execute":
+        assert restored.state.waiting_until == before["waiting_until"]
+        # Capacity recovers: the same persisted retry stays due with ordinary checkins off.
+        adapter.set_message_handler(lambda e: handler_recovered(e))
+
+        async def handler_recovered(event):
+            received.append(event)
+            event._goal_execution_started = True
+
+        await runner._goal_idle_wake_one(entry, 0, 3)
+        await _drain(adapter)
+        assert len(received) == 2
+        assert not (await asyncio.to_thread(goals.load_goal, "goal-sess")).incomplete_retry_wait
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["edit", "pause", "clear", "replace", "resume", "wait", "unwait", "new-claim", "evaluate"])
+async def test_retry_refund_respects_attempt_owner(rig, monkeypatch, mutation):
+    monkeypatch.setattr(goals.time, "time", lambda: 1000.0)
+
+    def scenario():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        mgr.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+        before = mgr.idle_wake_snapshot()
+        assert mgr.idle_wake_prompt(1060, checkin_minutes=0)
+        after = mgr.idle_wake_snapshot()
+        other = goals.GoalManager("goal-sess")
+        if mutation == "edit":
+            other.add_subgoal("preserved")
+        elif mutation == "pause":
+            other.pause()
+        elif mutation == "clear":
+            goals.clear_goal("goal-sess")
+        elif mutation == "replace":
+            other.set("g")  # deliberately identical goal + timestamp
+        elif mutation == "resume":
+            other.pause()
+            other.resume()
+        elif mutation == "wait":
+            other.wait_for_seconds(100, "deployment")
+        elif mutation == "unwait":
+            other.stop_waiting()
+        elif mutation == "new-claim":
+            assert other.idle_wake_prompt(3000, checkin_minutes=30)
+        else:
+            other.evaluate_after_turn("", turn_completed=False, max_incomplete_turns=1)
+        saved = goals.load_goal("goal-sess").to_json()
+        undone = goals.undo_idle_wake("goal-sess", before, after)
+        state = goals.load_goal("goal-sess")
+        if mutation == "edit":
+            assert undone
+            assert state.subgoals == ["preserved"]
+            assert state.incomplete_retry_wait and state.waiting_until == before["waiting_until"]
+            assert not goals.undo_idle_wake("goal-sess", before, after)  # settle exactly once
+        else:
+            assert not undone
+            assert state.to_json() == saved
+
+    await asyncio.to_thread(scenario)
 
 
 @pytest.mark.asyncio

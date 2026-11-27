@@ -26,6 +26,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from tests import rig_parent_watch
 from tests.e2e.core.upgrade import _helpers as H
 from tests.e2e.core.upgrade import _install_helpers as I
 
@@ -167,6 +168,8 @@ class Gateway:
             H.sandbox_argv([*(argv0 or []), sb.hermes, "gateway", "run"], writable=[sb.root]),
             env=env, cwd=str(sb.root), stdin=subprocess.DEVNULL, stdout=self._out, stderr=subprocess.STDOUT,
             text=True, start_new_session=True)
+        # Own session; bwrap's --die-with-parent covers only the sandboxed case.
+        rig_parent_watch.track(self.proc.pid)
 
     def state(self) -> str:
         try:
@@ -218,6 +221,7 @@ class Gateway:
                 self.proc.wait(timeout=60)
             except (subprocess.TimeoutExpired, ProcessLookupError):
                 H.kill_tree(self.proc)
+        rig_parent_watch.untrack(self.proc.pid)
         self._out.close()
 
 

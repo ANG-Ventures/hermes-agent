@@ -22,6 +22,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import hermes_yaml as yaml
 
+from tests import rig_parent_watch
+
 from tests.fakes.fake_llm_provider import Text, write_hermes_home
 from tests.fakes.platforms._standin import wait_until
 from tests.e2e.environ_snapshot import environ_snapshot
@@ -134,6 +136,7 @@ class GatewayUnderTest:
             env=hermetic_env(self.home, dict(self._env)), stdin=subprocess.DEVNULL, stdout=log,
             stderr=subprocess.STDOUT, start_new_session=True)
         log.close()
+        rig_parent_watch.track(self.proc.pid)  # own session: only this watch ends it if pytest dies first
         self.pids.append(self.proc.pid)
         wait_until(lambda: self._ready() or self.proc.poll() is not None, "adapter connected to the stand-in",
                    timeout=timeout, on_timeout=self.tail)
@@ -157,6 +160,7 @@ class GatewayUnderTest:
             os.killpg(proc.pid, signal.SIGKILL)  # stragglers in the session
         except (ProcessLookupError, PermissionError):
             pass
+        rig_parent_watch.untrack(proc.pid)
         return proc.returncode
 
     def run_cli(self, *argv: str, timeout: float = 120.0) -> subprocess.CompletedProcess:

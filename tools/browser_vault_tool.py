@@ -29,9 +29,162 @@ from __future__ import annotations
 import json
 import secrets
 import logging
-from typing import Any, Dict, Optional
+from contextvars import ContextVar
+from functools import wraps
+from inspect import signature
+from typing import Any, Dict, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# An operation-local document witness, never an origin-based tab selector.
+_PAGE_BINDING: ContextVar[Any] = ContextVar("vault_page_binding", default=None)
+
+
+class _Binding(NamedTuple):
+    task_id: str
+    key: Any        # agent-browser session key, the Browser Use route dict, or the leased VaultTransaction
+    session: Any    # agent-browser session record (None on Browser Use)
+    witness: str
+    driver: str = "agent-browser"
+    target: Optional[tuple] = None  # Browser Use: (target_id, cdp session_id, daemon pid) at pin time
+
+
+def _pin_page(task_id):
+    from tools.browser_tool import (
+        _active_sessions, _last_session_key, _session_info_owned_by_task,
+        _is_camofox_mode, _is_browser_use_cli_mode,
+    )
+    from tools.browser_tool_session import _run_browser_command
+
+    # Camofox has no CDP target API: fail closed. Never reuse a stale built-in session
+    # while another backend owns navigation.
+    if _is_camofox_mode():
+        return None
+    from tools.browser_use_target import _pin, browser_use_owns
+    # The tool handlers (_fenced_page_op) always hold a daemon selection lease here; a direct
+    # call without one binds through navigation's driver route instead.
+    if browser_use_owns(task_id) and _pin.get() is not None:
+        return _pin_selected_target_page(task_id)
+    if _is_browser_use_cli_mode():
+        return _pin_browser_use_page(task_id)
+    key = _last_session_key(task_id)
+    session = _active_sessions.get(key)
+    if session is None or not _session_info_owned_by_task(session, task_id, key):
+        return None
+    witness = secrets.token_hex(24)
+    result = _run_browser_command(key, "eval", [
+        f"window[{json.dumps(witness)}] = true; window.location.href"
+    ])
+    if not result.get("success"):
+        return None
+    return _Binding(task_id, key, session, witness)
+
+
+def _pin_browser_use_page(task_id):
+    """Pin the page browser_exec's harness daemon is attached to right now (its current target),
+    on the route navigation last drove. Requires that route's vault supervisor."""
+    from tools import browser_use_cli as bu
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    route = bu.last_route(task_id)
+    if not route or route.get("supervisor") is None or SUPERVISOR_REGISTRY.get(task_id) is not route["supervisor"]:
+        return None
+    witness = secrets.token_hex(24)
+    seen = bu.driver_eval(task_id, route, f"(window[{json.dumps(witness)}] = true, window.location.href)")
+    if not seen:
+        return None
+    return _Binding(task_id, route, None, witness, "browser-use",
+                    (seen["target_id"], seen["session_id"], seen.get("pid")))
+
+
+def _selected_target_eval(task_id, expression: str) -> Dict[str, Any]:
+    """Evaluate on the Browser Use target the daemon selection lease pins (validated per call)."""
+    try:
+        supervisor = _ensure_supervisor(task_id)
+        sup = supervisor.evaluate_runtime(expression)
+        return {"success": bool(sup.get("ok")), "result": sup.get("result"),
+                "error": sup.get("error", "")}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _pin_selected_target_page(task_id):
+    """Browser Use with a daemon selection lease (_fenced_page_op began it): mark the document on
+    the leased target with the operation witness. No lease for this task: refuse."""
+    from tools import browser_use_target as target
+
+    tx = target._pin.get()
+    if tx is None or tx.task_id != task_id:
+        return None
+    witness = secrets.token_hex(24)
+    seen = _selected_target_eval(task_id, f"(window[{json.dumps(witness)}] = true, window.location.href)")
+    if not seen.get("success"):
+        return None
+    return _Binding(task_id, tx, None, witness, "browser-use-lease", (tx.target,))
+
+
+def _bound_page(fn):
+    call_signature = signature(fn)
+
+    @wraps(fn)
+    def bound(*args, **kwargs):
+        task_id = call_signature.bind(*args, **kwargs).arguments.get("task_id") or "default"
+        # Nested save-login -> fill keeps the document the user approved.
+        existing = _PAGE_BINDING.get()
+        if existing is not None:
+            if existing[0] != task_id or not _binding_is_current(existing):
+                return json.dumps({"success": False, "error_type": "page_changed",
+                                   "error": "Browser session changed"})
+            return fn(*args, **kwargs)
+        binding = _pin_page(task_id)
+        if binding is None:
+            return json.dumps({"success": False, "error_type": "page_binding_required",
+                               "error": "No current browser page owned by this task. Navigate first."})
+        token = _PAGE_BINDING.set(binding)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _PAGE_BINDING.reset(token)
+    return bound
+
+
+def _binding_is_current(binding):
+    from tools.browser_tool import (
+        _active_sessions, _last_session_key, _is_camofox_mode, _is_browser_use_cli_mode,
+    )
+    if _is_camofox_mode():
+        return False
+    if binding.driver == "browser-use-lease":
+        from tools import browser_use_target as target
+        return (target.browser_use_owns(binding.task_id) and target._pin.get() is binding.key
+                and target.route_for_task(binding.task_id) is binding.key.route)
+    if binding.driver == "browser-use":
+        from tools import browser_use_cli as bu
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        return (_is_browser_use_cli_mode() and bu.last_route(binding.task_id) == binding.key
+                and SUPERVISOR_REGISTRY.get(binding.task_id) is binding.key["supervisor"])
+    return (not _is_browser_use_cli_mode()
+            and _last_session_key(binding.task_id) == binding.key
+            and _active_sessions.get(binding.key) is binding.session)
+
+
+def _driver_eval_bound(binding, expression: str) -> Dict[str, Any]:
+    """Evaluate in the navigation driver's CURRENT page, only while it is still the pinned document."""
+    witness = json.dumps(binding.witness)
+    guarded = f"window[{witness}] === true ? ({expression}) : null"
+    if binding.driver == "browser-use-lease":
+        return _selected_target_eval(binding.task_id, guarded)
+    if binding.driver == "browser-use":
+        from tools import browser_use_cli as bu
+        seen = bu.driver_eval(binding.task_id, binding.key, guarded)
+        if not seen or (seen["target_id"], seen["session_id"], seen.get("pid")) != binding.target:
+            return {"success": False, "error": "Current browser page changed"}
+        return {"success": True, "result": seen.get("value")}
+    from tools.browser_tool_session import _run_browser_command
+    result = _run_browser_command(binding.key, "eval", [guarded])
+    return {"success": bool(result.get("success")),
+            "result": (result.get("data") or {}).get("result")}
 
 
 # ---------------------------------------------------------------------------
@@ -56,11 +209,20 @@ def _check_vault_available() -> bool:
 def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
 
-    Prefers the supervisor's persistent CDP WebSocket, falls back to the
-    agent-browser CLI ``eval`` command. Never use this for expressions that
+    During a vault operation, use the navigation driver's current document,
+    guarded by the operation witness. Outside one, prefer the supervisor and
+    fall back to the agent-browser CLI. Never use this for expressions that
     embed secret values — the fallback places the expression in subprocess
     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
     """
+    binding = _PAGE_BINDING.get()
+    if binding is not None:
+        if not _binding_is_current(binding):
+            return {"success": False, "error": "Browser session changed"}
+        return _driver_eval_bound(binding, expression)
+    from tools.browser_use_target import browser_use_owns
+    if browser_use_owns(task_id):
+        return _selected_target_eval(task_id, expression)
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -95,15 +257,19 @@ def _ensure_supervisor(task_id: str):
     for the packaged Chromium's endpoint (``get cdp-url``: same daemon, same reaper) and attach.
     Returns None when no endpoint is reachable; the fill then refuses rather than touching argv."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.browser_use_target import browser_use_owns, supervisor_for_task
 
+    if browser_use_owns(task_id):
+        return supervisor_for_task(task_id)
+    from tools.browser_tool import _last_session_key
+    task_id = _last_session_key(task_id)
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
         return supervisor
-    from tools.browser_tool import _last_session_key
     from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
     from tools.browser_tool_session import _run_browser_command
 
-    res = _run_browser_command(_last_session_key(task_id), "get", ["cdp-url"])
+    res = _run_browser_command(task_id, "get", ["cdp-url"])
     cdp_url = str(((res or {}).get("data") or {}).get("cdpUrl") or "") if (res or {}).get("success") else ""
     if not cdp_url:
         return None
@@ -125,8 +291,12 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
     When no supervisor session is available the caller gets a typed refusal
     (``error_type='supervisor_required'``) and nothing is written.
     """
+    binding = _PAGE_BINDING.get()
     try:
-        supervisor = _ensure_supervisor(task_id)
+        # Browser Use: only the supervisor browser_exec attached for this route; never start a
+        # built-in browser to find one.
+        supervisor = (binding.key["supervisor"] if binding is not None and binding.driver == "browser-use"
+                      else _ensure_supervisor(task_id))
     except Exception as exc:
         logger.debug("vault fill: supervisor unavailable (%s)", exc)
         supervisor = None
@@ -155,11 +325,33 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
+    if binding is not None:
+        if binding.task_id != task_id or not _binding_is_current(binding):
+            return {"success": False, "error_type": "page_changed", "error": "Browser session changed"}
+        # Verify the driver's current document again after any human prompt or
+        # backend resolution. Never send secret-bearing JS through the driver.
+        if not _eval_js(task_id, "true").get("result"):
+            return {"success": False, "error_type": "page_changed", "error": "Current browser page changed"}
+        witness = json.dumps(binding.witness)
+        # Under a daemon selection lease the write is already pinned to the leased target
+        # (supervisor_for_task); otherwise the supervisor selects the bound document here.
+        if binding.driver != "browser-use-lease":
+            focused = supervisor.focus_page("", accept=f"window[{witness}] === true")
+            if not focused.get("ok"):
+                return {"success": False, "error_type": "page_changed", "error": "Bound document no longer exists"}
+            # Browser Use names its current target: the supervisor must have selected exactly that one.
+            if binding.target is not None and focused.get("target_id") != binding.target[0]:
+                return {"success": False, "error_type": "page_changed", "error": "Supervisor selected another tab"}
+            if not _binding_is_current(binding) or not _eval_js(task_id, "true").get("result"):
+                return {"success": False, "error_type": "page_changed", "error": "Browser page changed during target selection"}
+        expression = (f"window[{witness}] === true ? ({expression}) : "
+                      "JSON.stringify({refused: 'origin_changed'})")
     sup = supervisor.evaluate_runtime(expression)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {
         "success": False,
+        "outcome": sup.get("outcome", "unknown"),
         "error_type": "supervisor_required"
         if "supervisor" in str(sup.get("error") or "").lower()
         else "eval_failed",
@@ -189,28 +381,6 @@ def _current_page_origin(task_id: str) -> Optional[str]:
         return normalize_origin(href)
     except Exception:
         return None
-
-
-# Per kind: a JS probe that is truthy on a tab holding the form this kind fills.
-_TAB_PROBES = {
-    "login": "!!document.querySelector('input[type=password]')",
-    "payment": "!!document.querySelector('input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i]')",
-    "address": "!!document.querySelector('input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]')",
-}
-
-
-def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
-    """Point the supervisor's page session at the open tab on ``origin`` that holds a ``kind`` form
-    (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
-    login page). Returns the origin when a tab was focused, else None (caller falls back to the current page)."""
-    try:
-        supervisor = _ensure_supervisor(task_id)
-    except Exception:
-        supervisor = None
-    if supervisor is None:
-        return None
-    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
-    return (origin or focused.get("url")) if focused.get("ok") else None
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +465,7 @@ def browser_vault_unlock(backend_name: str) -> str:
     return json.dumps({"success": True, "backend": backend.name})
 
 
+@_bound_page
 def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> str:
     """Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it in the local
     vault bound to that origin, and fill the password at once. The values never enter the conversation."""
@@ -302,9 +473,6 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     from agent.vault_store import get_vault_store
 
     effective_task_id = task_id or "default"
-    # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
-    # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
-    _focus_bound_origin(effective_task_id, "", "login")
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
@@ -335,10 +503,7 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
                       ensure_ascii=False)
 
 
-_TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-code], input[name*=otp i], input[name*=code i], "
-                      "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]')")
-
-
+@_bound_page
 def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
@@ -350,7 +515,6 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
-    _focus_bound_origin(effective_task_id, "", "otp")
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
@@ -393,7 +557,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
     del code
     if not result.get("success"):
-        return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
+        return json.dumps({"success": False, "outcome": result.get("outcome", "unknown"),
+                           "error": str(result.get("error") or "fill failed")[:200]})
     parsed = _parse_json_result(result.get("result"))
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
@@ -404,6 +569,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                        "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
 
+@_bound_page
 def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     """Fill the current page from a vault handle: the password of a login, card fields of a payment
     item (one human approval per fill, naming the page), address fields of a local address item.
@@ -469,14 +635,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # nothing wildcard/parent-domain is ever inferred. A payment card with no saved
     # website has no allowed list: the user approves the one https page it may fill.
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
-    page_origin = None
-    for candidate in allowed:
-        page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
-        if page_origin:
-            break
-    if path == "approved_page":
-        _focus_bound_origin(effective_task_id, "", meta.kind)  # the tab holding a card form, any https site
-    page_origin = page_origin or _current_page_origin(effective_task_id)
+    page_origin = _current_page_origin(effective_task_id)
     if not page_origin:
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
@@ -580,7 +739,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         )
     if not fill_result.get("success"):
         err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
-        out = {"success": False, "error": err}
+        out = {"success": False, "error": err, "outcome": fill_result.get("outcome", "unknown")}
         if fill_result.get("error_type"):
             out["error_type"] = fill_result["error_type"]
         return json.dumps(out)
@@ -776,6 +935,10 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
 
 
 def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
+    from tools.browser_use_target import browser_use_owns, route_for_task
+    route = route_for_task(task_id) if browser_use_owns(task_id) else None
+    if route is not None:
+        return route.local
     from tools.browser_tool import _active_sessions, _last_session_key
     from tools.browser_tool_session import _shares_bot_desktop_browser
     return _shares_bot_desktop_browser(_active_sessions.get(_last_session_key(task_id or "default")) or {})
@@ -785,11 +948,43 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
     ``_run_browser_command``; they must honour the Bot Desktop lease like every other page access,
     or a human typing a credential on the taken-over screen could be read or written to."""
+    from tools.rail_preflight import browser_capability_error
+    if rail := browser_capability_error(identity=True):   # a credential is identity work (t_f935cb6f)
+        return json.dumps({"success": False, "error": rail})
     from tools.browser_tool import _active_sessions, _last_session_key
     from tools.browser_tool_session import run_fenced
 
-    session = _active_sessions.get(_last_session_key(task_id or "default")) or {}
-    res = run_fenced(session, lambda: {"raw": fn()})
+    from tools.browser_use_target import begin, browser_use_owns, end, route_for_task
+
+    tid = task_id or "default"
+    owned = browser_use_owns(tid)
+    route = route_for_task(tid) if owned else None
+    session = ({"features": {"local": route.local}} if route is not None else
+               _active_sessions.get(_last_session_key(tid)) or {})
+
+    def pinned_op():
+        token = None
+        try:
+            if route_for_task(tid) is not route:
+                raise RuntimeError("Browser Use route changed after takeover fence selection")
+            if owned:
+                token = begin(tid, expected_route=route)
+        except Exception:
+            return {"raw": json.dumps({"success": False, "error_type": "selected_target_unavailable",
+                    "outcome": "not_dispatched",
+                    "error": "Browser Use selected target changed, closed, or is unavailable; select a live tab with browser_exec and retry. Nothing was written."})}
+        try:
+            return {"raw": fn()}
+        except Exception:
+            # The callback may already have dispatched a fill (or saved an item).
+            # Never misreport an arbitrary callback failure as a pre-write refusal.
+            return {"raw": json.dumps({"success": False, "error_type": "operation_outcome_unknown",
+                    "outcome": "unknown", "error": "Vault operation outcome unknown; inspect the page and saved item before retrying."})}
+        finally:
+            if token is not None:
+                end(token)
+
+    res = run_fenced(session, pinned_op)
     return res["raw"] if "raw" in res else json.dumps(res)
 
 

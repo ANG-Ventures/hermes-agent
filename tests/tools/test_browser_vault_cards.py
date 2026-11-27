@@ -12,6 +12,17 @@ from unittest.mock import patch
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def unbound_unit_subject(monkeypatch):
+    """These classifier/backend unit tests stub page IO. The real document
+    binding contract is exercised with Chromium in test_browser_vault_target.
+    Keep these tests below the new binding boundary, not a fake owned page.
+    """
+    from tools import browser_vault_tool as vault
+    for name in ("browser_vault_fill", "browser_vault_save_login", "browser_vault_enter_code"):
+        monkeypatch.setattr(vault, name, getattr(vault, name).__wrapped__)
+
 from agent.vault_store import VaultItemMeta
 
 PAN, CVV = "4111111111111111", "8642"
@@ -78,7 +89,6 @@ def _run(backend, *, origins, consent="accept", controls=LINKTECH_CONTROLS, fill
         seen["registered"].append(value)
 
     with patch("agent.vault_backends.backend_for_handle", return_value=backend), \
-         patch.object(t, "_focus_bound_origin", lambda *a, **k: None), \
          patch.object(t, "_current_page_origin", side_effect=lambda tid: next(origin_iter)), \
          patch.object(t, "_eval_js", return_value={"success": True, "result": json.dumps(controls)}), \
          patch.object(t, "_eval_js_secret", side_effect=eval_secret), \
@@ -132,7 +142,6 @@ def test_real_consent_router_deny_timeout_or_exception_never_resolves(monkeypatc
     backend = _Backend(_meta())
     monkeypatch.setattr(approval_prompt, "prompt_dangerous_approval", prompt)
     with patch("agent.vault_backends.backend_for_handle", return_value=backend), \
-         patch.object(t, "_focus_bound_origin", lambda *a, **k: None), \
          patch.object(t, "_current_page_origin", return_value="https://checkout.example"), \
          patch.object(t, "_eval_js_secret") as secret_eval:
         out = json.loads(t.browser_vault_fill("op:card1", task_id="t"))
@@ -241,7 +250,6 @@ def test_formatted_card_number_readback_is_redacted(number, shown):
         from tools import browser_vault_tool as t
         controls = LINKTECH_CONTROLS
         with patch("agent.vault_backends.backend_for_handle", return_value=backend), \
-             patch.object(t, "_focus_bound_origin", lambda *a, **k: None), \
              patch.object(t, "_current_page_origin", return_value="https://c.example"), \
              patch.object(t, "_eval_js", return_value={"success": True, "result": json.dumps(controls)}), \
              patch.object(t, "_eval_js_secret", return_value={"success": True, "result": json.dumps({"filled": 5})}), \

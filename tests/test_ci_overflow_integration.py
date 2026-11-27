@@ -43,8 +43,18 @@ jobs:
 """
 
 
-def test_p2b_fallback_predicate_passes():
-    assert integ.fallback_predicate(workflow())["status"] == "PASS"
+TRUST = ("(github.event_name == 'push' || github.event_name == 'merge_group' || "
+         "(github.event_name == 'pull_request' && "
+         "github.event.pull_request.head.repo.full_name == github.repository))")
+
+
+def guarded(expression):
+    return "${{ " + TRUST + " && (" + expression[3:-2].strip() + ") || 'ubuntu-latest' }}"
+
+
+@pytest.mark.parametrize("wrap", [lambda expression: expression, guarded], ids=["legacy", "guarded"])
+def test_p2b_fallback_predicate_passes(wrap):
+    assert integ.fallback_predicate(workflow(e2e_runs_on=wrap(E2E_RUNS_ON)))["status"] == "PASS"
 
 
 def test_real_tests_yml_passes_fallback_and_attempt_gates():
@@ -62,7 +72,10 @@ def test_real_tests_yml_passes_fallback_and_attempt_gates():
     {"e2e_runs_on": E2E_RUNS_ON.replace(" || " + STATIC_E2E, "")},  # no static fallback
     {"e2e_runs_on": E2E_RUNS_ON.replace(STATIC_E2E, LOCAL_POOL)},  # all-local
 ])
-def test_removing_any_fallback_guard_blocks(mutant):
+@pytest.mark.parametrize("wrap", [lambda expression: expression, guarded], ids=["legacy", "guarded"])
+def test_removing_any_fallback_guard_blocks(mutant, wrap):
+    mutant = dict(mutant)
+    mutant["e2e_runs_on"] = wrap(mutant.get("e2e_runs_on", E2E_RUNS_ON))
     assert integ.fallback_predicate(workflow(**mutant))["status"] == "BLOCK"
 
 

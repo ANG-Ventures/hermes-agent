@@ -187,6 +187,50 @@ def chain_preexec(*fns: Optional[Callable[[], None]]) -> Optional[Callable[[], N
     return _all
 
 
+# Exec-form launcher (t_b9a61253): applies the worker's RLIMIT_NPROC ceiling and
+# nice/SCHED_IDLE in its own process, then execs the worker in place (same pid).
+# A preexec_fn would do the same between fork and exec, but any preexec_fn makes
+# tools.spawn_nofork fall back to _posixsubprocess.fork_exec, a real fork of the
+# multi-GB gateway on macOS (incident 2026-11-11 19:16 PST). Every step is
+# best-effort, as in the preexec it replaces. argv: <nproc|-> <nice> -- <cmd...>
+_WORKER_LIMITS_LAUNCHER = (
+    "import os,sys\n"
+    "n,nice=sys.argv[1],int(sys.argv[2]);cmd=sys.argv[4:]\n"
+    "if n!='-':\n"
+    " try:\n"
+    "  import resource;L=int(n);R=resource.RLIMIT_NPROC\n"
+    "  h=resource.getrlimit(R)[1];h=L if(h==resource.RLIM_INFINITY or h>L)else h\n"
+    "  resource.setrlimit(R,(min(L,h),h))\n"
+    " except Exception:pass\n"
+    "if nice>0:\n"
+    " try:os.setpriority(os.PRIO_PROCESS,0,nice)\n"
+    " except Exception:pass\n"
+    " try:os.sched_setscheduler(0,os.SCHED_IDLE,os.sched_param(0))\n"
+    " except Exception:pass\n"
+    "try:os.execvp(cmd[0],cmd)\n"
+    "except OSError as e:\n"
+    " sys.stderr.write(f'kanban worker launcher: exec {cmd[0]!r} failed: {e}\\n');os._exit(127)\n"
+)
+
+
+def worker_limits_launcher_argv(limit: Optional[int], nice_value: int) -> list[str]:
+    """Argv prefix that applies ``limit`` (RLIMIT_NPROC) and ``nice_value`` in
+    the exec'd child, or ``[]`` when there is nothing to apply.
+
+    The prefix execs the worker argv that follows it, so ``Popen.pid`` is the
+    worker. ``-I -S``: the launcher ignores PYTHON* env vars and site, but
+    the worker it execs inherits the environment unchanged.
+    """
+    if os.name != "posix":
+        return []
+    nproc = limit if (limit is not None and limit > 0) else None
+    nice = nice_value if (nice_value > 0 and hasattr(os, "setpriority")) else 0
+    if nproc is None and nice == 0:
+        return []
+    return [sys.executable, "-I", "-S", "-c", _WORKER_LIMITS_LAUNCHER,
+            str(nproc) if nproc is not None else "-", str(nice), "--"]
+
+
 def worker_max_procs_per_run(kanban_cfg: Optional[dict] = None) -> Optional[int]:
     """Per-run process cap from ``kanban.worker_max_procs_per_run``.
 

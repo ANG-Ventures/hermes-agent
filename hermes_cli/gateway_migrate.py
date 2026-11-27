@@ -455,11 +455,14 @@ def _profile_gateway_config(home: Path):
     importing the plugin; builtin bot tokens still collide.
     """
     from gateway.config import load_gateway_config
+    from gateway.config_env import inspect_only_load
     from gateway.run import _profile_runtime_scope
     from hermes_cli.plugins_discovery import suppress_plugin_discovery
     from hermes_cli.profiles import profile_is_parked
     scope = suppress_plugin_discovery() if profile_is_parked(home) else contextlib.nullcontext()
-    with _profile_runtime_scope(home), scope:
+    # inspect_only_load: no adapter starts from this read, so a sibling's "token missing" /
+    # "explicitly disabled" lines stay at DEBUG instead of landing in this gateway's errors.log.
+    with _profile_runtime_scope(home), scope, inspect_only_load():
         return load_gateway_config()
 
 

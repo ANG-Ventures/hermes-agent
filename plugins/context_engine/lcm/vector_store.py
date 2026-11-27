@@ -35,7 +35,7 @@ from .db_bootstrap import (
     verify_chunk_schema,
     verify_embedding_schema,
 )
-from .sqlite_util import _is_sqlite_locked_error
+from .sqlite_util import _is_sqlite_locked_error, connect_read, guard_connection
 
 logger = logging.getLogger(__name__)
 
@@ -373,12 +373,12 @@ class VectorStore:
         # data_version), defeating the cross-process cache invalidation. Write
         # atomicity is preserved via the explicit BEGIN IMMEDIATE in
         # _write_transaction.
-        self._conn = sqlite3.connect(
+        self._conn = guard_connection(sqlite3.connect(
             str(self.db_path),
             timeout=5.0,
             check_same_thread=False,
             isolation_level=None,
-        )
+        ))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
@@ -1971,7 +1971,7 @@ class VectorStore:
 
         uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
         try:
-            conn = sqlite3.connect(
+            conn = connect_read(
                 uri,
                 uri=True,
                 timeout=max(0.001, remaining),

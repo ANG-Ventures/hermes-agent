@@ -76,7 +76,7 @@ def i1_violation_sql() -> str:
             "ELSE json_extract(e.payload,'$.take_refusal') END")
     return (
         "SELECT e.task_id, e.payload FROM task_events e "
-        "WHERE e.kind = :kind AND e.created_at >= :since "
+        "WHERE e.kind IN (:kind, :kind_new) AND e.created_at >= :since "
         "AND json_extract(e.payload,'$.route_class') = 'portable' "
         f"AND json_extract(e.payload,'$.placement_default') = {_quote(_kwp.PLACEMENT_DEFAULT_REMOTE)} "
         "AND json_extract(e.payload,'$.reason') <> 'pool' "
@@ -85,7 +85,7 @@ def i1_violation_sql() -> str:
 
 
 FIELD_GUARD_SQL = (
-    "SELECT count(*) FROM task_events WHERE kind = :kind AND created_at >= :since "
+    "SELECT count(*) FROM task_events WHERE kind IN (:kind, :kind_new) AND created_at >= :since "
     "AND json_extract(payload,'$.placement_default') = 'remote' "
     "AND (json_extract(payload,'$.route_class') IS NULL OR json_extract(payload,'$.host') IS NULL "
     "OR json_extract(payload,'$.reason') IS NULL OR json_extract(payload,'$.pool_free_at_spawn') IS NULL "
@@ -94,15 +94,16 @@ FIELD_GUARD_SQL = (
 # A record with no placement_default in the window is half-migrated: it is
 # invisible to the remote-only queries above, so it is counted, never excluded.
 NO_DEFAULT_SQL = (
-    "SELECT count(*) FROM task_events WHERE kind = :kind AND created_at >= :since "
+    "SELECT count(*) FROM task_events WHERE kind IN (:kind, :kind_new) AND created_at >= :since "
     "AND json_extract(payload,'$.placement_default') IS NULL"
 )
 KIND_GUARD_SQL = (
-    "SELECT count(DISTINCT kind) FROM task_events WHERE kind IN ('placement','spawned') "
+    "SELECT count(DISTINCT CASE WHEN kind = 'allocation' THEN 'placement' ELSE kind END) FROM task_events "
+    "WHERE kind IN ('placement','allocation','spawned') "
     "AND created_at >= :since AND json_extract(payload,'$.route_class') IS NOT NULL"
 )
 LAST_RESORT_SQL = (
-    "SELECT json_extract(payload,'$.take_refusal') FROM task_events WHERE kind = :kind "
+    "SELECT json_extract(payload,'$.take_refusal') FROM task_events WHERE kind IN (:kind, :kind_new) "
     "AND created_at >= :since AND json_extract(payload,'$.reason') = 'last-resort'"
 )
 
@@ -110,7 +111,8 @@ LAST_RESORT_SQL = (
 def check_i1(conn: sqlite3.Connection, since: float) -> dict:
     """AC-2: I-1 violations, the kind guard, the field guard and the
     last-resort histogram over ``placement`` events since ``since``."""
-    args = {"kind": KIND, "since": int(since)}
+    kind_old, kind_new = _pr.kind_names(KIND)  # both stored names of the placement/allocation event
+    args = {"kind": kind_old, "kind_new": kind_new, "since": int(since)}
     violations = [{"task_id": r[0], "payload": json.loads(r[1] or "{}")}
                   for r in conn.execute(i1_violation_sql(), args)]
     kinds = conn.execute(KIND_GUARD_SQL, args).fetchone()[0]
@@ -121,7 +123,7 @@ def check_i1(conn: sqlite3.Connection, since: float) -> dict:
         code = _pr.take_refusal_code(refusal) or "null"
         hist[code] = hist.get(code, 0) + 1
     remote_rows = conn.execute(
-        "SELECT count(*) FROM task_events WHERE kind = :kind AND created_at >= :since "
+        "SELECT count(*) FROM task_events WHERE kind IN (:kind, :kind_new) AND created_at >= :since "
         "AND json_extract(payload,'$.placement_default') = 'remote'", args).fetchone()[0]
     red = []
     if violations:
@@ -241,7 +243,7 @@ def check_i0(lines: List[dict], *, since: float, until: float, interval: float) 
 _R10_SQL = """
 SELECT r.id, r.task_id, r.outcome, r.ended_at, coalesce(r.error,''), coalesce(r.summary,''),
        json_extract(p.payload,'$.host')
-FROM task_runs r JOIN task_events p ON p.run_id = r.id AND p.kind = 'worker_placed'
+FROM task_runs r JOIN task_events p ON p.run_id = r.id AND p.kind IN ('worker_placed', 'worker_allocated')
 WHERE r.ended_at >= :since AND r.ended_at < :until
 """
 _R10_EVENTS = (_gap.EVENT_KIND, "placement_reroute", "placement_custody_hold")

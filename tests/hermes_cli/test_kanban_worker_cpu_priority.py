@@ -106,37 +106,36 @@ def _spawn_and_capture_kwargs(fresh_home, monkeypatch, task_id="t_prio") -> dict
 # ---------------------------------------------------------------------------
 
 
+def _launch_with_captured_prefix(captured: dict, program: str, **kw):
+    """Run ``program`` under the launcher prefix _default_spawn put on the worker argv.
+
+    The prefix is everything before the worker's own argv (``--`` ends it), so
+    the probe child goes through exactly the exec-form launcher the worker does.
+    """
+    cmd = captured["cmd"]
+    assert "--" in cmd, f"_default_spawn put no limits launcher on the argv: {cmd[:6]}"
+    prefix = cmd[: cmd.index("--") + 1]
+    return subprocess.run([*prefix, sys.executable, "-c", program], capture_output=True, text=True, **kw)
+
+
 @pytest.mark.skipif(
     not hasattr(os, "setpriority"), reason="POSIX priority API unavailable"
 )
-def test_worker_preexec_applies_nice_19_in_a_real_child(fresh_home, monkeypatch):
-    """The preexec hook _default_spawn installs really deprioritises a child.
+def test_worker_launcher_applies_nice_19_in_a_real_child(fresh_home, monkeypatch):
+    """The launcher _default_spawn prefixes really deprioritises a child.
 
-    This runs the hook against a trivial ``python -c`` child (never a gateway)
+    This runs the prefix against a trivial ``python -c`` child (never a gateway)
     and reads the priority back from inside that child via ``os.getpriority``.
-    A hook that is wired but inert would return 0 here.
+    A launcher that is wired but inert would return 0 here. No preexec_fn
+    (t_b9a61253): a preexec_fn forces fork_exec, a whole-gateway fork on macOS.
     """
     monkeypatch.setattr(kb, "worker_cpu_priority_config", lambda cfg=None: ("background", 19))
     captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch)
-    preexec = captured.get("preexec_fn")
-    assert preexec is not None, (
-        "_default_spawn did not install a preexec_fn; worker CPU priority "
-        "is not being lowered and worker load can starve the gateway"
-    )
+    assert captured.get("preexec_fn") is None
 
-    # Restore the real Popen for the live child probe.
-    monkeypatch.undo()
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import os; print(os.getpriority(os.PRIO_PROCESS, 0))",
-        ],
-        capture_output=True,
-        text=True,
-        preexec_fn=preexec,
-        timeout=60,
-    )
+    monkeypatch.undo()  # real Popen for the live child probe
+    out = _launch_with_captured_prefix(
+        captured, "import os; print(os.getpriority(os.PRIO_PROCESS, 0))", timeout=60)
     assert out.returncode == 0, out.stderr
     assert int(out.stdout.strip()) == 19, (
         f"child niceness was {out.stdout.strip()!r}, expected 19"
@@ -154,13 +153,11 @@ def test_nice_is_inherited_by_forked_grandchildren(fresh_home, monkeypatch):
     Python script that ``os.fork()``ed 2*ncpu spinners for 2400s — five minutes
     after the first burn was killed. The burners are never the worker process
     itself, so deprioritising only the direct child would be theatre. Niceness
-    survives both fork and exec, which is exactly why the preexec hook is the
-    right seam; this test pins that property rather than assuming it.
+    survives both fork and exec, which is why setting it in the exec'd launcher
+    covers the tree; this test pins that property rather than assuming it.
     """
     monkeypatch.setattr(kb, "worker_cpu_priority_config", lambda cfg=None: ("background", 19))
     captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_fork")
-    preexec = captured.get("preexec_fn")
-    assert preexec is not None
     monkeypatch.undo()
 
     # A grandchild via fork(), and a great-grandchild via fork()+exec, both
@@ -179,13 +176,7 @@ def test_nice_is_inherited_by_forked_grandchildren(fresh_home, monkeypatch):
         "os.close(w)\n"
         "print(os.read(r,64).decode())\n"
     )
-    out = subprocess.run(
-        [sys.executable, "-c", program],
-        capture_output=True,
-        text=True,
-        preexec_fn=preexec,
-        timeout=120,
-    )
+    out = _launch_with_captured_prefix(captured, program, timeout=120)
     assert out.returncode == 0, out.stderr
     forked_nice, execed_nice = out.stdout.strip().split()
     assert int(forked_nice) == 19, f"fork()'d grandchild at nice {forked_nice}"
@@ -219,7 +210,8 @@ def test_default_spawn_argv_has_no_taskpolicy_prefix_and_no_nice(fresh_home, mon
     monkeypatch.setattr(kpb, "resolve_worker_nproc_limit", lambda *a, **k: None)
     captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_default")
     assert "/usr/sbin/taskpolicy" not in captured["cmd"], captured["cmd"][:4]
-    assert captured.get("preexec_fn") is None, "default spawn must not renice the worker"
+    assert captured.get("preexec_fn") is None
+    assert "--" not in captured["cmd"][:8], "default spawn must not renice the worker"
 
 
 # ---------------------------------------------------------------------------
@@ -242,17 +234,16 @@ def test_normal_mode_installs_no_preexec_fn(fresh_home, monkeypatch):
     from hermes_cli import kanban_proc_bounds as kpb
     monkeypatch.setattr(kpb, "resolve_worker_nproc_limit", lambda *a, **k: None)
     captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_normal")
-    assert captured.get("preexec_fn") is None, (
+    assert captured.get("preexec_fn") is None
+    assert "--" not in captured["cmd"][:8], (
         "'normal' must leave the child at inherited priority"
     )
 
 
-@pytest.mark.skipif(
-    not hasattr(os, "fork"), reason="POSIX preexec only"
-)
-def test_spawn_preexec_lowers_nproc_in_a_real_child(fresh_home, monkeypatch):
-    """The preexec _default_spawn hands Popen also lowers RLIMIT_NPROC
-    (t_368e9873), even with priority at 'normal'."""
+@pytest.mark.skipif(os.name != "posix", reason="POSIX RLIMIT_NPROC only")
+def test_spawn_launcher_lowers_nproc_in_a_real_child(fresh_home, monkeypatch):
+    """The launcher _default_spawn prefixes also lowers RLIMIT_NPROC soft AND
+    hard (t_368e9873), even with priority at 'normal', with no preexec_fn."""
     resource = pytest.importorskip("resource")
     soft = resource.getrlimit(resource.RLIMIT_NPROC)[0]
     if soft != resource.RLIM_INFINITY and soft <= 777:
@@ -263,15 +254,112 @@ def test_spawn_preexec_lowers_nproc_in_a_real_child(fresh_home, monkeypatch):
     from hermes_cli import kanban_proc_bounds as kpb
     monkeypatch.setattr(kpb, "resolve_worker_nproc_limit", lambda *a, **k: 777)
     captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_nproc")
-    hook = captured.get("preexec_fn")
-    assert hook is not None
+    assert captured.get("preexec_fn") is None
     monkeypatch.undo()  # real Popen again for the probe child
-    out = subprocess.run(
-        [sys.executable, "-c",
-         "import resource;print(resource.getrlimit(resource.RLIMIT_NPROC)[0])"],
-        preexec_fn=hook, capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    assert out == "777"
+    out = _launch_with_captured_prefix(
+        captured, "import os,resource;print(os.getpid(),resource.getrlimit(resource.RLIMIT_NPROC))",
+        timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split(None, 1)[1].strip() == "(777, 777)"
+
+
+def _bound_execute_child(captured: dict) -> dict:
+    """The ``_execute_child`` arguments Popen derives from the captured call."""
+    return dict(
+        args=captured["cmd"], executable=None, preexec_fn=captured.get("preexec_fn"),
+        close_fds=captured.get("close_fds", True), pass_fds=tuple(captured.get("pass_fds", ())),
+        cwd=captured.get("cwd"), env=captured.get("env"), startupinfo=None, creationflags=0,
+        shell=False, p2cread=-1, p2cwrite=-1, c2pread=-1, c2pwrite=-1, errread=-1, errwrite=-1,
+        restore_signals=captured.get("restore_signals", True), gid=None, gids=None, uid=None,
+        umask=-1, start_new_session=captured.get("start_new_session", False), process_group=-1,
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX spawn path only")
+def test_nproc_limited_spawn_is_posix_spawn_eligible(fresh_home, monkeypatch):
+    """t_b9a61253: with the NPROC ceiling AND nice active, the worker Popen must be
+    expressible as one posix_spawn (spawn_nofork._plan != None), never the
+    fork_exec fallback a preexec_fn forces. Pure decision check; runs on Linux CI."""
+    import tools.spawn_nofork as nofork
+
+    monkeypatch.setattr(kb, "worker_cpu_priority_config", lambda cfg=None: ("background", 19))
+    from hermes_cli import kanban_proc_bounds as kpb
+    monkeypatch.setattr(kpb, "resolve_worker_nproc_limit", lambda *a, **k: 777)
+    captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_plan")
+    assert captured.get("preexec_fn") is None
+    assert nofork._plan(_bound_execute_child(captured)) is not None
+    # Mutant arm: the pre-t_b9a61253 shape (same call plus a preexec_fn) is refused.
+    assert nofork._plan({**_bound_execute_child(captured), "preexec_fn": os.getpid}) is None
+
+
+@pytest.mark.platforms("macos")  # the spawn_nofork hook installs on macOS only
+def test_nproc_limited_spawn_takes_posix_spawn_not_fork_exec(fresh_home, monkeypatch):
+    """Real spawn under the gateway's no-fork hook: zero fork_exec calls, at least
+    one native posix_spawn, and the child reads the lowered RLIMIT_NPROC."""
+    import _posixsubprocess
+    import tools.spawn_nofork as nofork
+
+    resource = pytest.importorskip("resource")
+    soft = resource.getrlimit(resource.RLIMIT_NPROC)[0]
+    if soft != resource.RLIM_INFINITY and soft <= 777:
+        pytest.skip("inherited limit already at/below the probe value")
+    monkeypatch.setattr(kb, "worker_cpu_priority_config", lambda cfg=None: ("normal", 0))
+    from hermes_cli import kanban_proc_bounds as kpb
+    monkeypatch.setattr(kpb, "resolve_worker_nproc_limit", lambda *a, **k: 777)
+    captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_hook")
+    monkeypatch.undo()
+
+    counts = {"native": 0, "fork": 0}
+    real_native = nofork._native_spawn
+
+    def native(*a, **k):
+        rc, pid = real_native(*a, **k)
+        counts["native"] += rc == 0
+        return rc, pid
+
+    owner = subprocess if hasattr(subprocess, "_fork_exec") else _posixsubprocess
+    name = "_fork_exec" if owner is subprocess else "fork_exec"
+    real_fork = getattr(owner, name)
+
+    def fork(*a, **k):
+        counts["fork"] += 1
+        return real_fork(*a, **k)
+
+    monkeypatch.setattr(nofork, "_native_spawn", native)
+    monkeypatch.setattr(owner, name, fork)
+    monkeypatch.delenv("HERMES_SPAWN_LEGACY", raising=False)
+    assert nofork.install_process_hook()
+    try:
+        cmd = captured["cmd"]
+        prefix = cmd[: cmd.index("--") + 1]
+        proc = subprocess.Popen(
+            [*prefix, sys.executable, "-c",
+             "import os,resource;print(os.getpid(),resource.getrlimit(resource.RLIMIT_NPROC)[0])"],
+            stdout=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        out, _ = proc.communicate(timeout=60)
+    finally:
+        nofork.uninstall_process_hook()
+    assert counts["fork"] == 0 and counts["native"] >= 1, counts
+    pid, limit = out.split()
+    assert int(pid) == proc.pid, "the launcher must exec in place (Popen.pid is the worker)"
+    assert limit == "777"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX only")
+def test_launcher_exec_failure_exits_127():
+    from hermes_cli import kanban_proc_bounds as kpb
+
+    out = subprocess.run([*kpb.worker_limits_launcher_argv(10**6, 0), "/nonexistent/worker"],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 127 and "exec" in out.stderr
+
+
+def test_launcher_prefix_is_empty_with_nothing_to_apply():
+    from hermes_cli import kanban_proc_bounds as kpb
+
+    assert kpb.worker_limits_launcher_argv(None, 0) == []
+    assert kpb.worker_limits_launcher_argv(0, 0) == []
 
 
 def test_config_yaml_knob_reaches_the_resolver(fresh_home, monkeypatch):

@@ -54,6 +54,7 @@ _FINAL_TEXT = object()
 _FLUSH = object()
 _APPROVAL_BOUNDARY = object()
 _REOPEN_SEED = object()
+_HUMAN_ENGAGEMENT = object()
 _FUTURE_TYPES = (asyncio.Future, concurrent.futures.Future)
 
 # Boundary finalize text when nothing has accumulated yet (overridable per boundary).
@@ -99,6 +100,7 @@ class _Tick:
     got_flush: bool = False
     flush_event: Any = None
     got_reopen_seed: bool = False
+    got_human_engagement: bool = False
     approval_boundary: Optional[tuple] = None  # (future, cancelled_flag)
     commentary_text: Optional[str] = None
     # Set by _push_update for _finalize_turn / _end_segment.
@@ -277,6 +279,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def accepts_tool_progress(self) -> bool:
         """True only when native streaming is active (gates in-stream tool progress)."""
         return self._use_native_streaming
+
+    def on_human_engagement(self) -> None:
+        """Thread-safe policy handoff; delivery stays on the consumer's event loop."""
+        self._queue.put(_HUMAN_ENGAGEMENT)
 
     def on_tool_progress(self, line: str) -> None:
         """Thread-safe: overlay a tool-progress line in the native bubble until the next delta."""
@@ -599,6 +605,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     await asyncio.sleep(0.05)
                     continue
                 tick = self._drain_queue()
+                if tick.got_human_engagement:
+                    self.cfg.internal_event = False
+                    await self._release_internal_held()
+                    continue
 
                 # A flush barrier (clarify poll ordering) or an approval boundary must put
                 # everything queued before it on screen, including held internal-event interim.
@@ -724,6 +734,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             try:
                 item = self._queue.get_nowait()
             except queue.Empty:
+                return tick
+            if item is _HUMAN_ENGAGEMENT:
+                tick.got_human_engagement = True
                 return tick
             if item is _DONE:
                 tick.got_done = True

@@ -35,6 +35,9 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Working-state text on text-rendering indicators (Slack assistant status): "full"/true = verb +
     # argument preview, "verb" = verb only (keeps paths out of shared channels), "off"/false = static.
     "live_status": "full",
+    # Seconds one tool call may run before the progress bubble gets a "still inside <tool> for Nm" line,
+    # re-edited in place every minute (t_90e5c823). 0 = off.
+    "tool_inflight_notice_seconds": 300,
 }
 
 # Tiers: HIGH = editing, personal/team use; MEDIUM = editing but customer-facing;
@@ -252,6 +255,7 @@ _NORMALISERS: dict[str, Any] = {
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),
     "reasoning_style": _norm_choice(("code", "blockquote", "subtext")),
     "tool_preview_length": _norm_int,
+    "tool_inflight_notice_seconds": _norm_int,
 }
 
 

@@ -395,6 +395,12 @@
     "kind": "bare_which"
   },
   {
+    "path": "hermes_cli/update_cmd_git.py",
+    "symbol": "_locate_real_git",
+    "kind": "bare_which",
+    "reason": "Windows trampoline recovery must inspect the active PATH Git installation to find its adjacent real git-core binary, including versioned PM caches; covered by test_locator_finds_git_core_beside_path_git."
+  },
+  {
     "path": "hermes_cli/update_restart_recovery.py",
     "symbol": "_systemctl_scopes",
     "kind": "bare_which"

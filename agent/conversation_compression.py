@@ -4010,7 +4010,10 @@ def _candidate_rejected(
         with _swallow('no-progress backoff arm failed', exc_info=True):
             if callable(_recorder := getattr(agent.context_compressor, "_record_structural_no_op", None)):
                 _recorder("compaction returned the transcript unchanged (no_progress)")
-        _emit_aborted_attempt_telemetry(agent, attempt_started_at, "no_progress")
+        # An engine whose store is damaged (e.g. LCM ``database disk image is malformed``) returns the input
+        # unchanged too; name it so monitors and the blocked warning can tell it from an empty summariser.
+        _store_down = getattr(agent.context_compressor, "last_compress_store_unavailable", False) is True
+        _emit_aborted_attempt_telemetry(agent, attempt_started_at, "store_unavailable" if _store_down else "no_progress")
         return True
     if not compressed:
         logger.error(

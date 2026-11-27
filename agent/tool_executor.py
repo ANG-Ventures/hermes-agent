@@ -1159,6 +1159,7 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
             print(f"  📞 {prefix}: {function_name}({list(function_args.keys())}) - {_preview(json.dumps(display_args, ensure_ascii=False), agent.log_prefix_chars)}")
 
     agent._current_tool = function_name
+    agent._current_tool_started_at = time.time()  # gateway in-flight elapsed (t_90e5c823)
     agent._touch_activity(f"executing tool: {function_name}")
     _set_worker_activity_callback(agent)
 
@@ -1252,6 +1253,8 @@ def _commit_tool_result(
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
     agent._current_tool = None
+    agent._current_tool_started_at = None
+    agent._last_tool_name, agent._last_tool_ended_at = function_name, time.time()
     _status_suffix = " (error)" if is_error else ""
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
@@ -1766,6 +1769,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     timeout_s = _resolve_concurrent_tool_timeout()
     batch = _ConcurrentBatch(agent, messages, effective_task_id, parsed_calls, timeout_s)
     agent._current_tool = tool_names_str
+    agent._current_tool_started_at = time.time()
     agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
     spinner = _start_quiet_tool_spinner(agent, "", {}, label=f"⚡ running {num_tools} tools concurrently")

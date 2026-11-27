@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import dataclasses
+import functools
 import logging
 import time
 from contextlib import nullcontext, suppress
@@ -34,6 +35,16 @@ GOAL_PIN_FAILED = ("<goal pin failed>",)
 # its judge (an aux-LLM call, t_d81971a0) and parks (mgr, pending, reply, source) here for the
 # post-delivery callback, which judges after the reply is sent.
 _LOOP_JUDGE_DEFER: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar("loop_judge_defer", default=None)
+
+
+def _goal_idle_wake_sub(prompt: str, mgr: Any, max_checkins: int) -> str:
+    """Header sub-kind of a goal idle wake: ``check-in N/M`` for a counted check-in (N from the goal
+    state this wake just saved), else ``park expired`` (a timed park's deadline passed)."""
+    from hermes_cli.goals import GOAL_CHECKIN_PREFIX
+    if str(prompt or "").startswith(GOAL_CHECKIN_PREFIX):
+        n = getattr(getattr(mgr, "state", None), "idle_wakes", None)
+        return f"check-in {n}/{max_checkins}" if isinstance(n, int) else "check-in"
+    return "park expired"
 
 
 class GatewayGoalsMixin:
@@ -156,15 +167,19 @@ class GatewayGoalsMixin:
         return await self._manager_for_event(event, "heartbeat", _load)
 
     @staticmethod
-    def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False) -> MessageEvent:
+    def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False,
+                                wake_kind: Optional[str] = None, wake_sub: Optional[str] = None) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
         The stored source's ``message_id`` is the message that registered the watch; a synthetic
         prompt is not a reply to it, so it is dropped or every progress bubble and final reply
         would quote that stale message (Telegram DM topics route anchorless via the topic id).
+        ``wake_kind`` / ``wake_sub`` name the wake for its progress header (``gateway.wake_kind``).
         """
+        from gateway.wake_kind import wake_meta
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
-        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
+        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal,
+                            wake_kind=wake_kind, metadata=wake_meta(sub=wake_sub))
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""
@@ -223,7 +238,7 @@ class GatewayGoalsMixin:
             return
         if not prompt:
             return
-        event = self._synthetic_prompt_event(source, prompt)
+        event = self._synthetic_prompt_event(source, prompt, wake_kind="heartbeat")
         event.metadata["gateway_session_key"] = quick_key
         event._heartbeat_execution_started = False
         # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
@@ -336,6 +351,7 @@ class GatewayGoalsMixin:
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str, event: Any = None, goal_pin: Any = None,
+        turn_completed: bool = True,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -385,7 +401,8 @@ class GatewayGoalsMixin:
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
         from hermes_cli.goals import (
-            DEFAULT_CHECKIN_MINUTES, DEFAULT_MAX_IDLE_CHECKINS, DEFAULT_NO_PROGRESS_TURNS, is_goal_synthetic_text,
+            DEFAULT_CHECKIN_MINUTES, DEFAULT_MAX_IDLE_CHECKINS, DEFAULT_NO_PROGRESS_TURNS,
+            DEFAULT_MAX_INCOMPLETE_TURNS, is_goal_synthetic_text,
         )
         # A turn the goal loop did not start (user message, worker/process result) re-arms idle check-ins.
         _real_event = event is not None and not is_goal_synthetic_text(getattr(event, "text", ""))
@@ -413,6 +430,8 @@ class GatewayGoalsMixin:
                 made_tool_calls=_made_tools, no_progress_turns=_no_progress,
                 turn_effect=_effect, user_spoke=_user_spoke or _goal_turn,
                 nudge_on_read_only_turns=_nudge_read_only, checkin_minutes=_checkin, max_checkins=_max_checkins,
+                turn_completed=turn_completed, human_message=_user_spoke,
+                max_incomplete_turns=self._goal_int_setting("max_incomplete_turns", DEFAULT_MAX_INCOMPLETE_TURNS),
             ),
         )
         _sid = getattr(session_entry, "session_id", "?")
@@ -456,7 +475,9 @@ class GatewayGoalsMixin:
                 # this flag the shared-multi-user sender prefix would stamp "[<user>] " onto it
                 # (impersonation; same class as the boot-resume ghost message, 2026-07-10).
                 self._enqueue_fifo(
-                    _quick_key, self._synthetic_prompt_event(source, prompt, internal=True), adapter,
+                    _quick_key,
+                    self._synthetic_prompt_event(source, prompt, internal=True, wake_kind="goal", wake_sub="continue"),
+                    adapter,
                 )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
@@ -551,16 +572,23 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
-        # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
-        # still needs to be released and rescheduled.
+        # Blank failed turns still need goal failure accounting; blank successful turns can
+        # reset that streak without judging. An in-flight /loop tick must always be settled.
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip():
+        explicit_completed = (agent_result.get("completed") if isinstance(agent_result, dict)
+                              else getattr(event, "_goal_turn_completed", None))
+        from agent.turn_failure_copy import is_max_iteration_handoff
+
+        completed = explicit_completed is not False or is_max_iteration_handoff(agent_result)
+        unexecuted_wake = (getattr(event, "_goal_idle_wake", False) is True
+                           and getattr(event, "_goal_execution_started", False) is not True)
+        if not unexecuted_wake and (final_text.strip() or explicit_completed is not None):
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             if label not in parts:
                 continue
             try:
-                extra = {"event": event, "goal_pin": goal_pin} if label == "goal continuation" else {}
+                extra = {"event": event, "goal_pin": goal_pin, "turn_completed": completed} if label == "goal continuation" else {}
                 await hook(session_entry=session_entry, source=source, final_response=final_text, **extra)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
@@ -686,7 +714,7 @@ class GatewayGoalsMixin:
                 mgr.state.ticks_fired if mgr.state else "?",
                 platform_name, source.chat_id, source.thread_id,
             )
-            event = self._synthetic_prompt_event(source, wakeup, internal=True)
+            event = self._synthetic_prompt_event(source, wakeup, internal=True, wake_kind="loop")
             refused = []
 
             def _admit(key: str) -> bool:
@@ -781,12 +809,65 @@ class GatewayGoalsMixin:
 
         while self._running:
             try:
-                for _profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
+                scopes = await _resolve_handoff_watch_scopes(self)
+                for _profile_name, profile_home in scopes:
                     async with _scope(profile_home):
                         await self._goal_idle_wake_scan()
+                if self._goal_orphan_gc_due():
+                    await self._goal_orphan_gc(scopes, _scope)
             except Exception as exc:
                 logger.debug("goal idle-wake watcher error: %s", exc)
             await asyncio.sleep(interval)
+
+    # Hourly orphan GC (t_92fc3ff0) rides this watcher: no thread, no launchd job.
+    _GOAL_ORPHAN_GC_INTERVAL_S = 3600.0
+
+    def _goal_orphan_gc_due(self) -> bool:
+        """At most once per ``_GOAL_ORPHAN_GC_INTERVAL_S`` (monotonic); the first tick runs."""
+        now = time.monotonic()
+        last = getattr(self, "_goal_orphan_gc_last", None)
+        if last is not None and now - last < self._GOAL_ORPHAN_GC_INTERVAL_S:
+            return False
+        self._goal_orphan_gc_last = now
+        return True
+
+    async def _goal_orphan_gc(self, scopes, scope_cm) -> dict:
+        """Retire (``orphaned``) active goals/loops whose session id no routed key holds and that
+        were idle >= ``goals.orphan_gc_days`` (default 7; 0 = off; read under each profile's scope). Routing is the gateway-wide
+        store, so a goal routed under ANY served profile is kept; each profile's own store is
+        reaped under its scope. One INFO line per run, never a page."""
+        from hermes_cli.goals import DEFAULT_ORPHAN_GC_DAYS, reap_orphaned_goals_and_loops
+
+        totals = {"scanned": 0, "orphaned": 0, "loops": 0}
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return totals
+        entries = await self._run_in_executor_with_context(store.list_sessions)
+        routed = {e.session_id for e in entries if getattr(e, "session_id", None)}
+        lookup = getattr(store, "lookup_by_session_id", None)
+
+        def _is_routed_now(sid: str) -> bool:
+            # Re-read inside each retiring write: a /resume or topic rebind that routes the session
+            # after the snapshot above keeps its goal/loop. No lookup -> trust the snapshot.
+            return sid in routed if lookup is None else lookup(sid) is not None
+
+        ran = False
+        for _profile_name, profile_home in scopes:
+            async with scope_cm(profile_home):
+                # Read per scope: each profile's own goals.orphan_gc_days governs its own store.
+                gc_days = self._goal_int_setting("orphan_gc_days", DEFAULT_ORPHAN_GC_DAYS)
+                if gc_days <= 0:
+                    continue
+                await self._warm_goals_session_db("goal orphan gc")
+                counts = await self._run_in_executor_with_context(
+                    functools.partial(reap_orphaned_goals_and_loops, routed, gc_days=gc_days,
+                                      is_routed=_is_routed_now))
+            ran = True
+            for k in totals:
+                totals[k] += counts.get(k, 0)
+        if ran:
+            logger.info("goal-gc: scanned=%d orphaned=%d loops=%d", totals["scanned"], totals["orphaned"], totals["loops"])
+        return totals
 
     async def _goal_idle_wake_scan(self) -> None:
         from hermes_cli.goals import (
@@ -794,8 +875,6 @@ class GatewayGoalsMixin:
         )
 
         checkin_minutes = self._goal_int_setting("checkin_minutes", DEFAULT_CHECKIN_MINUTES)
-        if not checkin_minutes:
-            return
         max_checkins = self._goal_int_setting("max_idle_checkins", DEFAULT_MAX_IDLE_CHECKINS)
         await self._warm_goals_session_db("goal idle wake")
         sids = set(await self._run_in_executor_with_context(list_active_goal_session_ids))
@@ -866,7 +945,8 @@ class GatewayGoalsMixin:
         def _still_active() -> bool:
             # Strict (Prism 99ea851df13d): a failed read is not proof another writer ended the goal.
             try:
-                return mgr.reload(strict=True) is not None and mgr.is_active()
+                return (mgr.reload(strict=True) is not None and mgr.is_active()
+                        and mgr.state.idle_wake_attempt == after.get("idle_wake_attempt"))
             except Exception as exc:
                 logger.debug("goal idle wake for %s: post-save reload failed: %s", quick_key, exc)
                 return False
@@ -879,34 +959,55 @@ class GatewayGoalsMixin:
             # The goal lock is held through admission, so a gateway /goal pause|clear cannot complete
             # while the adapter prepares the event (Discord awaits get_chat_info before claiming).
             async with self._goal_session_lock(session_id):
-                mgr, prompt, before, after = await self._run_in_executor_with_context(_wake)
+                def _give_back(result):
+                    _mgr, _prompt, _before, _after = result
+                    if _prompt:
+                        undo_idle_wake(session_id, _before, _after)
+
+                mgr, prompt, before, after = await self._claim_off_loop(_wake, _give_back)
                 if not prompt:
                     return
-                # Writers outside this lock (CLI/TUI on the same session) may have ended the goal since
-                # the wake's save, or the re-read failed: give the wake back either way.
-                if not await self._run_in_executor_with_context(_still_active):
-                    await self._run_in_executor_with_context(_refund)
-                    return
-                if _ineligible(quick_key):
-                    await self._run_in_executor_with_context(_refund)
-                    return
-                logger.info(
-                    "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
-                    quick_key, session_id, prompt.splitlines()[0][:80],
-                )
-                event = self._synthetic_prompt_event(source, prompt, internal=True)
-                event.metadata["gateway_session_key"] = quick_key
-                refused = []
+                event = None
+                try:
+                    # Writers outside this lock (CLI/TUI on the same session) may have ended the goal since
+                    # the wake's save, or the re-read failed: give the wake back either way.
+                    if not await self._run_in_executor_with_context(_still_active):
+                        return
+                    if _ineligible(quick_key):
+                        return
+                    logger.info(
+                        "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
+                        quick_key, session_id, prompt.splitlines()[0][:80],
+                    )
+                    event = self._synthetic_prompt_event(
+                        source, prompt, internal=True, wake_kind="goal",
+                        wake_sub=_goal_idle_wake_sub(prompt, mgr, max_checkins))
+                    event._goal_idle_wake = True
+                    event.metadata["gateway_session_key"] = quick_key
+                    def _admit(key: str) -> bool:
+                        # Final eligibility check, run by the adapter at the claim itself (Prism
+                        # eb13daf988ed): no await separates it from the session claim or queue.
+                        return not _ineligible(key)
 
-                def _admit(key: str) -> bool:
-                    # Final eligibility check, run by the adapter at the claim itself (Prism
-                    # eb13daf988ed): no await separates it from the session claim or queue.
-                    if _ineligible(key):
-                        refused.append(key)
-                        return False
-                    return True
+                    event._admission_check = _admit
+                    await adapter.handle_message(event)
+                finally:
+                    # Adapter admission only spawns work: cap/route/lease refusal or cancellation
+                    # can settle it without execution. Register even when handle_message itself
+                    # was cancelled after spawning, and never await the turn under the goal lock.
+                    processing = (
+                        adapter._session_tasks.get(quick_key)
+                        if getattr(event, "_gateway_accepted", False) else None
+                    )
+                    if processing is None:
+                        if not getattr(event, "_goal_execution_started", False):
+                            await asyncio.shield(self._run_in_executor_with_context(_refund))
+                    else:
+                        def _settled(_task):
+                            if getattr(event, "_goal_execution_started", False):
+                                return
+                            refund = asyncio.create_task(self._run_in_executor_with_context(_refund))
+                            adapter._background_tasks.add(refund)
+                            refund.add_done_callback(adapter._background_tasks.discard)
 
-                event._admission_check = _admit
-                await adapter.handle_message(event)
-                if refused:  # the wake never ran: give it back
-                    await self._run_in_executor_with_context(_refund)
+                        processing.add_done_callback(_settled)

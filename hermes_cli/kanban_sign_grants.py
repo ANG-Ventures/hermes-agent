@@ -18,7 +18,9 @@ expiring piece of its signing authority instead of its identity:
   the insert's transaction, so no reader that trusts an author label honours it;
 * the ONE promotion is :func:`operator_rows_with_live_grants`: a reader meant to
   honour live grants reads the rows it returns (author = ``by``) and nothing else;
-  a revoked or expired grant's rows drop out, the way a head move voids a stamp.
+  a revoked or expired grant's rows drop out, the way a head move voids a stamp;
+* a CLOSED grant (``closed_at``, :func:`close`: its background batch ended normally, t_4548202f)
+  takes no new write, but the rows written before the close stay promoted until ``expires_at``.
 
 Kill switch: ``kanban.sign_grants`` (board-home config first, then the profile);
 anything but ``on`` refuses every mint and every granted write.
@@ -118,6 +120,9 @@ def operator_rows_with_live_grants(conn: sqlite3.Connection, task_id: str, *,
     A reader that is meant to honour live grants reads these; every other reader sees the
     marked author and honours nothing.
     """
+    if not enabled():
+        # Kill switch: no granted row is honoured, live, closed or otherwise (no restart needed).
+        return []
     now = int(time.time()) if now is None else int(now)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(task_comments)").fetchall()}
     sel = "id, author, body, run_id, session_ref, created_at" + (", grant_id" if "grant_id" in cols else "")
@@ -263,6 +268,7 @@ def mint(
 
 def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None) -> int:
     """Revoke every row of ``grant_id``; returns the rows changed. Voids its stamps.
+    A CLOSED grant can still be revoked: that voids the rows it wrote before the close.
 
     From inside a delegate child (its board connection is read-only) this is the one other
     write it may make, because it only narrows authority: the child revokes its OWN grant
@@ -270,25 +276,37 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
     same per-session identity :func:`mint` bound; never a caller-supplied ref, which a sibling
     child could copy off another child's row (Prism 27c3b03d5260).
     """
+    return _end(conn, grant_id, "revoked_at", "sign_grant_revoked", "revoked_at IS NULL", now)
+
+
+def close(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None) -> int:
+    """Close every row of ``grant_id`` (its background batch's child completed, t_4548202f); returns the rows
+    changed. A closed grant refuses every new write (:func:`validate_comment`), but the rows it wrote stay
+    promoted by :func:`operator_rows_with_live_grants` until ``expires_at``. A revoked grant never closes."""
+    return _end(conn, grant_id, "closed_at", "sign_grant_closed", "revoked_at IS NULL AND closed_at IS NULL", now)
+
+
+def _end(conn: sqlite3.Connection, grant_id: str, column: str, journal_kind: str, open_where: str,
+         now: Optional[int]) -> int:
     from hermes_cli import kanban_db as kb
 
     now = int(time.time()) if now is None else int(now)
-    where, args = "grant_id = ? AND revoked_at IS NULL", [grant_id]
+    where, args = f"grant_id = ? AND {open_where}", [grant_id]
     if not kb._is_delegated_child():
         with kb.write_txn(conn):
-            cards = _revoke_rows(conn, where, args, now)
+            cards = _end_rows(conn, column, where, args, now)
     else:
         own_ref = executing_session_ref()
         if not own_ref:
-            raise GrantRefused("a delegate child revokes only its own grant (no session bound)")
+            raise GrantRefused("a delegate child ends only its own grant (no session bound)")
         if not conn.execute("SELECT 1 FROM sign_grants WHERE grant_id = ? AND child_session_ref = ?",
                             (grant_id, own_ref)).fetchone():
-            raise GrantRefused(f"grant {grant_id} belongs to another session; a child revokes only its own")
+            raise GrantRefused(f"grant {grant_id} belongs to another session; a child ends only its own")
         with kb.delegated_child_write(conn):
             with kb.write_txn(conn):
-                cards = _revoke_rows(conn, where + " AND child_session_ref = ?", [*args, own_ref], now)
+                cards = _end_rows(conn, column, where + " AND child_session_ref = ?", [*args, own_ref], now)
     # Journaled after commit, one record per card, so a snapshot + journal replay restores the grant
-    # revoked instead of live (Prism a35d26840b79). Best-effort, like every journal write. Under the
+    # revoked (or closed) instead of live (Prism a35d26840b79). Best-effort, like every journal write. Under the
     # board ``conn`` is open on, not the ambient one, since replay reads only the restored board's
     # journal (Prism c2baca2e9dd1).
     try:
@@ -299,20 +317,19 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
         board = board_for_conn(conn)
         if board is None and cards:
             # No registered board owns this file (a snapshot, a forensics copy): journaling under the
-            # ambient board would revoke ITS live grant on the next restore (Prism 77b7e56c0d2c).
-            logger.warning("sign grant %s revoked on an unregistered board connection; "
-                           "revocation not journaled", grant_id)
+            # ambient board would end ITS live grant on the next restore (Prism 77b7e56c0d2c).
+            logger.warning("sign grant %s %s on an unregistered board connection; not journaled",
+                           grant_id, column)
         for card in (cards if board is not None else ()):
-            kanban_journal.append(board, card, "sign_grant_revoked",
-                                  {"grant_id": grant_id, "revoked_at": now})
+            kanban_journal.append(board, card, journal_kind, {"grant_id": grant_id, column: now})
     except Exception:  # pragma: no cover - the journal is a net, never a gate
         pass
     return len(cards)
 
 
-def _revoke_rows(conn: sqlite3.Connection, where: str, args: list, now: int) -> list:
+def _end_rows(conn: sqlite3.Connection, column: str, where: str, args: list, now: int) -> list:
     cards = [r[0] for r in conn.execute(f"SELECT task_id FROM sign_grants WHERE {where}", args)]
-    conn.execute(f"UPDATE sign_grants SET revoked_at = ? WHERE {where}", [now, *args])
+    conn.execute(f"UPDATE sign_grants SET {column} = ? WHERE {where}", [now, *args])
     return cards
 
 
@@ -445,6 +462,8 @@ def validate_comment(
     now = int(time.time()) if now is None else int(now)
     if row["revoked_at"] is not None:
         raise GrantRefused(f"grant {grant_id} was revoked")
+    if "closed_at" in row.keys() and row["closed_at"] is not None:
+        raise GrantRefused(f"grant {grant_id} is closed")
     if int(row["expires_at"]) <= now:
         raise GrantRefused(f"grant {grant_id} expired")
     if _norm_model(row["parent_model"]) != _norm_model(row["child_model"]):

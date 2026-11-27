@@ -219,3 +219,41 @@ def test_invalid_selected_environment_never_silently_falls_back(tmp_path, monkey
     }))
     with pytest.raises(RuntimeError, match="environment"):
         runtime_paths.selected_venv(root)
+
+
+def test_external_checkout_owner_ignores_stale_pm_selection(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    import venv
+    from pm import environments as runtime_paths
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".git").mkdir()
+    base = root / "venv"
+    venv.EnvBuilder(with_pip=False).create(base)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    state = runtime_paths.install_state_dir(root)
+    selected = state / "environments" / "stale" / "venv"
+    for environment, value in [(base, "locked"), (selected, "stale")]:
+        site = runtime_paths.site_packages(environment)
+        site.mkdir(parents=True, exist_ok=True)
+        (environment / "pyvenv.cfg").touch()
+        (site / "owner_probe.py").write_text(f"value = {value!r}")
+    (state / "facts.json").write_text(json.dumps({"packages": {"venv": {"environment": str(selected)}}}))
+    code = ("import sys; from pathlib import Path; "
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parents[2])!r}); "
+            "from pm.environments import activate_dependencies; "
+            f"activate_dependencies(Path({str(root)!r})); "
+            "import owner_probe; print(owner_probe.value)")
+    python = base / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    env = dict(os.environ, HERMES_CHECKOUT_VENV=str(base))
+    result = subprocess.run([str(python), "-c", code], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "locked"
+    env.pop("HERMES_CHECKOUT_VENV")
+    result = subprocess.run([str(python), "-c", code], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "stale"
+

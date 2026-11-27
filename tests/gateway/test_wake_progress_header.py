@@ -26,7 +26,7 @@ DEADMAN = ('[kanban review deadman] review deadman tier 1: act on this card or c
 @pytest.mark.parametrize("text,metadata,label", [
     ("[kanban wake] something changed", {}, "kanban wake"),
     ("[kanban] board note", {}, "kanban"),
-    (DEADMAN, {}, "kanban review deadman · t_3f625862"),
+    (DEADMAN, {}, "kanban review deadman"),  # legacy tag; a card is never read from the body (t_17ba87a6)
     ("[ASYNC DELEGATION COMPLETE — d_1]\nA background subagent finished.", {}, "delegation"),
     ("subagent finished", {"delegation_id": "d_1"}, "delegation"),
     ("[IMPORTANT: Background process proc_1 finished (exit code 0).]", {}, "background process"),
@@ -35,6 +35,40 @@ DEADMAN = ('[kanban review deadman] review deadman tier 1: act on this card or c
 ])
 def test_internal_turn_header_label(text, metadata, label):
     assert wake_progress_header(text, INTERNAL, metadata) == f"🔔 wake · {label}"
+
+
+# ── producer-named kinds (t_17ba87a6) ───────────────────────────────────────────────────────
+
+GOAL_CHECKIN = ("[Goal check-in 1/3: the session has been idle 31 min with this goal still active]\n"
+                "Goal: land t_c676b4f3 and deploy it")
+
+
+def test_goal_check_in_names_goal_wake_and_no_card_from_its_text():
+    meta = {"wake_kind": "goal", "wake_sub": "check-in 1/3"}
+    assert wake_progress_header(GOAL_CHECKIN, INTERNAL, meta) == "🔔 goal wake · check-in 1/3"
+
+
+def test_kanban_owner_wake_names_sub_kind_and_card():
+    meta = {"wake_kind": "kanban", "wake_sub": "review", "card_id": "t_3f625862"}
+    assert wake_progress_header("anything", INTERNAL, meta) == "🔔 kanban wake · review · t_3f625862"
+
+
+def test_unlabeled_wake_falls_back_and_warns(caplog):
+    with caplog.at_level("WARNING", logger="gateway.response_filters"):
+        head = wake_progress_header(GOAL_CHECKIN, INTERNAL, {})
+    assert head == "🔔 wake · internal"
+    assert any("unlabeled wake" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_goal_idle_producer_stamps_its_kind():
+    from gateway.run_goals import GatewayGoalsMixin, _goal_idle_wake_sub
+    from gateway.wake_kind import wake_display_metadata
+
+    sub = _goal_idle_wake_sub(GOAL_CHECKIN, SimpleNamespace(state=SimpleNamespace(idle_wakes=1)), 3)
+    event = GatewayGoalsMixin._synthetic_prompt_event(
+        SimpleNamespace(chat_id="c", platform=Platform.TELEGRAM, message_id=None), GOAL_CHECKIN,
+        internal=True, wake_kind="goal", wake_sub=sub)
+    assert wake_display_metadata(event) == {"wake_kind": "goal", "wake_sub": "check-in 1/3"}
 
 
 @pytest.mark.parametrize("text,kind", [
@@ -82,8 +116,8 @@ async def test_internal_turn_bubbles_carry_header_after_reset(monkeypatch):
     adapter = await _drive_progress(monkeypatch, ["💻 terminal: \"ls\"", ("__reset__",), "📖 read_file"], head)
     print("rendered bubble 1:", repr(adapter.sent[0]["content"]))
     assert [s["content"] for s in adapter.sent] == [
-        "🔔 wake · kanban review deadman · t_3f625862\n💻 terminal: \"ls\"",
-        "🔔 wake · kanban review deadman · t_3f625862\n📖 read_file",
+        "🔔 wake · kanban review deadman\n💻 terminal: \"ls\"",
+        "🔔 wake · kanban review deadman\n📖 read_file",
     ]
 
 
@@ -138,7 +172,7 @@ def _bare_runner():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind,expected", [(INTERNAL, "🔔 wake · kanban review deadman · t_3f625862"), (None, None)])
+@pytest.mark.parametrize("kind,expected", [(INTERNAL, "🔔 wake · kanban review deadman"), (None, None)])
 async def test_turn_context_carries_header_for_internal_turns_only(kind, expected):
     disp = MagicMock()
     disp.resolve_display_setting.return_value = False

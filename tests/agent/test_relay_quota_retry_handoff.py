@@ -97,7 +97,9 @@ def test_long_quota_never_retries_primary(status, fallback):
 def test_native_next_lane_and_same_model(provider, cls):
     agent = make_agent([], provider=provider)
     chain = ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr", "cpa"]
-    next_lane = chain[chain.index(provider) + 1]
+    # quota_model = no seat of the pool can serve the model; every other relay face
+    # shares those seats, so the walk skips to the first lane off the pool (t_5188f4ed).
+    next_lane = "cpa" if cls == "quota_model" else chain[chain.index(provider) + 1]
     agent._fallback_chain = agent._fallback_chain[chain.index(provider):]
     chosen_model = agent.model
     sleeps = []
@@ -245,7 +247,7 @@ def test_long_quota_stays_exhausted_when_capacity_policy_widens_ceiling():
     sleeps = []
     result, _, call, attempts = run(agent, quota_error(cls="quota_model"), sleeps)
     assert result["completed"] is True
-    assert [p for p, _ in attempts] == ["claude-alr", "claude-dtlr"]
+    assert [p for p, _ in attempts] == ["claude-alr", "cpa"]  # same-pool faces skipped (t_5188f4ed)
     assert call.call_count == 2
     assert sum(sleeps) == 0
 
@@ -262,3 +264,81 @@ def test_structured_stream_class_with_retry_header_uses_same_handoff(body):
     assert [p for p, _ in attempts] == ["claude-alr", "claude-dtlr"]
     assert call.call_count == 2
     assert sum(sleeps) == 0
+
+
+# ── Relay quota_model with no dated reset: fall back now, no capacity wait ──
+# claude-pool#421: when the requested model is capped on every seat the relay
+# answers at once with 503 + quota_model, x-relay-eligible 0, the Fable allowance
+# and NO Retry-After (the earliest reset is undated). The gateway read that as a
+# pool-capacity 503 and slept a jittered >= 5 s before retrying the same lane
+# ("capacity 503 on claude-dtlr: retry 2/3 in 7.4s", 2026-11-14).
+
+def model_capped_error(status=503):
+    return RelayError(status, {"error": "no eligible sub for the requested model"}, {
+        "x-relay-error-class": "quota_model", "x-relay-error-hop": "relay",
+        "x-relay-seat": "none", "x-relay-eligible": "0",
+        "x-pool-fable-allowance": "25/25"})
+
+
+def capacity_agent(provider="claude-dtlr", fallback=True, statuses=None):
+    agent = make_agent(statuses if statuses is not None else [], provider=provider, fallback=fallback)
+    chain = ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr", "cpa"]
+    if fallback:
+        agent._fallback_chain = agent._fallback_chain[chain.index(provider):]
+    agent._capacity_retry_attempts = 3
+    agent._capacity_retry_max_wait_s = 60
+    return agent
+
+
+@pytest.mark.parametrize("status", [503, 429])
+def test_undated_quota_model_falls_back_without_capacity_wait(status):
+    statuses = []
+    agent = capacity_agent(statuses=statuses)
+    sleeps = []
+    pool = agent._credential_pool
+    result, activate, call, attempts = run(agent, model_capped_error(status), sleeps)
+    assert sum(sleeps) == 0, f"slept {sleeps} on a model capped on every seat"
+    assert result["completed"] is True
+    assert activate.called
+    assert [p for p, _ in attempts] == ["claude-dtlr", "cpa"]  # same-pool faces skipped (t_5188f4ed)
+    pool.mark_exhausted_and_rotate.assert_not_called()
+    # Recorded as the quota it is: the existing Fable banner, not "relay busy".
+    assert any("Model fallback (Fable weekly limit)" in text for _, text in statuses), statuses
+
+
+def test_undated_quota_model_without_fallback_fails_loud_without_retry():
+    agent = capacity_agent(fallback=False)
+    sleeps = []
+    result, _, call, attempts = run(agent, model_capped_error(), sleeps)
+    assert sum(sleeps) == 0
+    assert call.call_count == 1
+    assert result["failed"] is True
+    assert result["final_response"]
+
+
+@pytest.mark.parametrize("error,wait", [
+    # quota_model with a dated reset inside the wait policy: recovers in place.
+    (quota_error(retry_after="30", cls="quota_model"), 30),
+    # Legacy unclassed "no eligible sub" is genuine pool capacity: jittered wait.
+    (RelayError(503, {"error": "no eligible sub for the requested model"}, {}), 2.0),
+])
+def test_capacity_wait_kept_for_recoverable_pool_503(error, wait):
+    agent = capacity_agent()
+    sleeps = []
+    result, activate, call, attempts = run(agent, error, sleeps)
+    assert result["completed"] is True
+    activate.assert_not_called()
+    assert [p for p, _ in attempts] == ["claude-dtlr", "claude-dtlr"]
+    assert sum(sleeps) == pytest.approx(wait, abs=0.21)
+
+
+@pytest.mark.parametrize("hint,expected", [(None, True), ("", True), ("30", False), ("1783", True)])
+def test_quota_model_without_usable_reset_outlasts_retry_window(hint, expected):
+    from agent.error_classifier import classify_api_error
+    from agent.fork_ext.relay_quota import relay_quota_outlasts_retry_window
+    error = quota_error(retry_after=hint, cls="quota_model")
+    if hint is None:
+        del error.response.headers["retry-after"]
+    assert relay_quota_outlasts_retry_window(
+        SimpleNamespace(provider="claude-dtlr"), error,
+        classify_api_error(error, provider="claude-dtlr")) is expected

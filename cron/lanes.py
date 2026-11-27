@@ -50,6 +50,10 @@ RUNNER_SKEW_DRAIN_MAX_S = 120
 # Bounded-drain kill grace: SIGTERM, wait this long, SIGKILL survivors (Prism 9dde2d9f29f3). Inside
 # the runner's 20 s shutdown wait.
 RUNNER_SKEW_KILL_GRACE_S = 15
+# t_fa0b5cff: a drain-killed run whose tree outlived SIGKILL re-fires once the tree is gone. A
+# member known only as "may be ours" (unreadable environ, never signalled) holds that re-fire for
+# at most this long after the kill; a real member holds it to the run's own script deadline.
+RUNNER_GATED_UNSURE_S = 600
 # hermes-agent#2396 (S1) merge commit: a gateway whose boot code_sha descends from it takes both
 # lane locks, so the runner may tick (host precondition, §5.4).
 S1_MERGE_SHA: Optional[str] = "410f6d65af5af9045ee1c0d24c56090cf715d4ff"

@@ -6,12 +6,15 @@ four stuck/gave_up wakes for t_49ca79b8 / t_c459e6e6 (events 21:11-21:22) were
 consumed after both cards were archived at 21:30. So the card's status is read
 again at SEND time and again at DEQUEUE time. A wake about a card that is now
 ``done``/``archived`` is dropped, unless the event itself is the completion or
-archive (that is still news). Every drop logs one ``kanban_wake_stale_dropped``
+archive (that is still news). A status notice (review_requested, blocked, gave_up,
+block_loop_detected) is also dropped once the card no longer holds that status
+(t_05badfca, see :func:`is_stale_notice`). Every drop logs one ``kanban_wake_stale_dropped``
 line. Any read failure keeps the wake: a duplicate turn is the safe failure.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -99,20 +102,73 @@ def filter_obligations(event: Any, *, now: Optional[float] = None) -> bool:
     return False
 
 
-def is_stale(status: Optional[str], kind: str) -> bool:
+def closed_card_news(kind: Any, payload: Any) -> bool:
+    """t_28b3f37c: main-train's owner notice (hermes-home main_train.Kanban._boomerang through
+    card_mechanical_wake.emit) tells the session behind a merged PR that the PR turned main red. The
+    card it names is usually closed already, so a done/archived status does not make it stale."""
+    p = payload if isinstance(payload, dict) else {}
+    return (kind == "mechanical_wake" and p.get("by") == "card-mechanical-wake"
+            and p.get("source") == "main-train"
+            and str(p.get("episode") or "").startswith("main-train-owner:"))
+
+
+def is_stale(status: Optional[str], kind: str, payload: Any = None) -> bool:
+    if status in FINAL_STATUSES and closed_card_news(kind, payload):
+        return False
     return (status in FINAL_STATUSES or status == GONE) and kind not in STILL_NEWS_KINDS
 
 
+def is_stale_notice(status: Optional[str], kind: str, payload: Any = None) -> bool:
+    """:func:`is_stale`, and also a status notice whose status the card no longer holds.
+
+    t_05badfca: on 11-18 house-voice t_305ecaca's review_requested wake (queued 16:24:25) ran at
+    16:24:48, after the owner had requested changes (16:24:28) and the implementer's run had
+    claimed the card. An unknown status (``None``, a read failure) keeps the wake."""
+    if is_stale(status, kind, payload):
+        return True
+    held = NOTICE_STATUSES.get(kind)
+    return bool(held) and bool(status) and status not in held
+
+
+# The status each notice kind leaves the card in, measured from the board events (3 days, 11-18):
+# blocked -> blocked, gave_up -> blocked, block_loop_detected -> triage, review_requested -> review.
+NOTICE_STATUSES = {
+    "review_requested": frozenset({"review"}),
+    "blocked": frozenset({"blocked"}),
+    "gave_up": frozenset({"blocked"}),
+    "block_loop_detected": frozenset({"triage"}),
+}
+
+
+def current_status(conn: Any, task_id: str) -> str:
+    """Status, ``GONE`` for a deleted row; a card RUNNING under a review claim (the claim's
+    ``source_status`` is review) reads as ``review``: the review it was handed off for is underway."""
+    row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not row:
+        return GONE
+    status = str(row[0] or "")
+    if status == "running" and row[1] is not None:
+        claim = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1", (task_id, row[1])).fetchone()
+        try:
+            payload = json.loads(claim[0]) if claim and claim[0] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if isinstance(payload, dict) and payload.get("source_status") == "review":
+            return "review"
+    return status
+
+
 def read_status(board: Optional[str], task_id: str) -> Optional[str]:
-    """Current status, ``GONE`` for a deleted row. Raises if the board can't be read."""
+    """:func:`current_status` on ``board``. Raises if the board can't be read."""
     from hermes_cli import kanban_db as kb
 
     conn = kb.connect_readonly(board=board or None)
     try:
-        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return current_status(conn, task_id)
     finally:
         conn.close()
-    return str(row[0] or "") if row else GONE
 
 
 def log_dropped(task_id: str, kind: str, event_ts: Any, stage: str, status: Optional[str],
@@ -129,9 +185,12 @@ def log_dropped(task_id: str, kind: str, event_ts: Any, stage: str, status: Opti
 
 
 def card_entry(board: Optional[str], task_id: str, kinds: Iterable[str], event_ts: Any,
-               text: str) -> dict:
-    return {"board": board or "", "task_id": task_id, "kinds": sorted(set(kinds)),
-            "event_ts": event_ts, "text": text}
+               text: str, closed_news: bool = False) -> dict:
+    entry = {"board": board or "", "task_id": task_id, "kinds": sorted(set(kinds)),
+             "event_ts": event_ts, "text": text}
+    if closed_news:   # t_28b3f37c: the wake carries an owner notice, news on a done/archived card
+        entry["closed_news"] = True
+    return entry
 
 
 def filter_event(event: Any, *, now: Optional[float] = None) -> bool:
@@ -158,7 +217,8 @@ def filter_event(event: Any, *, now: Optional[float] = None) -> bool:
             live.append(card)
             continue
         kinds = list(card.get("kinds") or [])
-        if kinds and all(is_stale(status, k) for k in kinds):
+        news = card.get("closed_news") is True and status in FINAL_STATUSES
+        if kinds and not news and all(is_stale_notice(status, k) for k in kinds):
             for k in kinds:
                 log_dropped(str(card.get("task_id")), k, card.get("event_ts"), "dequeue",
                             status, now)

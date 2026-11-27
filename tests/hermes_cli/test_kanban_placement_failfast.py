@@ -95,7 +95,7 @@ def test_reroute_then_needs_input_never_triage(board, monkeypatch):
     assert kwe.block_on_rail_absent(RAIL) is True
     t = _task(tid)
     assert t.status == "ready"
-    assert t.body.rstrip().endswith("requires: browser-session")
+    assert t.body.rstrip().endswith("requires: browser-session (re-routed after BROWSER_RAIL_ABSENT on ace-ai)")
     ev = _events(tid, pff.REROUTE_EVENT)
     assert ev[0].pop("after_comment_id") == 0          # continuation causality snapshot (360354deb8ab)
     assert ev == [{"from": "ace-ai", "cap": "browser-session", "run_id": run1, "token": "BROWSER_RAIL_ABSENT",
@@ -247,6 +247,9 @@ def test_midrun_skill_view_returns_the_token_and_records_it(board, monkeypatch, 
 def test_undeclared_browser_navigate_on_ci_box_returns_the_token_and_records_it(board, monkeypatch):
     # Layer 1b, D1b-undeclared (t_f813a42f): no requires: line and no skill on the card, so
     # boot, dispatch and skill_view all pass; the browser tool itself must refuse up front.
+    # A CDP override is a signed-in browser (t_f935cb6f): the call asks browser-session, the rail.
+    # Without one it asks browser-public (test_kanban_browser_capability_split.py).
+    monkeypatch.setenv("BROWSER_CDP_URL", "wss://cdp.browsers.ace/id-github-kyzcreig")
     from tools import rail_preflight as rp
     from tools.registry import registry
     import model_tools  # noqa: F401
@@ -282,6 +285,20 @@ def test_capability_gate_is_inert_on_a_capable_host_unplaced_or_warn(board, monk
     _placed_env(monkeypatch, tid, 1, host="ci-box")
     monkeypatch.delenv("HERMES_KANBAN_TASK")                # not the owning worker: never gated
     assert pff.capability_gate("browser-session") is None
+
+
+def test_capability_gate_reads_the_browser_remote_grant(board, monkeypatch):
+    # t_ce9bd5a3: Layer 1b reads the host's MAPPED browser-session, the same reading placement
+    # uses: a pool host whose browser_remote row proves both lease legs has it; one failed leg does not.
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1, host="ace-ai")
+    assert pff.capability_gate("browser-session") is not None    # no producer row: still refused
+    doc = json.loads((board / khc.MAP_FILE).read_text())
+    for record, refused in (({"front_door": True, "ssh": True}, False), ({"front_door": True, "ssh": False}, True)):
+        doc["hosts"]["ace-ai"]["browser_remote"] = record
+        (board / khc.MAP_FILE).write_text(json.dumps(doc))
+        assert (pff.capability_gate("browser-session") is not None) is refused, record
 
 
 def test_preload_is_never_gated(board, monkeypatch, tmp_path):
@@ -731,7 +748,7 @@ def test_cli_only_preload_is_refused_before_anything_renders(board, monkeypatch,
         csq._run_single_query_mode(cli, "do it", None, True, True)
     assert exc.value.code == 0 and cli.calls == []
     t = _task(tid)
-    assert t.status == "ready" and t.body.rstrip().endswith("requires: browser-session")
+    assert t.status == "ready" and t.body.rstrip().endswith("requires: browser-session (re-routed after BROWSER_RAIL_ABSENT on ace-ai)")
 
 
 @pytest.mark.parametrize("body", ["requires: never-defined-cap", "plain\nrequires: browser-session, never-defined-cap"])

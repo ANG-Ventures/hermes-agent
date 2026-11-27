@@ -1,0 +1,299 @@
+[
+  {
+    "profile": "default",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "aegis",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "argus",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "athena",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "athena-kimi",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "athena-opus",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "cadmus",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "cc-worker",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "chiron",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "codex-worker",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "daedalus",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "daedalus-astra",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "daedalus-fable",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "daedalus-haiku",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "daedalus-kimi",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "daedalus-luna",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "daedalus-opus",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "daedalus-sol",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "daedalus-sonnet",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "marconi",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "momus",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "opencode-worker",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "pi-worker",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "shopper",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "themis",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "tiresias",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  },
+  {
+    "profile": "vulcan",
+    "exit_code": 0,
+    "receipt": [
+      "{\"verdict\": \"continue\", \"parse_failed\": false, \"transport_failed\": false}",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=0 provider=custom model=unreachable-control",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt failed: rung=0 provider=custom model=unreachable-control category=unavailable",
+      "INFO:hermes_cli.goal_judge_chain:goal judge attempt: rung=1 provider=cpa model=gpt-6.1-sol",
+      "INFO:hermes_cli.goal_judge_chain:goal judge winner: rung=1 provider=cpa model=gpt-6.1-sol served_model=gpt-6.1-sol"
+    ]
+  }
+]

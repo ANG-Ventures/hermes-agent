@@ -112,7 +112,6 @@ REACHABLE_BASELINE = frozenset({
     # fork/main c14e059f8f2: 17 sites before, 18 after; none newly reachable.
     "gateway/platforms/api_server.py _handle_toolsets -> urlopen",
     "gateway/platforms/api_server_runs.py _execute_run -> requests.get",
-    "gateway/run_inbound.py _enrich_inbound_images -> requests.get",
     "gateway/run_inbound.py _inbound_model_context_length -> requests.get",
     "gateway/run_startup.py _start_log_startup_environment -> open_credentialed_url",
     "gateway/run_startup.py _start_recover_previous_run -> urlopen",

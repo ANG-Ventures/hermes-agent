@@ -14,6 +14,7 @@ import os
 import contextlib
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from agent.redact import redact_sensitive_json, redact_sensitive_text
@@ -23,7 +24,7 @@ from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
-    KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+    KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENT_READ_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
@@ -177,7 +178,7 @@ _UNDECLARED_ARGS: dict[str, frozenset[str]] = {
     "kanban_attach_url": frozenset({"title"}),
     "kanban_list": frozenset({"all"}),
     "kanban_complete": _FORK_MUTATION_ARGS | frozenset({
-        "superseded_by", "draft_ok", "survivor_pr", "survivor_ref"}),
+        "superseded_by", "draft_ok", "draft_kind", "survivor_pr", "survivor_ref"}),
     "kanban_block": _FORK_MUTATION_ARGS,
     "kanban_unblock": _FORK_MUTATION_ARGS,
     "kanban_request_review": _FORK_MUTATION_ARGS,
@@ -333,9 +334,8 @@ def _enforce_worker_task_ownership(tid: str) -> None:
             "delegate_task children, or in-process cron jobs. Report results to the owning "
             "worker instead.")
     if tid != env_tid:
-        raise _Reject(
-            f"worker is scoped to task {env_tid}; refusing to mutate {tid}. Use kanban_comment "
-            f"to hand off information to other tasks, or kanban_create to spawn follow-up work.")
+        from hermes_cli.kanban_db_board_registry import worker_scope_refusal
+        raise _Reject(worker_scope_refusal(env_tid, tid))
 
 
 def _worker_guard(tool_name: str, args: dict) -> str:
@@ -500,6 +500,15 @@ def _parse_bool_arg(args: dict, name: str) -> bool:
 
 def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
     return int(value) if value is not None else default
+
+
+def _tool_default_priority(conn) -> int:
+    """No-priority create through the tool: the live band for a person/operator author (t_febbdb61), else 0."""
+    from hermes_cli.kanban_parser import live_band_default
+    try:
+        return live_band_default(conn, _persisted_identity()) or 0
+    except Exception:  # a band read must never fail the create
+        return 0
 
 
 _TASK_FIELDS = tuple(
@@ -705,6 +714,27 @@ def heartbeat_current_worker_from_env(progress_at: Optional[float] = None) -> bo
 _COMMENT_POLL_MIN_INTERVAL_SECONDS = 6.0
 _comment_poll_last_attempt: float = float("-inf")  # see _auto_heartbeat_last_attempt
 _comment_watermark: dict[str, int] = {}
+# Machine authors whose card comments are status lines or reads for the card OWNER, never an
+# instruction to the running worker: they stay on the card (kanban_show) but are not steered in
+# as "from the operator" (t_718e6208: a boomerang child's owner read became an unasked gate change
+# on t_949dac2e). Worker-addressed automation (fleetreview-route, pr-only-ci-reds, the dispatcher's
+# SOFT DEADLINE, kanban-dispatcher collision warnings) and every human/operator author still deliver.
+_MIDRUN_SKIP_AUTHORS = frozenset({
+    "boomerang-wake", "kanban", "detached-run", "obligations", "review-failsafe", "ci-dead-run",
+})
+# ``<fleet root>/state/<flag>`` present: deliver machine authors mid-run again (pre-t_718e6208).
+MIDRUN_MACHINE_NOTES_FLAG = "kanban-midrun-machine-notes.enabled"
+
+
+def _skip_midrun_author(author: str) -> bool:
+    a = str(author or "").strip().lower()
+    if a not in _MIDRUN_SKIP_AUTHORS:
+        return False
+    try:
+        from hermes_constants import get_default_hermes_root
+        return not (get_default_hermes_root() / "state" / MIDRUN_MACHINE_NOTES_FLAG).exists()
+    except Exception:
+        return True
 
 
 def inject_new_comments_from_env(agent: Any) -> bool:
@@ -736,7 +766,8 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
     # re-enter the live turn as fake operator steering).
     own = _persisted_identity()
-    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()
+             and not _skip_midrun_author(c.author)]
     if not fresh:
         return False
     lines = [
@@ -804,7 +835,24 @@ def _latest_review(kb, conn, tid: str, runs: list) -> Optional[dict[str, Any]]:
             "summary": _cap_text(run.summary, _SHOW_REVIEW_CHARS)}
 
 
-def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
+def _cap_context(ctx: str, limit: int, spans: Optional[dict] = None) -> str:
+    """Cut the worker context to ``limit`` (t_5949eafd). The header+body (``spans["head"]``) and the
+    one current send-back (``spans["sendback"]``, char offsets from build_worker_context) are never
+    cut; the history between them gives way first, then what follows."""
+    spans = spans or {}
+    if "head" not in spans and "sendback" not in spans:
+        return _cap_text(ctx, limit)
+    h_end = spans.get("head", (0, 0))[1]
+    start, end = spans.get("sendback", (len(ctx), len(ctx)))
+    head, keep = ctx[:h_end], ctx[start:end]
+    mid, post = ctx[h_end:start], ctx[end:]
+    room = max(0, limit - len(head) - len(keep))
+    mid_k = _cap_text(mid, max(room // 2, room - len(post)))
+    post_k = _cap_text(post, max(0, room - len(mid_k)))
+    return head + mid_k + keep + post_k
+
+
+def _bounded_show(out: dict[str, Any], spans: Optional[dict] = None) -> dict[str, Any]:
     """Shrink the history lists, oldest entries first, until the response fits the budget."""
     def size() -> int:
         return len(json.dumps(out, ensure_ascii=False, default=str))
@@ -818,7 +866,7 @@ def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
     if size() > _SHOW_BUDGET_CHARS:
         excess = size() - _SHOW_BUDGET_CHARS
         ctx = out.get("worker_context") or ""
-        out["worker_context"] = _cap_text(ctx, max(4_000, len(ctx) - excess - 200))
+        out["worker_context"] = _cap_context(ctx, max(4_000, len(ctx) - excess - 200), spans)
     if not omitted:
         out.pop("omitted")
     return out
@@ -828,15 +876,18 @@ def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
 def _handle_show(args: dict, **kw) -> str:
     """Task state, bounded: newest review first, then the row, links, the newest comments, events
     and runs (newest first), and the worker context. Full history via ``hermes kanban show``."""
+    from hermes_cli.kanban_artifact_pointer import read as _read_pointer
     tid = _require_task_id(args)
     with _board(args.get("board"), verb="show", card_ids=(tid,)) as (kb, conn):
         task = _existing_task(kb, conn, tid)
         runs = kb.list_runs(conn, tid)
         comments = kb.list_comments(conn, tid)
         events = kb.list_events(conn, tid)
+        spans: dict = {}
         out: dict[str, Any] = {
             "latest_review": _latest_review(kb, conn, tid, runs),
-            "task": _fields(task, _TASK_FIELDS),
+            "task": {**_fields(task, _TASK_FIELDS),
+                     "artifact_pointer": _read_pointer(getattr(task, "artifact_pointer", None))},
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
             # gate is not holding it and kanban_complete will refuse.
@@ -860,7 +911,7 @@ def _handle_show(args: dict, **kw) -> str:
                      for r in reversed(runs[-_SHOW_MAX_RUNS:])],
             "runs_order": "newest_first",
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)}
+            "worker_context": _worker_context_or_error(kb, conn, tid, spans)}
         omitted = {k: n for k, n in (("comments", len(comments) - _SHOW_MAX_COMMENTS),
                                      ("events", len(events) - _SHOW_MAX_EVENTS),
                                      ("runs", len(runs) - _SHOW_MAX_RUNS)) if n > 0}
@@ -882,7 +933,17 @@ def _handle_show(args: dict, **kw) -> str:
                                           "error": _cap_text(r_last["error"], _SHOW_FIELD_CHARS)},
                 "note": "moved to %s; full text: hermes kanban show %s" % (kar.ARCHIVE_NAME, tid),
                 **({"error": arch["error"]} if arch.get("error") else {})}
-        return json.dumps(_bounded_show(out), ensure_ascii=False, default=str)
+        return json.dumps(_bounded_show(out, spans), ensure_ascii=False, default=str)
+
+
+def _worker_context_or_error(kb, conn, tid: str, spans: Optional[dict] = None) -> str:
+    """An unreadable kanban-archive.db is named in place of the context, never rendered as less history."""
+    from hermes_cli import kanban_archive_read as kar
+
+    try:
+        return kb.build_worker_context(conn, tid, spans)
+    except kar.ArchiveUnreadable as exc:
+        return "worker context unavailable: archived history unreadable (%s)" % exc
 
 
 @_kanban_handler("kanban_list")
@@ -989,6 +1050,9 @@ def _handle_complete(args: dict, **kw) -> str:
     _check(draft_ok is None or isinstance(draft_ok, str),
            f"draft_ok must be a string reason, got {type(draft_ok).__name__}")
     draft_ok = _redact_opt(draft_ok)
+    draft_kind = args.get("draft_kind")
+    _check(draft_kind is None or draft_kind in ("merge_hold", "keep_draft"),
+           f"draft_kind must be 'merge_hold' or 'keep_draft', got {draft_kind!r}")
     _check(summary or result or superseded_by is not None,
            "provide at least one of: summary (preferred), result — or "
            "superseded_by if the card's premise was already satisfied elsewhere")
@@ -1011,7 +1075,8 @@ def _handle_complete(args: dict, **kw) -> str:
                 conn, tid, result=result, summary=summary, metadata=metadata,
                 created_cards=created_cards, expected_run_id=_worker_run_id(tid),
                 survivor_pr=survivor_pr, survivor_ref=survivor_ref,
-                superseded_by=superseded_by, draft_ok=draft_ok)
+                superseded_by=superseded_by, draft_ok=draft_ok, draft_kind=draft_kind,
+                scheduled_ok=True)
         except kb.EmptyDraftOverrideError as draft_err:
             return tool_error(f"kanban_complete blocked: {draft_err}.")
         except kb.EmptySupersedeError as supersede_err:
@@ -1102,6 +1167,9 @@ def _handle_block(args: dict, **kw) -> str:
     with _board(args.get("board"), verb="block", card_ids=(tid,)) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
+        from hermes_cli import kanban_human_ask
+        ask_refusal = kanban_human_ask.refusal(kind, reason)
+        _check(ask_refusal is None, ask_refusal or "")
         until = None
         if until_raw not in (None, ""):
             try:
@@ -1439,6 +1507,104 @@ def _handle_attachments(args: dict, **kw) -> str:
                 _fields(a, _ATTACHMENT_FIELDS) for a in kb.list_attachments(conn, tid)]})
 
 
+# One read returns at most this many bytes. Base64 of 64 KiB is ~87K chars, under the
+# 100K-char default tool-result budget, so the reply is never spilled to a host file
+# a pool-host worker cannot open (t_0fc58360).
+KANBAN_ATTACHMENT_READ_MAX_BYTES = 64 * 1024
+
+
+def _readable_task_ids(kb, conn, own_tid: str) -> set[str]:
+    """Cards a dispatcher-owned worker may read attachment bytes from: its own card
+    and its direct parents (handoff files)."""
+    return {own_tid, *kb.parent_ids(conn, own_tid)}
+
+
+@_kanban_handler("kanban_attachment_read")
+def _handle_attachment_read(args: dict, **kw) -> str:
+    """Return one attachment's bytes through the board connection, so a worker whose
+    terminal runs on a pool host can read what it cannot reach by ``stored_path``.
+    The file is located from the DB row only; no caller path is ever opened."""
+    import base64
+    import hashlib
+    raw_id = args.get("attachment_id")
+    try:
+        att_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise _Reject("attachment_id is required (an integer from kanban_attachments)")
+    encoding = str(args.get("encoding") or "auto").strip().lower()
+    _check(encoding in ("auto", "base64"), "encoding must be 'auto' or 'base64'")
+    cap = KANBAN_ATTACHMENT_READ_MAX_BYTES
+    ranged = args.get("offset") is not None or args.get("length") is not None
+    try:
+        offset = int(args.get("offset") or 0)
+        length = int(args["length"]) if args.get("length") is not None else cap
+    except (TypeError, ValueError):
+        raise _Reject("offset and length must be integers (bytes)")
+    _check(offset >= 0, "offset must be >= 0")
+    _check(1 <= length <= cap, f"length must be between 1 and {cap} bytes")
+    tid = _require_task_id(args)
+    owned = _owned_worker_task_id()
+    with _board(args.get("board"), verb="attachment_read", card_ids=(tid,)) as (kb, conn):
+        _existing_task(kb, conn, tid)
+        if owned:
+            allowed = _readable_task_ids(kb, conn, owned)
+            _check(tid in allowed,
+                   f"kanban_attachment_read refused: a worker on {owned} may read attachments of its "
+                   f"own card and its parents ({', '.join(sorted(allowed))}), not {tid}")
+        att = kb.get_attachment(conn, att_id)
+        _check(att is not None and att.task_id == tid,
+               f"attachment {att_id} is not an attachment of {tid}")
+        # The row's path must resolve inside the card's own attachments dir.
+        base = kb.task_attachments_dir(tid).resolve()
+        try:
+            path = Path(att.stored_path).resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise _Reject(f"attachment {att_id} of {tid}: stored file is missing on the board host")
+        _check(path.is_relative_to(base) and path.is_file(),
+               f"attachment {att_id} of {tid}: stored file is not inside the card's attachments "
+               "directory; refusing to read it")
+    # One pass: hash the whole file, keep only the requested range.
+    whole = hashlib.sha256()
+    data = b""
+    size = 0
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            lo, hi = max(offset - size, 0), min(offset + length - size, len(block))
+            if lo < hi:
+                data += block[lo:hi]
+            whole.update(block)
+            size += len(block)
+    _check(ranged or size <= cap,
+           f"attachment {att_id} ({att.filename}) is {size} bytes, over the "
+           f"{cap}-byte kanban_attachment_read cap; nothing returned. Read it in ranges "
+           f"with offset/length (each at most {cap} bytes)")
+    _check(offset <= size, f"offset {offset} is past the end of attachment {att_id} ({size} bytes)")
+    out: dict[str, Any] = {
+        "task_id": tid, "attachment_id": att_id, "filename": att.filename,
+        "content_type": att.content_type, "size_bytes": size,
+        "sha256": whole.hexdigest(), "offset": offset, "size": len(data),
+        "eof": offset + len(data) >= size}
+    if ranged:
+        out["range_sha256"] = hashlib.sha256(data).hexdigest()
+    b64 = {"encoding": "base64", "content_base64": base64.b64encode(data).decode("ascii")}
+    if encoding == "auto":
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        if text is not None:
+            reply = _ok(**out, encoding="utf-8", text=text)
+            # JSON escaping can inflate text up to 6x (NUL -> \u0000); an over-budget
+            # result is spilled to a board-host file a pool worker cannot open.
+            from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS
+            if len(reply) <= DEFAULT_RESULT_SIZE_CHARS:
+                return reply
+            b64["note"] = (f"UTF-8 text serialized to {len(reply)} chars (JSON escaping), over "
+                           f"the {DEFAULT_RESULT_SIZE_CHARS}-char tool-result budget; "
+                           "returned as base64")
+    return _ok(**out, **b64)
+
+
 def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
     """Return a session id only when it is present in this profile's state.db."""
     if not session_id:
@@ -1455,6 +1621,13 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         return session_id if state.get_session(session_id) else None
     finally:
         state.close()
+
+
+def _slot_note(requested, stored) -> Optional[str]:
+    """``stored as slot X, currently id Y`` when the board kept the slot for the id asked for."""
+    from hermes_cli.model_registry import slot_store_note
+
+    return slot_store_note(requested, stored)
 
 
 @_kanban_handler("kanban_create")
@@ -1501,9 +1674,20 @@ def _handle_create(args: dict, **kw) -> str:
     until_raw = args.get("until")
     force_model = args.get("force_model")
     _check(force_model is None or isinstance(force_model, str), "force_model must be a reason string")
+    model_rewritten = None  # G7 (t_1e1450d1): a RETIRED id becomes its successor unless forced
+    if model_override and not (force_model or "").strip():
+        from hermes_cli.model_registry import retired_rewrite
+        model_override, model_rewritten = retired_rewrite(model_override)
     allow_flagship = args.get("allow_flagship")
     _check(allow_flagship is None or isinstance(allow_flagship, str),
            "allow_flagship must be a reason string")
+    # The board's create code sees every caller's REAL body; the hook sees one agent's call (t_4743853f).
+    from hermes_cli import kanban_access_bound_pin as _pin
+    body = args.get("body")
+    body = body if isinstance(body, str) else None
+    from hermes_cli import kanban_requires_words as _krw
+    for why in (_pin.refusal(body), _pin.studio_refusal(body), _krw.refusal(body)):
+        _check(not why, f"kanban_create: {why}")
     from hermes_cli import kanban_worker_policy as _worker_policy
     # allow_flagship authority (operator label, not a dispatched worker) is
     # judged by create_task itself, before any write.
@@ -1534,9 +1718,11 @@ def _handle_create(args: dict, **kw) -> str:
                 and not args.get("workspace_of")):
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        # Prism a8e263caef71: "false" is a truthy string; normalise before the default helper.
+        boomerang_arg = (None if args.get("boomerang_wake") is None
+                         else _parse_bool_arg(args, "boomerang_wake"))
         boomerang = _auto_boomerang(
-            # Prism a8e263caef71: "false" is a truthy string; normalise before the default helper.
-            None if args.get("boomerang_wake") is None else _parse_bool_arg(args, "boomerang_wake"),
+            boomerang_arg,
             worker=_is_dispatcher_owned_worker(),
             subscribed=bool(not unhomed and _auto_wake(args.get("wake"))
                             and _resolve_notify_target()
@@ -1550,7 +1736,8 @@ def _handle_create(args: dict, **kw) -> str:
             parents=tuple(parents), parents_kind=parents_kind, continues=args.get("continues"),
             workspace_of=args.get("workspace_of") or None,
             tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
-            priority=_opt_int(args.get("priority"), 0),
+            priority=(_opt_int(args.get("priority")) if args.get("priority") is not None
+                      else _tool_default_priority(conn)),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
@@ -1560,13 +1747,14 @@ def _handle_create(args: dict, **kw) -> str:
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
-            force_model_reason=force_model,
+            force_model_reason=force_model, keep_literal_model=bool(model_rewritten),
             flagship_override_reason=allow_flagship,
             flagship_override_author=_persisted_identity(),
             reasoning_effort=reasoning_effort,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
-            boomerang_wake=boomerang,
+            # Only the caller's own choice; create_task applies the default and records which.
+            boomerang_wake=boomerang_arg,
             initial_status=str(args.get("initial_status") or "running"),
             # Fan-out brake: worker-created cards park per kanban.worker_created_status.
             forced_status=_worker_policy.resolve_park_status(
@@ -1583,26 +1771,41 @@ def _handle_create(args: dict, **kw) -> str:
             "SELECT payload FROM task_events WHERE task_id = ? AND "
             "kind = 'assignee_remapped' ORDER BY id DESC LIMIT 1", (new_tid,)).fetchone()
         assignee_remap = json.loads(_remap_row[0]) if _remap_row and _remap_row[0] else None
-        landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS + ("reasoning_effort",))
+        landed = _fields(kb.get_task(conn, new_tid),
+                         _CREATED_FIELDS + ("reasoning_effort", "boomerang_wake"))
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
-        return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(
-                       conn, new_tid,
-                       # boomerang wake is a wake level: it always subscribes as a waker.
-                       wake=(True if boomerang
-                             else args.get("wake") if isinstance(args.get("wake"), bool) else None),
-                       # t_ea40ff83: an explicit foreign home subscribes the home, not this chat.
-                       # Prism 8efbb3c7ece2: the PERSISTED home (an idempotency hit or an
-                       # inherited home can differ from the session_id argument).
-                       explicit_home=((kb.get_task(conn, new_tid).session_id or "",
-                                       _current_session_id()
-                                       or get_session_env("HERMES_SESSION_ID", "") or None)
-                                      if args.get("session_id") and session_id else None),
-                       # Ace 2026-11-06: the env-less home row is the boomerang default's
-                       # half; an opt-out (or worker) create keeps today's no-row behaviour.
-                       home_fallback=bool(boomerang) and not _is_dispatcher_owned_worker()),
+        subscribed = _maybe_auto_subscribe(
+            conn, new_tid,
+            # boomerang wake is a wake level: it always subscribes as a waker.
+            wake=(True if boomerang
+                  else args.get("wake") if isinstance(args.get("wake"), bool) else None),
+            # t_ea40ff83: an explicit foreign home subscribes the home, not this chat.
+            # Prism 8efbb3c7ece2: the PERSISTED home (an idempotency hit or an
+            # inherited home can differ from the session_id argument).
+            explicit_home=((kb.get_task(conn, new_tid).session_id or "",
+                            _current_session_id()
+                            or get_session_env("HERMES_SESSION_ID", "") or None)
+                           if args.get("session_id") and session_id else None),
+            # Ace 2026-11-06: the env-less home row is the boomerang default's
+            # half; an opt-out (or worker) create keeps today's no-row behaviour.
+            home_fallback=bool(boomerang) and not _is_dispatcher_owned_worker())
+        from hermes_cli.kanban_boomerang_default import wake_route
+        from hermes_cli.kanban_create_placement import preview_line
+        placement = preview_line(conn, new_tid)  # t_0a5740f3: where it will run, which line decided it
+        from hermes_cli.kanban_requires_inherit import not_inherited_note
+        not_inherited = not_inherited_note(conn, new_tid)  # t_41763e36: the caller sees it here
+        # ``wake_route``: whether any chat will actually be woken (never assumed).
+        return _ok(task_id=new_tid, **landed, **gate, subscribed=subscribed,
+                   wake_route=wake_route(conn, new_tid),
+                   **({"placement": placement} if placement else {}),
+                   **({"requires_not_inherited": not_inherited} if not_inherited else {}),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
+                   **({"model_rewritten": model_rewritten}
+                      if model_rewritten and kb.get_task(conn, new_tid).model_override
+                      in (model_override, model_override.partition("/")[2]) else {}),
+                   **({"model_canonicalised": _canon} if (_canon := _slot_note(
+                       model_override, kb.get_task(conn, new_tid).model_override)) else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
 
@@ -1642,16 +1845,22 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
         "parent_chat_id": env("HERMES_SESSION_PARENT_CHAT_ID", ""),
         "message_id": env("HERMES_SESSION_MESSAGE_ID", ""),
         "profile": env("HERMES_SESSION_PROFILE", ""),
-    }, wake=wake)
+    }, wake=wake, session_id=env("HERMES_SESSION_ID", ""))
 
 
 def resolve_notify_target_for_source(source: dict[str, Any], *,
-                                     wake: Optional[bool] = None) -> dict[str, Any]:
+                                     wake: Optional[bool] = None,
+                                     session_id: Optional[str] = None) -> dict[str, Any]:
     """``add_notify_sub`` kwargs for a session identified by its ``SessionSource`` dict
     (``SessionSource.to_dict()`` shape: the persisted ``sessions.origin_json``, or the
     calling turn's bound vars). The ONE resolver: the calling session and a foreign home
     (t_ea40ff83, operator ruling 14:0x) both go through it, so a home's sub is exactly
-    what the home session itself would write. Pure apart from config/profile reads."""
+    what the home session itself would write. Pure apart from config/profile/state.db reads.
+
+    ``notifier_profile`` with no ``profile`` in the source: the profile whose state.db holds
+    ``session_id`` (t_e861b07c), else the process's profile. An aegis turn ran
+    ``hermes -p default kanban create --session <its own sid>``: the process profile read
+    "default", the default gateway claimed the card's wakes and could never deliver them."""
     def _s(key: str) -> str:
         value = source.get(key)
         return "" if value is None else str(value)
@@ -1673,6 +1882,9 @@ def resolve_notify_target_for_source(source: dict[str, Any], *,
     thread_id = _s("thread_id") or None
     message_id = _s("message_id")
     notifier_profile = _s("profile")
+    if not notifier_profile and session_id:
+        from hermes_cli.kanban_db import session_owner_profile
+        notifier_profile = session_owner_profile(session_id) or ""
     if not notifier_profile:
         from hermes_cli.profiles import current_profile_name
         notifier_profile = current_profile_name("default")
@@ -1701,7 +1913,9 @@ def resolve_notify_target_for_source(source: dict[str, Any], *,
 
 
 def _auto_boomerang(value: Optional[bool], *, worker: bool, subscribed: bool) -> Optional[bool]:
-    """Only operator-created auto-subscriptions inherit the runtime default."""
+    """Whether this create SUBSCRIBES its chat as a boomerang waker. Only operator-created
+    auto-subscriptions follow the runtime default here; the card's own ``boomerang_wake``
+    default is applied for every producer by ``kanban_db.create_task``."""
     if value is not None:
         return bool(value)
     if worker or not subscribed:
@@ -1761,7 +1975,8 @@ def routable_home_target(home_sid: Optional[str], *,
         return None
     if _hr.home_from_row(home_sid, row).target is None:
         return None
-    return resolve_notify_target_for_source(json.loads(row["origin_json"]), wake=wake)
+    return resolve_notify_target_for_source(json.loads(row["origin_json"]), wake=wake,
+                                            session_id=home_sid)
 
 
 def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],
@@ -1801,7 +2016,7 @@ def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],
     origin = json.loads(row["origin_json"])
     logger.info("kanban: %s homed to %s; subscribing home %s (caller chat %s)",
                 task_id, home_sid, home.target.chat_id, target["chat_id"])
-    return resolve_notify_target_for_source(origin, wake=wake)
+    return resolve_notify_target_for_source(origin, wake=wake, session_id=home_sid)
 
 
 def subscribe_calling_session(
@@ -1944,6 +2159,7 @@ _TOOLS = (
     ("kanban_attach", KANBAN_ATTACH_SCHEMA, _handle_attach, "📎"),
     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
+    ("kanban_attachment_read", KANBAN_ATTACHMENT_READ_SCHEMA, _handle_attachment_read, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _with_mutation_actor(_handle_unblock), "▶"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _with_mutation_actor(_handle_link), "🔗"))

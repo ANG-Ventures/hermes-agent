@@ -141,10 +141,13 @@ processes are killed at its teardown and their notices are suppressed in the par
 the result as `orphaned_processes`, exited-but-never-read notify processes as `unread_completions` (`_ChildRun.account_background_processes`, before `cleanup` kills them). **Child kernels:** a child's `execute_code` kernels are keyed `<parent-owner>::child::<child-session-id>`, pinned against the `max_session_kernels` LRU cap while the child runs and disposed by `cleanup` (`code_kernel.shutdown_kernels_for_delegated_child`) — never let a finished child's kernel squat the cap. **output_schema:** a miss after the one retry keeps `status: completed` with the raw text in `summary` plus `schema_valid: false` / `schema_errors` / `schema_note` — never discard a child's result. **Durability:** a gateway background
 unit with a durable record runs in its own detached process (`tools/delegate_detached.py`,
 `delegation.detached_background`, docs/dev/delegate-detached-background.md) and is adopted, not re-run, by the
-next boot; other background delegation is process-local. `heartbeat=N` on the same spawn emits a `heartbeat` event (type on the completion queue; delta output only, `HEARTBEAT_MIN_SECONDS` floor, one daemon timer thread for all sessions in `process_registry.py::ProcessRegistry._heartbeat_loop`) — every surface that renders `watch_match` must render `heartbeat` (`process_registry_notifications.py`, `gateway/run.py::_drain_gateway_watch_events`, `tui_gateway/session_notifications.py::_DEDUP_EXTRA_FIELDS`). **Stop fan-out:** a turn's hard interrupt reaches only
-`_active_children`; background units are detached at dispatch, so every stop surface (gateway `/stop` busy AND
-idle paths, TUI `session.interrupt`, ACP `cancel`, CLI `/stop` via `interrupt_all`) calls
-`async_delegation.interrupt_for_session` too. Depth>0 delegations are always synchronous
+next boot; other background delegation is process-local. `heartbeat=N` on the same spawn emits a `heartbeat` event (type on the completion queue; delta output only, `HEARTBEAT_MIN_SECONDS` floor, one daemon timer thread for all sessions in `process_registry.py::ProcessRegistry._heartbeat_loop`) — every surface that renders `watch_match` must render `heartbeat` (`process_registry_notifications.py`, `gateway/run.py::_drain_gateway_watch_events`, `tui_gateway/session_notifications.py::_DEDUP_EXTRA_FIELDS`). **Stop ownership:** a turn's hard interrupt reaches only
+`_active_children`; background units are detached at dispatch and owned by the async registry, so a TURN stop
+(gateway `/stop` busy and idle, `/queue run`, TUI `session.interrupt`, ACP `cancel`) leaves them running
+(t_8c4608e6). They end via `delegate_task(action='stop')`, CLI `/stop` (`interrupt_all`, a background-work kill),
+or session end/reset (`async_delegation.interrupt_for_session`). **Admission:** a background call is admitted
+(`async_delegation.preflight_admission`) BEFORE any child is built; a refusal there or at dispatch returns
+`{"status": "rejected", "reason": ...}` and never joins the work synchronously. Depth>0 delegations are always synchronous
 (`_model_background_value`), so the stop recurses through the child's own `_active_children` fan-out; an
 interrupted entry's `summary` is the child's last real assistant text (`_build_result_entry`). API: `website/docs/developer-guide/subagent-lifecycle-api.md`.
 

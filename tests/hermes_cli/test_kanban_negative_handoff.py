@@ -264,7 +264,7 @@ def test_non_running_card_completes_with_negative_wording(conn, armed, status):
     tid = kb.create_task(conn, title="vendor", assignee="daedalus")
     if status == "blocked":
         kb.claim_task(conn, tid)
-        assert kb.block_task(conn, tid, reason="vendor")
+        assert kb.block_task(conn, tid, reason="vendor", kind="needs_input")
     assert _status(conn, tid)["status"] == status
     # Operator close of a card no worker is running: not an implementer handoff.
     assert kb.complete_task(conn, tid, summary="blocked on vendor, closing as won't-fix")

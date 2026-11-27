@@ -130,6 +130,9 @@ _DISCORD_COMMAND_DRIFT_CHECK_INTERVAL_SECONDS = 3600.0
 # can't spin forever re-POSTing every ~1s and leave a permanent "is typing…"
 # bubble after the response was already sent. A healthy POST resets the counter.
 _DISCORD_TYPING_MAX_CONSECUTIVE_FAILURES = 5
+# Discord expires typing after 10s. Leave headroom for HTTP/event-loop latency;
+# rate-limit backoff still takes precedence over this healthy refresh cadence.
+_DISCORD_TYPING_REFRESH_INTERVAL_SECONDS = 5.0
 # Discord caps global slash commands at 100/app; exceeding it fails the ENTIRE sync (error 30032).
 _DISCORD_MAX_APP_COMMANDS = 100
 # ``discord.slash_commands`` — per-profile scope of this bot's native slash menu.
@@ -531,6 +534,9 @@ _NON_REPO_PATH_MARKERS = (
 
 # Set once the mirror handler is attached to the ``discord.gateway`` logger.
 _HEARTBEAT_BLOCKED_MIRROR_INSTALLED = False
+# Monotonic count of PHASE=event_loop_blocked lines the mirror wrote. The liveness probe diffs it across an
+# unhealthy streak so its forced-reconnect line can say whether a blocked-site line exists to grep for.
+_HEARTBEAT_BLOCKED_EMITTED = 0
 
 
 def _discord_repo_root() -> str:
@@ -594,6 +600,8 @@ class _DiscordHeartbeatBlockedMirror(logging.Handler):
             seconds_match = _HEARTBEAT_BLOCKED_SECONDS_RE.search(message)
             seconds = seconds_match.group(1) if seconds_match else "unknown"
             site = _innermost_repo_frame(message)
+            global _HEARTBEAT_BLOCKED_EMITTED
+            _HEARTBEAT_BLOCKED_EMITTED += 1
             logger.error(
                 "PHASE=event_loop_blocked platform=discord seconds=%s site=%s",
                 seconds,
@@ -2443,6 +2451,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         interval = self._liveness_interval_seconds
         threshold = self._liveness_failure_threshold
         failures = 0
+        blocked_at_streak_start = _HEARTBEAT_BLOCKED_EMITTED
         while self._running:
             try:
                 await asyncio.sleep(interval)
@@ -2473,6 +2482,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         self.name, failures,
                     )
                 failures = 0
+                # Window for the reconnect line's blocked-site count: since the last HEALTHY sample, so a
+                # block that caused the first unhealthy sample is inside it.
+                blocked_at_streak_start = _HEARTBEAT_BLOCKED_EMITTED
                 # Piggyback the hourly slash-command registry drift check on
                 # the existing healthy-sample tick — no extra task, and it only
                 # runs when the Gateway is actually up. Fail-soft.
@@ -2501,14 +2513,29 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 "transport closed" if terminal else "remained unhealthy",
                 reason, failures, threshold,
             )
-            # A stalled event loop is the common cause of latency_exceeded /
-            # ack_stale here — grep this log for PHASE=event_loop_blocked to see
-            # whether discord.py's keep-alive thread named a blocking call site.
-            logger.error(
-                "[%s] If this repeats, grep gateway.log for PHASE=event_loop_blocked "
-                "— it names the synchronous call blocking the event loop",
-                self.name,
-            )
+            # A stalled event loop is the common cause of latency_exceeded / ack_stale. Say whether the
+            # heartbeat-blocked mirror actually wrote a PHASE=event_loop_blocked line during this streak:
+            # discord.py only reports a block when ONE heartbeat send waits >= 10 s, so a loop starved by
+            # host load (many short stalls) reconnects with no such line, and the old unconditional "grep
+            # for it" hint sent the 2026-11-09 04:56:45 triage looking for a line that never existed
+            # (t_8783804a).
+            blocked_lines = _HEARTBEAT_BLOCKED_EMITTED - blocked_at_streak_start
+            if blocked_lines:
+                logger.error(
+                    "[%s] %d PHASE=event_loop_blocked line(s) logged during this unhealthy streak — they "
+                    "name the synchronous call blocking the event loop",
+                    self.name, blocked_lines,
+                )
+            else:
+                load = None
+                with suppress(Exception):
+                    load = round(os.getloadavg()[0], 1)  # admission-lint: not-a-decider log context only, gates nothing
+                logger.error(
+                    "[%s] No PHASE=event_loop_blocked during this unhealthy streak (no single call held the "
+                    "loop >= 10 s); load1=%s ncpu=%s — suspect host CPU starvation or a slow Gateway ACK, "
+                    "not one blocking call",
+                    self.name, load, os.cpu_count(),
+                )
             self._set_fatal_error(
                 "discord_websocket_health_stale",
                 f"Discord Gateway WebSocket health check failed: {reason}", retryable=True,
@@ -5256,7 +5283,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
         Discord's TYPING_START gateway event is unreliable in DMs for bots.
         Instead, start a background loop that hits the typing endpoint every
-        12 seconds (typing indicator lasts ~10s).  The loop is cancelled when
+        5 seconds (Discord expires the indicator after 10s), leaving latency
+        headroom on healthy requests. The loop is cancelled when
         stop_typing() is called (after the response is sent).
 
         Rate-limit handling: if a 429 is encountered, the loop logs a
@@ -5303,18 +5331,30 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
         async def _typing_loop() -> None:
             consecutive_failures = 0
+            successful_posts = 0
+            exit_reason = "stopped_or_superseded"
+            logger.debug("Discord typing loop started for %s", chat_id)
             try:
                 # Stop when the stop_event fires OR our turn is superseded —
                 # the latter terminates an orphan whose stop_typing never ran.
                 while (not stop_event.is_set()
                        and self._typing_token_is_current(chat_id, my_token)):
+                    # connect() publishes the replacement before login initializes
+                    # its HTTP state. Keep this owner alive, but never POST through
+                    # a missing, closed or not-yet-ready transport.
+                    client = self._client
+                    if client is None or client.is_closed() or not client.is_ready():
+                        await _interruptible_sleep(_DISCORD_TYPING_REFRESH_INTERVAL_SECONDS)
+                        continue
                     try:
                         route = discord.http.Route(
                             "POST", "/channels/{channel_id}/typing", channel_id=chat_id,
                         )
-                        await self._client.http.request(route)
+                        await client.http.request(route)
+                        successful_posts += 1
                         consecutive_failures = 0
                     except asyncio.CancelledError:
+                        exit_reason = "cancelled"
                         return
                     except Exception as e:
                         # Don't die on a single 429 — backoff and continue,
@@ -5323,12 +5363,18 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         consecutive_failures += 1
                         retry_after = self._extract_discord_retry_after(e)
                         if retry_after is None:
-                            logger.debug(
-                                "Discord typing indicator failed for %s: %s",
-                                chat_id, e,
+                            # A request can be in flight when its client is retired.
+                            if client is not self._client or client.is_closed() or not client.is_ready():
+                                await _interruptible_sleep(_DISCORD_TYPING_REFRESH_INTERVAL_SECONDS)
+                                continue
+                            exit_reason = "request_failed"
+                            logger.warning(
+                                "Discord typing indicator failed for %s (%s); loop ending",
+                                chat_id, type(e).__name__,
                             )
                             return
                         if consecutive_failures >= _DISCORD_TYPING_MAX_CONSECUTIVE_FAILURES:
+                            exit_reason = "rate_limit_cap"
                             logger.warning(
                                 "Typing indicator giving up for %s after %d "
                                 "consecutive rate-limited POSTs",
@@ -5341,10 +5387,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         )
                         await _interruptible_sleep(retry_after)
                         continue
-                    await _interruptible_sleep(12)
+                    await _interruptible_sleep(_DISCORD_TYPING_REFRESH_INTERVAL_SECONDS)
             except asyncio.CancelledError:
-                pass
+                exit_reason = "cancelled"
             finally:
+                logger.debug(
+                    "Discord typing loop ended for %s: reason=%s successful_posts=%d",
+                    chat_id, exit_reason, successful_posts,
+                )
                 # Only clear shared state if WE are still the registered owner —
                 # never clobber a newer turn's loop that already replaced us.
                 if self._typing_tasks.get(chat_id) is asyncio.current_task():
@@ -5630,6 +5680,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self, interaction: discord.Interaction, command_text: str, followup_msg: str | None = None,
     ) -> None:
         """Defer, dispatch the command string, then replace/delete the "thinking..." indicator."""
+        # Invoke stamps for PHASE=stop_stages inv_lag / inv_auth / inv_defer (t_41843f70: 5.35 s
+        # between this log line and /stop's generation bump, not attributed by any stage).
+        _invoked_at = time.monotonic()
         # Log the invoker so ghost-command reports can be triaged post-mortem.
         try:
             _user = interaction.user
@@ -5644,12 +5697,18 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Auth gate must precede defer() so the ephemeral rejection can still be sent.
         if not await self._check_slash_authorization(interaction, command_text):
             return
+        _authed_at = time.monotonic()
         deferred_response = await self._defer_unless_expired(
             interaction,
             "[Discord] slash %s: interaction expired before defer. "
             "Executing command anyway, skipping interaction followup.", command_text,
         )
         event = self._build_slash_event(interaction, command_text)
+        try:
+            event.invoke_timing = {"at": _invoked_at, "auth": _authed_at - _invoked_at,
+                                   "defer": time.monotonic() - _authed_at}
+        except Exception:
+            pass  # diagnostics only
         # This interaction is deferred and WE will answer it below. Tell the
         # base adapter's inline command-dispatch paths (busy bypass,
         # interrupt-then-dispatch, clarify intercept) to hand their reply
@@ -8557,14 +8616,21 @@ def _define_discord_view_classes() -> None:
             await self._edit(
                 interaction, t("platform.discord.picker.switching", model=model_id),
                 title=t("platform.discord.picker.switching_title"), view=None)
+            from gateway.platforms.base import call_model_selected
+
+            async def _render(text):  # the confirmation renders before the gateway saves the switch
+                await interaction.edit_original_response(
+                    embed=self._config_embed(text, title=t("platform.discord.picker.switched_title"), color=discord.Color.green()),
+                    view=None,
+                )
+
             try:
-                result_text = await self.on_model_selected(str(interaction.channel_id), model_id, self._selected_provider)
+                result_text, rendered = await call_model_selected(
+                    self.on_model_selected, str(interaction.channel_id), model_id, self._selected_provider, _render)
             except Exception as exc:
-                result_text = t("platform.discord.picker.switch_error", error=str(exc))
-            await interaction.edit_original_response(
-                embed=self._config_embed(result_text, title=t("platform.discord.picker.switched_title"), color=discord.Color.green()),
-                view=None,
-            )
+                result_text, rendered = t("platform.discord.picker.switch_error", error=str(exc)), False
+            if not rendered:
+                await _render(result_text)
 
         async def _on_model_selected(self, interaction: discord.Interaction):
             if not await self._gate(interaction, resolved_msg=t("platform.discord.picker.already_resolved"), unauth_msg=_unauthorized()):

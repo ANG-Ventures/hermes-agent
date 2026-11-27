@@ -13,9 +13,11 @@ for one EVENT when either is true at delivery time:
   instance is fed ``os.getloadavg()``, so the band applies here too: it trips
   above ``pause_above`` and clears only below ``resume_below``, and does not
   flap at the bar.
-* lane headroom: the waker profile's model lane is out of capacity
-  (``kanban_provider_health.capped_provider``, the probe the dispatcher uses
-  before a spawn: relay ``eligible_count`` / box ``five_hour`` rejection).
+* lane headroom: the waker profile's primary AND its configured fallback
+  chain have no capacity (``kanban_provider_health.capped_provider`` and
+  ``available_profile_fallback``). This is an admission check, not a route
+  override: the normal agent resolver still owns credentials, context,
+  explicit pins and runtime failover policy.
 
 The subscription row is never changed. Config: ``kanban.wake_load_gate``
 (``enabled``, ``host_axis``, ``cpu_pause``, ``pause_above``, ``resume_below``,
@@ -326,17 +328,47 @@ def _default_lane_probe(profile: str) -> Optional[str]:
     from hermes_cli import kanban_provider_health as _ph
 
     task = SimpleNamespace(assignee=profile, model_override=None, provider_override=None)
-    capped = _ph.capped_provider(
-        task,
-        _ph.configured_probes(),
-        {},
-        min_eligible=_ph.configured_min_eligible(),
-        pool_urls=_ph.configured_pool_health_urls(),
-        box_health=_ph.configured_box_health(),
-    )
+    # Admission is for the profile's complete authorized route, not just its
+    # primary. Leave execution to the normal agent resolver/failover machinery:
+    # installing this health-check selection as a /model override would lose
+    # endpoint/key/context options and overwrite explicit session preferences.
+    probes = _ph.configured_probes()
+    cache: dict = {}
+    kwargs = {
+        "min_eligible": _ph.configured_min_eligible(),
+        "pool_urls": _ph.configured_pool_health_urls(),
+        "box_health": _ph.configured_box_health(),
+    }
+    capped = _ph.capped_provider(task, probes, cache, **kwargs)
     if not capped:
         return None
-    return f"lane {capped.get('provider') or '?'} capped"
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import get_routing_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from tui_gateway.launch_profile_policy import launch_secret_scope
+
+    home = Path(resolve_profile_env(profile))
+    home_token = set_hermes_home_override(home)
+    try:
+        # Derived sources need the owner's credentials. Only the launch home
+        # may inherit its frozen env-only injection; secondary homes stay isolated.
+        if home.resolve() == get_routing_process_hermes_home().resolve():
+            secrets = launch_secret_scope(home)
+        else:
+            secrets = build_profile_secret_scope(home)
+        secret_token = set_secret_scope(secrets, profile_home=str(home))
+        try:
+            fallback = _ph.available_profile_fallback(task, probes, cache, **kwargs)
+        finally:
+            reset_secret_scope(secret_token)
+    finally:
+        reset_hermes_home_override(home_token)
+    if fallback is not None:
+        _log.info("wake admission: primary %s capped; configured fallback %s/%s has headroom; "
+                  "execution retains normal route resolution", capped.get("provider"),
+                  fallback[1], fallback[0])
+        return None
+    return f"lane {capped.get('provider') or '?'} capped; no configured fallback has headroom"
 
 
 def _default_dispatcher_state() -> Optional[dict]:

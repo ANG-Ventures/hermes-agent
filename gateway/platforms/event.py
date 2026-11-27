@@ -98,9 +98,21 @@ class MessageEvent:
     # of publishing a second public message. Adapters that never defer leave it False.
     suppress_public_echo: bool = False
     deferred_reply_text: Optional[str] = None
+    # Fork (t_17ba87a6): what kind of self-injected wake this is (``gateway.wake_kind``: kanban,
+    # goal, loop, ...), named by its PRODUCER; detail rides ``metadata`` (wake_sub/wake_name/card_id).
+    # The progress header reads it instead of guessing from the text. None = a human turn.
+    wake_kind: Optional[str] = None
+
+    # Platform invoke stamps for the /stop stage line (t_41843f70): {"at": monotonic at the
+    # adapter's invoke, "auth": s, "defer": s}. Diagnostics only; None when the adapter sets none.
+    invoke_timing: Optional[Dict[str, float]] = field(default=None, init=False, repr=False, compare=False)
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Idle wake hooks require a concrete execution receipt (never ingress metadata).
+    _goal_idle_wake: bool = field(default=False, init=False, repr=False, compare=False)
+    # Goal retry ownership transfers only when the runner reaches execution, not adapter spawn.
+    _goal_execution_started: bool = field(default=False, init=False, repr=False, compare=False)
     # Armed by /queue run (queue_mgmt.restage_held): this event was staged by a release and is being
     # dispatched by the adapter drain, so the FIFO orphan rescue must not reorder behind it.
     _queue_released: bool = field(default=False, init=False, repr=False, compare=False)

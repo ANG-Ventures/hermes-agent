@@ -121,6 +121,15 @@ class TurnRecord:
     # Terminal-error marker: the turn_exit_reason of a turn that ended FAILED
     # (fallback chain exhausted, raised); None for a turn that ended normally.
     terminal_error: Optional[str] = None
+    # Which box ran this turn's terminal/file tools (t_c9fc6c9f): the pool host
+    # name of a spilled kanban worker (``KANBAN_WORKER_PLACEMENT``), or
+    # ``studio-local`` for a worker that runs on the dispatcher host. None for a
+    # turn that is not a dispatcher-owned kanban worker's.
+    placement_host: Optional[str] = None
+    # Model slot the turn asked for (``sol``, ``cpa/sol``; t_5c87d313): ``model`` above is the id it
+    # resolved to and is what the turn is priced by. ``''`` when a literal id was asked for; None
+    # on rows written before the column existed.
+    model_slot: Optional[str] = None
     # Not persisted on the main row — written to the side table:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # {name,args_preview,result_preview}
 

@@ -392,7 +392,7 @@ def test_closed_run_needs_no_tool_history(worker_run, handoff):
                                 result="closed by test", expected_run_id=task.current_run_id)
     elif handoff == "block":
         assert kb.block_task(
-            conn, task.id, reason="Missing input", expected_run_id=task.current_run_id,
+            conn, task.id, reason="Missing input", kind="needs_input", expected_run_id=task.current_run_id,
         )
     else:
         assert kb.request_review(conn, task.id, expected_run_id=task.current_run_id)

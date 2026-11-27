@@ -50,6 +50,7 @@ def _create_review_block(delivery_mode, *, reason="Tests need updates"):
     try:
         task_id = kb.create_task(
             conn,
+            boomerang_wake=False,
             title="existing implementation card",
             assignee="implementer",
             session_id="agent:main:telegram:thread:chat-1:topic-7",

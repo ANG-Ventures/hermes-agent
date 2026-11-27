@@ -233,6 +233,8 @@ def repair_record(path: str, turn_id: str):
             "profile": profile_for_path(path),
             "provisional": True,
             "terminal_error": REPAIR_MARKER,
+            # The repair CLI is not the process that ran the turn: unknown host.
+            "placement_host": None,
         },
     )
     if record is None:

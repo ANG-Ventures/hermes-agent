@@ -13,7 +13,7 @@ import os
 import sys
 
 from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_dispatch_defaults as kbd
 from hermes_cli import kanban_db_notify as kbn
 
 
@@ -179,6 +179,53 @@ def create_default_priority(created_by: str | None, origin: str | None = None) -
     return 0 if (origin or kb.classify_create_origin()) in _MINTER_ORIGINS else HUMAN_DEFAULT_PRIORITY
 
 
+# Live band (t_febbdb61, ruling:t_febbdb61-live-band-scope): a person's or an operator's create with no
+# --priority lands at the median priority of the cards spawned in the last 24 h (floor 100), so filed
+# work is not starved under incident minters at 300-410. Machine minters keep the bands above (<= 59).
+# KANBAN_LIVE_BAND=off restores the flat human default (100).
+LIVE_BAND_WINDOW_S = 86400
+_LIVE_BAND_OPERATORS = frozenset({"apollo", "daedalus", "daedalus-opus"})
+
+
+def live_priority_band(conn, *, now: int | None = None) -> int:
+    """Median ``tasks.priority`` over the ``spawned`` events of the last 24 h (one value per spawn, so the band
+    follows where the dispatcher's capacity actually went), floor 100."""
+    import statistics
+    import time
+    since = int(time.time() if now is None else now) - LIVE_BAND_WINDOW_S
+    rows = conn.execute(
+        "SELECT t.priority FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = 'spawned' AND e.created_at >= ?", (since,)).fetchall()
+    prios = [int(r[0] or 0) for r in rows]
+    return max(HUMAN_DEFAULT_PRIORITY, int(statistics.median(prios))) if prios else HUMAN_DEFAULT_PRIORITY
+
+
+def live_band_default(conn, author: str | None, origin: str | None = None) -> int | None:
+    """The live band for a no-``--priority`` create by a person (``user``, not a cron/worker/script process)
+    or a named operator profile (apollo, daedalus, daedalus-opus; never from a cron job), else None."""
+    off = ("0", "off", "false", "no")
+    if ((os.environ.get("KANBAN_PRIORITY_BANDS") or "").strip().lower() == "off"
+            or (os.environ.get("KANBAN_LIVE_BAND") or "").strip().lower() in off):
+        return None
+    from gateway.session_context import is_cron_session
+
+    # Task-local cron scope outranks process/profile identity, including root's alias.
+    if is_cron_session():
+        return None
+    author = "apollo" if author == "default" else author  # eligibility only; never rewrite the creator
+    origin = origin or kb.classify_create_origin()
+    if author == HUMAN_CREATED_BY:
+        eligible = origin not in _MINTER_ORIGINS
+    else:
+        eligible = author in _LIVE_BAND_OPERATORS and origin != kb.CREATE_ORIGIN_CRON
+    if not eligible:
+        return None
+    try:
+        return live_priority_band(conn)
+    except Exception:  # a band read must never fail the create
+        return HUMAN_DEFAULT_PRIORITY
+
+
 _CREATE_PRIORITY = _arg(
     "--priority", type=priority_value, default=None,
     help="Dispatch priority, higher = first: int or tier p0=300 p1=200 p2=100 p3=0. Bands: ace_direct 300, "
@@ -213,6 +260,11 @@ _FORCE_MODEL = _arg(
     "--force-model", dest="force_model", metavar="REASON",
     help="Pin a model id the lane's live model list does not know (normally refused with the "
          "valid list; incident t_d564a8dd). Requires a non-empty reason, recorded as a comment.",
+)
+_REQUIRES_UNKNOWN_OK = _arg(
+    "--requires-unknown-ok", dest="requires_unknown_ok", metavar="REASON",
+    help="Store a body whose requires: line names words the capability map does not define "
+         "(normally refused; t_c754f664). The reason is recorded as a requires_unknown_override event.",
 )
 _ALLOW_FLAGSHIP = _arg(
     "--allow-flagship", "--firepower", dest="allow_flagship", metavar="REASON",
@@ -387,6 +439,7 @@ _SPECS = [
                   "card with the same title created in the last 24h, or an OPEN card with "
                   "a >=0.6 similar title head or the same 'Momus pass N' + spec. The reason "
                   "is recorded as a near_duplicate_forced event."),
+        _REQUIRES_UNKNOWN_OK,
         _arg("--until", metavar="TS",
              help="Mint the card parked in 'scheduled' until TS (ISO-8601, epoch, or +<N>[smhd]); "
                   "the dispatcher wakes it then (todo while parents are open). Use this for a "
@@ -405,7 +458,7 @@ _SPECS = [
                   f"circuit breaker. Trip on the Nth failure — e.g. --max-retries 1 blocks on the "
                   f"first failure (no retries), --max-retries 3 allows two retries. Omit to use "
                   f"the dispatcher's kanban.failure_limit config (default "
-                  f"{kb.DEFAULT_FAILURE_LIMIT})."),
+                  f"{kbd.DEFAULT_FAILURE_LIMIT})."),
         _arg("--model", dest="model_override",
              help="Pin the worker to this model (passed as -m <model>) without "
                   "changing the profile's configured model. Combine with --provider "
@@ -600,10 +653,10 @@ _SPECS = [
              help="Read-only pool placement view: band, streak and projected() per host, "
                   "and the rung take() would pick now (no probe, no streak advance)"),
         _arg("--fleet", action="store_true",
-             help="With --placement: the fleet view (alias of `kanban placement --fleet`)"),
+             help="With --placement: the fleet view (alias of `kanban allocation --fleet`)"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the board named by --board or the DB pin"),
-    _cmd("placement", [
+    _cmd("allocation", [
         _arg("task_id", nargs="?", help="One card: its Placement block only"),
         _arg("--fleet", action="store_true",
              help="Per host in ladder order: running/slots/band/pressure and the cards there, "
@@ -701,8 +754,12 @@ _SPECS = [
         _arg("--draft-ok", metavar="REASON",
              help="Audited per-card override for the DRAFT-PR refusal: the handoff names a "
                   "draft PR that is intentionally left open (e.g. a CI vehicle for an upstream "  # windows-footgun: ok (string literal, not a call)
-                  "PR). The draft is not routed to review; a completion_draft_override event "
+                  "PR). --draft-kind says what happens to the PR; a completion_draft_override event "
                   "records the PRs and REASON. An empty REASON is refused."),
+        _arg("--draft-kind", choices=("merge_hold", "keep_draft"), default=None,
+             help="With --draft-ok: merge_hold (default) sets a ledger hold on the card's own draft PR(s), "
+                  "marks them ready so CI and Prism run, and routes the card to review, not done; "
+                  "keep_draft (a stacked/pinned PR that must stay draft) closes it done as before."),
         _arg("--abandon-routed-pr", metavar="REASON",
              help="Audited override: the card was routed to review on its own PR, that PR is still "
                   "OPEN, and the --survivor-pr/--survivor-ref claim names something else. Without "
@@ -751,6 +808,7 @@ _SPECS = [
         _TASK_ID,
         _arg("--title", help="Replace the task title"),
         _arg("--body", help="Replace the task body"),
+        _REQUIRES_UNKNOWN_OK,
         _arg("--priority", type=int, metavar="N",
              help="Set the dispatch priority (higher first); records priority_set."),
         _group(
@@ -958,6 +1016,21 @@ _SPECS = [
     ], help="Operator-only: spawn ONE ready card on ONE host now, skipping the load gate "
             "and the host admission band (never the measured-danger floor or eligibility). "
             "Needs KANBAN_OPERATOR_TOKEN; kill switch kanban.admin_admit.enabled"),
+    _cmd("studio-override", [
+        _TASK_ID,
+        _arg("--capability", required=True,
+             help="The ONE Studio-only capability the hold names (from its studio_default_deny:<cap> wait reason)"),
+        _arg("--why", required=True, help="Why this card truly needs the Mac Studio (at least 3 words)"),
+        _arg("--need", choices=("signed-in-identity", "public-page", "lan-reach", "ssh", "gmail", "other"),
+             help="Required with --capability browser-session: what the card needs. Only signed-in-identity (and "
+                  "other, recorded) is accepted; the rest are refused with the capability to use instead"),
+        _group(
+            _arg("--once", action="store_true", help="One run only (default): the next spawn uses it up"),
+            _arg("--until", metavar="TIME", help="Hold until TIME (ISO-8601, epoch, or +N[smhd])"),
+        ),
+    ], help="Operator-only (t_062a5948): let ONE card held by Studio default-deny start on the Mac Studio for a "
+            "named capability. Writes a studio_override event and a capability-gap ledger line. "
+            "Needs KANBAN_OPERATOR_TOKEN"),
     _cmd("daemon", [
         _arg("--interval", type=float, default=60.0, help="Seconds between dispatch ticks (default: 60)"),
         _arg("--max", type=int, help="Cap number of spawns per tick"),

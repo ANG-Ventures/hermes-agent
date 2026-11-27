@@ -73,6 +73,9 @@ gateway:
     err_switch_failed: "Model switch to {model} failed ({error}); staying on {current}."
     err_config_not_updated: "config.yaml not updated ({error})"
     err_stale_override: "saved to config.yaml, but the stale session override was not cleared ({error})"
+    saving_global: "Active for this session; saving to config.yaml after this reply."
+    save_failed: "⚠️ Model switch active for this session, but saving it failed: {error}"
+    save_interrupted: "⚠️ Model switch active for this session, but saving it was interrupted (saved: {saved})."
     next_turn_only: "    (next turn only — restores after one response)"
     switch_cancelled: "🟡 Model switch cancelled. Current model unchanged ({model})."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Text fallback: reply `{prefix}approve` to switch or `{prefix}cancel` to keep the current model._"
@@ -489,7 +492,7 @@ gateway:
     stopped: "⚡ Stopping — finishing the current step and halting. You can continue this session."
     no_active: "No active task to stop."
     force_stopped_pending: "⚡ Force-stopped. The agent was still starting — session unlocked."
-    queue_held: "{count} queued prompt(s) held. /queue run releases them, /queue list shows them, /queue clear drops them."
+    queue_held: "{count} queued prompt(s) held. They run after the next completed turn; /queue run runs them now, /queue clear drops them."
     queue_released: "Releasing {count} queued prompt(s) now, in order."
   title:
     db_unavailable: "Session database not available."
@@ -763,6 +766,7 @@ gateway:
     reject_model: "Agent is running — wait or /stop first, then switch models."
     reject_codex_runtime: "Agent is running — wait or /stop first, then change runtime."
     reject_moa: "Agent is running — wait or /stop first, then run /moa."
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ Gateway {action} — queued for the next turn after it comes back."
     drain_rejected: "⏳ Gateway is {action} and is not accepting another turn right now."
     drain_rejected_new_work: "⏳ Gateway is {action} and is not accepting new work right now."
@@ -833,7 +837,7 @@ gateway:
     moved: "Moved queue item {source} to {destination}."
     refused_command: "Not queued: /{command} is a command, and commands can't be queued as prompts. Send it on its own."
     cap_reached: "Not queued: the queue is full ({cap} items). Use /queue list, /queue rm N or /queue clear."
-    added_to_held: "Added to the held queue ({count} held). /queue run releases them."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "Released {count} queued prompt(s); they run next, in order."
     released_interrupting: "Interrupting the current turn; releasing {count} queued prompt(s) in order."
     dropped_on_reset: "Dropped {count} queued prompt(s) with the old conversation."
@@ -922,7 +926,7 @@ gateway:
     working_heartbeat: "⏳ Working — {minutes} min{detail}"
     thinking_prefix: "💬 {text}"
     tool_head: "{emoji} {tool}"
-    wake_head: "🔔 wake · {label}"
+    wake_head: "🔔 {label}"
     tool_verbose: "{emoji} {tool}({keys})\n{args}"
     tool_preview: "{emoji} {tool}: \"{preview}\""
     tool_pending: "{emoji} {tool}..."
@@ -942,8 +946,11 @@ gateway:
     action_shutting_down: "shutting down"
     action_restarting: "restarting"
     cron_interrupted: "⚠️ Scheduled job '{job}' was cut short because Hermes is {action}; no result this run. It will run again on schedule, or run it now with `hermes cron run {job}` once Hermes is back."
-    notice_shutdown: "⚠️ Hermes is shutting down — your current task will be interrupted. When it is back online, send any message and I'll try to pick up where we left off."
-    notice_restart: "⚠️ Hermes is restarting — your current task will be interrupted. Send any message after the restart and I'll try to resume where you left off."
+    notice_shutdown: "⚠️ Hermes is shutting down."
+    notice_restart: "⚠️ Hermes is restarting."
+    active_interruption: "Your current task may be interrupted."
+    continue_prompt: "If Hermes comes back online, you can ask to continue any interrupted work."
+    continue_auto: "If Hermes comes back online and recovery checks allow it, interrupted work may continue automatically."
 
   startup:
     handoff_thread_title: "Hermes — {title}"
@@ -3673,6 +3680,7 @@ display:
     aux_failure_label: "background review"
   notice:
     uncompressed_context_overflow: "⚠️ Session context (~{tokens} tokens) exceeds the model context window (~{context_length} tokens) with compression disabled (compression.enabled: false). Use /compact to compress history or enable compression in config.yaml."
+    compression_store_unavailable: "⚠️ Context is over the compression threshold (~{tokens} tokens >= {threshold}) but compression cannot run: the compaction store is damaged (database error). /compress uses the same store and will not help. Run /new to start a fresh session."
 
 explainer:
   # Turn-completion explanations and file-mutation footers (agent/turn_explainers.py). Appended to

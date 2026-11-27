@@ -732,11 +732,12 @@ def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypa
             payload={"text": "x" * 180, "index": index},
         )
 
-    one_event = rooms.read_events(db, room_id="room-1", limit=1)
-    budget = len(
-        json.dumps(one_event, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
+    # Creation and message events have different payloads/timestamp widths.
+    # Size the page for the largest individual event, not just room.created.
+    budget = max(
+        len(json.dumps(rooms.read_events(db, room_id="room-1", since_seq=seq, limit=1),
+                       ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        for seq in range(5)
     ) + 1
     monkeypatch.setattr(rooms, "MAX_LOG_PAGE_BYTES", budget)
 

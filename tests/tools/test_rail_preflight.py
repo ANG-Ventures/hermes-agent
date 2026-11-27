@@ -37,7 +37,9 @@ def _worker(monkeypatch, task="t_rail0001"):
 
 
 def _placed(monkeypatch, host="ace-ai"):
-    monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps({"host": host, "env": {"TERMINAL_ENV": "ssh"}}))
+    # The dispatcher stamps the card's hard requirements; these cards need a browser (t_f1a3ee84).
+    monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps({"host": host, "env": {"TERMINAL_ENV": "ssh"},
+                                                       "requires": ["browser-public"]}))
 
 
 class _Resp:
@@ -63,6 +65,16 @@ EXPECTED_BROWSER = (
     "which lives only on the Mac Studio. Add the line `host: studio` to the card body (or "
     "`requires: browser-session` once the affinity spec lands) and re-run; do not retry here."
 )
+
+
+# The agent's own Chromium is browser-public (t_f935cb6f): its failure never names Ace's browser rail.
+EXPECTED_PUBLIC = (
+    "BROWSER_PUBLIC_ABSENT cap=browser-public host={host} need=studio: this card needs browser-public, which "
+    "{host} does not have. The pool will re-route it once; to pin by hand add the line "
+    "`requires: browser-public`. Do not retry here."
+)
+# What the sandbox failure said rides under the token line (t_f1a3ee84).
+EXPECTED_PUBLIC_XVNC = EXPECTED_PUBLIC + "\ncause: Bot Desktop needs Xvnc inside the terminal backend's sandbox"
 
 
 def _navigate(monkeypatch, cdp_url):
@@ -117,7 +129,8 @@ def test_remote_cdp_or_no_override_is_not_a_rail(monkeypatch):
 
 
 def test_placed_worker_sandbox_browser_failure_reports_rail(monkeypatch):
-    # Own-Chromium path: placement onto the pool host's sandbox failed -> name the Studio fix.
+    # Own-Chromium path: placement onto the pool host's sandbox failed. That browser is a public one
+    # (t_f935cb6f), so the line names browser-public and the re-route goes to a pool host, not the Studio.
     _worker(monkeypatch)
     _placed(monkeypatch, "ace-media")
     from tools import browser_tool_session as bts
@@ -126,7 +139,7 @@ def test_placed_worker_sandbox_browser_failure_reports_rail(monkeypatch):
     def refused():
         raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
     monkeypatch.setattr(bd, "tool_placement", refused)
-    assert bts._browser_command_preflight() == {"success": False, "error": EXPECTED_BROWSER.format(host="ace-media")}
+    assert bts._browser_command_preflight() == {"success": False, "error": EXPECTED_PUBLIC_XVNC.format(host="ace-media")}
 
 
 def test_unplaced_sandbox_failure_keeps_generic_error(monkeypatch):
@@ -273,7 +286,7 @@ def test_background_cleanup_failure_never_queues_a_rail(monkeypatch):
     monkeypatch.setattr(bts, "_run_browser_command", lambda *a, **k: closed.append(real(*a, **k)) or closed[-1])
     monkeypatch.setitem(bt._active_sessions, "rail-janitor", {"session_name": "rail-janitor", "features": {}})
     _cleanup_single_browser_session("rail-janitor")
-    assert closed and closed[0]["error"] == EXPECTED_BROWSER.format(host="ace-media")
+    assert closed and closed[0]["error"] == EXPECTED_PUBLIC_XVNC.format(host="ace-media")
     assert rp.take_rail_absent() is None
 
 
@@ -288,7 +301,7 @@ def test_vault_tool_direct_browser_command_queues_rail(monkeypatch):
         raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
     monkeypatch.setattr(bd, "tool_placement", refused)
     bts._run_browser_command("rail", "eval", ["1"])
-    assert rp.take_rail_absent() == EXPECTED_BROWSER.format(host="ace-media")
+    assert rp.take_rail_absent() == EXPECTED_PUBLIC_XVNC.format(host="ace-media")
 
 
 def test_active_browser_tool_call_with_sandbox_failure_queues_rail(monkeypatch):
@@ -300,8 +313,8 @@ def test_active_browser_tool_call_with_sandbox_failure_queues_rail(monkeypatch):
         raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
     monkeypatch.setattr(bd, "tool_placement", refused)
     out = _navigate(monkeypatch, "")
-    assert out["error"] == EXPECTED_BROWSER.format(host="ace-media")
-    assert rp.take_rail_absent() == EXPECTED_BROWSER.format(host="ace-media")
+    assert out["error"] == EXPECTED_PUBLIC_XVNC.format(host="ace-media")
+    assert rp.take_rail_absent() == EXPECTED_PUBLIC_XVNC.format(host="ace-media")
 
 
 def test_adapter_that_drops_the_error_still_queues_rail(monkeypatch):
@@ -316,7 +329,7 @@ def test_adapter_that_drops_the_error_still_queues_rail(monkeypatch):
         raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
     monkeypatch.setattr(bd, "tool_placement", refused)
     registry.dispatch("browser_console", {}, task_id="rail")
-    assert rp.take_rail_absent() == EXPECTED_BROWSER.format(host="ace-media")
+    assert rp.take_rail_absent() == EXPECTED_PUBLIC_XVNC.format(host="ace-media")
 
 
 def test_browser_cdp_on_placed_worker_uses_dispatcher_side_liveness(monkeypatch):

@@ -292,7 +292,8 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
             chat_type="webhook", user_id="msgraph", user_name="Microsoft Graph")
         return MessageEvent(
             text=self._render_prompt(notification), message_type=MessageType.TEXT, source=source,
-            raw_message=notification, message_id=message_id, internal=True)
+            raw_message=notification, message_id=message_id, internal=True,
+            wake_kind="webhook", metadata={"wake_name": "msgraph"})
 
     def _render_prompt(self, notification: Dict[str, Any]) -> str:
         template = self.config.extra.get("prompt", "")

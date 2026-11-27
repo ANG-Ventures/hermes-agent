@@ -79,7 +79,7 @@ DEFAULT_MIRROR_INTERVAL_S = 30.0
 #   mark_job_run (_record_run_outcome + _advance_after_run)      last_run_at, next_run_at,
 #       last_status, last_error, last_delivery_error, failure_streak, error_repeat_streak,
 #       manual_run_at, manual_run_prompt, preflight_alerted, last_fire_error,
-#       restart_requeue_count, interval_fire_at, repeat.completed
+#       restart_requeue_count, interval_fire_at, interval_fire_tick, repeat.completed
 #   cron/unreachable_retry.py plan_retry / clear_state           unreachable_retry
 #   cron/quota_hold.py plan_hold / clear_state                   quota_hold_until, quota_hold_cron_expr
 #   request_restart_requeue / _apply_restart_requeue             restart_requeue, restart_requeue_count
@@ -87,6 +87,7 @@ DEFAULT_MIRROR_INTERVAL_S = 30.0
 #   cron/scheduler_delivery.py (update_job per delivery)         last_delivery_unverified,
 #                                                                last_delivery_queued
 #   cron/monitor.py check_monitor                                monitor_state
+#   cron/shutdown_replay.py mark_replay_pending / consume_replay_markers  replay_pending
 #   note_fire_forward_failure                                    last_fire_error
 # ``repeat.completed`` is the one nested key: ``repeat.times`` is definition, ``completed`` is
 # bumped on every recurring run. ``state``/``enabled``/``paused_*`` stay definitions: they are
@@ -97,7 +98,9 @@ RUNTIME_FIELDS = frozenset({
     "last_delivery_unverified", "last_delivery_queued", "last_fire_error",
     "failure_streak", "error_repeat_streak", "manual_run_at", "manual_run_prompt",
     "preflight_alerted", "restart_requeue", "restart_requeue_count", "interval_fire_at",
+    "interval_fire_tick",
     "unreachable_retry", "quota_hold_until", "quota_hold_cron_expr", "monitor_state",
+    "replay_pending",
 })
 REPEAT_COMPLETED = "repeat.completed"
 

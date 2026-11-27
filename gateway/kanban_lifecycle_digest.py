@@ -25,6 +25,16 @@ t_dcc4ed08 (2026-10-02): Apollo's 17:18 operator batch sent 8 landed-close-gate 
 posted as 8 lines. A line added with ``fold={"key": ...}`` (the coverage ``batch_id``) is rendered
 together with the other held lines that share its key, as ONE line:
 ``⏳ [board] Kanban 8 cards landed (batch apollo-1700) · close on: t_a <gate>; t_b <gate>; ...``.
+
+r143 (2026-11-11): #logs still carried 1,728 single lifecycle lines in 48 h (991 ready for review,
+577 done, 134 blocked, 26 closed). r142 C made ``render`` keep every card id but left the knob's
+default at 0, and the fleet flip it named as an operator follow-up never happened, so every line
+still posted alone. Measured on the board: 965 of the 996 ready-for-review lines map 1:1 to a real
+``review_requested`` event (cards cycling review -> changes_requested -> running -> review, 424 of
+them re-entering with the same "auto-routed: PR X still open" summary); no re-notify timer and no
+delivery retry. So the shipped default (``hermes_cli/config_defaults.py``) is now
+``DEFAULT_DIGEST_SECONDS`` (30 min); an explicit ``0`` still means one post per line. Inside one batch a card's repeated transitions of
+one kind render as ONE line tagged ``×N`` (the newest), so a bouncing card is one line, not N.
 """
 from __future__ import annotations
 
@@ -34,6 +44,8 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# Shipped default of ``kanban.lifecycle_digest_seconds`` (r143; config_defaults.py). Explicit 0 = off.
+DEFAULT_DIGEST_SECONDS = 1800
 FAMILY_TAG = "-# family=digest:kanban-lifecycle"
 MAX_HELD = 400  # lines per channel; oldest dropped (and counted) past this
 LINE_CHARS = 220
@@ -54,6 +66,8 @@ def parse_digest_seconds(value: Any) -> int:
 
 
 def resolve_digest_seconds() -> int:
+    """The configured window (``hermes_cli.config_defaults`` supplies ``DEFAULT_DIGEST_SECONDS``
+    when the user config does not set it). Explicit 0 or junk = 0 (off); unreadable config = 0."""
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -69,15 +83,17 @@ def _one_line(msg: str) -> str:
     return first if len(first) <= LINE_CHARS else first[: LINE_CHARS - 1] + "…"
 
 
-def _compact(msg: str) -> str:
-    """``✔ t_x [board] title`` (board shown only off default), clipped to COMPACT_CHARS."""
+def _compact(msg: str, repeats: int = 1) -> str:
+    """``✔ t_x [board] title`` (board shown only off default), clipped to COMPACT_CHARS.
+    ``repeats`` > 1 renders the id as ``t_x×N`` (r143)."""
     first = _one_line(msg)
     m = _LINE_RE.match(first)
     if not m:
         out = first
     else:
         mark, board, tid, title = m.groups()
-        out = f"{mark} {tid}" + ("" if board == "default" else f" [{board}]") + f" {title.strip()}"
+        rep = f"×{repeats}" if repeats > 1 else ""
+        out = f"{mark} {tid}{rep}" + ("" if board == "default" else f" [{board}]") + f" {title.strip()}"
     return out if len(out) <= COMPACT_CHARS else out[: COMPACT_CHARS - 1] + "…"
 
 
@@ -119,17 +135,69 @@ def fold_batches(lines: list[str], folds: Optional[list] = None) -> list[str]:
     return out
 
 
+def _repeat_key(msg: str) -> Optional[tuple[str, str, str]]:
+    """(mark, board, card id) of a parseable lifecycle line; None for anything else."""
+    hit = _LINE_RE.match(_one_line(msg))
+    return (hit.group(1), hit.group(2), hit.group(3)) if hit else None
+
+
+def collapse_repeats(lines: list[str]) -> tuple[list[str], dict[int, int]]:
+    """One line per (mark, board, card): the NEWEST, at the position of its first occurrence.
+
+    Returns the kept lines and ``{index in kept: N}`` for every line that stood for N > 1
+    transitions. Unparseable lines (folded operator batches) are kept as they are."""
+    order: list = []
+    newest: dict = {}
+    count: dict = {}
+    for i, m in enumerate(lines):
+        key = _repeat_key(m)
+        if key is None:
+            order.append(("raw", i))
+            continue
+        if key not in newest:
+            order.append(("key", key))
+        newest[key] = m
+        count[key] = count.get(key, 0) + 1
+    out: list[str] = []
+    reps: dict[int, int] = {}
+    for kind, ref in order:
+        if kind == "raw":
+            out.append(lines[ref])
+            continue
+        if count[ref] > 1:
+            reps[len(out)] = count[ref]
+        out.append(newest[ref])
+    return out, reps
+
+
+_VERB_RE = re.compile(r"(Kanban\s+t_[0-9a-f]+\s+(?:ready for review|done|closed|blocked))")
+
+
+def _tag_repeat(msg: str, n: int) -> str:
+    """``👀 … Kanban t_x ready for review ×3 — title`` (the count sits after the verb)."""
+    head, sep, rest = (msg or "").partition("\n")
+    tagged, hits = _VERB_RE.subn(lambda m: f"{m.group(1)} ×{n}", head, count=1)
+    return f"{tagged if hits else head + f' ×{n}'}{sep}{rest}"
+
+
 def render(lines: list[str], dropped: int = 0, folds: Optional[list] = None) -> str:
     """One held line posts unchanged; two or more become ONE digest message that fits one post."""
-    lines = fold_batches(lines, folds)
+    raw = fold_batches(lines, folds)
+    if len(raw) == 1 and not dropped:
+        return raw[0]
+    # r143: a card that re-entered one state N times in the window is ONE line (the newest,
+    # tagged ×N). The header still counts every transition; the grouped tier gets the raw
+    # lines and marks the same repeats as t_x×N.
+    kept, reps = collapse_repeats(raw)
+    lines = [_tag_repeat(m, reps[i]) if i in reps else m for i, m in enumerate(kept)]
     if len(lines) == 1 and not dropped:
         return lines[0]
     counts: dict[str, int] = {}
-    for m in lines:
+    for m in raw:
         mark = (m.strip()[:1] or "?")
         counts[mark] = counts.get(mark, 0) + 1
     tally = " · ".join(f"{k} {v}" for k, v in counts.items())
-    head = f"🗂 **kanban lifecycle** — {len(lines)} transition(s) ({tally})"
+    head = f"🗂 **kanban lifecycle** — {len(raw)} transition(s) ({tally})"
     tail = []
     if dropped:
         tail.append(f"-# {dropped} older line(s) dropped while this channel was unreachable")
@@ -138,13 +206,13 @@ def render(lines: list[str], dropped: int = 0, folds: Optional[list] = None) -> 
     if len("\n".join([head] + full + tail)) <= MAX_MESSAGE_CHARS:
         return "\n".join([head] + full + tail)
     budget = MAX_MESSAGE_CHARS - len(head) - sum(len(t) + 1 for t in tail) - 80
-    compact = [_compact(m) for m in lines]
+    compact = [_compact(m, reps.get(i, 1)) for i, m in enumerate(kept)]
     if sum(len(c) + 1 for c in compact) <= budget:
         return "\n".join([head] + compact + tail)
     # Titles do not fit: one line per transition kind listing every card id, so the
     # day's card flow stays readable in one post (r142 C: titled-compact dropped 102
     # of 671 ids at a 30 min window).
-    return "\n".join([head] + _grouped_ids(lines, budget) + tail)
+    return "\n".join([head] + _grouped_ids(raw, budget) + tail)
 
 
 _KIND_WORDS = {"👀": "ready", "✔": "done", "↩️": "closed", "↩": "closed", "⏸": "blocked", "⏳": "landed"}

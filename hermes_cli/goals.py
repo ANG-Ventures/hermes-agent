@@ -9,6 +9,7 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -16,8 +17,9 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -69,6 +71,7 @@ _IDLE_WAKE_HORIZON_S = 6 * 3600
 # No-progress stop: this many judged-``continue`` turns in a row with no tool call (the agent is only
 # answering the judge) pauses the goal. 0 disables.
 DEFAULT_NO_PROGRESS_TURNS = 4
+DEFAULT_MAX_INCOMPLETE_TURNS = 3
 # Turn effects (hermes_cli.goal_turn_effects) after which no continuation is queued unless the user
 # spoke: a wake/page/NO_REPLY answered with reads only changed nothing the next turn could act on.
 _NO_NUDGE_TURN_EFFECTS = frozenset({"read", "none"})
@@ -470,6 +473,9 @@ class GoalState:
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    consecutive_incomplete_turns: int = 0     # agent turns that failed before completion
+    incomplete_retry_wait: bool = False       # only the retry loop owns this wait barrier
+    idle_wake_attempt: Optional[str] = None   # survives compatible edits, revoked by new waits
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
@@ -517,7 +523,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision", "evaluation_writes")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_incomplete_turns", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision", "evaluation_writes")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at", "resumed_at")}
         return cls(
             goal=data.get("goal", ""),
@@ -530,6 +536,8 @@ class GoalState:
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_reason=data.get("waiting_reason"),
+            incomplete_retry_wait=bool(data.get("incomplete_retry_wait", False)),
+            idle_wake_attempt=data.get("idle_wake_attempt"),
             checkin_minutes=int(data["checkin_minutes"]) if data.get("checkin_minutes") is not None else -1,
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
@@ -547,6 +555,8 @@ class GoalState:
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
     def clear_wait(self) -> None:
+        self.idle_wake_attempt = None
+        self.incomplete_retry_wait = False
         self.waiting_on_pid = None
         self.waiting_on_session = None
         self.waiting_until = 0.0
@@ -560,7 +570,7 @@ class GoalState:
 # GoalState fields an idle wake mutates (accounting + the wait barrier it consumes).
 _IDLE_WAKE_FIELDS = (
     "idle_wakes", "last_idle_wake_at", "waiting_on_pid", "waiting_on_session", "waiting_until",
-    "waiting_on_delegations", "waiting_reason", "waiting_since",
+    "waiting_on_delegations", "waiting_reason", "waiting_since", "incomplete_retry_wait", "idle_wake_attempt",
 )
 
 
@@ -766,9 +776,9 @@ def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any
     """Give back a recorded idle wake that was never dispatched (the session turned busy or was
     /stop-ped meanwhile), so it does not consume a check-in. Read, compare and write run in ONE
     write transaction, so a pause/clear from any surface either lands first (and the goal is left
-    alone) or after (and sees the restored fields). The give-back applies only while the stored row
-    is byte-identical to the row the wake saved (``after["_row"]``): any save since then, including
-    a replacement goal whose fields happen to equal the post-wake values, wins and is left alone.
+    alone) or after (and sees the restored fields). The activation and unique wake-attempt token
+    own the refund, not the whole row: compatible edits survive. New waits, unwait, replacement,
+    resume or another evaluation revoke ownership and are left alone.
     Returns True when anything changed."""
     db = _get_session_db() if session_id and before else None
     execute_write = getattr(db, "_execute_write", None)
@@ -778,15 +788,19 @@ def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any
 
     def _txn(conn) -> bool:
         row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-        if not row or not after.get("_row") or row[0] != after["_row"]:
-            return False  # the row is no longer the one this wake wrote (another save or another goal)
-        state = GoalState.from_json(row[0]) if row and row[0] else None
-        if state is None or state.status != "active":
+        if not row or not after.get("_row"):
+            return False
+        state = GoalState.from_json(row[0])
+        owner = GoalState.from_json(after["_row"])
+        if (not same_active_goal(owner, state) or not owner.idle_wake_attempt
+                or state.idle_wake_attempt != owner.idle_wake_attempt
+                or any(getattr(state, f) != after.get(f) for f in _IDLE_WAKE_FIELDS)):
             return False
         changed = [f for f in _IDLE_WAKE_FIELDS if f in before and getattr(state, f) == after.get(f) != before[f]]
         for field in changed:
             setattr(state, field, before[field])
         if changed:
+            state.revision += 1
             conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
         return bool(changed)
 
@@ -835,12 +849,283 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         return False
 
 
+# ── Orphan GC (t_92fc3ff0) ────────────────────────────────────────────
+# A goal row is keyed by session id. When the gateway replaces a routed conversation (/new, /reset,
+# an auto-reset) the old id stops being routed, and an ACTIVE row left on it never wakes anyone but
+# is loaded by every 15 s idle-wake scan. Rotations retire it (``superseded``); the hourly reaper
+# retires what any other path leaves behind (``orphaned``). Retire, never delete: ``/goal resume``
+# (or ``save_goal``) restores the row.
+
+DEFAULT_ORPHAN_GC_DAYS = 7   # goals.orphan_gc_days; 0 disables the reaper
+_ORPHAN_GC_SCAN_CHUNK = 500  # bound on one sessions IN (...) read
+
+
+def _retired_goal_json(raw: Optional[str], status: str, reason: str) -> Optional[str]:
+    """*raw* re-stamped *status* / *reason*, or None when it is not an ACTIVE goal (never revive or
+    re-stamp a done, paused or /stop-latched goal: Ace 2026-10-19)."""
+    state = GoalState.from_json(raw) if raw else None
+    if state is None or state.status != "active":
+        return None
+    state.status, state.paused_reason = status, reason
+    state.clear_wait()
+    state.revision += 1
+    return state.to_json()
+
+
+def retire_goal(session_id: str, status: str, reason: str, *, db: Any = None) -> bool:
+    """Flip an ACTIVE goal row to *status* (``superseded``) with ``paused_reason`` *reason*.
+    Compare-and-set against the row read here, so a concurrent edit wins. Never touches a non-active
+    row. *db*: the store holding the row (gateway rotations pass the routing key's profile store).
+    The reaper does NOT use this: it retires through :func:`_retire_if_still_orphaned`, which re-checks
+    eligibility inside the write. Best-effort, never raises; True when this call retired it."""
+    if not session_id:
+        return False
+    db = db if db is not None else _get_session_db()
+    if db is None:
+        return False
+    key = _meta_key(session_id)
+    try:
+        raw = db.get_meta_committed(key)
+        new = _retired_goal_json(raw, status, reason)
+        return new is not None and bool(db.compare_and_set_meta(key, raw, new))
+    except Exception as exc:
+        logger.debug("GoalManager: retiring goal %s failed: %s", session_id, exc)
+        return False
+
+
+def orphaned_goal_and_loop_ids(
+    now: float, routing: Any, session_activity: Dict[str, float], *, gc_days: int = DEFAULT_ORPHAN_GC_DAYS,
+) -> List[str]:
+    """Pure: the session ids in *session_activity* (``{sid: last activity epoch}`` for every session
+    with an active goal or loop) that are NOT routed (*routing*: current session ids of every routed
+    key, all served profiles) AND idle for >= *gc_days*. CLI/TUI sessions are never routed, so the
+    idle test alone protects them. ``gc_days <= 0`` returns nothing."""
+    if gc_days <= 0:
+        return []
+    routed = set(routing or ())
+    cutoff = now - gc_days * 86400
+    return sorted(sid for sid, last in session_activity.items() if sid not in routed and (last or 0.0) <= cutoff)
+
+
+# Every clock that says a goal/loop row is live: set/resume, last turn, last idle wake, park start; a
+# loop's last tick and the ``next_due_at`` that ``LoopManager.resume()`` re-arms to now.
+_ORPHAN_GC_ROW_CLOCKS = (
+    ("goal:", ("created_at", "resumed_at", "last_turn_at", "last_idle_wake_at", "waiting_since")),
+    ("loop:", ("created_at", "last_fired_at", "next_due_at")),
+)
+
+
+def _orphan_gc_session_activity_sql() -> str:
+    """Session-store recency for a ``sessions s`` row: the fleet's canonical freshest-of (the
+    ``last_activity_at`` heartbeat that ``touch_session_activity`` stamps during API/tool/compaction
+    work before any message lands, the newest message, else ``started_at``) and ``effective_last_active``.
+    The scan and the in-transaction recheck both use this one expression."""
+    from hermes_state_common import _sql_session_last_active
+
+    return f"MAX(COALESCE(s.effective_last_active, 0), COALESCE({_sql_session_last_active('s')}, 0))"
+
+
+def _active_row_clock(prefix: str, raw: Optional[str]) -> Optional[float]:
+    """Latest liveness clock of an ACTIVE goal/loop row, or None when the row is absent or not active."""
+    try:
+        data = json.loads(raw) if raw else None
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("status") != "active":
+        return None
+    clocks = dict(_ORPHAN_GC_ROW_CLOCKS)[prefix]
+    return max(float(data.get(c) or 0.0) for c in clocks)
+
+
+def _goal_loop_session_activity(db: Any) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, str]]:
+    """``(activity, goal_rows, loop_rows)`` for sessions with an ACTIVE goal or loop row in *db*.
+    Activity is the latest of the rows' clocks and the session store's recency. This scan only picks
+    CANDIDATES; :func:`_retire_if_still_orphaned` re-decides each one inside the write. A failed read
+    raises: an unreadable store must not look idle."""
+    activity: Dict[str, float] = {}
+    rows_by_prefix: Dict[str, Dict[str, str]] = {"goal:": {}, "loop:": {}}
+    for prefix, _clocks in _ORPHAN_GC_ROW_CLOCKS:
+        for key, raw in db.list_meta_prefix(prefix):
+            sid = key[len(prefix):]
+            last = _active_row_clock(prefix, raw)
+            if not sid or last is None:
+                continue
+            rows_by_prefix[prefix][sid] = raw
+            activity[sid] = max(activity.get(sid, 0.0), last)
+    ids = sorted(activity)
+    recency = _orphan_gc_session_activity_sql()
+    for i in range(0, len(ids), _ORPHAN_GC_SCAN_CHUNK):
+        chunk = ids[i:i + _ORPHAN_GC_SCAN_CHUNK]
+        rows = db._read_all(
+            f"SELECT s.id, {recency} FROM sessions s WHERE s.id IN ({','.join('?' * len(chunk))})",
+            tuple(chunk),
+        )
+        for sid, last in rows:
+            activity[sid] = max(activity[sid], float(last or 0.0))
+    return activity, rows_by_prefix["goal:"], rows_by_prefix["loop:"]
+
+
+def _retire_if_still_orphaned(
+    db: Any, prefix: str, sid: str, cutoff: float, scanned: Dict[str, Optional[str]], retire: Callable,
+) -> Optional[Tuple[str, str]]:
+    """Retire ``<prefix><sid>`` only if, read inside ONE write transaction (BEGIN IMMEDIATE, so no
+    writer can land between the check and the write), nothing about the session changed since the
+    candidate scan:
+    - fence: each of the session's goal/loop rows that the scan saw ACTIVE is byte-identical to the
+      scanned row, so any edit (a turn, ``/goal`` subgoal/gate/contract edits that move no clock, a
+      loop re-arm) keeps BOTH rows;
+    - a sibling row the scan did NOT see active (e.g. a paused loop resumed since) has every clock
+      <= *cutoff*;
+    - the session store's recency (activity heartbeat, messages, start) is <= *cutoff*.
+    Routing is NOT read here: the caller checks it outside the transaction (a routing lookup can
+    re-enter this SessionDB's non-reentrant write lock). *scanned*: ``{prefix: raw | None}``.
+    *retire*: ``raw -> new raw | None``. Returns ``(old_raw, new_raw)`` when written, else None.
+    Raises on a read failure (the caller counts nothing)."""
+    key = f"{prefix}{sid}"
+    recency = _orphan_gc_session_activity_sql()
+
+    def _txn(conn) -> Optional[Tuple[str, str]]:
+        def _raw(k):
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (k,)).fetchone()
+            return row[0] if row else None
+
+        raw = _raw(key)
+        if raw is None or raw != scanned.get(prefix):
+            return None
+        for p, _clocks in _ORPHAN_GC_ROW_CLOCKS:
+            if p == prefix:
+                continue
+            sibling = _raw(f"{p}{sid}")
+            if scanned.get(p) is not None:
+                if sibling != scanned[p]:
+                    return None
+                continue
+            last = _active_row_clock(p, sibling)
+            if last is not None and last > cutoff:
+                return None
+        srow = conn.execute(f"SELECT {recency} FROM sessions s WHERE s.id = ?", (sid,)).fetchone()
+        if srow is not None and float(srow[0] or 0.0) > cutoff:
+            return None
+        new = retire(raw)
+        if new is None:
+            return None
+        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (new, key))
+        return raw, new
+
+    return db._execute_write(_txn)
+
+
+def reap_orphaned_goals_and_loops(
+    routed_session_ids: Any, *, gc_days: int = DEFAULT_ORPHAN_GC_DAYS, now: Optional[float] = None, db: Any = None,
+    is_routed: Optional[Callable[[str], bool]] = None,
+) -> Dict[str, int]:
+    """Retire (status ``orphaned``) every active goal and loop in this profile's store that
+    :func:`orphaned_goal_and_loop_ids` selects AND that is still orphaned when re-checked inside the
+    retiring write. *routed_session_ids*: the routing snapshot for the candidate scan. *is_routed*: the
+    live routing lookup re-read per row inside the write (gateway: ``SessionStore.lookup_by_session_id``);
+    defaults to membership in the snapshot. Returns ``{"scanned", "orphaned", "loops"}`` (scanned =
+    sessions holding an active goal or loop). Any read failure reaps nothing."""
+    counts = {"scanned": 0, "orphaned": 0, "loops": 0}
+    if gc_days <= 0:
+        return counts
+    db = db if db is not None else _get_session_db()
+    if db is None:
+        return counts
+    now = time.time() if now is None else now
+    try:
+        activity, goal_sids, loop_sids = _goal_loop_session_activity(db)
+    except Exception as exc:
+        logger.debug("goal-gc: activity read failed, nothing reaped: %s", exc)
+        return counts
+    counts["scanned"] = len(activity)
+    routed = set(routed_session_ids or ())
+    live_routed = is_routed if is_routed is not None else routed.__contains__
+    cutoff = now - gc_days * 86400
+    stamp = time.strftime("%Y-%m-%d", time.localtime(now))
+    reason = f"orphan-gc: unrouted and idle >= {gc_days}d (retired {stamp})"
+    from hermes_cli.loops import _retired_loop_json
+
+    for sid in orphaned_goal_and_loop_ids(now, routed, activity, gc_days=gc_days):
+        scanned = {"goal:": goal_sids.get(sid), "loop:": loop_sids.get(sid)}
+        for prefix, counter, retire in (
+            ("goal:", "orphaned",
+             functools.partial(_retired_goal_json, status="orphaned", reason=f"{reason}; /goal resume restores")),
+            ("loop:", "loops",
+             functools.partial(_retired_loop_json, session_id=sid, status="orphaned",
+                               reason=f"{reason}; /loop resume restores")),
+        ):
+            if scanned[prefix] is None:
+                continue
+            try:
+                # Live routing is read OUTSIDE the write transaction: a SessionStore lookup may load
+                # routing from this same SessionDB, whose write lock is not reentrant (Prism 0d90dba2499b).
+                if live_routed(sid):
+                    continue
+                written = _retire_if_still_orphaned(db, prefix, sid, cutoff, scanned, retire)
+                if not written:
+                    continue
+                # A /resume that routed the session between the check above and the commit: give the
+                # row back (CAS, so a newer edit is never clobbered).
+                if live_routed(sid):
+                    db.compare_and_set_meta(f"{prefix}{sid}", written[1], written[0])
+                    continue
+                scanned[prefix] = written[1]  # our own write is not a concurrent edit for the sibling's fence
+                counts[counter] += 1
+            except Exception as exc:
+                logger.debug("goal-gc: retiring %s%s failed, left active: %s", prefix, sid, exc)
+    return counts
+
+
 # ── Judge ─────────────────────────────────────────────────────────────
 
 def _truncate(text: str, limit: int) -> str:
     if not text:
         return ""
     return text if len(text) <= limit else text[:limit] + "… [truncated]"
+
+
+# Identifies this process in retry claims: a claim from a dead claimant can be recovered.
+_PROCESS_INSTANCE = uuid4().hex[:12]
+
+
+def _process_start_time(pid: int) -> Optional[int]:
+    try:
+        from gateway.status import get_process_start_time
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def _new_retry_claim() -> str:
+    pid = os.getpid()
+    start = _process_start_time(pid)
+    fingerprint = str(start) if start is not None else "unknown"
+    return f"retry:{pid}:{fingerprint}:{_PROCESS_INSTANCE}:{uuid4().hex}"
+
+
+def _orphaned_retry_claim(token: Optional[str]) -> bool:
+    """Recover proven-dead/replaced claimants; unknown identity stays fenced."""
+    parts = (token or "").split(":")
+    if len(parts) not in (4, 5) or parts[0] != "retry":
+        return False
+    instance = parts[-2]
+    if instance == _PROCESS_INSTANCE:
+        return False
+    try:
+        pid = int(parts[1])
+    except ValueError:
+        return False
+    if pid == os.getpid() or not _pid_alive(pid):
+        return True
+    if len(parts) == 5:
+        current = _process_start_time(pid)
+        if current is not None and parts[2] != "unknown":
+            try:
+                recorded = int(parts[2])
+                return recorded > 0 and int(current) > 0 and recorded != int(current)
+            except (ValueError, TypeError):
+                return False
+    return False
 
 
 def _pid_alive(pid: int) -> bool:
@@ -949,6 +1234,11 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if data is None:
         return "continue", f"judge reply was not JSON: {_truncate(raw, 200)!r}", True, None
 
+    if not (isinstance(data.get("verdict"), str) and data["verdict"].strip().lower() in {"done", "blocked", "continue", "wait"}):
+        if "verdict" in data or not isinstance(data.get("done"), bool):
+            return "continue", "judge reply did not match verdict schema", True, None
+    if "reason" in data and not isinstance(data["reason"], str):
+        return "continue", "judge reason did not match verdict schema", True, None
     reason = str(data.get("reason") or "").strip() or "no reason provided"
     verdict_raw = data.get("verdict")
     if isinstance(verdict_raw, str):
@@ -982,7 +1272,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     seconds = _first_int("wait_for_seconds", "seconds", "wait_seconds")
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
-    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
+    return "continue", "judge wait verdict had no valid target", True, None
 
 
 def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
@@ -1041,6 +1331,7 @@ def judge_goal(
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
     completion_handoff: bool = False,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1095,6 +1386,11 @@ def judge_goal(
             "whether the substantive work is done.\n"
         )
     try:
+        from hermes_cli.goal_judge_chain import chain_config, judge_chain
+        policy = chain_config(timeout)
+        if policy is not None:
+            return judge_chain(policy, system_prompt, prompt, _goal_judge_max_tokens(), _parse_judge_response,
+                               cancel_check=cancel_check)
         raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
@@ -1122,6 +1418,15 @@ def goal_judge_available() -> bool:
     """
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
+        from hermes_cli.goal_judge_chain import chain_config
+        try:
+            policy = chain_config(_goal_judge_timeout())
+        except (ValueError, TypeError):
+            return True  # configured but invalid: judge must report failure, never bypass the gate
+        if policy is not None:
+            # Explicit chain exists even when its primary cannot currently resolve. Let
+            # the bounded judge report exhaustion rather than silently bypassing it.
+            return True
         client, model = get_text_auxiliary_client("goal_judge")
     except Exception:
         return False
@@ -1735,11 +2040,14 @@ class GoalManager:
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
         s = self._state
-        if s is None or (s.waiting_on_pid is None and s.waiting_on_session is None and not s.waiting_until):
+        if s is None:
+            return False
+        had_wait = bool(s.waiting_on_pid is not None or s.waiting_on_session is not None or s.waiting_until)
+        if not had_wait and s.idle_wake_attempt is None:
             return False
         s.clear_wait()
         self._save()
-        return True
+        return had_wait
 
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
@@ -1767,7 +2075,9 @@ class GoalManager:
             logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
                         self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
             still = False
-        if not still:
+        # Observation (e.g. /loop arbitration) must not consume a pending retry wake.
+        # idle_wake_prompt clears it only when claiming the continuation.
+        if not still and not s.incomplete_retry_wait:
             self.stop_waiting()
         return still
 
@@ -1852,6 +2162,8 @@ class GoalManager:
         no_progress_turns: int = DEFAULT_NO_PROGRESS_TURNS, turn_effect: Optional[str] = None,
         user_spoke: bool = False, nudge_on_read_only_turns: bool = False,
         checkin_minutes: float = DEFAULT_CHECKIN_MINUTES, max_checkins: int = DEFAULT_MAX_IDLE_CHECKINS,
+        turn_completed: bool = True, max_incomplete_turns: int = DEFAULT_MAX_INCOMPLETE_TURNS,
+        human_message: bool = False,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
@@ -1873,9 +2185,69 @@ class GoalManager:
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        # Real events re-arm check-ins even when the agent turn fails before judging.
         if real_event and state.idle_wakes:
             state.idle_wakes = 0
             self._save()
+        # Failed agent turns are not evidence for gates or the judge. Persist the streak so
+        # reloading the manager (or restarting the gateway) cannot restart a rapid retry loop.
+        blank_success = turn_completed and not last_response.strip()
+        retry_recovery = state.incomplete_retry_wait or (
+            bool(state.idle_wake_attempt) and state.idle_wake_attempt.startswith("retry:"))
+        if blank_success and retry_recovery and not human_message:
+            # A blank/muted/[SILENT] success queues no successor and proves no progress: keep a
+            # pending recovery timer, and charge a claimed retry like a failure (streak backoff +
+            # turn budget) so silent retries can never loop at a fixed cadence.
+            if not state.incomplete_retry_wait:
+                state.consecutive_incomplete_turns += 1
+                state.turns_used += 1
+                state.last_turn_at = time.time()
+                if state.turns_used >= state.max_turns:
+                    state.clear_wait()
+                    return self._budget_pause(state, "skipped", "empty completed retry")
+                excess = state.consecutive_incomplete_turns - max(1, int(max_incomplete_turns))
+                self._park("empty completed retry", incomplete_retry_wait=True,
+                           waiting_until=time.time() + min(1800, 60 * 2 ** min(max(excess, 0), 5)))
+            return _decision("active", False, None, "skipped", "empty completed response", "")
+        if (state.consecutive_incomplete_turns or retry_recovery) and (turn_completed or human_message):
+            state.consecutive_incomplete_turns = 0
+            if blank_success and retry_recovery:
+                # A human's blank turn resets the streak but must not strand a claimed retry.
+                if not state.incomplete_retry_wait:
+                    self._park("empty completed retry", waiting_until=time.time() + 60,
+                               incomplete_retry_wait=True)
+            elif state.incomplete_retry_wait:
+                state.clear_wait()
+            self._save()
+        if not blank_success:
+            state.idle_wake_attempt = None
+        # A completed/human turn may reset retry state, never a deployment/process barrier.
+        if not turn_completed and not state.incomplete_retry_wait and self.is_waiting():
+            return self._waiting_decision(state)
+        if turn_completed and not last_response.strip():
+            return _decision("active", False, None, "skipped", "empty completed response", "")
+        if not turn_completed:
+            # An executed failure spent model budget; unexecuted wakes never reach here (refunded).
+            state.consecutive_incomplete_turns += 1
+            state.turns_used += 1
+            state.last_turn_at = time.time()
+            if state.turns_used >= state.max_turns:
+                state.clear_wait()
+                return self._budget_pause(state, "incomplete", "agent turn did not complete")
+            limit = max(1, int(max_incomplete_turns))
+            failures = state.consecutive_incomplete_turns
+            if failures >= limit:
+                delay = min(1800, 60 * 2 ** min(failures - limit, 5))
+                self._park("consecutive incomplete agent turns",
+                           waiting_until=time.time() + delay, incomplete_retry_wait=True)
+                message = (
+                    f"⏳ Goal parked after {failures} incomplete turns. Retrying in {delay}s "
+                    "with exponential backoff (up to 30 min). Send a message to reset retries."
+                ) if failures == limit else ""
+                return _decision("active", False, None, "incomplete", "agent turn did not complete", message)
+            self._save()
+            return _decision("active", True, self.next_continuation_prompt(), "incomplete",
+                             "agent turn did not complete", "")
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
@@ -1893,9 +2265,24 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
+        activation = replace(state)
+
+        def judge_cancelled():
+            # User verbs can mutate state in place, including pause followed by resume.
+            if not same_active_goal(activation, self._state):
+                return True
+            # A failed read is not a user stop. The save CAS still fences stale verdicts.
+            if _get_session_db() is None:
+                return False
+            current, raw = _load_goal_raw(self.session_id, strict=True)
+            if raw and current is None:
+                raise ValueError('unreadable goal state')
+            return not same_active_goal(activation, current)
+
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
+            cancel_check=judge_cancelled,
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -2009,8 +2396,10 @@ class GoalManager:
         if s is None or s.status != "active":
             return None
         minutes = s.checkin_minutes if s.checkin_minutes >= 0 else checkin_minutes
-        if not minutes or minutes <= 0:
+        orphan = _orphaned_retry_claim(s.idle_wake_attempt)
+        if (checkin_minutes <= 0 or minutes <= 0) and not s.incomplete_retry_wait and not orphan:
             return None
+        retry_wake = s.incomplete_retry_wait or orphan
         now = time.time() if now is None else now
         if now - max(s.last_turn_at, s.last_idle_wake_at, s.waiting_since, s.created_at) > _IDLE_WAKE_HORIZON_S:
             return None  # stale/abandoned goal: never wake it out of the blue
@@ -2019,7 +2408,13 @@ class GoalManager:
         if s.waiting_until:
             if now < s.waiting_until:
                 return None
-            self.stop_waiting()
+            if retry_wake:
+                s.clear_wait()  # persist timer consumption only with the claim CAS below
+            else:
+                self.stop_waiting()
+            prompt = self.next_continuation_prompt()
+            counted = False
+        elif orphan:  # the claimant died before settling: re-offer the same retry
             prompt = self.next_continuation_prompt()
             counted = False
         elif s.waiting_on_pid is not None or s.waiting_on_session is not None:
@@ -2043,9 +2438,43 @@ class GoalManager:
             counted = True
         if not prompt:
             return None
-        if counted:
-            s.idle_wakes += 1
-        s.last_idle_wake_at = now
+        if not orphan:
+            if counted:
+                s.idle_wakes += 1
+            s.last_idle_wake_at = now
+            s.idle_wake_attempt = (
+                _new_retry_claim() if retry_wake else "idle:" + uuid4().hex)
+        if orphan:
+            # The dead claimant may have executed before dying. Charge once and
+            # back off, never immediately replay a potentially crashing turn.
+            s.turns_used += 1
+            s.consecutive_incomplete_turns += 1
+            s.idle_wake_attempt = None
+            s.last_turn_at = now
+            s.waiting_since = now
+            s.waiting_reason = "retry claimant exited before settlement"
+            s.incomplete_retry_wait = s.turns_used < s.max_turns
+            s.waiting_until = (now + min(1800, 60 * 2 ** min(max(
+                s.consecutive_incomplete_turns - 1, 0), 5))) if s.incomplete_retry_wait else 0.0
+            if not s.incomplete_retry_wait:
+                s.status = "paused"
+            prompt = None
+        if retry_wake:
+            # Both recovery settlement and eventual timer dispatch require ownership CAS.
+            db = _get_session_db() if self.session_id else None
+            if db is not None:
+                s.revision += 1
+                raw = s.to_json()
+                try:
+                    won = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
+                except Exception as exc:
+                    logger.debug("GoalManager: retry reclaim write failed: %s", exc)
+                    won = False
+                if not won:
+                    self._state, self._stored = _load_goal_raw(self.session_id)
+                    return None
+                self._stored = raw
+                return prompt
         self._save()
         return prompt
 

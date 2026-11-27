@@ -13,6 +13,9 @@ from tools import browser_tool as bt
 from tools import browser_tool_install as install
 from tools import browser_tool_session as session
 
+# Discovery itself is under test here, against fixture binaries in a tmp PM store with PATH="".
+pytestmark = pytest.mark.real_agent_browser
+
 
 @pytest.fixture
 def browser_store(tmp_path, monkeypatch):

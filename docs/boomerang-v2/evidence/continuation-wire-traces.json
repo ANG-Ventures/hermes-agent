@@ -1,0 +1,416 @@
+[
+  {
+    "scenario": "busy",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "claude-pin",
+        "path": "/primary/anthropic/v1/messages"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "claude-second",
+        "path": "/second/anthropic/v1/messages"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cpa-sol",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "claim": {
+      "action": "complete",
+      "assignee": "worker",
+      "board": null,
+      "child_session": "20261107_235621_64163a",
+      "claimed_at": 1794124581.6937943,
+      "cursor_event_id": 1,
+      "delegation_id": "del-20261107-235621-2ad7",
+      "event_id": 1,
+      "event_ts": 1,
+      "finished_at": 1794124588.2088656,
+      "head": null,
+      "home_sid": "20261107_235620_5bd3f93e",
+      "inherit_mode": "summary",
+      "key": "default|t_6765b89b|1",
+      "kind": "completed",
+      "max_minutes": 45,
+      "mode": "fork",
+      "outcome": "complete",
+      "path": "notifier",
+      "pr": null,
+      "resurfaced": false,
+      "route": {
+        "chat_id": "scratch",
+        "platform": "discord",
+        "profile": null,
+        "thread_id": ""
+      },
+      "row": "completed",
+      "state": "terminal",
+      "status": "done",
+      "subagent_id": "sa-0-bda91b7f",
+      "task_id": "t_6765b89b",
+      "title": "isolated routing",
+      "verdict_nonce": "cc0d50ab95564be4",
+      "wake_text": "original owner obligation"
+    },
+    "sent": [
+      "boomerang handled t_6765b89b (completed): AUTO-WIRE-c3576d7ab8a842dc89baa19d48c8a7cb"
+    ]
+  },
+  {
+    "scenario": "cold",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "claude-pin",
+        "path": "/primary/anthropic/v1/messages"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "claude-second",
+        "path": "/second/anthropic/v1/messages"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cpa-sol",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "claim": {
+      "action": "complete",
+      "assignee": "worker",
+      "board": null,
+      "child_session": "20261108_075630_3d33f9",
+      "claimed_at": 1794124590.4800282,
+      "cursor_event_id": 1,
+      "delegation_id": "del-20261108-075630-8e2c",
+      "event_id": 1,
+      "event_ts": 1,
+      "finished_at": 1794124592.512628,
+      "head": null,
+      "home_sid": "20261108_075630_f63dffc8",
+      "inherit_mode": "summary",
+      "key": "default|t_f6dd6179|1",
+      "kind": "completed",
+      "max_minutes": 45,
+      "mode": "fork",
+      "outcome": "complete",
+      "path": "notifier",
+      "pr": null,
+      "resurfaced": false,
+      "route": {
+        "chat_id": "scratch",
+        "platform": "discord",
+        "profile": null,
+        "thread_id": ""
+      },
+      "row": "completed",
+      "state": "terminal",
+      "status": "done",
+      "subagent_id": "sa-0-44a462dd",
+      "task_id": "t_f6dd6179",
+      "title": "isolated routing",
+      "verdict_nonce": "576ba136c7b360cb",
+      "wake_text": "original owner obligation"
+    },
+    "sent": [
+      "boomerang handled t_f6dd6179 (completed): AUTO-WIRE-3e7938e040404f65bff4f2df4956afd0"
+    ]
+  },
+  {
+    "scenario": "owner-wake",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "claude-pin",
+        "path": "/primary/anthropic/v1/messages"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "claude-second",
+        "path": "/second/anthropic/v1/messages"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cpa-sol",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "claim": {
+      "action": "complete",
+      "assignee": "worker",
+      "board": null,
+      "child_session": "20261108_075641_7b5a0b",
+      "claimed_at": 1794124601.561412,
+      "cursor_event_id": 1,
+      "delegation_id": "del-20261108-075641-f596",
+      "event_id": 1,
+      "event_ts": 1,
+      "finished_at": 1794124603.0298135,
+      "head": null,
+      "home_sid": "20261108_075641_ad783cde",
+      "inherit_mode": "summary",
+      "key": "default|t_8a535d87|1",
+      "kind": "completed",
+      "max_minutes": 45,
+      "mode": "fork",
+      "outcome": "complete",
+      "path": "owner-wake",
+      "pr": null,
+      "resurfaced": false,
+      "route": {
+        "chat_id": "scratch",
+        "platform": "discord",
+        "profile": null,
+        "thread_id": ""
+      },
+      "row": "completed",
+      "state": "terminal",
+      "status": "done",
+      "subagent_id": "sa-0-5576599f",
+      "task_id": "t_8a535d87",
+      "title": "isolated routing",
+      "verdict_nonce": "6945a6211b374788",
+      "wake_text": "[kanban wake] Card t_8a535d87 \"isolated routing\" (board default), a card this session owns: completed. Resolve it and get the chain back on track; reply in the home chat with what you did."
+    },
+    "sent": [
+      "boomerang handled t_8a535d87 (completed): AUTO-WIRE-29b0ac4cffaf44ce8e1345178f0f477b"
+    ]
+  },
+  {
+    "profile": "b",
+    "pid": 264623,
+    "model": "selected-b",
+    "sentinel": "DETACHED-b",
+    "status": "completed"
+  },
+  {
+    "scenario": "summary",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "parent-pin",
+        "path": "/primary/v1/chat/completions"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "second-model",
+        "path": "/second/v1/chat/completions"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cross-model",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "status": "completed",
+    "sentinel": "BOOMERANG-WIRE-6d022dde0d0c429e84cb01061f73fa1f",
+    "final": "BOOMERANG-WIRE-6d022dde0d0c429e84cb01061f73fa1f"
+  },
+  {
+    "scenario": "downgrade",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "parent-pin",
+        "path": "/primary/v1/chat/completions"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "second-model",
+        "path": "/second/v1/chat/completions"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cross-model",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "status": "completed",
+    "sentinel": "BOOMERANG-WIRE-c4df6a76a21649f58ca2d79cefccf8e3",
+    "final": "BOOMERANG-WIRE-c4df6a76a21649f58ca2d79cefccf8e3"
+  },
+  {
+    "scenario": "busy",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "parent-pin",
+        "path": "/primary/v1/chat/completions"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "second-model",
+        "path": "/second/v1/chat/completions"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cross-model",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "status": "completed",
+    "sentinel": "BOOMERANG-WIRE-30eb0957a0ef48798de00c5e9e1139e9",
+    "final": "BOOMERANG-WIRE-30eb0957a0ef48798de00c5e9e1139e9"
+  },
+  {
+    "scenario": "cold",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "parent-pin",
+        "path": "/primary/v1/chat/completions"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "second-model",
+        "path": "/second/v1/chat/completions"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cross-model",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "status": "completed",
+    "sentinel": "BOOMERANG-WIRE-5692288ae8584fe3b390ee576c620893",
+    "final": "BOOMERANG-WIRE-5692288ae8584fe3b390ee576c620893"
+  },
+  {
+    "scenario": "detached",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "parent-pin",
+        "path": "/primary/v1/chat/completions"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "second-model",
+        "path": "/second/v1/chat/completions"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cross-model",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "status": "completed",
+    "sentinel": "BOOMERANG-WIRE-d5022bc7901646d5bcb81c9d49bd7769",
+    "final": "BOOMERANG-WIRE-d5022bc7901646d5bcb81c9d49bd7769"
+  },
+  {
+    "scenario": "active-fallback",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "second",
+        "model": "second-model",
+        "path": "/second/v1/chat/completions"
+      },
+      {
+        "ordinal": 2,
+        "lane": "cross-vendor",
+        "model": "cross-model",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "status": "completed",
+    "sentinel": "BOOMERANG-WIRE-d682ca00c53d4512a8a5832d05bc0b09",
+    "final": "BOOMERANG-WIRE-d682ca00c53d4512a8a5832d05bc0b09"
+  },
+  {
+    "scenario": "disabled",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "parent-pin",
+        "path": "/primary/v1/chat/completions"
+      }
+    ],
+    "status": "failed",
+    "sentinel": "BOOMERANG-WIRE-bed446db2b324eb8a6e3aa0f202bf17f",
+    "final": "Billing or credits exhausted: HTTP 429: insufficient_quota: synthetic provider exhausted\n\nOpenRouter reported that billing, credits, or account entitlement is exhausted for parent-pin.\nAdd credits or update billing with that provider, then retry.\nOpenRouter billing: https://openrouter.ai/settings/credits\nYou can switch providers temporarily with /model <model> --provider <provider>."
+  },
+  {
+    "scenario": "auto-wake",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "parent-pin",
+        "path": "/primary/v1/chat/completions"
+      },
+      {
+        "ordinal": 2,
+        "lane": "second",
+        "model": "second-model",
+        "path": "/second/v1/chat/completions"
+      },
+      {
+        "ordinal": 3,
+        "lane": "cross-vendor",
+        "model": "cross-model",
+        "path": "/cross-vendor/v1/chat/completions"
+      }
+    ],
+    "status": "completed",
+    "sentinel": "BOOMERANG-WIRE-b64f4fed7cf6476295093cecd83dc888",
+    "final": "BOOMERANG-WIRE-b64f4fed7cf6476295093cecd83dc888"
+  },
+  {
+    "scenario": "downgrade",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "parent-pin",
+        "path": "/primary/v1/chat/completions"
+      }
+    ],
+    "status": "failed",
+    "sentinel": "BOOMERANG-WIRE-7f1969ca9e5f49918d91bdf9fc75ac28",
+    "final": "Billing or credits exhausted: HTTP 429: insufficient_quota: synthetic provider exhausted\n\nOpenRouter reported that billing, credits, or account entitlement is exhausted for parent-pin.\nAdd credits or update billing with that provider, then retry.\nOpenRouter billing: https://openrouter.ai/settings/credits\nYou can switch providers temporarily with /model <model> --provider <provider>."
+  },
+  {
+    "scenario": "downgrade",
+    "trace": [
+      {
+        "ordinal": 1,
+        "lane": "primary",
+        "model": "parent-pin",
+        "path": "/primary/v1/chat/completions"
+      }
+    ],
+    "status": "failed",
+    "sentinel": "BOOMERANG-WIRE-e28a74f140fc4755b5337fc1ea7554f2",
+    "final": "Billing or credits exhausted: HTTP 429: insufficient_quota: synthetic provider exhausted\n\nOpenRouter reported that billing, credits, or account entitlement is exhausted for parent-pin.\nAdd credits or update billing with that provider, then retry.\nOpenRouter billing: https://openrouter.ai/settings/credits\nYou can switch providers temporarily with /model <model> --provider <provider>."
+  }
+]

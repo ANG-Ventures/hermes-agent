@@ -427,6 +427,12 @@ def _apply_process_rlimit() -> str | None:
     cap = int(gib * _GIB)
     # Before the early return: a child pytest inherits the parent's soft cap and still needs it.
     _bound_malloc_arenas()
+    # mallopt() bounds THIS interpreter only; every child inherits the cap too. uv (glibc malloc, one rayon
+    # thread per CPU) aborts "memory allocation of 15 bytes failed" (rc -6) under it on a 32-thread host:
+    # tests/hermes_cli/test_{memory_dependency_admission,update_missing_configured_deps,
+    # web_memory_provider_setup_install}.py red on ACE-AI, green with the variable set (t_c2a562c9).
+    # tests/pm/conftest.py exported it for tests/pm only; the cap is suite-wide, so is this.
+    os.environ.setdefault("MALLOC_ARENA_MAX", _CHILD_MALLOC_ARENA_MAX)
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)
     if soft != resource.RLIM_INFINITY and soft <= cap:
         return None
@@ -451,6 +457,8 @@ def _apply_process_rlimit() -> str | None:
 # not 1: threads still spread across arenas, so lock contention barely changes.
 _MALLOC_ARENA_MAX = 8
 _M_ARENA_MAX = -8  # glibc <malloc.h>
+# Children (uv, other native tools) read the env var; 2 is the value tests/pm/conftest.py measured for uv.
+_CHILD_MALLOC_ARENA_MAX = "2"
 
 
 def _bound_malloc_arenas() -> None:

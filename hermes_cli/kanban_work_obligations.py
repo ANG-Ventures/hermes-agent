@@ -475,7 +475,8 @@ def receipt(conn: sqlite3.Connection, ob_id: str, wake_outcome: str, *,
     if not outcome:
         raise ObligationRefused("receipt needs --wake-outcome")
     with kb.write_txn(conn):
-        get(conn, ob_id)
+        if get(conn, ob_id).state == RESOLVED:
+            raise ObligationRefused("receipt refused on resolved obligation")
         conn.execute(
             "UPDATE obligations SET wake_attempts = wake_attempts + 1, "
             "first_wake_at = COALESCE(first_wake_at, ?), last_wake_at = ?, last_wake_outcome = ? "

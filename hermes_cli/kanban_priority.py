@@ -85,7 +85,7 @@ def sync_door_asap(conn, task_id, *, client=None) -> None:
 
 def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default_assignee=None,
                     conn=None, caps=None, cap_only=None, worktree_ports=None, local_budget=None,
-                    browser_joins=None):
+                    browser_joins=None, continuity=None):
     """Use the dispatcher's resolved routes, never its pressure-filtered slot budget.
 
     No age or workload ordering is decided here. The common publisher selects its
@@ -134,11 +134,18 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
             only, _ = _portable_only(conn, card, assignee, plan, caps,
                                      own_only.get(card["id"]),
                                      (worktree_ports or {}).get(card["id"]))
+        # A prose preference is soft (Prism 77c519869eff, as the dispatcher reads it): the preferred hosts are
+        # tried first, the hard set (``fallback``, None = any pool host) decides eligibility.
+        prefer = ()
+        from hermes_cli.kanban_db_dispatch import _ProsePreferred
+        if isinstance(only, _ProsePreferred):
+            only, prefer = only.fallback, tuple(only)
         allowed = None if only is None else {n.lower() for n in only}
         local_free = local_budget is None or local_used < local_budget
         remote = (route == "portable" and plan is not None
                   and _portable_goes_remote(local_free, own_only.get(card["id"]), plan,
-                                            card["id"] in (browser_joins or {})))
+                                            card["id"] in (browser_joins or {}),
+                                            continuity=card["id"] in (continuity or {})))
         if route == "local" or (route == "portable" and not remote
                                 and (allowed is None or local_names & allowed)):
             out[local_host].append(card)
@@ -146,7 +153,9 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
             continue
         if plan is None:
             continue
-        for name, host in plan.hosts.items():
+        want = {n.lower() for n in prefer}
+        ordered = sorted(plan.hosts.items(), key=lambda kv: kv[0].lower() not in want)
+        for name, host in ordered:
             if route in ("pin", "origin") and name != arg:
                 continue
             if allowed is not None and name.lower() not in allowed:
@@ -212,15 +221,16 @@ def _table_hosts():
 
 
 def _auth_refusal(client, exc) -> bool:
-    """A stale-record withdraw we can never authenticate: no/unreadable pair token, or a typed ``auth`` refusal."""
+    """Only explicit credential faults are auth; a bare HTTP refusal must still latch."""
     if not isinstance(exc, client.Refused):
         return False
-    return getattr(exc, "reason", "auth") == "auth"
+    return (getattr(exc, "reason", None) == "auth"
+            or isinstance(exc, getattr(client, "TokenUnreadable", ()))
+            or str(exc) == "provisioned demand publisher token required")
 
 
 def _drop_stale(current, hid, uid, why) -> None:
-    """Round 6 (Prism 7e404c636d6f): a recorded unit on a host we cannot reach cannot be live for us; keeping it made
-    every publish withdraw it, get Refused and latch, forever. Drop it from the record with one line; never latch."""
+    """A host removed from the table has no withdrawal destination. Warn once and forget it."""
     current.discard((hid, uid))
     _log.warning("kanban door: dropped published unit %s on %s from the record: %s", uid, hid, why)
 
@@ -238,12 +248,38 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
             raise _Stop({(host, None): str(exc)}) from exc
         plan.append((host, hid, [(card, door.unit_id(conn, card["id"])) for card in cards]))
     current = door.load_published(conn)
+    pending = door.load_pending_withdrawals(conn)
     wanted = {(hid, uid) for _, hid, rows in plan for _, uid in rows}
-    if not plan and not current:
+    if not plan and not current and not pending:
         return {}                # no allocd call made: proves nothing about publish health (Prism 0056dc604414)
     errors = {}
     known = _table_hosts()
+    import time
+    now = time.time()
+    answered = False
     try:
+        # Reconcile desired ownership before destructive retries, even if enqueue later fails.
+        for entry in list(pending):
+            pair = (entry["host"], entry["unit_id"])
+            if pair in wanted:
+                current.add(pair)
+                pending.remove(entry)
+        for entry in list(pending):
+            hid, uid = entry["host"], entry["unit_id"]
+            if known is not None and hid not in known:
+                pending.remove(entry)
+                _log.warning("kanban door: dropped pending withdrawal %s on %s: host left table", uid, hid)
+                continue
+            try:
+                client.withdraw("kanban", hid, uid)  # idempotent, including a unit already absent
+                pending.remove(entry)
+                answered = True
+            except (client.Refused, client.Unreachable) as exc:
+                entry["last_reason"] = str(exc)
+                if _auth_refusal(client, exc):
+                    continue
+                errors[(hid, uid)] = str(exc)
+                _classify(client, faults, exc, errors)
         for hid, uid in sorted(current - wanted):
             if known is not None and hid not in known:
                 _drop_stale(current, hid, uid, "host is no longer in the host table")
@@ -251,14 +287,18 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
             try:
                 client.withdraw("kanban", hid, uid)
                 current.discard((hid, uid))
+                answered = True
             except (client.Refused, client.Unreachable) as exc:
                 if _auth_refusal(client, exc):
-                    _drop_stale(current, hid, uid, f"withdraw refused for auth ({exc})")
+                    current.discard((hid, uid))
+                    if not any(p["host"] == hid and p["unit_id"] == uid for p in pending):
+                        pending.append({"host": hid, "unit_id": uid, "first_seen": now, "last_reason": str(exc)})
+                        _log.warning("kanban door: pending withdrawal of published unit %s on %s: %s", uid, hid, exc)
                     continue
                 errors[(hid, uid)] = str(exc)        # still ours; retried after the fault clears
                 _classify(client, faults, exc, errors)
     finally:
-        door.save_published(conn, current)
+        door.save_published(conn, current, pending_withdrawals=pending)
     for host, hid, rows in plan:
         # The capacity fact only (last writer wins); units are managed per id below.
         try:
@@ -274,7 +314,8 @@ def _publish_waiting(conn, waiting, verdicts, client, door):
             except (client.Refused, client.Unreachable) as exc:
                 errors[(hid, uid)] = str(exc)
                 _classify(client, faults, exc, errors)
-    faults.note_success("publish")                   # publish health only; never clears the authorize history
+    if plan or answered:
+        faults.note_success("publish")               # only a real answer proves publish health
     return errors
 
 

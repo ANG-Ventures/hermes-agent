@@ -1,4 +1,4 @@
-"""Fork canary: the /queue + /stop contract (Ace rulings 2026-10-12, -13 and -18).
+"""Fork canary: the /queue + /stop contract (Ace rulings 2026-10-12, -13, -18 and 2026-11-26 x2).
 
 Surface: CLI + every gateway surface (Telegram, Discord, Slack), busy and idle. Upstream has NEITHER
 ``gateway/queue_mgmt.py`` NOR ``hermes_cli/queue_verbs.py`` (checked 2026-10-18 against upstream/main), so a
@@ -231,3 +231,56 @@ def test_user_reset_drops_and_reports_auto_reset_carries(rig):
     runner._clear_conversation_scope(KEY, reason="session_reset")
     assert _held(runner) == []
     assert qm.take_reset_drop_suffix(runner, KEY) == "\nDropped 2 queued prompt(s) with the old conversation."
+
+
+# --------------------------------------------------------------------------- R7: a new /queue item is never held
+# Ace 2026-11-26 (Discord 1575705667786776607): with items held, a new `/queue <text>` still goes to the ACTIVE
+# queue (busy: armed to run after the turn; idle: runs now) and the held items stay held. Red if either entry
+# point appends the new item to `held_queue` again (the old D14 "joins held" rule).
+
+@pytest.mark.asyncio
+async def test_new_queue_item_goes_active_while_held(rig):
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    qm.hold_user_items(runner, KEY, adapter)
+    reply = await runner._busy_queue_command(_ev("/queue z"), KEY, _source())
+    assert reply.startswith("Queued for the next turn.") and "1 older prompt(s) still held" in reply
+    assert _held(runner) == ["a"] and adapter._pending_messages[KEY].text == "z"
+    adapter._pending_messages.pop(KEY)
+    async def _ack(*_a):
+        return None
+    runner._send_command_ack = _ack
+    ev = _ev("/queue y")
+    assert await runner._hm_cmd_queue(ev, _source(), KEY) == (False, None) and ev.text == "y"
+    assert _held(runner) == ["a"] and KEY not in adapter._pending_messages
+
+
+# --------------------------------------------------------------------------- R8: held releases on the next completed turn
+# Ace 2026-11-26 (Discord 1575714860740907081): /stop still holds (R4), but the session's next completed human
+# turn releases the held items oldest first through restage_held. Red if release_on_turn_end stops restaging,
+# releases while automatic work is paused or with only [system] items held, or _run_agent_inner stops calling it
+# or stops requiring an explicit completed=True result (a truncated reply must not release).
+
+def test_completed_turn_releases_held_oldest_first(rig):
+    runner, adapter = rig
+    runner._queue_release_mode = "per_item"
+    _seed(runner, adapter, "a", "b")
+    qm.hold_user_items(runner, KEY, adapter)
+    _seed(runner, adapter, "z")
+    runner._session_state(KEY).conversation.automatic_turns_paused = True
+    assert qm.release_on_turn_end(runner, KEY, adapter) == 0 and _held(runner) == ["a", "b"]
+    runner._session_state(KEY).conversation.automatic_turns_paused = False
+    assert qm.release_on_turn_end(runner, KEY, adapter) == 3
+    assert _active(runner, adapter) == ["a", "b", "z"] and _held(runner) == []
+    assert adapter._pending_messages[KEY]._queue_released is True
+    runner._session_state(KEY).conversation.held_queue.append(_ev("wake", internal=True))
+    assert qm.release_on_turn_end(runner, KEY, adapter) == 0 and _held(runner) == ["wake"]
+
+
+def test_turn_end_drain_calls_the_release():  # noqa: source-proxy structural: the behaviour is exercised end to end in tests/gateway/test_queue_release_real_adapter.py
+    import inspect
+
+    from gateway.run_turn import GatewayTurnMixin
+    src = inspect.getsource(GatewayTurnMixin._run_agent_inner)
+    assert "queue_mgmt.release_on_turn_end(" in src
+    assert 'result.get("completed") is True' in src   # only an explicitly complete turn releases

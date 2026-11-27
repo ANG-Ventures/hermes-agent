@@ -113,7 +113,7 @@ async def test_kanban_notify_wake_tick(lane, tmp_path, monkeypatch):
     kb.init_db()
     conn = kb.connect()
     try:
-        task = kb.create_task(conn, title="test", assignee="worker", session_id=human.session_key)
+        task = kb.create_task(conn, boomerang_wake=False, title="test", assignee="worker", session_id=human.session_key)
         kbn.add_notify_sub(conn, task_id=task, platform="discord", chat_id="123",
                           chat_type="channel", user_id="456", delivery_mode="notify+wake")
         kb.complete_task(conn, task, summary="finished")

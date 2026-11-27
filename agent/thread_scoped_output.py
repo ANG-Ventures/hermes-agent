@@ -10,12 +10,47 @@ once, idempotently, and never uninstalled (that would race other threads mid-wri
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 import sys
 import threading
-from typing import Iterator, TextIO
+from typing import Any, Iterator, TextIO
 
-__all__ = ["thread_scoped_silence"]
+__all__ = ["thread_scoped_silence", "iter_wrapped_streams", "UNWRAP_STDIO_LAYER"]
+
+# Protocol shared by every transparent stdio wrapper in-tree (this module's routing
+# proxy, ``agent.process_bootstrap._SafeWriter``): a method of this name returns the
+# stream one layer down. Each installer walks the chain before wrapping so two
+# wrappers that only recognised THEMSELVES cannot alternate forever — that pairing
+# added two layers per fresh agent build until one attribute lookup overflowed the
+# interpreter stack (``RecursionError`` in ``setup_logging`` on long-lived gateways).
+UNWRAP_STDIO_LAYER = "_hermes_unwrap_stdio_layer"
+_MAX_WRAPPER_HOPS = 10_000
+
+
+def iter_wrapped_streams(stream: Any) -> Iterator[Any]:
+    """Yield ``stream`` and every stream beneath it, outermost first, ending at the
+    first object that is not a known wrapper. Resolved statically so a wrapper's
+    attribute pass-through is never consulted (that pass-through is the hot path
+    that overflowed)."""
+    seen: set[int] = set()
+    for _ in range(_MAX_WRAPPER_HOPS):
+        if stream is None or id(stream) in seen:
+            return
+        seen.add(id(stream))
+        yield stream
+        unwrap = inspect.getattr_static(stream, UNWRAP_STDIO_LAYER, None)
+        if unwrap is None or not callable(unwrap):
+            return
+        stream = unwrap(stream)
+
+
+def _find_layer(stream: Any, kind: type) -> Any:
+    for layer in iter_wrapped_streams(stream):
+        if isinstance(layer, kind):
+            return layer
+    return None
+
 
 _install_lock = threading.Lock()
 # Proxy installed per attribute ("stdout"/"stderr"): never double-wrap.
@@ -86,18 +121,24 @@ class _ThreadRoutingStream:
     def __getattr__(self, name):  # type: ignore[no-untyped-def]
         return getattr(self._target(), name)
 
+    def _hermes_unwrap_stdio_layer(self) -> TextIO:
+        return self._passthrough
+
 
 def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
     """Install (idempotently) a routing proxy as ``sys.<attr>`` and return it."""
     with _install_lock:
         proxy = _installed.get(attr)
         current = getattr(sys, attr, None)
-        if isinstance(current, _ThreadRoutingStream):
-            # A redirect context may restore an older proxy; adopt it rather
-            # than wrapping it into an unbounded chain.
-            _installed[attr] = current
-            _routing_states[attr] = current._state
-            return current
+        # A redirect context may restore an older proxy, or another transparent
+        # wrapper (``_SafeWriter``) may have been layered on top of ours since the
+        # last call. Adopt the proxy already in the chain rather than wrapping the
+        # whole stack again — the routing still happens one layer down.
+        existing = _find_layer(current, _ThreadRoutingStream)
+        if existing is not None:
+            _installed[attr] = existing
+            _routing_states[attr] = existing._state
+            return existing
         if proxy is not None and current is proxy:
             return proxy
         # Route non-silenced threads to whatever is currently bound (an active

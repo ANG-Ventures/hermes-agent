@@ -800,7 +800,8 @@ def test_multiplex_recovery_isolates_profile_failures(tmp_path):
     recovery_homes: list[str] = []
     tick_homes: list[str] = []
 
-    def _recover():
+    def _recover(*, replay_pass=True):
+        # Same keyword-only signature as recover_interrupted (#150 added replay_pass).
         home = str(get_hermes_home())
         recovery_homes.append(home)
         if home == str(failing_home):

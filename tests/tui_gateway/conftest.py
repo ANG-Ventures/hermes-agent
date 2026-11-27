@@ -50,6 +50,9 @@ import sys
 import pytest
 
 import hermes_bootstrap  # noqa: F401
+# Capture the watchdog's real Thread before turn fixtures replace the shared
+# threading.Thread with synchronous starters. State is intentionally lazy now.
+import hermes_state_lockowners  # noqa: F401
 
 _PRISTINE: dict = {}
 

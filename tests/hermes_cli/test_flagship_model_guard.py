@@ -1556,6 +1556,9 @@ def test_refused_send_back_opens_no_review_run(flagship_profiles, proven_operato
         task_id = kb.create_task(conn, title="review", assignee=None)
         conn.execute("UPDATE tasks SET assignee = 'daedalus-sonnet', status = 'review' WHERE id = ?",
                      (task_id,))
+        if missing == "review_requested":
+            # Emulate pre-guard corruption; new review entries repair this now.
+            conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='review_requested'", (task_id,))
         if missing == "implementer":
             kb._append_event(conn, task_id, "review_requested", {"implementer": " "})
         conn.commit()

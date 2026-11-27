@@ -295,7 +295,10 @@ def test_compaction_leaves_recent_terminal_bodies_alone():
     with store.locked_registry() as registry:
         store._prune(registry, now, path)
     record = store.read_registry()["records"]["deleg_00000005"]  # 1 h old, delivered
-    assert "tool_trace" in record["terminal"]["result"]["results"][0]
+    # Past the size bound the body moves to its sidecar (t_86324a22); D5 still never strips a
+    # recent record's tool_trace, wherever the body lives.
+    full = store.read_offloaded_record(path, record) or record
+    assert "tool_trace" in full["terminal"]["result"]["results"][0]
     assert _compacted(record["outbox"][0]["payload"])
 
 

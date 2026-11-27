@@ -96,12 +96,25 @@ def fleet(tmp_path, monkeypatch):
     (root / "config").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setenv("PLACEMENT_HOME", str(root))
+    monkeypatch.setenv("ALLOCATION_HOME", str(root))
     monkeypatch.setenv("ALLOCD_URL", _closed_port())
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     pages = []
     monkeypatch.setattr(faults, "_page", lambda text: pages.append(text) or True)
+    # Provision the root now, as the operator does before any runtime: conftest's lazy provisioning otherwise writes
+    # the root generation file mid-tick, after a publish-pass latch fingerprinted it absent, so the start path reads
+    # "config changed", clears the latch and pages a second time (t_e7bb19cf).
+    from hermes_cli import fleet_placement
+    try:
+        demand = fleet_placement.admission_demand
+    except ImportError:  # POSIX-only module (fcntl/pwd): no placement root to provision on native Windows
+        pass
+    else:
+        demand._receipt_path(root.absolute())
+    # The orphan sweep walks the HOST process table and realpath()s every init-parented process's cwd, which reads
+    # the real hermes home; this file tests the door, not the sweep.
+    monkeypatch.setattr(kb, "sweep_terminal_workspace_orphans", lambda conn, **kw: {})
     kb.init_db()
     ns = type("Fleet", (), {})()
     ns.root, ns.pages = root, pages
@@ -117,9 +130,20 @@ def fleet(tmp_path, monkeypatch):
         d = root / alloc_client.TOKENS_REL
         d.mkdir(parents=True, exist_ok=True)
         (d / "kanban@mac-studio").write_text("pair-token\n", encoding="utf-8")
+        # Local capacity accounting is upgraded in place; authorization authenticates
+        # the existing row's owner as well as the host/workload pair.
+        (d / "kanban").write_text("capacity-owner-token\n", encoding="utf-8")
+        (d / "asap-operator").write_text("operator-token\n", encoding="utf-8")
+        # the fcfs flip's other door on this root: scripts/test-gate's base owner + --local capability (t_dd8c53c4)
+        (d / "test-gate").write_text("test-gate-owner-token\n", encoding="utf-8")
+        (d / "test-gate-local-venue").write_text("local-venue-token\n", encoding="utf-8")
 
     ns.registry, ns.table, ns.token = registry, table, token
     return ns
+
+
+def _latch_pages(fleet):
+    return [p for p in fleet.pages if "config fault" in p]
 
 
 def _tick(spawned, **kw):
@@ -187,14 +211,14 @@ def test_config_fault_blocks_capability_latches_and_is_not_reclaimed(fleet, monk
     task = _status(tid)
     assert spawned == []
     assert task.status == "blocked" and task.block_kind == "capability"
-    assert len(fleet.pages) == 1 and "config fault" in fleet.pages[0]
+    assert len(_latch_pages(fleet)) == 1
     n = len(allocd.calls)
     other = _card("other")
     _tick(spawned)
     assert spawned == []
     assert _status(tid).status == "blocked" and _status(other).status == "ready"
     assert len(allocd.calls) == n, "a latched door makes no door call"
-    assert len(fleet.pages) == 1
+    assert len(_latch_pages(fleet)) == 1
     # the operator fixes the config: the latch clears, the next tick starts the other card
     allocd.answer = ok_door()
     fleet.table()
@@ -345,7 +369,10 @@ def test_fcfs_start_consumes_one_authorization_and_survives_restart(fleet, monke
     allocd.answer = ok_door()
     monkeypatch.setenv("ALLOCD_URL", allocd.url)
     tid = _card()
-    proc = subprocess.run([sys.executable, "-c", _KILLED_TICK], env=dict(os.environ), timeout=120,
+    # a subprocess has no conftest: hand it this test's provisioned root receipt (hermes-home #9789)
+    from hermes_cli import fleet_placement
+    receipt = fleet_placement.admission_demand._receipt_path(Path(os.environ["ALLOCATION_HOME"]).absolute())
+    proc = subprocess.run([sys.executable, "-c", _KILLED_TICK], env=dict(os.environ, PLACEMENT_ROOT_RECEIPT=str(receipt)), timeout=120,
                           capture_output=True, text=True)
     assert proc.returncode == -signal.SIGKILL, proc.stderr[-2000:]
     auth = [b for p, b in allocd.calls if p == "/demand/authorize"]
@@ -405,3 +432,251 @@ def test_spawn_only_aggregate_publish_is_fire_and_forget(fleet, monkeypatch):
     assert err                                            # reported to the caller, not raised
     counted = {k: klg.PUBLISH_STATS[k] - before[k] for k in before}
     assert counted["ok"] == 0 and counted["failed"] + counted["skipped"] == len(doc["hosts"])
+
+
+def _spawn_only_fleet(fleet, monkeypatch, hosts, tokened):
+    """A spawn-only fleet table with ``hosts`` (sorted publish order) and a pair token for each name in ``tokened``."""
+    fleet.registry("spawn-only")
+    doc = json.loads(json.dumps(TABLE))
+    doc["hosts"] = {name: {**TABLE["hosts"]["mac-studio"], "aliases": []} for name in hosts}
+    doc["default_first"] = hosts[-1]
+    (fleet.root / "config" / "fleet-hosts.json").write_text(json.dumps(doc), encoding="utf-8")
+    d = fleet.root / alloc_client.TOKENS_REL
+    d.mkdir(parents=True, exist_ok=True)
+    for name in tokened:
+        (d / f"kanban@{name}").write_text("pair-token\n", encoding="utf-8")
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    return allocd
+
+
+def _queue_ok(slow=(), delay=1.5):
+    def answer(path, body):
+        if body.get("host") in slow:
+            time.sleep(delay)                             # the local door's write outlasts the pass budget
+        return 200, {"schema": 1, "workload": body.get("workload"), "host": body.get("host"), "ok": True}
+    return answer
+
+
+def test_spawn_only_publish_tokenless_host_is_not_a_failure_and_is_asked_again_once_tokened(fleet, monkeypatch,
+                                                                                            caplog):
+    """A host with no local publisher token next to a tokened one: every pass returns None, one log line names it,
+    and it is still checked every pass, so a token written between pass 2 and pass 3 is published on pass 3 with
+    no restart and no reset of module state."""
+    import logging
+    from hermes_cli import kanban_load_gate as klg
+    allocd = _spawn_only_fleet(fleet, monkeypatch, ["mbp-arm", "studio"], tokened=["studio"])
+    allocd.answer = _queue_ok()
+    errs = []
+    with caplog.at_level(logging.INFO, logger=klg.__name__):
+        for _ in range(3):
+            errs.append(klg.publish_ready_demand(1))
+    assert errs == [None, None, None], errs
+    named = [r for r in caplog.records if "mbp-arm" in r.getMessage()]
+    assert len(named) == 1, [r.getMessage() for r in caplog.records]
+    # provision it now: token file + protected marker, as alloc_client._token requires
+    (fleet.root / alloc_client.TOKENS_REL / "kanban@mbp-arm").write_text("pair-token\n", encoding="utf-8")
+    marker = fleet.root / alloc_client.PROTECTED_REL / "kanban@mbp-arm"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    assert klg.publish_ready_demand(1) is None
+    published = [b["host"] for p, b in allocd.calls if p == "/demand/publish"]
+    assert published.count("mbp-arm") == 1 and published.count("studio") == 4, published
+
+
+def test_spawn_only_publish_slow_door_text_is_unchanged(fleet, monkeypatch):
+    """The first write outlasts the 1.0 s budget: the hosts after it read "skipped (publish budget 1.0 s spent)",
+    exactly as on main (the publish stays sequential on one shared budget)."""
+    from hermes_cli import kanban_load_gate as klg
+    hosts = ["a-slow", "h2", "h3"]
+    allocd = _spawn_only_fleet(fleet, monkeypatch, hosts, tokened=hosts)
+    allocd.answer = _queue_ok(slow={"a-slow"})
+    err = klg.publish_ready_demand(2)
+    assert err and err.startswith("a-slow: TimedOut"), err   # alloc_client.TimedOut(Unreachable), hermes-home main
+    for h in ("h2", "h3"):
+        assert f"{h}: skipped (publish budget {klg.PUBLISH_BUDGET_S} s spent)" in err, err
+
+
+def test_spawn_only_publish_logs_no_failed_line_when_every_host_answers(fleet, monkeypatch, caplog):
+    """All reachable and tokened: zero "failed" lines over several passes, and None (the gate tick's caller,
+    gateway/kanban_gate_tick.py publish_demand, logs "failed" only for a non-None return)."""
+    import logging
+    from hermes_cli import kanban_load_gate as klg
+    hosts = ["ace-ai", "mac-studio", "nas"]
+    allocd = _spawn_only_fleet(fleet, monkeypatch, hosts, tokened=hosts)
+    allocd.answer = _queue_ok()
+    monkeypatch.setattr(klg, "unified_admit", lambda env=None: True)
+    errs = []
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            errs.append(klg.publish_ready_demand(4, root=fleet.root))
+    assert errs == [None, None, None], errs
+    assert not [r for r in caplog.records if "failed" in r.getMessage()], [r.getMessage() for r in caplog.records]
+    assert sorted(b["host"] for p, b in allocd.calls if p == "/demand/publish") == sorted(hosts * 3)
+
+
+def _cred_pages(fleet):
+    return [p for p in fleet.pages if "kanban door credential" in p]
+
+
+def test_credential_check_present_set_is_clean(fleet, monkeypatch):
+    """t_793ef0f6: every _door_credentials() file present -> no credential page, nothing reported."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    allocd.answer = ok_door()
+    _card()
+    _tick([])
+    assert faults.check_credentials() == {}
+    assert _cred_pages(fleet) == []
+
+
+@pytest.mark.parametrize("name,problem,mint", [
+    ("kanban", "missing", "allocd.py --mint kanban "),
+    ("asap-operator", "missing", "allocd.py --mint asap-operator "),
+    ("kanban@mac-studio", "empty", "allocd.py --mint-demand kanban mac-studio "),
+    ("test-gate", "missing", "allocd.py --mint test-gate "),
+    ("test-gate-local-venue", "missing", "allocd.py --mint test-gate-local-venue "),
+])
+def test_credential_check_pages_once_per_bad_file_with_the_mint_command(fleet, monkeypatch, name, problem, mint):
+    """t_793ef0f6 (2026-11-14 18:39: unminted var/alloc/tokens/kanban latched the board 15 min): a planted bad door
+    credential pages ONCE through the pager on the armed door's tick, naming the file and its mint command; a second
+    tick does not re-page; repairing it pages once more (cleared)."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    p = fleet.root / alloc_client.TOKENS_REL / name
+    if problem == "missing":
+        p.unlink()
+    else:
+        p.write_text("\n", encoding="utf-8")
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    allocd.answer = ok_door()
+    _tick([])
+    _tick([])
+    pages = _cred_pages(fleet)
+    assert len(pages) == 1, pages
+    assert f"credential {problem}: {p}" in pages[0] and mint in pages[0]
+    assert faults.check_credentials() == {str(p): problem}
+    assert len(_cred_pages(fleet)) == 1
+    fleet.token()
+    assert faults.check_credentials() == {}
+    pages = _cred_pages(fleet)
+    assert len(pages) == 2 and "is back" in pages[1]
+
+
+def test_credential_check_is_off_while_the_door_is_spawn_only(fleet):
+    """No door call is made in spawn-only, so no credential is needed and nothing pages (pool boxes carry the host
+    table too)."""
+    fleet.registry("spawn-only")
+    fleet.table()
+    _card()
+    _tick([])
+    assert _cred_pages(fleet) == []
+
+
+def test_an_asap_start_without_the_asap_operator_token_still_starts_and_never_latches(fleet, monkeypatch):
+    """t_793ef0f6 ask 2: the asap-operator read is reachable from a start (start -> sync_asap -> mark_asap_if_set ->
+    alloc_client.mark_asap), but its Refused is logged and swallowed: the card starts on its arrival, the door is not
+    latched, and the only page is the credential page."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    (fleet.root / alloc_client.TOKENS_REL / alloc_client.ASAP_OPERATOR).unlink()
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    allocd.answer = ok_door()
+    tid, spawned = _card(), []
+    with kbc.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET asap=1 WHERE id=?", (tid,))
+        conn.commit()
+    _tick(spawned)
+    assert spawned == [tid]
+    assert faults.latched() is None and _latch_pages(fleet) == []
+    assert len(_cred_pages(fleet)) == 1 and "asap-operator" in _cred_pages(fleet)[0]
+    assert not any(b.get("op") == "mark_asap" for _, b in allocd.calls), "no operator capability, no mark_asap call"
+
+
+def test_credential_check_reports_an_absent_pair_token_for_a_configured_host(fleet, monkeypatch):
+    """Prism 9de108709849: a host the door can start on whose kanban@<host> was never minted (or was deleted) is
+    reported, though no file exists to list; deleting a pair file that was paged empty keeps it paged (still bad),
+    so no "is back" page goes out."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    p = fleet.root / alloc_client.TOKENS_REL / "kanban@mac-studio"
+    p.unlink()
+    assert faults.check_credentials() == {str(p): "missing"}
+    pages = _cred_pages(fleet)
+    assert len(pages) == 1 and f"credential missing: {p}" in pages[0] and "--mint-demand kanban mac-studio" in pages[0]
+    fleet.token()
+    assert faults.check_credentials() == {}
+    fleet.pages.clear()
+    p.write_text("\n", encoding="utf-8")              # paged empty ...
+    assert faults.check_credentials() == {str(p): "empty"}
+    p.unlink()                                        # ... then deleted
+    assert faults.check_credentials() == {str(p): "missing"}
+    assert len(_cred_pages(fleet)) == 1 and not any("is back" in x for x in _cred_pages(fleet))
+
+
+def test_credential_check_retries_a_page_the_notifier_failed_to_send(fleet, monkeypatch):
+    """Prism a492fc587bb2: a failed page is not recorded as sent, so the next tick pages; a failed "is back" page
+    keeps the path paged until one goes out."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    p = fleet.root / alloc_client.TOKENS_REL / "kanban"
+    p.unlink()
+    sent, fail = [], [True]
+    monkeypatch.setattr(faults, "_page", lambda text: (not fail[0]) and (sent.append(text) or True))
+    faults.check_credentials()
+    assert sent == []
+    fail[0] = False
+    faults.check_credentials()
+    faults.check_credentials()
+    assert len(sent) == 1 and f"credential missing: {p}" in sent[0]
+    fleet.token()
+    fail[0] = True
+    faults.check_credentials()
+    assert len(sent) == 1
+    fail[0] = False
+    faults.check_credentials()
+    faults.check_credentials()
+    assert len(sent) == 2 and "is back" in sent[1]
+
+
+def test_credential_check_uses_the_alloc_client_token_shape():
+    """Prism simplify note: no copy of alloc_client._TOKEN_SHAPE in the fault module."""
+    assert "_TOKEN_SHAPE = " not in Path("hermes_cli/kanban_priority_faults.py").read_text(encoding="utf-8")
+
+
+#: the Studio's var/alloc/tokens at the 2026-11-14 21:1x P7 re-flip (t_94fec622), less the kanban door's own files
+#: the fixture writes: no bare test-gate, no test-gate-local-venue. Every no-env test-gate run then refused rc 78.
+STUDIO_FLIP_EXTRA = ("prism", "test-gate@ace-ai", "test-gate@mac-studio", "ci@ci-box")
+
+
+def test_fcfs_preflight_names_the_test_gate_tokens_the_2026_11_14_flip_lacked(fleet, capsys):
+    """t_dd8c53c4: the pre-flip check runs in spawn-only (before the flip), pages nothing, writes no state, and exits 1
+    naming the test-gate base owner and the local-venue capability with their mint commands."""
+    fleet.registry("spawn-only")
+    fleet.table()
+    fleet.token()
+    d = fleet.root / alloc_client.TOKENS_REL
+    for name in STUDIO_FLIP_EXTRA:
+        (d / name).write_text("present-token\n", encoding="utf-8")
+    (d / "test-gate").unlink()
+    (d / "test-gate-local-venue").unlink()
+    assert faults.preflight() == 1
+    out = capsys.readouterr().out
+    assert f"missing {d / 'test-gate'}" in out and "allocd.py --mint test-gate " in out, out
+    assert f"missing {d / 'test-gate-local-venue'}" in out and "allocd.py --mint test-gate-local-venue " in out, out
+    assert "fcfs preflight: RED 2 of" in out, out
+    assert "present-token" not in out and "capacity-owner-token" not in out
+    assert fleet.pages == [] and not (fleet.root / faults.STATE_REL).exists()
+    fleet.token()
+    assert faults.preflight() == 0
+    assert "fcfs preflight: GREEN" in capsys.readouterr().out
+    assert fleet.pages == []

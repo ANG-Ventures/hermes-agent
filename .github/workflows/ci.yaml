@@ -147,6 +147,13 @@ concurrency:
   cancel-in-progress: ${{ inputs.release != true && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
 
 jobs:
+  # Keep the regression under the allowlisted orchestrator (no extra PR trigger).
+  vault-page-target:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    uses: ./.github/workflows/vault-page-target.yml
+    permissions:
+      contents: read
+
   # ─────────────────────────────────────────────────────────────────────
   # detect: run the classifier once. Every downstream job reads its outputs
   # to decide whether to run. On push/dispatch the classifier fails open
@@ -161,7 +168,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1' }}
     name: Detect affected areas
     # Unblock all lanes without waiting for a self-hosted test slot.
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       python: ${{ steps.gate-lanes.outputs.python }}
@@ -242,6 +249,11 @@ jobs:
           # behind it (Ace 2026-11-01, t_38da7416). push:main and merge_group still run them.
           if os.environ['EVENT_NAME'] == 'pull_request' and os.environ.get('PR_E2E_UPGRADE') == 'off':
               values['e2e_upgrade'] = 'false'
+          # CI_PR_E2E_UPGRADE=on is the kill switch for the main-only narrowing (t_4897b522):
+          # the classifier now starts e2e_upgrade on a PR only when the diff touches the upgrade
+          # path itself; `on` runs it on every pull request again. push:main always runs it.
+          if os.environ['EVENT_NAME'] == 'pull_request' and os.environ.get('PR_E2E_UPGRADE') == 'on':
+              values['e2e_upgrade'] = 'true'
           if not release and os.environ['DESKTOP_JOBS'] != 'on':
               values['desktop'] = 'false'
           # macOS + Windows unit lanes: path-gated on pull_request only
@@ -541,6 +553,7 @@ jobs:
   all-checks-pass:
     name: All required checks pass
     needs:
+      - vault-page-target
       - detect
       - tests
       - tests-os
@@ -575,7 +588,7 @@ jobs:
       # run open. That is what blocked ``gh run rerun``.
     if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (always()) }}
     # A completed matrix must not wait for the pool to report its verdict.
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
@@ -615,7 +628,7 @@ jobs:
     needs: [all-checks-pass]
     if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (always()) }}
     # GitHub API/cache/artifacts only; reserve pool slots for tests.
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout code

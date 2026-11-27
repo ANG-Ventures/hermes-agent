@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -32,12 +33,15 @@ class AdmissionBaselineTests(unittest.TestCase):
             root = Path(directory)
             (root / "fleet").mkdir()
             baseline = root / "fleet/admission-decider-baseline.json"
-            baseline.write_text(json.dumps({"schema": 1, "scan": ["."], "files": {}}))
+            baseline.write_text(json.dumps({"schema": 1, "scan": ["."], "library": [], "files": {}}))
             before = baseline.read_bytes()
             (root / "scripts").mkdir()
             (root / "scripts/planted_decider.py").write_text(
                 "if load1 > 0.9 * ncpu:\n    pass\n"
             )
+            # the lint scans git-tracked files (and --update requires a git index)
+            subprocess.run(["git", "init", "-q", str(root)], check=True, env=LINT._git_env())
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True, env=LINT._git_env())
             for flags in ((), ("--update",)):
                 with self.subTest(flags=flags):
                     rc, output = self.run_lint("--root", str(root), *flags)

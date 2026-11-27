@@ -29,6 +29,23 @@ _TTL_SECONDS = {"1h": 3600, "5m": 300}
 _FROZEN_TOOL_SNAPSHOT_GENERATION = 2_147_483_647
 
 
+class ForkPinRefused(RuntimeError):
+    """The first fork request was refused before any upstream work was accepted."""
+
+
+def raise_if_fork_pin_refused(agent: Any, error: Any) -> None:
+    """Only a relay's explicit 503 refusal can authorize a summary rebuild."""
+    if (getattr(agent, "_inherit_mode", None) != "fork" or not getattr(agent, "_fork_rebuild_args", None)
+            or not getattr(agent, "_fork_pin_sent", False)):
+        return
+    from agent.fork_ext.relay_headers import _POOL_AFFINITY_PROVIDERS
+    if getattr(agent, "provider", None) not in _POOL_AFFINITY_PROVIDERS:
+        return
+    headers = getattr(getattr(error, "response", None), "headers", {}) or {}
+    if getattr(error, "status_code", None) == 503 and headers.get("x-pool-pin-refused"):
+        raise ForkPinRefused("relay refused the first-request seat pin")
+
+
 def normalize_inherit_mode(value: Any) -> Optional[str]:
     """``"fork"|"branch"`` -> ``"fork"``, ``"summary"`` -> ``"summary"``, None/"" -> None.
 
@@ -195,7 +212,7 @@ def fork_constructor_overrides(parent: Any) -> Dict[str, Any]:
     return {
         "ephemeral_system_prompt": getattr(parent, "ephemeral_system_prompt", None),
         "prefill_messages": copy.deepcopy(getattr(parent, "prefill_messages", None)) or None,
-        "request_overrides": dict(getattr(parent, "request_overrides", None) or {}),
+        "request_overrides": copy.deepcopy(getattr(parent, "request_overrides", None) or {}),
     }
 
 

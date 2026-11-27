@@ -153,7 +153,7 @@ def _handler_nodes():
     found = {}
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name in ("_on_model_selected", "_finish_switch"):
+            if node.name in ("_finish_switch", "_on_model_selected_locked"):
                 found[node.name] = node
     return found
 
@@ -178,7 +178,7 @@ def _switch_model_calls(node):
     return out
 
 
-@pytest.mark.parametrize("handler", ["_on_model_selected", "_finish_switch"])
+@pytest.mark.parametrize("handler", ["_finish_switch"])
 def test_both_model_handlers_thread_session_reasoning(handler):
     """Source contract: EVERY ``switch_model`` call in BOTH /model handlers
     must splat ``_switch_reasoning_kwargs``. Wiring only one site leaves the
@@ -206,7 +206,7 @@ def test_both_model_handlers_thread_session_reasoning(handler):
         )
 
 
-@pytest.mark.parametrize("handler", ["_on_model_selected", "_finish_switch"])
+@pytest.mark.parametrize("handler", ["_finish_switch"])
 def test_both_model_handlers_read_post_switch_effort(handler):
     """#467 rule 3 at the source level: each handler must consult
     ``_post_switch_reasoning_config`` (the agent's ACTUAL state) rather than
@@ -222,3 +222,11 @@ def test_both_model_handlers_read_post_switch_effort(handler):
         f"{handler} computes its effort display without reading the agent's "
         "post-switch reasoning_config"
     )
+
+
+def test_picker_routes_through_the_typed_reasoning_commit():
+    node = _handler_nodes()["_on_model_selected_locked"]
+    calls = {n.func.attr for n in ast.walk(node)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert "_handle_model_command" in calls
+    assert not _switch_model_calls(node), "picker must not bypass the shared reasoning commit"

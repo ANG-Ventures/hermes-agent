@@ -430,6 +430,51 @@ def skips_quota_gate(cls: str) -> bool:
     return cls not in QUOTA_GATE_CLASSES
 
 
+# t_d780729d: on a pooled relay lane the relay owns every seat's quota state. A
+# quota class there is cached locally only until the relay's own stated reset
+# (its Retry-After / reset_at), else for this short, fixed lifetime; it never
+# doubles and never takes the 6 h -> 24 h open-ended default. After it the
+# restore gate asks the relay (/eligibility) again.
+RELAY_QUOTA_CACHE_S = 5 * MIN
+RELAY_QUOTA_CLASSES = frozenset({"quota_seat", "quota_model"})
+# The credential-pool failure reasons (FailoverReason values) that are seat
+# quota on a relay lane, besides a bare 429: the relay owns them, the pool row
+# stores nothing (credential_pool.relay_lane_quota_is_relays).
+RELAY_QUOTA_FAILURE_REASONS = frozenset({"rate_limit", "upstream_rate_limit", "pool_exhausted"})
+
+
+def _relay_pooled(provider: Optional[str]) -> bool:
+    from agent.relay_lanes import is_relay_pooled
+
+    return is_relay_pooled(provider)
+
+
+def relay_quota_cooldown_s(cls: str, *, stated_reset_s: Optional[float] = None,
+                           retry_after_s: Optional[float] = None,
+                           window: Optional[str] = None, jitter: float = 1.0) -> float:
+    """The relay's reset for this seat/model (times ``jitter``), else
+    :data:`RELAY_QUOTA_CACHE_S`; the class ceiling applies after jitter."""
+    reset = next((float(v) for v in (stated_reset_s, retry_after_s)
+                  if isinstance(v, (int, float)) and v > 0), None)
+    if reset is None:
+        return RELAY_QUOTA_CACHE_S
+    if window == "7d":
+        ceiling = WINDOW_CEILING_7D_S
+    elif cls == "quota_seat":
+        ceiling = COOLDOWN_TABLE["quota_seat"].ceiling_s
+    else:
+        ceiling = WINDOW_CEILING_DEFAULT_S
+    return min(reset * jitter, ceiling)
+
+
+def skips_legacy_arm(cls: str, provider: Optional[str]) -> bool:
+    """Whether the per-agent ``_rate_limited_until`` bench is skipped. Besides
+    the class rule (:func:`skips_quota_gate`), a quota class on a pooled relay
+    lane never arms it: that bench escalates to 4 h on this lane name alone,
+    while the relay rotates the pool (t_d780729d)."""
+    return skips_quota_gate(cls) or (cls in RELAY_QUOTA_CLASSES and _relay_pooled(provider))
+
+
 def _load(store: StickyStore, key: StickyKey) -> Optional[StickyState]:
     try:
         return _store_mod.get(key, store)
@@ -452,9 +497,13 @@ def arm_sticky(store: StickyStore, key: StickyKey, *, cls: str, now: float,
         return None
     prev = _load(store, key)
     n = next_n(prev, cls, now)
-    cooldown = compute_cooldown_s(cls, n, stated_reset_s=stated_reset_s,
-                                  retry_after_s=retry_after_s, window=window,
-                                  jitter=default_jitter() if jitter is None else jitter)
+    jit = default_jitter() if jitter is None else jitter
+    if cls in RELAY_QUOTA_CLASSES and _relay_pooled(key.primary_provider):
+        cooldown = relay_quota_cooldown_s(cls, stated_reset_s=stated_reset_s,
+                                          retry_after_s=retry_after_s, window=window, jitter=jit)
+    else:
+        cooldown = compute_cooldown_s(cls, n, stated_reset_s=stated_reset_s,
+                                      retry_after_s=retry_after_s, window=window, jitter=jit)
     state = dataclasses.replace(prev) if prev is not None else StickyState()
     was_active = bool(prev and prev.active)
     state.primary_provider, state.primary_model = key.primary_provider, key.primary_model
@@ -620,6 +669,10 @@ class Eligibility:
     # their window, so a non-empty list = "warm copy exists, not eligible".
     warm_skip: Optional[str] = None
     warm_skipped: Tuple[str, ...] = ()
+    # t_d780729d: whether the answer carried ``model_eligible`` at all. A relay
+    # build that omits the key reads as model_eligible=False; only an answer
+    # that carries it may hold a session on its fallback (restore_allowed).
+    model_eligible_known: bool = False
 
 
 def _opt_int(v: Any) -> Optional[int]:
@@ -650,6 +703,7 @@ def parse_eligibility(obj: Any) -> Optional[Eligibility]:
         bound_seat=str(seat) if seat else None,
         bound_eligible=bool(obj.get("bound_eligible")),
         model_eligible=bool(obj.get("model_eligible")),
+        model_eligible_known="model_eligible" in obj,
         bound_expires_in_s=_opt_float(obj.get("bound_expires_in_s")),
         bound_idle_s=_opt_float(obj.get("bound_idle_s")),
         bound_expiry=obj.get("bound_expiry"),
@@ -767,6 +821,7 @@ def _warm_seat(state: StickyState, now: float, *, primary_provider: str,
 
 
 BOX_FULL_REASON = "warm_seat: bound box full"
+RELAY_MODEL_INELIGIBLE_REASON = "relay: no seat eligible for the model"
 
 
 def _box_full(elig: Optional[Eligibility], verdict: Optional[str]) -> bool:
@@ -923,6 +978,24 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
         # verdict == "cap" (primary warm copy expired/absent) does NOT return
         # here: the fallback copy may still be warm, and D6 waits for
         # fallback_cold/compaction below (t_e001a935; no cap_expiry branch).
+        if ((state.cls in RELAY_QUOTA_CLASSES or state.cls == NO_FIRST_BYTE_BUDGET_CLASS)
+                and _relay_pooled(provider)
+                and eligibility is not None and not is_direct_pin(provider)):
+            # t_d780729d: the episode's quota verdict was only a short local cache;
+            # past it the relay's answer for this model decides. A relay that says
+            # no seat can serve the model keeps the session on its fallback (the
+            # cold/compaction branches below would only replay the refusal).
+            # A budget cut counts too (2026-11-13: a 600 s cut on claude-dtlr/Fable
+            # with 23/25 seats drained returned to Fable next turn and looped).
+            # This reads the session-scoped /eligibility answer on any relay URL; the
+            # loopback-only capacity probe is a separate gate (fallback_wiring.
+            # _primary_capacity_hold) and is not folded into this answer.
+            # Unreachable / stale -> None -> the branches below, unchanged; so is an
+            # answer without a ``model_eligible`` key (an older relay build).
+            elig = eligibility()
+            if (elig is not None and elig.model_eligible_known
+                    and not (elig.model_eligible or elig.bound_eligible)):
+                return Decision(False, None, RELAY_MODEL_INELIGIBLE_REASON, exp, warm)
     last_fb = state.last_fallback_call_epoch
     if last_fb is None:
         last_fb = state.entered_at
@@ -992,6 +1065,7 @@ class RebuildDecision(NamedTuple):
 
 def decide_rebuild(store: StickyStore, key: StickyKey, now: float, *,
                    live_session_id: Optional[str],
+                   capacity_hold: Optional[Callable[[], Optional[str]]] = None,
                    eligibility: Optional[EligibilityFn] = None,
                    direct_pin_benched: Optional[BenchFn] = None,
                    sticky_policy: bool = True,
@@ -1007,6 +1081,11 @@ def decide_rebuild(store: StickyStore, key: StickyKey, now: float, *,
         return RebuildDecision("store_unreadable", None, None)
     if state is None or not state.active:
         return RebuildDecision("primary", state, None)
+    held = capacity_hold() if capacity_hold is not None else None
+    if held:
+        # 2026-11-13: the primary's relay states it cannot serve the primary model;
+        # a rebuilt session resumes its fallback whatever the episode's class.
+        return RebuildDecision("resume", state, Decision(False, None, held))
     if state.cls in TRANSIENT_CLASSES:
         # A restart never resumes a transient episode, even inside its
         # cooldown: the rebuilt session starts on the primary and the normal
@@ -1355,13 +1434,46 @@ def _bridge_code_body(row: Mapping[str, Any], seat: str, cause: str) -> str:
     seat_seg = f" on {seat}" if seat != SUB_UNKNOWN else f" ({SUB_UNKNOWN})"
     detail = f"; {entry.detail}" if entry.detail else ""
     reporter = "the DPX alias layer" if code.startswith("contentalias:") else "the bridge"
-    origin = LANE_INCAPABLE_NOT_ANTHROPIC if entry.ours else f"reported by {reporter}"
-    return (f"{cause} — {st} {code} {where} ({origin})"
+    origin = (f" ({LANE_INCAPABLE_NOT_ANTHROPIC})" if entry.ours
+              else "" if where.startswith("reported by") else f" (reported by {reporter})")
+    return (f"{cause} — {st} {code} {where}{origin}"
             f"{seat_seg}{detail}{_pool_context(row)}")
 
 
 BUDGET_CUT_BEFORE_HEADERS = "relay sent no headers before the cut"
 BUDGET_CUT_HEAD = "no reply within the turn budget"
+
+
+def _credit_code(row: Mapping[str, Any]) -> Optional[str]:
+    from agent.fallback_events import CREDIT_LANE_ERROR_CODES
+
+    code = str(row.get("credit_code") or "").strip().lower()
+    return code if code in CREDIT_LANE_ERROR_CODES else None
+
+
+def _credit_lane_body(row: Mapping[str, Any], seat_names: bool) -> str:
+    """``relay could not reach Anthropic through sub-vps-12 (TimeoutError),
+    not re-sent`` (t_4c447d32): the credit-lane relay's own code, the seat and
+    the exception its message named."""
+    from agent.fallback_events import CREDIT_LANE_ERROR_CODES
+
+    entry = CREDIT_LANE_ERROR_CODES[_credit_code(row) or ""]
+    seat = row.get("seat")
+    exc = f" ({row['credit_exc']})" if row.get("credit_exc") else ""
+    # Upload-failed parts (credit_upstream_write_failed): dropped when absent.
+    took = f" in {row['credit_limit_s']} s" if row.get("credit_limit_s") else ""
+    try:
+        # Stopped before the limit (a reset, not a timeout): say how long it ran.
+        if float(row.get("credit_elapsed_s")) < float(row.get("credit_limit_s")):
+            took = f", failed after {row['credit_elapsed_s']} s of {row['credit_limit_s']} s"
+    except (TypeError, ValueError):
+        pass
+    size = f"{row['credit_mb']} MB, " if row.get("credit_mb") else ""
+    if entry.seat_cause and seat and seat != "unknown":
+        return entry.seat_cause.format(seat=str(seat) if seat_names else "a sub", exc=exc,
+                                       took=took, size=size)
+    why = f" ({row['credit_why']})" if row.get("credit_why") else ""
+    return entry.cause.format(why=why, took=took, size=size)
 
 
 def _budget_cut_body(row: Mapping[str, Any], seat_names: bool) -> str:
@@ -1490,7 +1602,15 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
                 return pool_pressure_label(pp)
             return "relay unavailable"
         if "budget" in t and "capped" in t:
-            return "model budget capped"
+            # Name the model and say "not account-wide" only when the relay's own text scopes the cap
+            # to the requested model (#188 follow-up, Prism 341f2b8e51c2); a bare or account budget cap
+            # keeps the spec-pinned wording (route-notice spec rev12 §4.8).
+            if "requested model" not in t and "other models" not in t:
+                return "model budget capped"
+            model = str(row.get("from_model") or "the requested model")
+            provider = str(row.get("from_provider") or "the requested provider")
+            return (f"model budget capped for {model} via {provider} "
+                    "(model-specific, not account-wide)")
         windowed = _window_cause(row, t)
         if windowed and quota_window_from_text(t) is None:
             # A synthetic no-eligible refusal can still carry the rejected window.
@@ -1511,8 +1631,9 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
         return _window_cause(row, t) or "account rate limit"
     if cls == "auth" and "third-party apps" in t:
         return THIRD_PARTY_CAUSE
-    if cls == "auth" and any(n in t for n in _CREDIT_NEEDLES):
-        # "credit exhausted" over "OAuth revoked (401)" (t_94a2b0e4): one cause.
+    if cls in ("auth", "unclassified") and any(n in t for n in _CREDIT_NEEDLES):
+        # "credit exhausted" over "OAuth revoked (401)" (t_94a2b0e4) or over
+        # "unclassified error" (t_2ff17f3d: the runtime labels it billing): one cause.
         return CREDITS_CAUSE
     return {
         "rate_upstream": "account rate limit",
@@ -1539,7 +1660,8 @@ def _seat_token(row: Mapping[str, Any], seat_names: bool) -> str:
 
 
 def _hop_segment(hop: Optional[str], seat: str, status: Any) -> str:
-    st = status if status else "error"
+    # A 200 with an error is the error event a relay sent in-stream (t_2ff17f3d).
+    st = "in-stream error" if status == 200 else status if status else "error"
     if seat == SUB_UNKNOWN:
         known = {
             "client→relay": "to the relay",
@@ -1605,6 +1727,21 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
     if floors is not None:
         floors.extend(hit)
     body = _seat_absent_words(row, body)
+    reset = row.get("quota_reset_at")
+    nxt = _next_seat_clause(row)
+    if nxt:
+        # t_18148399: the relay said when the next seat frees; the upstream
+        # (weekly) reset is when the LAST one does, so it would mislead here.
+        m = _TRAILING_WINDOW_RE.search(body)
+        body = f"{body[:m.start()]}{nxt}{body[m.start():]}" if m else body + nxt
+        reset = None
+    if (row.get("trigger_class") in ("quota_model", "quota_seat")
+            and isinstance(reset, (int, float)) and not isinstance(reset, bool)
+            and "reset" not in body):
+        at = _hms(reset, tz).strftime("%Y-%m-%d %H:%M %Z").strip()
+        m = _TRAILING_WINDOW_RE.search(body)
+        tail = f"; upstream reset {at}"
+        body = f"{body[:m.start()]}{tail}{body[m.start():]}" if m else body + tail
     wait = _cause_wait_clause(row)
     if wait:
         m = _TRAILING_WINDOW_RE.search(body)
@@ -1613,6 +1750,18 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
 
 
 _TRAILING_WINDOW_RE = re.compile(r", (?:\d\d:\d\d:\d\d[-:\d]*|time \?)$")
+
+
+def _next_seat_clause(row: Mapping[str, Any]) -> str:
+    """``; no seat for ~6 min`` when a relay quota_seat row carries the relay's
+    ``next_seat_in_s`` (its Retry-After, spec D2), else ``""``."""
+    s = row.get("next_seat_in_s")
+    if (row.get("trigger_class") != "quota_seat" or isinstance(s, bool)
+            or not isinstance(s, (int, float)) or not 0 < s < float("inf")):
+        return ""
+    mins = max(1, round(float(s) / 60))
+    span = f"~{mins} min" if mins < 90 else f"~{round(float(s) / 3600)} h"
+    return f"; no seat for {span}"
 
 
 def _cause_wait_clause(row: Mapping[str, Any]) -> str:
@@ -1695,6 +1844,9 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
     if _refusal_floor(row) and (_refusal_floor(row).get("served_by") or not _plain_provider(row)):
         # A pool seat answered the refusal 200 (x-pool-served-by): name it (t_5d79bfea).
         return f"{prefix}{_refusal_body(row, seat_names)}, {window}", ()
+    if _credit_code(row):
+        # The credit-lane relay stated cause and seat in its own body (t_4c447d32).
+        return f"{prefix}{_credit_lane_body(row, seat_names)}, {window}", ()
     if _plain_provider(row):
         # The banner ends after the vendor's words when there are any (Ace,
         # 2026-09-27: no relay legs, no seats, nothing after the cause).
@@ -1870,7 +2022,7 @@ def relay_conn_without_evidence(row: Mapping[str, Any]) -> bool:
         return False
     if normalize_hop(row.get("hop")) or (row.get("seat") and row.get("seat") != "unknown"):
         return False
-    if row.get("class_source") in ("relay_header", "relay_stream") or row.get("relay_synthetic"):
+    if row.get("class_source") in ("relay_header", "relay_stream", "relay_probe") or row.get("relay_synthetic"):
         return False
     if row.get("http_status") is not None:  # an HTTP status means the relay answered
         return False
@@ -1956,7 +2108,13 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     name the real cause instead of the status-derived ``rate limit``. When
     this returns a label, ``_quota_window_suffix`` is not applied."""
     cls = row.get("trigger_class")
-    relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream")
+    ccode = _credit_code(row)
+    if ccode:
+        # The credit-lane relay's own code names what happened (t_4c447d32).
+        from agent.fallback_events import credit_lane_head
+
+        return credit_lane_head(ccode, row.get("credit_exc"))
+    relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream", "relay_probe")
                      or bool(row.get("relay_synthetic")))
     cause = _cause_phrase(row)
     if (cause in ("relay unavailable", "relay quota exhausted", "relay transport unavailable")

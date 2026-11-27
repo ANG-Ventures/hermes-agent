@@ -257,6 +257,19 @@ def collect_acceptance(contract: str, published_pr: str | None,
                         outcomes.remove("missing")
                         outcomes.append("success")
                         break
+        attr_missing = any(e["name"] == _ATTR_CONTEXT and e["classification"] == "missing" for e in receipt["checks"])
+        # A user-posted attribution status on this head (any state; the operator-lane path above
+        # owns it) is an explicit verdict: a retroactive record never overrides it (Prism dbe6b95e2c87).
+        if current.get("merged") and attr_missing and operator_candidate is None and current["head"]["sha"] == sha:
+            stage = "verify retroactive attribution"
+            retro = _retroactive_attribution(repo, canonical or repo, number, sha, current, profile_home)
+            if retro:
+                for entry in receipt["checks"]:
+                    if entry["name"] == _ATTR_CONTEXT and entry["classification"] == "missing":
+                        entry.update(classification="waived", retroactive_attribution=retro)
+                        outcomes.remove("missing")
+                        outcomes.append("success")
+                        break
         if current.get("merged") and "missing" in outcomes and set(outcomes) <= {"success", "missing"}:
             stage = "verify break-glass landing evidence"
             waiver = _break_glass_waiver(repo, canonical or repo, number, sha, current, receipt["checks"], profile_home)
@@ -341,6 +354,74 @@ def _operator_lane_attribution(repo: str, number: int, sha: str, status: dict,
                     "satisfied_by": f"operator-lane status({login})",
                     "operator_lane": {"agent": agent, "lane": lane, "login": login,
                                       "comment_id": comment.get("id"), "comment_url": comment.get("html_url")}}
+    return None
+
+
+def _retroactive_attribution(repo: str, canonical: str, number: int, sha: str, current: dict,
+                             profile_home: str | None) -> dict | None:
+    """Accept ``fleet/attribution`` ABSENT on a PR merged outside fleet-merge, on its retroactive record.
+
+    ``fleet-merge --record-only`` on a MERGED PR writes the attribution comment and ledger row but
+    never posts the status (retroactive != reviewed), so such a card could never close (t_d6b1d123).
+    Only the attribution context is satisfied here, never CI: other missing/failed checks keep their
+    classification. Every link must hold, else None:
+    - GitHub says the PR is merged at this head, by ``merged_by``;
+    - ``<hermes root>/state/merge-ledger.jsonl`` has fleet-merge's ``record-only`` row with
+      ``gate_kind`` ``retroactive`` for the canonical OWNER/REPO, this PR and head, ``by`` an approver
+      in ``config/operator-approvers.json`` on an operator lane;
+    - the same ledger has an exact-head ``operator_coverage`` APPROVE for this PR by an approver
+      (the head was reviewed, not merely attributed);
+    - ``merged_by`` (or a listed ``operator_logins`` account) posted the matching
+      ``🤖 merged-by: <by> · lane: <lane> ·`` comment.
+    """
+    from hermes_constants import get_default_hermes_root
+    merger = (current.get("merged_by") or {}).get("login")
+    if not merger or current["head"]["sha"] != sha:
+        return None
+    hermes_root = Path(get_default_hermes_root())
+    try:
+        cfg = json.loads((hermes_root / "config" / "operator-approvers.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    approvers = cfg.get("approvers") if isinstance(cfg, dict) else None
+    logins = cfg.get("operator_logins") if isinstance(cfg, dict) else None
+    if not isinstance(approvers, list) or not approvers:
+        return None
+    record = approval = latest_cov = None
+    try:
+        with (hermes_root / "state" / "merge-ledger.jsonl").open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                # fleet-merge writes GitHub's canonical OWNER/REPO, so the compare is byte-exact.
+                if not isinstance(row, dict) or row.get("repo") != canonical or str(row.get("pr")) != str(number):
+                    continue
+                if (row.get("action") == "record-only" and row.get("gate_kind") == "retroactive"
+                        and row.get("head") == sha and row.get("by") in approvers
+                        and row.get("lane") in _OPERATOR_LANES):
+                    record = row
+                cov = row.get("operator_coverage")
+                if isinstance(cov, dict) and cov.get("head_sha") == sha:
+                    latest_cov = cov  # the newest verdict at this head decides (Prism 61279c7e7bcd)
+    except OSError:
+        return None
+    if (isinstance(latest_cov, dict) and latest_cov.get("verdict") == "APPROVE"
+            and latest_cov.get("by") in approvers):
+        approval = latest_cov
+    if not record or not approval:
+        return None
+    authors = {merger, *(logins if isinstance(logins, list) else [])}
+    pages = _api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True, profile_home=profile_home)
+    for comment in (c for page in pages for c in page):
+        found = _MERGED_BY.match(comment.get("body") or "")
+        if ((comment.get("user") or {}).get("login") in authors and found
+                and found[1] == record["by"] and found[2] == record["lane"]):
+            return {"kind": "retroactive-record-only", "merged_by": merger, "by": record["by"],
+                    "lane": record["lane"], "ledger_attempt_id": record.get("attempt_id"),
+                    "ledger_ts": record.get("ts"), "approve_by": approval.get("by"),
+                    "comment_id": comment.get("id"), "comment_url": comment.get("html_url")}
     return None
 
 

@@ -80,6 +80,14 @@ def log_active(server_id: str, workspace_root: str) -> None:
                f"active for {workspace_root}", f"reused client for {workspace_root}")
 
 
+def log_spawned(server_id: str, workspace_root: str, pid: Optional[int], config_path: Optional[str]) -> None:
+    """A server process started.  INFO every spawn: the rootUri and config it indexes are what a
+    memory blow-up (pyright over a whole home, t_9cba3363) is diagnosed from."""
+    from pathlib import Path
+    _emit(server_id, logging.INFO,
+          f"spawned pid={pid} rootUri={Path(workspace_root).as_uri()} config={config_path or 'none'}")
+
+
 def log_diagnostics(server_id: str, file_path: str, count: int) -> None:
     """Diagnostics arrived for a file.  INFO every time — rare per edit and what users grep for."""
     _emit(server_id, logging.INFO, f"{count} diags ({_short_path(file_path)})")
@@ -114,6 +122,14 @@ def log_server_error(server_id: str, file_path: str, exc: BaseException) -> None
 def log_spawn_failed(server_id: str, workspace_root: str, exc: BaseException) -> None:
     """The LSP server failed to spawn or initialize.  WARNING."""
     _emit(server_id, logging.WARNING, f"spawn/initialize failed for {workspace_root}: {type(exc).__name__}: {exc}")
+
+
+def log_server_crashed(server_id: str, workspace_root: str, details: str, crashes: int, retry_in: float) -> None:
+    """A running server died without being asked to stop (V8 heap abort, OOM kill).  WARNING once per
+    crash: the caller records each dead client exactly once, then backs off ``retry_in`` seconds."""
+    until = f"respawn in {retry_in:.0f}s" if retry_in > 0 else "respawn on the next edit"
+    _emit(server_id, logging.WARNING, f"server for {workspace_root} died unexpectedly "
+          f"({details or 'exit status unknown'}); crash {crashes} in a row, {until}")
 
 
 def log_skipped_broken(server_id: str, workspace_root: str, file_path: str, retry_in: Optional[float] = None) -> None:

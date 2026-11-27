@@ -17,7 +17,7 @@ def test_interrupted_child_entry_carries_its_partial_output():
         {"role": "assistant", "content": "Operation interrupted."},
     ]
     result = {"final_response": "Operation interrupted.", "messages": messages, "api_calls": 2,
-              "completed": False, "interrupted": True}
+              "completed": False, "interrupted": True, "interrupt_message": "Stop requested"}
     child = SimpleNamespace(model="m", session_estimated_cost_usd=0.0, session_cost_status="unknown",
                             session_prompt_tokens=1, session_completion_tokens=1, _delegate_role="leaf")
 
@@ -26,3 +26,4 @@ def test_interrupted_child_entry_carries_its_partial_output():
     assert entry["status"] == entry["exit_reason"] == "interrupted"
     assert entry["summary"] == "Audited 3 of 7 modules; two findings so far."
     assert entry["error"] == "Operation interrupted."
+    assert entry["interrupt_message"] == "Stop requested"

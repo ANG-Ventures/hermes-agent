@@ -285,7 +285,8 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
     judged there).
 
     Returns ``{"ok": True, "task_id", "pid"}``, or ``{"ok": False, "error"}`` after archiving any
-    card it made: the caller then supersedes the attempt and runs the unit in-process (§5.2.4)."""
+    card it made: the caller then supersedes the attempt and runs the unit in-process (§5.2.4). A pause-hold
+    refusal adds ``"paused": <reason>``: the host is closed to new work, so the caller must not run it at all."""
     kb = _kb()
     from hermes_cli import kanban_db_dispatch as kbd
 
@@ -332,7 +333,10 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
         if task_id:
             hold_launch_fence(task_id)
         fenced = not task_id or (_archive_quietly(task_id) and _runner_gone(task_id))
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "task_id": task_id, "fenced": fenced}
+        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "task_id": task_id, "fenced": fenced}
+        if isinstance(exc, kbd.SpawnNowPaused):
+            out["paused"] = exc.reason    # policy refusal: the caller must not fall back (Prism 0f110d29ad76)
+        return out
 
 
 def _execution_route(delegation_id: str, profile_home: Path) -> Tuple[Optional[str], Optional[str]]:

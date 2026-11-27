@@ -176,7 +176,12 @@ async def test_cancelled_start_hard_kills_sigterm_ignoring_descendant(tmp_path: 
             await asyncio.wait_for(start, timeout=0.05)
 
         deadline = asyncio.get_running_loop().time() + 15.0
-        while child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+        while child.is_running():
+            try:
+                if child.status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break  # Reaped between the liveness and status probes.
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.01)
         assert client.state == "error"
@@ -185,8 +190,12 @@ async def test_cancelled_start_hard_kills_sigterm_ignoring_descendant(tmp_path: 
         if not start.done():
             start.cancel()
             await asyncio.gather(start, return_exceptions=True)
-        if child is not None and child.is_running():
-            child.kill()
+        if child is not None:
+            try:
+                if child.is_running():
+                    child.kill()
+            except psutil.NoSuchProcess:
+                pass  # Cleanup raced with successful process-tree teardown.
 
 
 @pytest.mark.asyncio

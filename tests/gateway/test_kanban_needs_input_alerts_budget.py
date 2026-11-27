@@ -414,3 +414,74 @@ def test_census_2026_11_04_replay_fits_the_family_budget(monkeypatch, tmp_path, 
     assert len(steps) == 55
     assert to_alerts == ["t_ddac87fd", "t_9db3644a", "t_1fccef3a"]  # was 55; budget <= 3/day
     assert all(sent for sent in per_step)  # every block still pages somewhere
+
+
+# t_98cdaa01 (13 #alerts needs-ruling lines on 2026-11-12, 5 of them ONE tick
+# paging "pin host lacks studio-state" for 5 cards): a tick sends one line per
+# (reason, home) that lists the card ids; distinct reasons stay distinct lines.
+
+@pytest.fixture
+def lines(monkeypatch, tmp_path):
+    monkeypatch.delenv("DISCORD_ALERTS_CHANNEL", raising=False)
+    monkeypatch.delenv("DISCORD_LOGS_CHANNEL", raising=False)
+    out: list = []
+    monkeypatch.setattr(kw, "_alert_notify_script", lambda: tmp_path / "notify.py")
+    monkeypatch.setattr(kw, "_notify_send",
+                        lambda script, msg, extra, **kwargs: out.append((msg, extra)) or True)
+    return out
+
+
+def _tick_items(pager, items, now=1000.0):
+    cards = [("default", it) for it in items]
+    return pager.observe(cards, kw._send_needs_input_page, {"default"}, now=now)
+
+
+def test_five_same_reason_asks_in_one_tick_are_one_line(lines, tmp_path):
+    pager = kw._NeedsInputPager(tmp_path / "pages.json")
+    reason = "pin host lacks studio-state"
+    items = [_item(None, 150, reason, f"t_{i}") for i in range(5)]
+    assert _tick_items(pager, items) == 5
+    assert len(lines) == 1
+    msg, extra = lines[0]
+    assert extra == ["--sev", "error"]
+    assert "5 cards need a ruling: pin host lacks studio-state" in msg
+    for i in range(5):
+        assert f"`t_{i}`" in msg
+    # The ledger is per card: the next tick inside the window sends nothing.
+    lines.clear()
+    assert _tick_items(pager, items, now=1100.0) == 0
+    assert lines == []
+    # The 2 h re-page is one #logs line for the group, not five.
+    assert _tick_items(pager, items, now=1000.0 + 2 * 3600 + 1) == 5
+    assert len(lines) == 1 and lines[0][1] == ["--target", LOGS]
+    assert lines[0][0].startswith("⚠️ still waiting: 5 cards")
+
+
+def test_two_different_reasons_in_one_tick_are_two_lines(lines, tmp_path):
+    pager = kw._NeedsInputPager(tmp_path / "pages.json")
+    items = [_item(None, 150, "reason A", "t_a1"), _item(None, 150, "reason A", "t_a2"),
+             _item(None, 150, "reason B", "t_b1")]
+    assert _tick_items(pager, items) == 3
+    assert len(lines) == 2
+    msgs = sorted(m for m, _ in lines)
+    assert "2 cards need a ruling: reason A" in msgs[0]
+    assert "`t_b1` needs a ruling: reason B" in msgs[1]
+
+
+def test_same_reason_different_homes_are_separate_lines(lines, tmp_path):
+    pager = kw._NeedsInputPager(tmp_path / "pages.json")
+    items = [_item(OTHER, 150, "r", "t_1"), _item(OTHER, 150, "r", "t_2"),
+             _item(None, 150, "r", "t_3")]
+    _tick_items(pager, items)
+    targets = sorted(str(extra) for _, extra in lines)
+    assert targets == [str(["--sev", "error"]), str(["--target", OTHER])]
+
+
+def test_group_line_caps_the_id_list(lines, tmp_path):
+    pager = kw._NeedsInputPager(tmp_path / "pages.json")
+    n = kw._NEEDS_INPUT_GROUP_LIST_CAP + 3
+    _tick_items(pager, [_item(None, 150, "r", f"t_{i:02d}") for i in range(n)])
+    assert len(lines) == 1
+    msg = lines[0][0]
+    assert f"{n} cards need a ruling" in msg and "+3 more" in msg
+    assert msg.count("`t_") == kw._NEEDS_INPUT_GROUP_LIST_CAP

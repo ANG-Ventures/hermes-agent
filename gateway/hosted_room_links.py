@@ -126,11 +126,22 @@ def load_room_links_tolerant(db_path: DbPath) -> tuple[tuple[StoredRoomLink, ...
     return tuple(links), tuple(errors)
 
 
-def save_room_link(db_path: DbPath, link: StoredRoomLink) -> None:
-    hosted_rooms.upsert_room_link_record(db_path, record=link.as_record(), max_links=MAX_LINKS)
-    if os.name == "posix":
+def _make_private(db_path: DbPath) -> None:
+    """Owner-only database AND its WAL sidecars. SQLite creates ``-wal``/``-shm`` with the
+    database's mode, and a long-lived reader (the hosted-room worker's WAL anchor,
+    t_dd40e9f2) keeps them alive, so a sidecar made while the database was 0644 would
+    keep committed grants readable after the database itself turned 0600."""
+    if os.name != "posix":
+        return
+    for suffix in ("", "-wal", "-shm"):
         with contextlib.suppress(OSError):
-            Path(db_path).chmod(0o600)
+            Path(f"{db_path}{suffix}").chmod(0o600)
+
+
+def save_room_link(db_path: DbPath, link: StoredRoomLink) -> None:
+    _make_private(db_path)  # before the write: the grant never lands in a wider WAL
+    hosted_rooms.upsert_room_link_record(db_path, record=link.as_record(), max_links=MAX_LINKS)
+    _make_private(db_path)  # after: a database (and sidecars) this call created
 
 
 def mark_room_link_status(db_path: DbPath, *, room_id: str, member_id: str, status: str) -> bool:

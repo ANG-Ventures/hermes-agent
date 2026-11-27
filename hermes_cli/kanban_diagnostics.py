@@ -868,7 +868,20 @@ def _rule_claim_refused_live_owner(task, events, runs, now, cfg) -> list[Diagnos
 
 
 # Order matters: earlier rules render first on severity ties.
+def _rule_review_missing_handoff(task, events, runs, now, cfg):
+    if (_task_field(task, "status") == "review"
+            and not any(_task_field(ev, "kind") == "review_requested" for ev in events)):
+        return [Diagnostic(
+            kind="review_missing_handoff", severity="error",
+            title="Review has no handoff provenance",
+            detail="Board integrity: review_requested is missing; sendback and request-changes cannot route to an implementer.",
+            actions=[DiagnosticAction(kind="comment", label="Ask operator to repair review provenance")],
+        )]
+    return []
+
+
 _RULES: list[RuleFn] = [
+    _rule_review_missing_handoff,
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,

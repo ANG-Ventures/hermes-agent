@@ -67,6 +67,20 @@ def test_update_check_ancestry_probe_never_fetches_from_the_promisor(partial_clo
     assert source_check._git_ok(["merge-base", "--is-ancestor", parent, head], cwd=clone)
 
 
+def test_workspace_binding_tip_probe_never_fetches_from_the_promisor(partial_clone, monkeypatch):
+    """t_3833cb99: a remote tip absent from the store reads missing (containment unverified), never fetched."""
+    from hermes_cli import kanban_worker_hosts as kwh
+
+    clone, _head, upstream_tip = partial_clone
+    _git("checkout", "-q", "-f", "main", cwd=clone)  # a clean checkout, so only the remote probe decides
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("GIT_NO_LAZY_FETCH", raising=False)
+
+    assert kwh.local_workspace_binding(str(clone)) == "remote-unverified: ."
+    assert not _fetched(clone, upstream_tip), "the workspace binding probe downloaded the advertised tip"
+
+
 def test_bounded_git_probe_never_fetches_from_the_promisor(partial_clone):
     clone, head, upstream_tip = partial_clone
 

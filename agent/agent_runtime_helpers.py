@@ -27,7 +27,7 @@ from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
     STATUS_EXHAUSTED, _parse_absolute_timestamp, credential_pool_entry_serves_endpoint,
-    credential_pool_matches_provider, resolve_runtime_pool_key,
+    credential_pool_matches_provider, relay_lane_quota_is_relays, resolve_runtime_pool_key,
 )
 from agent.error_classifier import FailoverReason
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
@@ -1006,6 +1006,13 @@ def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, c
     if current_entry is None:
         current_entry = pool.current()
     current_last_status = getattr(current_entry, "last_status", None) if current_entry else None
+    if current_last_status == STATUS_EXHAUSTED and relay_lane_quota_is_relays(
+        getattr(pool, "provider", None), getattr(current_entry, "last_error_code", None),
+        getattr(current_entry, "failure_reason", None),
+    ):
+        # t_d780729d: a stored seat-quota row on a relay lane is not evidence; the relay's
+        # refusal on THIS request is. Take the normal retry-then-rotate path.
+        current_last_status = None
     if current_last_status == STATUS_EXHAUSTED:
         _ra().logger.info(
             "Credential already exhausted (last_status=%s) — rotating immediately instead of retrying",
@@ -1459,6 +1466,10 @@ def _revert_credential_rotation(agent) -> None:
     agent._credential_pool_revert_id = None
 
 
+from agent.route_snapshot import route_mutation
+
+
+@route_mutation
 def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents). ``_policy_decision`` is the mid-turn
@@ -1573,6 +1584,8 @@ def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None)
             agent.reasoning_config = dict(saved_reasoning) if isinstance(saved_reasoning, dict) else saved_reasoning
         agent._fallback_activated = False
         agent._fallback_index = 0
+        if "model_slot" in rt:  # init snapshot: the restored route's slot (a startup rung's)
+            agent._model_slot = rt["model_slot"]
         # Clear the fallback-announce dedupe so a LATER fallback episode (after this primary
         # recovery) re-announces instead of being suppressed as a repeat of the prior transition
         # (once per episode, not once ever).
@@ -2601,7 +2614,7 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
     return rt
 
 
-def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
+def _finish_switch(agent, new_provider, old_norm, new_norm, *, persist_fallback=True) -> None:
     """Post-switch bookkeeping: fallback reset/prune, request_overrides, billing route."""
     agent._fallback_activated = False
     agent._provider_fallback_active = False
@@ -2615,7 +2628,8 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     try:
         from agent import fallback_sticky_store as _fss
         from agent import fallback_wiring as _fw
-        _fw.close_episodes_for_user_route(_fss.lineage_root_for_agent(agent))
+        if persist_fallback:
+            _fw.close_episodes_for_user_route(_fss.lineage_root_for_agent(agent))
     except Exception:  # noqa: BLE001 — best-effort, never blocks a switch
         logger.debug("sticky close on switch_model failed", exc_info=True)
     # On a deliberate provider swap, prune fallback entries targeting the OLD or NEW primary;
@@ -2651,9 +2665,11 @@ def _persist_switch_billing_route(agent) -> None:
         logger.warning("Failed to persist billing route after model switch", exc_info=True)
 
 
+@route_mutation
 def switch_model(
     agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None,
-    session_reasoning_config=_SESSION_REASONING_UNSET,
+    session_reasoning_config=_SESSION_REASONING_UNSET, persist_billing_route=True,
+    persist_fallback=True,
 ):
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
@@ -2663,6 +2679,15 @@ def switch_model(
     ``session_reasoning_config`` lets a caller that owns session state (the gateway) hand in the
     effort the session actually runs at for the NEW model. Callers without session state (CLI,
     TUI, one-turn restore) omit it and get the #467 keep-current-unless-per-model behaviour."""
+    # A slot name (``sol``) switches to the slot's current id; the slot is kept on the agent
+    # so the next turns follow a re-rendered view (agent/model_slots.py).
+    from hermes_cli.model_registry import slot_resolve as _resolve_slot
+    new_model, _new_slot = _resolve_slot(new_model)
+    if _new_slot:
+        # Callers normalize the name they pass (the slot), not its id: an aggregator lane needs the
+        # vendor prefix on the id (kimi -> moonshotai/kimi-k3.1-pro), the id /model validated.
+        from hermes_cli.model_normalize import normalize_model_for_provider
+        new_model = normalize_model_for_provider(new_model, new_provider)
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
@@ -2752,12 +2777,14 @@ def switch_model(
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
-    _finish_switch(agent, new_provider, old_norm, new_norm)
+    agent._model_slot = _new_slot
+    _finish_switch(agent, new_provider, old_norm, new_norm, persist_fallback=persist_fallback)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
     )
-    _persist_switch_billing_route(agent)
+    if persist_billing_route:
+        _persist_switch_billing_route(agent)
 
 
 def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
@@ -4129,7 +4156,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # user message (which persists like any other user turn).
         _requeue_pending_steer(agent, steer_text)
         return
-    messages.append(steer_user_row(steer_text))
+    messages.append(steer_user_row(steer_text, agent=agent))
     note_steer_injected(agent, steer_text)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message", len(steer_text),

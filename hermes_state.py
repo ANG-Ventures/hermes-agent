@@ -79,7 +79,8 @@ from hermes_state_schema import SessionSchemaMixin, _FTS_TRIGRAM_TRIGGERS
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import (
-    describe_write_lock_holders, hold_committing, hold_ended, hold_started, log_write_lock_holders,
+    WAITER_ATTRIBUTION_S, describe_write_lock_holders, ensure_watchdog, hold_committing, hold_ended,
+    hold_started, log_write_lock_holders, log_write_lock_waiter,
 )
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
@@ -92,7 +93,8 @@ from hermes_state_dbfile import (
 from hermes_state_messages import SessionMessagesMixin
 from hermes_state_rewind import SessionRewindMixin
 from hermes_state_wal import (
-    _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
+    _WAL_INCOMPAT_MARKERS, _apply_macos_checkpoint_barrier, _enforce_macos_synchronous_full, _on_disk_journal_mode,
+    apply_database_pragmas, apply_wal_with_fallback, writer_autocheckpoint_enabled,
 )
 from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
 from hermes_state_titles import SessionTitlesMixin
@@ -258,15 +260,8 @@ def _os_account_home() -> Optional[Path]:
     clever: an unusable anchor would point the deny-list at a root nothing
     ever resolves to, silently disarming the guard.
     """
-    try:
-        import pwd
-
-        home = pwd.getpwuid(os.getuid()).pw_dir.strip()  # windows-footgun: ok — POSIX-only module inside try/except
-        if home and os.path.isdir(home):
-            return Path(home)
-    except Exception:
-        pass
-    return None
+    from hermes_state_roots import account_home
+    return account_home()
 
 
 def _deployed_hermes_home_root() -> Optional[Path]:
@@ -315,22 +310,8 @@ def _deployed_hermes_home_root() -> Optional[Path]:
     ``Path.home``), and a guard that resolves through a patched callable
     misidentifies the patcher's own tmpdir as production.
     """
-    declared = os.environ.get("HERMES_HOME", "").strip()
-    if not declared:
-        return None
-    account_home = _os_account_home()
-    if account_home is None:
-        return None
-    try:
-        root = Path(declared).expanduser().resolve()
-        account = account_home.resolve()
-    except Exception:
-        return None
-    if root.parent.name == "profiles":
-        root = root.parent.parent
-    if root != account:
-        return None  # a redirected/hermetic HERMES_HOME, not a deployment
-    return root
+    from hermes_state_roots import deployed_root
+    return deployed_root(_os_account_home())
 
 
 _STATE_DB_GUARD_BYPASS = False
@@ -938,22 +919,27 @@ class SessionDB(
         # Never materialize a deleted/archived named profile's home: a multiplexer or Desktop backend
         # still holding the profile's route would otherwise re-scaffold it on the next turn (#94590).
         mkdir_under_hermes_home(self.db_path.parent)
-        # Read-only file/sidecar preflight BEFORE the first connection: an actionable message
-        # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
-        preflight_db_writability(self.db_path, db_label="state.db")
         try:
             # Serialize zero-byte check, quarantine, connect and schema commit so concurrent
             # openers don't race the absent-path -> schema-commit window.
             if not self.db_path.exists() or has_invalid_sqlite_header_preopen(self.db_path):
+                # The lock file lives in the db's directory: repair or refuse that directory first.
+                preflight_db_writability(self.db_path, db_label="state.db", dirs_only=True)
                 with quarantine_cross_process_lock(self.db_path) as lock_acquired:
                     if not lock_acquired:
                         logger.warning(
                             "startup quarantine lock for %s not acquired within 5s; proceeding",
                             self.db_path,
                         )
+                    # Under the lock: a concurrent opener's quarantine renames this file, and a
+                    # main db that vanishes mid-preflight is refused as read-only (CI 43663228054).
+                    preflight_db_writability(self.db_path, db_label="state.db")
                     self._handle_quarantine_if_invalid(already_locked=lock_acquired)
                     self._connect_and_init_with_lock_patience()
             else:
+                # Read-only file/sidecar preflight BEFORE the first connection: an actionable message
+                # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
+                preflight_db_writability(self.db_path, db_label="state.db")
                 self._handle_quarantine_if_invalid(already_locked=False)
                 self._connect_and_init_with_lock_patience()
         except sqlite3.DatabaseError as exc:
@@ -1062,6 +1048,9 @@ class SessionDB(
             # normalize any sidecars that became visible during WAL setup.
             _secure_state_db_files(self.db_path)
             apply_database_pragmas(conn, db_label="state.db")
+            if self._wal_active and not writer_autocheckpoint_enabled():
+                # No checkpoint inside COMMIT (it ran under self._lock); _try_wal_checkpoint backfills.
+                conn.execute("PRAGMA wal_autocheckpoint=0")
             conn.execute("PRAGMA foreign_keys=ON")
             self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
         except BaseException:
@@ -1250,8 +1239,31 @@ class SessionDB(
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
+    def _writer_wait_timer(self):
+        """Waiter-side attribution for the in-process writer lock (t_7fe48f0b): when ``self._lock`` is
+        already held, arm a daemon timer that logs the ledger's current holder once if this writer has
+        not entered ``with self._lock`` within WAITER_ATTRIBUTION_S. The lock itself is still taken by the
+        caller's plain ``with self._lock`` (same acquire, same blocking); the caller cancels the timer
+        as its first statement inside the lock. Uncontended writes start no thread. Never raises."""
+        try:
+            locked = getattr(self._lock, "locked", None)
+            if not callable(locked) or not locked():
+                return None
+            t0, db_path = time.monotonic(), self.db_path
+            timer = threading.Timer(
+                WAITER_ATTRIBUTION_S,
+                lambda: log_write_lock_waiter(db_path, time.monotonic() - t0, lock="writer"),
+            )
+            timer.daemon = True
+            timer.name = "state-db-writer-waiter"
+            timer.start()
+            return timer
+        except Exception:
+            return None
+
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        *, timings: Optional[dict] = None,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
@@ -1261,6 +1273,7 @@ class SessionDB(
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        write_started = time.monotonic() if timings is not None else None
         compression_deadline: Optional[float] = None  # set on the first compression-busy collision
         # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
         # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
@@ -1270,6 +1283,7 @@ class SessionDB(
         # mutations, not just idempotent UPSERTs.
         ioerr_begin_retried = False
         lock_wait_warned = False
+        waiter_attributed = False  # one waiter-side holder line per write (t_7fe48f0b)
         while True:
             self._raise_if_db_corrupt(storage=True)
             # NOTE: the replaced/generation live probe runs INSIDE the lock below,
@@ -1283,8 +1297,14 @@ class SessionDB(
             # later writes (#105567). Inside the lock the probe only ever sees the
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
+            # Outside both locks: a watchdog (re)start is a GIL handoff that took ~1 s under load
+            # inside BEGIN IMMEDIATE, stalling every other writer (t_6e1c17e7).
+            ensure_watchdog()
             try:
+                waiter_timer = self._writer_wait_timer()
                 with self._lock:
+                    if waiter_timer is not None:
+                        waiter_timer.cancel()
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
@@ -1295,9 +1315,17 @@ class SessionDB(
                         # transaction open (hold_started never raises; this is the backstop).
                         hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
                         fn_started = True
+                        if timings is not None:
+                            exec_started = time.monotonic()
+                            timings["wait_s"] = exec_started - write_started
                         result = fn(self._conn)
                         hold_committing(hold)  # a long hold then says callback vs commit I/O
+                        if timings is not None:
+                            commit_started = time.monotonic()
+                            timings["exec_s"] = commit_started - exec_started
                         self._conn.commit()
+                        if timings is not None:
+                            timings["commit_s"] = time.monotonic() - commit_started
                     except BaseException:
                         try:
                             self._conn.rollback()
@@ -1359,6 +1387,9 @@ class SessionDB(
                 if isinstance(exc, sqlite3.OperationalError):
                     if is_sqlite_lock_error(exc):
                         waited = time.monotonic() - (deadline - patience_s)
+                        if not waiter_attributed and waited >= WAITER_ATTRIBUTION_S:
+                            waiter_attributed = True
+                            log_write_lock_waiter(self.db_path, waited, lock="sqlite")
                         if not lock_wait_warned and patience_s > self._LOCK_WAIT_WARN_S and waited >= self._LOCK_WAIT_WARN_S:
                             lock_wait_warned = True
                             logger.warning(
@@ -1780,10 +1811,15 @@ class SessionDB(
         """The dedicated checkpoint connection (opened once, closed in close()). Caller holds self._lock,
         so its open/close is ordered against the writer's own open/close and the WAL lock guard."""
         if self._ckpt_conn is None:
-            self._ckpt_conn = _connect_tracked_db(
+            conn = _connect_tracked_db(
                 self.db_path, tracking_path=self.db_path, check_same_thread=False, timeout=1.0,
                 isolation_level=None,
             )
+            # Per-connection pragmas: the writer's barrier does not reach the connection that actually
+            # checkpoints. Without F_FULLFSYNC a panic after the WAL reset can lose the copied pages (t_e8c62e86).
+            _apply_macos_checkpoint_barrier(conn)
+            _enforce_macos_synchronous_full(conn)
+            self._ckpt_conn = conn
         return self._ckpt_conn
 
     def _try_wal_checkpoint(self) -> None:

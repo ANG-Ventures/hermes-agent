@@ -6,9 +6,13 @@ not what should be persisted in conversation history.
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
+from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # Canonical model-emitted control token for intentional silence (fork).
 SILENT_REPLY_TOKEN = "NO_REPLY"
@@ -277,10 +281,11 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
     return display_kind in MACHINERY_DISPLAY_KINDS
 
 
-# A wake's own bracket tag (``[kanban review deadman] ...``): a short word label, never a
-# ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION COMPLETE — id]`` sentence.
+# LEGACY fallback only (a wake whose producer stamped no ``wake_kind``, e.g. an external caller):
+# its own bracket tag (``[kanban review deadman] ...``), a short word label, never a
+# ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION COMPLETE — id]`` sentence. The card id is never read
+# from the body any more (t_17ba87a6: a goal text naming a card read as a kanban wake).
 _WAKE_TAG_RE = re.compile(r"\A\s*\[([A-Za-z][A-Za-z0-9 _-]{0,39})\]")
-_WAKE_CARD_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
 
 
 def _wake_fallback_label(text: str, metadata: dict) -> str:
@@ -301,11 +306,17 @@ def wake_progress_header(message: Any, display_kind: Any, metadata: Optional[dic
     """
     if not is_machinery_display_kind(display_kind) or not isinstance(message, str) or not message.strip():
         return None
-    tag = _WAKE_TAG_RE.match(message)
-    label = " ".join(tag.group(1).split()) if tag else _wake_fallback_label(message, metadata or {})
-    card = _WAKE_CARD_RE.search(message)
-    if card:
-        label = f"{label} · {card.group(0)}"
+    # The producer names the wake (``wake_kind`` + ``wake_sub`` / ``wake_name`` / ``card_id``);
+    # the prose is never parsed for it (t_17ba87a6).
+    from gateway.wake_kind import wake_label
+    label = wake_label(metadata)
+    if label is None:
+        tag = _WAKE_TAG_RE.match(message)
+        legacy = " ".join(tag.group(1).split()) if tag else _wake_fallback_label(message, metadata or {})
+        label = f"wake · {legacy}"
+        logger.warning(
+            "wake header: unlabeled wake (producer stamped no wake_kind; got %r), legacy label %r; "
+            "wake opens %r", (metadata or {}).get("wake_kind"), legacy, message.lstrip()[:60])
     from agent.i18n import t
     return t("gateway.progress.wake_head", label=label)
 
@@ -337,9 +348,11 @@ def wake_chrome_muted(display_kind: Any, source: Any, user_config: Optional[dict
 def route_notice_muted(source: Any, user_config: Optional[dict]) -> bool:
     """True when a route-change notice ("🔄 Model fallback (relay busy): A → B") would post into an
     act-now page channel. A fallback the agent already rode out is telemetry, not a page
-    (t_733b4104: 30 lines/day in fleet #alerts from the alerts-handling session). The hop is still
-    in the fallback_events ledger and the gateway log. ``display.route_notice_muted_chats`` lists
-    chat ids; unset means the fleet #alerts channel on Discord; ``[]`` disables.
+    (t_733b4104: 30 lines/day in fleet #alerts from the alerts-handling session). The fleet #logs
+    channel is muted too: the banner is agent-only by the #logs rule (Discord 1571854816139944097,
+    t_79c10430). The hop is still in the fallback_events ledger, the gateway log and one fleet
+    agent-log row (``write_route_notice_agent_log``). ``display.route_notice_muted_chats`` lists
+    chat ids; unset means the fleet #alerts and #logs channels on Discord; ``[]`` disables.
     """
     chat_id = str(getattr(source, "chat_id", "") or "")
     if not chat_id:
@@ -350,10 +363,34 @@ def route_notice_muted(source: Any, user_config: Optional[dict]) -> bool:
         if getattr(source, "platform", None) != Platform.DISCORD:
             return False
         from gateway.kanban_watchers import _needs_input_channels
-        configured = [_needs_input_channels()[0]]
+        configured = list(_needs_input_channels())
     if not isinstance(configured, (list, tuple, set)):
         configured = [configured]
     return chat_id in {str(c) for c in configured if c}
+
+
+ROUTE_NOTICE_AGENT_LOG_PRODUCER = "gateway-route-notice"
+
+
+def write_route_notice_agent_log(source: Any, text: str) -> bool:
+    """One fleet agent-log row for a muted route notice (``<fleet root>/scripts/lib/agent_inbox.py``
+    write_agent_log, the library the cron #alerts/#logs gates load). False when there is no library
+    or the write fails; the caller has already logged the line to the gateway log (t_79c10430)."""
+    try:
+        from cron.fork_ext.alerts_audience_gate import _fleet_root, _load_lib
+        from hermes_constants import get_hermes_home
+
+        root = _fleet_root(Path(get_hermes_home()))
+        lib = _load_lib(root) if root is not None else None
+        if lib is None or not hasattr(lib, "write_agent_log"):
+            return False
+        platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+        lib.write_agent_log(root, ROUTE_NOTICE_AGENT_LOG_PRODUCER, "info", text,
+                            platform=str(platform or ""), chat_id=str(getattr(source, "chat_id", "") or ""))
+        return True
+    except Exception as exc:
+        logger.warning("route-change notice: agent-log row not written: %s", exc)
+        return False
 
 
 def lifecycle_notice_muted(platform: Any, chat_id: Any, user_config: Optional[dict]) -> bool:

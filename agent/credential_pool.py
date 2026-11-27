@@ -578,8 +578,45 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
     return normalized
 
 
+# A 401/403 on a relay lane is the LOCAL relay key (or the relay refusing this
+# client), never a seat's quota: that stays a local, benchable fact.
+_LOCAL_AUTH_STATUS_CODES = frozenset({401, 403})
+_LOCAL_AUTH_FAILURE_REASONS = frozenset({"auth", "auth_permanent"})
+
+
+def relay_lane_quota_is_relays(provider: Any, status_code: Optional[int],
+                               failure_reason: Optional[str]) -> bool:
+    """True when a failure on ``provider`` is seat quota the relay owns (t_d780729d).
+
+    Every Claude relay lane reaches the same subscriptions through a relay that
+    tracks each seat; a per-lane "exhausted" row disagrees with every sibling
+    lane name the moment the relay rotates, and a 429 with no reset left 25
+    pinned-lane rows exhausted forever (Studio, 2026-11-12). Such a failure is
+    never stored on the pool row: the relay's typed refusal / ``/eligibility``
+    decides.
+
+    A positive match on quota evidence only: status 429, or a failure reason in
+    ``fallback_policy.RELAY_QUOTA_FAILURE_REASONS``. Auth (401/403/auth*) stays
+    local; every other failure (a 503/529, a ``None`` status from a refresh
+    path) keeps the pool's normal behaviour.
+    """
+    from agent.fallback_policy import RELAY_QUOTA_FAILURE_REASONS
+    from agent.relay_lanes import is_relay_backed
+
+    if not is_relay_backed(provider):
+        return False
+    reason = str(failure_reason or "").strip().lower()
+    if status_code in _LOCAL_AUTH_STATUS_CODES or reason in _LOCAL_AUTH_FAILURE_REASONS:
+        return False
+    return status_code == 429 or reason in RELAY_QUOTA_FAILURE_REASONS
+
+
 def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) -> Optional[float]:
     if entry.last_status != STATUS_EXHAUSTED:
+        return None
+    if relay_lane_quota_is_relays(entry.provider, entry.last_error_code, entry.failure_reason):
+        # A stored seat-quota verdict on a relay lane benches nothing (t_d780729d):
+        # selection clears it, the merge never resurrects it, and no wait is reported.
         return None
     reset_at = _parse_absolute_timestamp(entry.last_error_reset_at)
     if reset_at is not None:
@@ -1343,6 +1380,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         failure_reason: Optional[str] = None,
     ) -> PooledCredential:
         normalized_error = _normalize_error_context(error_context)
+        # t_d780729d choke point: seat quota on a relay lane is never stored on the
+        # row, whichever caller reached here (sibling marking, admin paths, plugins).
+        if relay_lane_quota_is_relays(self.provider, status_code, failure_reason):
+            return entry
         # Permanent OAuth failures become STATUS_DEAD, not STATUS_EXHAUSTED:
         # otherwise a revoked credential re-enters rotation every hour and
         # fails immediately until the user removes it (#32849).
@@ -2646,6 +2687,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
+            if relay_lane_quota_is_relays(self.provider, status_code, failure_reason):
+                # t_d780729d: seat quota on a relay lane is the relay's to rotate around;
+                # another local key of the same door reaches the same seats. Store nothing,
+                # rotate nothing: the caller's retry / fallback path and the relay decide.
+                logger.info(
+                    "credential pool: %s %s on relay lane %s is seat quota the relay owns; "
+                    "not marking it exhausted", _label, status_code, self.provider,
+                )
+                self._current_id = None
+                return None
             if self._is_model_scoped_failure(status_code, model, failure_reason):
                 # A generic Anthropic 429 (per-model rate limit) or a Codex account model
                 # entitlement rejection: bench this model only, the credential stays

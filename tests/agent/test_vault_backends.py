@@ -76,6 +76,8 @@ def _enabled(exe):
 def test_locked_manager_is_reported_not_prompted_when_headless(fake_bw, monkeypatch):
     exe, log = fake_bw
     from tools.browser_vault_tool import browser_vault_fill, browser_vault_list
+    # Backend/classifier fixture mocks page IO; real targeting is tested separately.
+    browser_vault_fill = browser_vault_fill.__wrapped__
 
     patcher, backend = _enabled(exe)
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")  # headless: nobody can answer a prompt
@@ -97,6 +99,8 @@ def test_locked_manager_is_reported_not_prompted_when_headless(fake_bw, monkeypa
 def test_unlock_uses_vendor_passwordenv_contract_then_fill_routes_by_prefix(fake_bw):
     exe, log = fake_bw
     from tools.browser_vault_tool import browser_vault_fill, browser_vault_list
+    # Backend/classifier fixture mocks page IO; real targeting is tested separately.
+    browser_vault_fill = browser_vault_fill.__wrapped__
 
     patcher, backend = _enabled(exe)
     prompts = []

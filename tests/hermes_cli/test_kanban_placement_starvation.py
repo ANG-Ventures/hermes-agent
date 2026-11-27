@@ -87,7 +87,8 @@ def test_unreached_alias_is_excluded_only_from_the_fallback(tmp_path):
 
 # -- (b) a card whose only target nobody reaches still waits -------------------
 
-@pytest.mark.parametrize("body", ["ssh haos 'ha core info'", "ssh unifi 'info'"])
+# A HOST_BOUND skill still reads its ssh-shaped target (Prism ac47bd4b21d9): no reach: line needed.
+@pytest.mark.parametrize("body", ["ssh haos 'ha core info'", "ssh unifi 'info'", "reach: haos\nssh haos 'ha core info'"])
 def test_card_naming_only_an_unreachable_alias_still_waits(tmp_path, body):
     pool = _pool(tmp_path / "fleet")
     pool = kwp.PoolConfig(**{**pool.__dict__, "ssh_hosts": frozenset({"haos", "unifi"})})
@@ -101,8 +102,21 @@ def test_unnamed_card_on_an_empty_or_unreached_matrix_still_waits(tmp_path):
     dark = _pool(tmp_path / "b", rows={h: {a: 255 for a in _LINUX} for h in POOL})
     assert _portable(dark, "fix it", ("ssh-machines",)) == (False, "host_reach", None)
     # A named pool host nobody reaches waits too, never widens to the fallback.
-    lone = _pool(tmp_path / "c", rows={h: {**_LINUX, "ace-ai": 255} for h in POOL})
+    # Under the self rule (t_8c580b20) the target must not be a candidate itself:
+    # ace-ai is down, so it has no fresh row (absent, or stale past 36 h), and no
+    # peer reaches it.
+    peers = {h: {**_LINUX, "ace-ai": 255} for h in POOL if h != "ace-ai"}
+    lone = _pool(tmp_path / "c", rows=peers)
     assert _portable(lone, B904, ("media-homelab-servarr",)) == (False, "host_reach", None)
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / kwp.REACH_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        **{h: {"at": NOW, "reach": r} for h, r in peers.items()},
+        "ace-ai": {"at": NOW - 40 * 3600, "reach": {**_LINUX, "ace-ai": 255}}}}))
+    reach, aliases, status = kwp.read_reach(tmp_path / "d", now=NOW)
+    assert "ace-ai" not in reach
+    stale = kwp.PoolConfig(hosts=POOL, profiles=("alpha",), reach=reach, reach_aliases=aliases,
+                           reach_status=status)
+    assert _portable(stale, B904, ("media-homelab-servarr",)) == (False, "host_reach", None)
 
 
 # -- t_cb47a348: the origin line is never a need --------------------------------
@@ -220,3 +234,13 @@ def test_capacity_waits_are_never_reported(kanban_home):
     assert kps.fix_for("pin_host_full") is None
     assert kps.fix_for("not_portable:host_reach") is not None
     assert kps.fix_for("requires_unsatisfied:docker+studio_needs") is not None
+
+
+def test_the_comment_names_the_allocation_verb_never_the_deprecated_alias():
+    """Rename wave 3 (t_3a394860): a reader that follows this comment's advice must run `kanban allocation`, not the
+    `kanban placement` alias being deleted (an agent did, 2026-11-23 21:13Z, and it was the only old-name read)."""
+    hit = {"code": "not_portable:workspace_kind", "waited": 3600, "events": 4, "task_id": "t_x",
+           "fix": kps.fix_for("not_portable:workspace_kind")}
+    texts = [fix for _, fix in kps._FIXES] + [kps.comment_body(hit)]
+    assert "kanban allocation t_x" in kps.comment_body(hit)
+    assert not [t for t in texts if "kanban placement" in t]

@@ -4266,6 +4266,7 @@
                 "image_generate",
                 "kanban_attach",
                 "kanban_attach_url",
+                "kanban_attachment_read",
                 "kanban_attachments",
                 "kanban_block",
                 "kanban_comment",

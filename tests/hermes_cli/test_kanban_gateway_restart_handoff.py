@@ -12,6 +12,16 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_proc_bounds as _kpb
+
+_NPROC = 777
+
+
+def _launcher() -> list[str]:
+    """The worker-limits launcher prefix (t_b9a61253). It is the OUTERMOST argv
+    on Linux: it lowers RLIMIT_NPROC, then execs the scope wrapper (or the
+    worker) in place, so the limit is inherited by everything under it."""
+    return _kpb.worker_limits_launcher_argv(_NPROC, 0)
 
 
 @pytest.fixture
@@ -24,6 +34,8 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    # Pin the worker RLIMIT_NPROC ceiling so the launcher prefix is exact.
+    monkeypatch.setattr(_kpb, "resolve_worker_nproc_limit", lambda *a, **k: _NPROC)
 
     workspace = tmp_path / "candidate-worktree"
     workspace.mkdir()
@@ -78,11 +90,13 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
 
     assert kbd._default_spawn(task, str(workspace)) == 4242
-    assert captured_cmd[:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--quiet"]
+    n = len(_launcher())
+    assert captured_cmd[:n] == _launcher()
+    assert captured_cmd[n:n + 4] == ["/usr/bin/systemd-run", "--user", "--scope", "--quiet"]
     unit_index = captured_cmd.index("--unit")
     assert captured_cmd[unit_index + 1] == "hermes-worker-kanban-t_candidate_restart-run-23"
     assert "MemoryMax=536870912" in captured_cmd
-    separator = captured_cmd.index("--")
+    separator = captured_cmd.index("--", n)
     assert captured_cmd[separator + 1 : separator + 4] == ["hermes", "-p", "coder"]
     assert captured_cwd == str(workspace)
     assert captured_env["HERMES_KANBAN_TASK"] == task.id
@@ -140,7 +154,9 @@ def test_standalone_dispatcher_keeps_direct_worker_spawn(
     )
 
     assert kbd._default_spawn(task, str(workspace)) == 4243
-    assert captured_cmd[:3] == ["hermes", "-p", "coder"]
+    n = len(_launcher())
+    assert captured_cmd[:n] == _launcher()
+    assert captured_cmd[n:n + 3] == ["hermes", "-p", "coder"]
 
 
 @pytest.mark.platforms("linux")
@@ -171,14 +187,17 @@ def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
     )
 
     kbd._default_spawn(task, str(workspace))
-    assert spawned[-1][:3] == ["systemd-run", "--user", "--scope"]
+    n = len(_launcher())
+    assert spawned[-1][:n] == _launcher()
+    assert spawned[-1][n:n + 3] == ["systemd-run", "--user", "--scope"]
     assert f"hermes-worker-kanban-{task.id}-run-{task.current_run_id}" in spawned[-1]
 
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
     monkeypatch.setattr(process_registry, "_scope_degraded_warned", False)
     with caplog.at_level("WARNING", logger=process_registry.logger.name):
         kbd._default_spawn(task, str(workspace))
-    assert spawned[-1][:3] == ["hermes", "-p", "coder"]
+    assert spawned[-1][:n] == _launcher()
+    assert spawned[-1][n:n + 3] == ["hermes", "-p", "coder"]
     warned = [r.getMessage() for r in caplog.records if "KILLED when the unit exits" in r.getMessage()]
     assert len(warned) == 1 and "KillMode=process" in warned[0]
 

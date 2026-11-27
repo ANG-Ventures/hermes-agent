@@ -917,7 +917,8 @@ class GatewayStartupMixin:
             self._resumed_this_boot.add(entry.session_key)
             self._persist_active_agents()
             # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
-            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True,
+                                 wake_kind="restart")
             resume_reason = getattr(entry, "resume_reason", None)
             task = self._get_startup_resume_pool().submit(
                 self._run_startup_resume_event, adapter, event, entry.session_key, resume_reason,
@@ -2231,6 +2232,7 @@ class GatewayStartupMixin:
             ),
             source=dest.source,
             internal=True,
+            wake_kind="handoff",
         )
         logger.info(
             "Handoff: dispatching synthetic turn for CLI session %s → %s "

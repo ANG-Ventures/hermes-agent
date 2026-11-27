@@ -29,9 +29,11 @@ NEEDS_ROOT_OR_DOCKER = {
 _USES = re.compile(r"^\./\.github/workflows/([A-Za-z0-9._-]+\.ya?ml)$")
 
 
-def _resolve(runs_on, variables):
+def _resolve(runs_on, variables, *, event="push", head_repo="o/r"):
     if isinstance(runs_on, str) and runs_on.strip().startswith("${{"):
-        return evaluate(runs_on, {"vars": variables}, {})
+        github = {"event_name": event, "repository": "o/r",
+                  "event": {"pull_request": {"head": {"repo": {"full_name": head_repo}}}}}
+        return evaluate(runs_on, {"vars": variables, "github": github}, {})
     return runs_on
 
 
@@ -78,7 +80,13 @@ def test_root_or_docker_jobs_never_take_the_plumbing_var():
 def test_plumbing_routed_job_is_hosted_unless_the_var_is_set(workflow, job_id, runs_on):
     assert HOSTED_LINUX.match(_resolve(runs_on, {})), (workflow, job_id)
     assert _resolve(runs_on, {PLUMBING: ""}) == _resolve(runs_on, {})
-    assert _resolve(runs_on, {PLUMBING: MIRROR_LABELS}) == ["self-hosted", "hermes-ci"]
+    for event in ("push", "merge_group", "pull_request"):
+        assert _resolve(runs_on, {PLUMBING: MIRROR_LABELS}, event=event) == ["self-hosted", "hermes-ci"]
+    if workflow in {"ci.yaml", "tests.yml"}:
+        # Only the workflows in this slice have the independent fork guard.
+        for labels in (MIRROR_LABELS, "malformed-json"):
+            assert _resolve(runs_on, {PLUMBING: labels}, event="pull_request",
+                            head_repo="outside/fork") == "ubuntu-latest"
     # Never the heavy-job pool var: a saturated CI_RUNNER_LABELS pool must not strand plumbing.
     assert "CI_RUNNER_LABELS" not in runs_on
 
@@ -150,18 +158,16 @@ def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
     # Every case except a validated, attempt-bound managed plan (non-merge_group,
     # switch OFF, or NO plan — t_42bed567) ends in the legacy binding; never a
     # fixed local pool.
-    assert job["runs-on"].startswith("${{ fromJSON(github.event_name == 'merge_group' && "
-                                     "vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && ")
-    assert job["runs-on"].endswith(
-        "&& needs.placement.outputs.e2e_runs_on || "
-        "vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && "
-        "(github.event_name == 'push' || github.event_name == 'merge_group' || "
-        "github.event.pull_request.head.repo.full_name == github.repository) "
-        "&& '[\"self-hosted\",\"Linux\",\"X64\",\"ace-e2e-vm\"]' || ("
-        "contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
-        "&& format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"')) "
-        "|| '[\"ubuntu-latest\"]')) }}"
-    )
+    for event in ("push", "merge_group", "pull_request"):
+        assert _resolve(job["runs-on"], {"CI_RUNNER_LABELS": MIRROR_LABELS}, event=event) == [
+            "self-hosted", "hermes-ci", "X64"]
+        assert _resolve(job["runs-on"], {}, event=event) == ["ubuntu-latest"]
+    for variables in ({"CI_RUNNER_LABELS": MIRROR_LABELS},
+                      {"CI_RUNNER_LABELS": "malformed-json",
+                       "CI_E2E_VM_ENABLED": "true", "CI_E2E_VM_ROUTE": "open",
+                       "CI_OVERFLOW_PLACEMENT_ENABLED": "true"}):
+        assert _resolve(job["runs-on"], variables, event="pull_request",
+                        head_repo="outside/fork") == "ubuntu-latest"
     # The static last resort is GitHub-hosted ubuntu-latest (public repo, free
     # minutes; t_e95fdb01): a literal, so an unset repo var can never route it.
     # Blacksmith is reachable only through the overflow placement plan.

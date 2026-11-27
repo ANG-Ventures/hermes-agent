@@ -1,5 +1,78 @@
 [
   {
+    "feature": "Discord typing cadence, owner-matched stop and in-flight refresh survive adapter replacement without a tool-progress event",
+    "tests": [
+      "tests/gateway/test_discord_typing_stop.py",
+      "tests/gateway/test_discord_typing_recreate_race.py",
+      "tests/gateway/test_midturn_reconnect_probe.py"
+    ],
+    "paths": [
+      "gateway/platforms/base.py",
+      "gateway/platforms/base_*.py",
+      "plugins/platforms/discord/adapter.py",
+      "plugins/platforms/discord/adapter_*.py"
+    ],
+    "why": "Discord liveness reconnect replaces the adapter object while a turn still refreshes typing through the retired object. Resolve the owning transport slot each tick, issue a token on the replacement, and retire only that token on stop/cancel/supersede. The probe exercises the real reconnect installer without needing progress painting. Card t_5880041a.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": ["gateway", "discord"]
+  },
+  {
+    "feature": "wake headers name their kind from producer metadata: '🔔 kanban wake · review · t_X', '🔔 goal wake · check-in 1/3', loop/delegation/process/restart/watcher/heartbeat/webhook; the card id comes only from card_id metadata, never the wake text",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_wake_kind_headers.py",
+      "tests/gateway/test_wake_kind_producer_contract.py",
+      "tests/gateway/test_wake_progress_header.py"
+    ],
+    "paths": [
+      "gateway/wake_kind.py",
+      "gateway/wake.py",
+      "gateway/response_filters.py",
+      "gateway/platforms/event.py",
+      "gateway/run_goals.py",
+      "gateway/run_turn.py",
+      "gateway/run_turn_*.py",
+      "gateway/kanban_owner_wake.py",
+      "gateway/kanban_watchers.py",
+      "gateway/kanban_watchers_*.py",
+      "gateway/kanban_wake_defer.py",
+      "gateway/run_notifications.py",
+      "gateway/run_startup.py",
+      "locales/*.yaml"
+    ],
+    "why": "2026-11-08: 38 /goal idle check-ins rendered '🔔 wake · internal · t_c676b4f3' because wake_progress_header (fork PR #2127) guessed the label from a leading [tag] and took the FIRST t_xxxxxxxx in the body; the goal text named a card and Ace read it as a kanban wake (Ace 17:53/18:05 PT, discord 1569168012643410073 / 1569170967492562995). Every producer now stamps MessageEvent.wake_kind / deliver_wake(wake_kind=) and puts wake_sub / wake_name / card_id in metadata; run_turn spreads wake_display_metadata(event) into persist_user_display_metadata, which the header reads. The text tag survives only as a WARNING-logged legacy fallback. Upstream has the header's ancestor but none of the kinds: resolving response_filters.py, run_goals.py or run_turn.py toward upstream drops the label silently, and an upstream wake producer added by a parity merge renders unlabeled. Card t_17ba87a6.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_wake_kind_headers.py (RED-proven t_17ba87a6: wake_progress_header reverted to the regex-only form; wake_kind dropped from the goal idle-wake producer)"
+  },
+  {
+    "feature": "delegated process completion preserves human route and execution ownership",
+    "tests": [
+      "tests/tools/test_subagent_process_handoff.py",
+      "tests/gateway/test_async_delegation_session_binding.py",
+      "tests/tools/test_terminal_watcher_arming.py"
+    ],
+    "paths": [
+      "tools/process_registry.py",
+      "tools/process_registry_*.py",
+      "tools/terminal_tool_background.py",
+      "gateway/run_notifications.py",
+      "agent/delegation_context.py"
+    ],
+    "why": "Child process notifications must not pin human chats to child sessions or leak child execution context through explicit parent handoff. Preserve actual watcher delivery, unread results, closure and compression boundaries.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": ["gateway", "tools"]
+  },
+  {
     "feature": "chat model pins and cross-session reply mismatch announcements",
     "tests": [
       "tests/gateway/test_discord_chat_identity.py",
@@ -1634,6 +1707,119 @@
     "absorbed_date": null,
     "surfaces": [
       "gateway"
+    ]
+  },
+  {
+    "feature": "a command the busy path would reject (/model, /reasoning, /moa...) sent while /stop is still tearing the turn down waits (bounded 120 s) for the slot release and then runs on the idle path, instead of replying 'Agent is running, wait or /stop first'; a stop that outlives the bound gets an honest 'still finishing' reply",
+    "tests": [
+      "tests/gateway/test_busy_slash_after_stop.py::test_model_sent_during_stop_runs_after_the_slot_frees",
+      "tests/gateway/test_busy_slash_after_stop.py::test_reject_command_without_a_stop_still_rejects_immediately",
+      "tests/gateway/test_busy_slash_after_stop.py::test_stop_that_never_settles_gets_an_honest_reply"
+    ],
+    "paths": [
+      "gateway/session_state.py",
+      "gateway/run_agent_cache.py",
+      "gateway/run_inbound.py",
+      "gateway/run_inbound_*.py",
+      "gateway/run_busy.py",
+      "locales/*.yaml"
+    ],
+    "why": "Ace 2026-11-08 11:27 (#fix-bottlenecks): /stop at :04, /model at :08 bounced, slot freed at :41. PR #128. Upstream shape: TurnState.stopping set after the generation bump in the stop funnel, waited on before the busy fast-path.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ]
+  },
+  {
+    "feature": "/stop's durable user-stopped marker reads only the newest message row (get_messages latest=True limit=1), and every stop logs PHASE=stop_stages (per-stage time + default-pool queue) and rowid_s/store_s on PHASE=user_stopped",
+    "tests": [
+      "tests/gateway/test_stop_marker_fast_lookup.py::test_marker_reads_only_the_newest_row",
+      "tests/gateway/test_stop_marker_fast_lookup.py::test_every_stop_logs_its_stages"
+    ],
+    "paths": [
+      "gateway/run.py",
+      "gateway/run_*.py",
+      "gateway/run_agent_cache.py"
+    ],
+    "why": "37 Discord stops 11-04..11-08: p90 15 s, max 38.7 s; the stage line is what attributed the remaining cost to the marker write. PR #132, card t_eae5d4ab.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "busy /stop runs the async-delegation cancel off the event loop and fails open: a TimeoutError on state/async-delegations.lock no longer escapes /stop before the marker, adapter interrupt and slot release",
+    "tests": [
+      "tests/gateway/test_stop_survives_delegation_lock_timeout.py::test_stop_releases_the_session_when_the_delegation_cancel_times_out"
+    ],
+    "paths": [
+      "gateway/run_agent_cache.py"
+    ],
+    "why": "Ace 2026-11-08 15:38: /stop replied 'Sorry, I encountered an error (TimeoutError) timed out acquiring .../async-delegations.lock' and the session stayed busy (next /model refused). PR #134. Idle /stop and /new already failed open on the same call.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ]
+  },
+  {
+    "feature": "mark_user_stopped / clear_user_stopped persist with the single-entry routing UPSERT (_save_entry), not the whole-index rewrite plus sessions.json mirror; still durable before the method returns",
+    "tests": [
+      "tests/gateway/test_stop_marker_single_row_write.py::test_mark_and_clear_skip_the_full_rewrite_and_land_on_disk",
+      "tests/gateway/test_stop_marker_single_row_write.py::test_out_of_order_stop_still_persists_the_newer_marker_with_one_row"
+    ],
+    "paths": [
+      "gateway/session.py",
+      "gateway/session_*.py"
+    ],
+    "why": "PHASE=user_stopped store_s measured 0.6 s, 5.5 s, 2.8 s on live stops 2026-11-08: /stop queued behind every other session's full routing save. Card t_eae5d4ab.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "goal/loop orphan GC: a reset rotation (/new, /reset, suspended auto-reset, compression-exhausted reset) retires the replaced session's ACTIVE /goal and /loop as 'superseded', and an hourly reaper on the goal idle-wake watcher retires active rows that no routed key holds and that were idle >= goals.orphan_gc_days (default 7, 0 = off) as 'orphaned'; retire never deletes (/goal resume restores)",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_new_reset_retires_the_replaced_goal_and_loop",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_suspended_auto_reset_retires_the_replaced_goal",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_reset_never_touches_a_non_active_goal",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_orphaned_ids_pure_contract",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_reaper_retires_only_unrouted_and_idle",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_reaper_disabled_at_zero_days",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_orphaned_goal_and_loop_round_trip_through_resume",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_goal_routed_only_under_a_secondary_profile_is_kept",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_config_zero_disables_the_gateway_pass",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_gc_runs_at_most_once_per_hour",
+      "tests/fork_canaries/test_fork_canary_goal_loop_gc.py::test_idle_wake_watcher_runs_the_gc"
+    ],
+    "paths": [
+      "gateway/session_recovery.py",
+      "gateway/run_goals.py",
+      "hermes_cli/goals.py",
+      "hermes_cli/loops.py",
+      "hermes_cli/config_defaults.py"
+    ],
+    "why": "Studio 2026-11-08 17:56 PT: 205 active goals, 190 on session ids no routing key pointed at (187 older than 7 days, oldest 2026-05-12); they never woke anyone but every 15 s idle-wake scan reloaded them. Apollo hand-cleared 187; nothing stopped regrowth. Ace 18:05 PT asked for GC that a fork update cannot drop. Card t_92fc3ff0. Upstream PR shape: retire in SessionStore's reset transition + reaper beside the goal idle-wake watcher.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli",
+      "discord",
+      "telegram"
     ]
   }
 ]

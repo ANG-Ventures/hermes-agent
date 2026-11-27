@@ -185,8 +185,10 @@ def test_worker_context_lists_attachments_with_absolute_path(kanban_home):
         ctx = kb.build_worker_context(conn, task_id)
         assert "## Attachments" in ctx
         assert "manual.pdf" in ctx
-        # The absolute path must appear so the worker can read_file it.
+        # The board-host path is kept for local readers; pool-host workers read
+        # the bytes by id through kanban_attachment_read (t_0fc58360).
         assert str(blob.resolve()) in ctx
+        assert "kanban_attachment_read" in ctx
     finally:
         conn.close()
 

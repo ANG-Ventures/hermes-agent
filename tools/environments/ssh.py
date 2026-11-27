@@ -2,12 +2,15 @@
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
+import uuid
 from pathlib import Path
 from typing import Iterable
 
@@ -39,6 +42,172 @@ def _placed_lease_env_names() -> tuple[str, ...]:
         return ()
     from hermes_cli.kanban_browser_lease import LEASE_ENV_NAMES
     return tuple(n for n in LEASE_ENV_NAMES if os.environ.get(n))
+
+
+def _placed_kanban_exports() -> str:
+    """``export`` line giving a dispatcher-placed worker's remote shell its card identity (t_dad3fadc).
+    ssh carries no env and no host AcceptEnv's these names, so on every pool host (kanbanw and owner
+    login alike) ``$HERMES_KANBAN_TASK``/``$HERMES_KANBAN_WORKSPACE`` were empty and host scripts that
+    key on them (test-gate's card stamp and operator escape, prism-change's worker refusal) saw no card.
+    WORKSPACE is the HOST path (the placement's TERMINAL_CWD). The owner marker is not a pid, so a
+    ``hermes`` started on the host never resolves itself as the worker (``owns_kanban_worker_authority``
+    refuses a non-pid). Not secrets: a card id and a path. None for a delegate_task child."""
+    raw, task = os.environ.get("KANBAN_WORKER_PLACEMENT"), os.environ.get("HERMES_KANBAN_TASK")
+    if not raw or not task:
+        return ""
+    try:
+        from agent.delegation_context import KANBAN_OWNER_PID_ENV, is_delegated_child_process_context
+        if is_delegated_child_process_context():
+            return ""
+        workspace = (json.loads(raw).get("env") or {}).get("TERMINAL_CWD") or ""
+    except Exception:
+        return ""
+    values = {"HERMES_KANBAN_TASK": task, KANBAN_OWNER_PID_ENV: f"placed:{os.getpid()}"}
+    if workspace:
+        values["HERMES_KANBAN_WORKSPACE"] = workspace
+    return "export " + " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(values.items())) + "\n"
+
+
+# exits 97 unless the forced command fleet-worker-shell set FLEET_WORKER_SESSION=1 (t_3911e84c);
+# kept byte-identical to hermes_cli.kanban_worker_pool.WORKER_SESSION_GUARD (a test pins it)
+WORKER_SESSION_GUARD = ('[ "${FLEET_WORKER_SESSION:-}" = 1 ] || '
+                        '{ echo "not a fleet worker session" >&2; exit 97; }; ')
+
+
+def control_socket_path(user: str, host: str, port: int, control_scope: str = "", *, probe: str = "",
+                        key_path: str = "") -> Path:
+    """The plain ControlMaster socket for ``user@host:port`` (+ a kanban run's ``control_scope``). The kanban
+    release reads a finished run's footprint over this same master (t_26acfaa2), so both name it here.
+    ``key_path`` keys an unscoped socket (t_3911e84c): a master never re-authenticates, so a keyed and an
+    unkeyed environment for one user@host:port (a pool-placed delegate child on an owner login) must not
+    share one. A scoped socket belongs to one kanban run, whose key is fixed, and keeps its name."""
+    socket_key = f"{user}@{host}:{port}" + (f":{control_scope}" if control_scope else "")
+    if key_path and not control_scope:
+        socket_key = f"{socket_key}:key:{key_path}"
+    if probe:
+        socket_key = f"{socket_key}:probe:{probe}"
+    return Path(tempfile.gettempdir()) / "hermes-ssh" / f"{hashlib.sha256(socket_key.encode()).hexdigest()[:16]}.sock"
+
+
+def control_sockets(plain: Path) -> list[Path]:
+    """``plain`` plus every SendEnv-set sibling master beside it (shared 8-char target prefix)."""
+    plain = Path(plain)
+    siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []
+    return [plain, *(s for s in siblings if s != plain)]
+
+
+_RUN_MARK = "hermes-run-"
+
+
+_RUN_DIR = "$HOME/.hermes-run"
+
+
+def _run_pidfile(token: str) -> str:
+    """Legacy shell path (``$HOME`` expands remotely), in a private 0700 directory."""
+    return f"{_RUN_DIR}/{_RUN_MARK}{token}.pid"
+
+
+def _enter_runtime_dir(variable: str = "XDG_RUNTIME_DIR") -> str:
+    """Enter a private tmpfs XDG directory before checking it. Using relative paths after
+    checking the cwd keeps a replaced path component from redirecting a pidfile operation.
+    Shell builtins check path/owner; one find checks both exact mode and filesystem type.
+    The ``(pattern)`` form is load-bearing: the kill command nests this inside ``$( )``, and
+    macOS /bin/sh (bash 3.2) reads a bare ``pattern)`` there as the closing paren (syntax error,
+    so on a Mac the remote kill never ran and timed-out commands lived on; t_4786c7b1)."""
+    return (f'case "${{{variable}:-}}" in (/*) '
+            f'CDPATH= cd -P -- "${variable}" && [ -O . ] && '
+            '[ "$(PATH=/usr/bin:/bin exec find . -maxdepth 0 -perm 0700 -fstype tmpfs -print)" = . ];; '
+            '(*) false;; esac')
+
+
+def _run_preamble(token: str, runtime_var: str = "XDG_RUNTIME_DIR") -> str:
+    """First lines of every remote command: sweep dead pidfiles, then record the ``bash -c`` pid
+    (= its process group, as sshd starts each command in its own session) where the kill path can
+    find it. A file, not the argv: a top-level ``exec`` replaces the argv but keeps the pid and the
+    group. The EXIT trap is best effort (a command that replaces it, ``exec``s or is SIGKILLed
+    leaves its file), so the next command on the host removes such leftovers (t_70090b16)."""
+    legacy = _run_pidfile(token)
+    name = f"{_RUN_MARK}{token}.pid"
+    # The off switch affects new writes only: kills and sweeps still see in-flight runtime files.
+    enabled = "false" if os.getenv("HERMES_SSH_RUNTIME_PIDFILES") == "0" else (
+        '[ "${HERMES_SSH_RUNTIME_PIDFILES:-}" != 0 ]')
+    return (f": {_RUN_MARK}{token}\n"
+            f"{_stale_pidfile_sweep()}\n"
+            f"if ({{ {_enter_runtime_dir(runtime_var)}; }} || exit 1;\n"
+            f"{_stale_pidfile_sweep('.')};\n"
+            f"{enabled} || exit 1; umask 077;\n"
+            f"echo $$ >| '{name}' || {{ rm -f -- '{name}'; exit 1; }}) 2>/dev/null; then\n"
+            f'printf -v _vr_dir %q "${runtime_var}"\n'
+            # Only unlink on exit, never read or write a PID. Quote/freeze the original path.
+            f'''trap "CDPATH= cd -P -- $_vr_dir && [ -O . ] && rm -f -- '{name}'" EXIT\n'''
+            "unset _vr_dir\n"
+            "else\n"
+            f'''(umask 077; mkdir -p "{_RUN_DIR}" && echo $$ >| "{legacy}") 2>/dev/null;\n'''
+            f'''trap "rm -f \\"{legacy}\\"" EXIT\n'''
+            "fi\n")
+
+
+def _stale_pidfile_sweep(directory: str = _RUN_DIR) -> str:
+    """Shell that removes this writer's pidfiles (``hermes-run-<32 hex>.pid`` only) whose pid is
+    gone. Builtins only (no fork unless a file is removed); an empty or non-numeric file (pid not
+    written yet) is kept; its loop variables are unset so the command never sees them."""
+    name = _RUN_MARK + "[0-9a-f]" * 32 + ".pid"
+    return (f"for _vr_f in \"{directory}\"/{name}; do "
+            "[ -f \"$_vr_f\" ] || continue; _vr_p=; read -r _vr_p < \"$_vr_f\" 2>/dev/null; "
+            "case \"$_vr_p\" in ''|*[!0-9]*) continue;; esac; "
+            "kill -0 \"$_vr_p\" 2>/dev/null || rm -f -- \"$_vr_f\"; done 2>/dev/null; unset _vr_f _vr_p")
+
+
+_KILLED_MARK = "hermes-run-killed"
+
+
+def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
+    """Remote ``sh`` that signals the process group of the command that wrote ``token``'s pidfile
+    (TERM, 1 s, KILL; KILL only without ``grace``), so ``cmd &`` children die too. A pid that is
+    not its own group leader is signalled alone. No pidfile (the command already exited) = no-op.
+    Prints ``_KILLED_MARK`` once a signal reached a live process."""
+    sigs = "TERM KILL" if grace else "KILL"
+    f = _run_pidfile(token)
+    name = f"{_RUN_MARK}{token}.pid"
+    script = (
+        f'''if [ -f "{f}" ]; then p=$(cat "{f}" 2>/dev/null); rm -f "{f}"; '''
+        f'''else p=$({{ {_enter_runtime_dir()}; }} && [ -f './{name}' ] && '''
+        f'''{{ cat './{name}'; rm -f -- './{name}'; }}) 2>/dev/null; fi; '''
+        "case \"$p\" in ''|*[!0-9]*) exit 0;; esac; "
+        "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); [ -n \"$g\" ] || exit 0; "
+        "[ \"$g\" = \"$p\" ] && t=\"-$g\" || t=\"$p\"; "
+        f"for sig in {sigs}; do kill -s $sig -- \"$t\" 2>/dev/null || exit 0; echo {_KILLED_MARK}; "
+        "[ $sig = TERM ] && sleep 1; done; exit 0")
+    return "sh -c " + shlex.quote(script)
+
+
+# Remote half of a plain ``ssh host cmd`` timeout (t_4786c7b1). Killing the local client never reaches
+# the remote command: without a pty sshd sends it no SIGHUP, and under a ControlMaster the sshd that
+# owns it stays up. So the remote side keeps its own clock and, if the command still runs after
+# ``$1`` s, sends SIGHUP to its process group (sshd gives every command its own session), which is
+# what a terminal hangup does: nohup'd jobs ignore it, setsid / detached-run.py jobs are in another
+# group. POSIX sh + ps only: macOS has no setsid(1) and dash has no job control without a tty.
+_DEADLINE_SH = (
+    't=$1 c=$2; g=$(ps -o pgid= -p $$ | tr -d " "); '
+    '(trap "kill \\$p 2>/dev/null; exit 0" TERM; sleep "$t" & p=$!; wait $p && [ -n "$g" ] && kill -HUP -"$g") '
+    '</dev/null >/dev/null 2>&1 & w=$!; '
+    '"${SHELL:-/bin/sh}" -c "$c"; s=$?; kill $w 2>/dev/null; exit $s')
+
+
+def remote_deadline_command(command: str, timeout: float) -> str:
+    """The remote half of ``ssh host <this>`` for a caller that kills ssh after ``timeout`` s: runs
+    ``command`` in the remote login shell, as plain ``ssh host command`` does, and hangs it up on the
+    remote side once ``timeout`` s pass. Single quotes always (zsh expands a bare leading ``=``).
+    A timeout that is not a positive finite number sets no deadline (``sleep 0`` would hang the
+    command up as it starts): ``command`` is returned unchanged."""
+    if not (isinstance(timeout, (int, float)) and 0 < timeout < float("inf")):
+        return command
+    secs = format(float(timeout), "f").rstrip("0").rstrip(".")  # no exponent: sleep(1) on macOS rejects 1e+06
+    if secs == "0":  # below 1 us: formats to sleep 0
+        return command
+    def sq(s: str) -> str:
+        return "'" + s.replace("'", "'\"'\"'") + "'"
+    return f"sh -c {sq(_DEADLINE_SH)} sh {secs} {sq(command)}"
 
 
 def _ensure_ssh_available() -> None:
@@ -82,11 +251,8 @@ class SSHEnvironment(BaseEnvironment):
         # per-instance socket so its cleanup() can never close the agent's shared master.
         # ``control_scope`` (a kanban run) gives concurrent processes to one target their own
         # master instead of racing to create the shared one.
-        socket_key = f"{user}@{host}:{port}" + (f":{control_scope}" if control_scope else "")
-        if probe_only:
-            socket_key = f"{socket_key}:probe:{self._session_id}"
-        _socket_id = hashlib.sha256(socket_key.encode()).hexdigest()[:16]
-        self.control_socket = self.control_dir / f"{_socket_id}.sock"
+        self.control_socket = control_socket_path(
+            user, host, port, control_scope, probe=self._session_id if probe_only else "", key_path=key_path)
         _ensure_ssh_available()
         self._establish_connection()
         if probe_only:
@@ -118,14 +284,24 @@ class SSHEnvironment(BaseEnvironment):
 
     def _control_sockets(self) -> list[Path]:
         """The plain socket plus every SendEnv-set sibling (shared 8-char target prefix)."""
-        plain = Path(self.control_socket)
-        siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []
-        return [plain, *(s for s in siblings if s != plain)]
+        return control_sockets(self.control_socket)
 
     def _target_flags(self, port_flag: str) -> list:
         """Port/key flags shared by ssh (``-p``) and scp (``-P``)."""
         flags = [port_flag, str(self.port)] if self.port != 22 else []
-        return flags + (["-i", self.key_path] if self.key_path else [])
+        # IdentitiesOnly: with a key named, offer only it, never the agent's or the default keys
+        # (a pool owner login accepts the owner's own key too, past the worker wrapper). An unreadable
+        # key turns auth off: ssh would fall back to the ssh_config IdentityFile, the owner's key (t_3911e84c).
+        if not self.key_path:
+            return flags
+        # expanded once, here: os.access() reads a literal "~/..." as missing (a04c57100fc5)
+        key = os.path.expanduser(self.key_path)
+        # IdentityAgent=none: no agent key (the owner's, if loaded) is ever offered (fb4485599af6)
+        flags += ["-i", key, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none"]
+        if not os.access(key, os.R_OK):
+            flags += ["-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no",
+                      "-o", "KbdInteractiveAuthentication=no"]
+        return flags
 
     def _build_ssh_command(self, extra_args: list | None = None, send_env: Iterable[str] = (),
                            log_to_file: bool = False) -> list:
@@ -139,6 +315,11 @@ class SSHEnvironment(BaseEnvironment):
             cmd.extend(["-o", f"ControlPath={self._control_socket_for(send_env)}",
                         "-o", "ControlMaster=auto", "-o", "ControlPersist=300"])
         cmd.extend(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"])
+        # A host that dies mid-command sends no RST/FIN: without keepalives the call hangs until the
+        # tool timeout. sshd answers these, not the command, so a silent command stays up. Only the
+        # process that owns the TCP connection uses them: the ControlMaster, which inherits this argv
+        # from the first command that starts it (a mux client's own value is ignored).
+        cmd.extend(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"])
         # Names only; values ride the ssh client's own environment (never the remote command text).
         cmd.extend(arg for name in send_env for arg in ("-o", f"SendEnv={name}"))
         cmd.extend(self._target_flags("-p"))
@@ -146,9 +327,15 @@ class SSHEnvironment(BaseEnvironment):
         cmd.append(f"{self.user}@{self.host}")
         return cmd
 
+    def _guarded(self, remote_cmd: str) -> str:
+        """``remote_cmd`` behind the worker-session guard when a worker key is pinned (t_3911e84c
+        fb4485599af6): ssh may still log in with the ssh_config IdentityFile, the owner's key, past the
+        forced command that exports FLEET_WORKER_SESSION=1. Same text as kanban_worker_pool's guard."""
+        return WORKER_SESSION_GUARD + remote_cmd if self.key_path else remote_cmd
+
     def _run_ssh(self, remote_cmd: str, timeout: float) -> subprocess.CompletedProcess:
         """Run one remote shell command over the multiplexed connection, capturing output."""
-        return run_capture(self._build_ssh_command() + [remote_cmd], timeout=timeout)
+        return run_capture(self._build_ssh_command() + [self._guarded(remote_cmd)], timeout=timeout)
 
     def _run_ssh_checked(self, remote_cmd: str, timeout: float, reason: str, subject: str) -> None:
         result = self._run_ssh(remote_cmd, timeout=timeout)
@@ -210,7 +397,7 @@ class SSHEnvironment(BaseEnvironment):
             # then fails and retries on every tool call. (Not run_capture: that
             # closes stdin.)
             result = subprocess.run(
-                self._build_ssh_command() + ["xargs -0 mkdir -p --"],
+                self._build_ssh_command() + [self._guarded("xargs -0 mkdir -p --")],
                 input="\0".join(parents) + "\0", capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=30)
             if result.returncode != 0:
@@ -239,7 +426,8 @@ class SSHEnvironment(BaseEnvironment):
 
             # --no-overwrite-dir keeps tar from stamping the staging dir's mode onto
             # existing dirs (e.g. /home/<user>); a umask-002 0775 home breaks sshd StrictModes.
-            ssh_cmd = self._build_ssh_command() + [f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}"]
+            ssh_cmd = self._build_ssh_command() + [
+                self._guarded(f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}")]
             tar_proc = subprocess.Popen(["tar", "-chf", "-", "-C", staging, "."], stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
@@ -283,7 +471,7 @@ class SSHEnvironment(BaseEnvironment):
         # "socket ignored" and some builds exit 2, which failed every sync-back and left a
         # multi-GB temp tar behind on each retry. Exclude them up front.
         ssh_cmd = self._build_ssh_command() + [
-            f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel_base)}"]
+            self._guarded(f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel_base)}")]
         with open(dest, "wb") as f:
             result = subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.PIPE, timeout=120)
         if result.returncode != 0:
@@ -315,9 +503,79 @@ class SSHEnvironment(BaseEnvironment):
         scope are unset remotely so a shared host cannot serve another profile's value."""
         values, unset_names = resolve_passthrough_env(explicit_forward=_placed_lease_env_names(),
                                                       hermes_env_loader=_load_hermes_env_vars)
-        cmd = self._build_ssh_command(send_env=values, log_to_file=True) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
+        token = uuid.uuid4().hex
+        # Capture XDG from the SSH login shell, the same context used by the kill command.
+        # Bash startup (including login profiles and BASH_ENV) may set a different value.
+        remote = ('_vr_runtime=$1; shift\n' + _run_preamble(token, "_vr_runtime")
+                  + 'unset _vr_runtime\n' + self._guarded(_placed_kanban_exports()
+                                                         + prepend_unset(cmd_string, unset_names)))
+        # Read XDG in POSIX sh, not the user's login shell or Bash startup files.
+        # exec keeps the original SSH process group and the final argv is still the Bash script.
+        dispatch = 'exec bash "$@" bash "${XDG_RUNTIME_DIR:-}"'
+        cmd = self._build_ssh_command(send_env=values, log_to_file=True) + [
+            "exec", "sh", "-c", shlex.quote(dispatch), "sh",
+            *bash_argv(shlex.quote(remote), login)[1:],
+        ]
         client_env = client_env_with(values)
-        return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
+        proc = _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
+        proc._hermes_run_token = token
+        return proc
+
+    def _kill_process(self, proc):
+        """Kill the local ssh client, then the REMOTE command's process group. Killing only the
+        client leaves the remote ``bash -c`` tree running: without a pty sshd sends it no
+        signal, so a silent ``grep -r`` ran on for 30+ h after its tool call timed out (t_44017fbc)."""
+        super()._kill_process(proc)
+        if token := getattr(proc, "_hermes_run_token", None):
+            self._remote_group_kill(token, grace=True)
+
+    def _force_kill_process(self, proc):
+        """Hard-exit path: the client dies inline; the KILL-only remote kill runs on a daemon
+        thread given 0.25 s to start its ssh child, which then finishes it after this process exits."""
+        super()._kill_process(proc)
+        if token := getattr(proc, "_hermes_run_token", None):
+            t = threading.Thread(target=self._remote_group_kill, args=(token,), kwargs={"grace": False},
+                                 daemon=True)
+            t.start()
+            t.join(0.25)
+
+    def _remote_group_kill(self, token: str, *, grace: bool) -> bool | None:
+        """True: a live remote command was signalled; False: none was running; None: unknown."""
+        try:
+            result = self._run_ssh(_remote_group_kill_command(token, grace=grace), timeout=5)
+        except Exception:
+            logger.debug("SSH: remote process-group kill failed", exc_info=True)
+            return None
+        if getattr(result, "returncode", 0) != 0:
+            return None
+        return _KILLED_MARK in (getattr(result, "stdout", "") or "")
+
+    def _wait_for_process(self, proc, timeout: int = 120, **kwargs) -> dict:
+        """An ssh client that exits 255 without the command's cwd marker may have lost its
+        connection (master ended, host gone) while the remote command still runs; sshd sends a
+        tty-less command no signal, so it would run on unowned (t_db3261ec). Kill its group and say
+        so. With nothing left running the result says it was the command's own 255 or a dropped link."""
+        result = super()._wait_for_process(proc, timeout, **kwargs)
+        token = getattr(proc, "_hermes_run_token", None)
+        output = result.get("output") or ""
+        if (result.get("returncode") != 255 or not token or self._cwd_marker in output
+                or result.get("hermes_interrupted") or result.get("hermes_timed_out")):
+            return result
+        killed = self._remote_group_kill(token, grace=True)
+        if killed is False:
+            # No completion marker and nothing left running: the command ran ``exit 255`` itself, or
+            # the link dropped and the command then died (a chatty one gets SIGPIPE). Name both.
+            note = ("[exit 255 without the completion marker: the command exited 255 itself or the ssh "
+                    f"connection to {self.user}@{self.host} closed; no remote process is left]")
+            result["output"] = f"{output.rstrip(chr(10))}\n{note}" if output.strip() else note
+            return result
+        fate = ("the remote command was still running and has been killed" if killed
+                else "the remote command's state could not be checked")
+        note = f"[ssh connection to {self.user}@{self.host} closed before the command finished (exit 255); {fate}]"
+        logger.warning("SSH: %s", note)
+        result["output"] = f"{output.rstrip(chr(10))}\n{note}" if output.strip() else note
+        result["hermes_connection_lost"] = True
+        return result
 
     def cleanup(self):
         if self._sync_manager:

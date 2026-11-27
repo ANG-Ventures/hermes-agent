@@ -94,7 +94,7 @@ async def _one_tick(monkeypatch, runner):
 
 
 def _card(conn, *, chat=CHAT):
-    tid = kb.create_task(conn, title="self close", assignee="worker", session_id=HOME_SID)
+    tid = kb.create_task(conn, boomerang_wake=False, title="self close", assignee="worker", session_id=HOME_SID)
     kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat, chat_type="group",
                        user_id="u1", delivery_mode="notify+wake")
     return tid
@@ -230,7 +230,7 @@ def test_receipt_failure_keeps_the_event_deliverable(board, monkeypatch):
 
 
 def _thread_card(conn, *, chat=THREAD, thread=THREAD):
-    tid = kb.create_task(conn, title="thread self close", assignee="worker", session_id=THREAD_SID)
+    tid = kb.create_task(conn, boomerang_wake=False, title="thread self close", assignee="worker", session_id=THREAD_SID)
     kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat, thread_id=thread,
                        chat_type="thread", user_id="u1", delivery_mode="notify+wake")
     return tid
@@ -303,7 +303,7 @@ OP_SID = "20261106_113450_09aa5a58"
 
 
 def _operator_card(conn):
-    tid = kb.create_task(conn, title="operator-homed", assignee="worker", session_id=OP_HOME)
+    tid = kb.create_task(conn, boomerang_wake=False, title="operator-homed", assignee="worker", session_id=OP_HOME)
     kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT, chat_type="group",
                        user_id="u1", delivery_mode="notify+wake")
     return tid
@@ -317,7 +317,7 @@ def test_operator_homed_self_block_is_withheld_as_own_echo(board, monkeypatch):
     try:
         tid = _operator_card(conn)
         with kb.mutation_actor(session_ids=[OP_SID], profile="default", surface="gateway"):
-            assert kb.block_task(conn, tid, reason="waiting on Ace") is True
+            assert kb.block_task(conn, tid, reason="waiting on Ace", kind="needs_input") is True
         assert _events(conn, tid, "blocked")[0].actor_profile == "default"
     finally:
         conn.close()
@@ -341,7 +341,7 @@ def test_operator_homed_worker_block_still_wakes(board, monkeypatch):
         kb.claim_task(conn, tid)
         run_id = kb.get_task(conn, tid).current_run_id
         with kb.mutation_actor(session_ids=["20261106_000001_worker"], profile="worker", surface="worker"):
-            assert kb.block_task(conn, tid, reason="need creds", expected_run_id=run_id) is True
+            assert kb.block_task(conn, tid, reason="need creds", expected_run_id=run_id, kind="needs_input") is True
     finally:
         conn.close()
     adapter = Adapter()

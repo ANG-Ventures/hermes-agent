@@ -297,13 +297,19 @@ class SessionGatewayMixin:
             self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
-    def save_gateway_routing_entry(self, session_key: str, entry_json: str, *, scope: str = "") -> None:
+    def save_gateway_routing_entry(
+        self, session_key: str, entry_json: str, *, scope: str = "", timings: Optional[dict] = None,
+    ) -> None:
         """Upsert one gateway routing entry (session_key -> SessionEntry JSON); ``scope``
         namespaces the index per sessions_dir so two stores never share routing state."""
         if not session_key or not entry_json:
             return
         def _do(conn):
+            started = time.monotonic() if timings is not None else None
             self._assert_unique_gateway_routes(conn, {session_key: entry_json}, scope)
+            if timings is not None:
+                checked = time.monotonic()
+                timings["route_check_s"] = checked - started
             conn.execute(
                 """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -312,7 +318,9 @@ class SessionGatewayMixin:
                        updated_at = excluded.updated_at""",
                 (scope, session_key, entry_json, time.time()),
             )
-        self._execute_write(_do)
+            if timings is not None:
+                timings["route_sql_s"] = time.monotonic() - checked
+        self._execute_write(_do, timings=timings)
 
     def replace_gateway_routing_entries(
         self, entries: Dict[str, str], *, scope: str = "", retired_keys=(),
@@ -427,14 +435,13 @@ class SessionGatewayMixin:
         mapping per routing key. ``platform`` filters on ``source``."""
         # Full rows carry token/cost totals — drain queued async accounting deltas first.
         self.flush_token_counts()
-        query = f"""
-            SELECT sessions.*,
-                   COALESCE(sp.prompt, sessions.system_prompt)
-                       AS _system_prompt_resolved,
+        # Rank (id, last_active) only, then join the full rows by id and order in Python.
+        # ``sessions.* + resolved prompt ... ORDER BY`` sorted whole rows (~100 KB prompts):
+        # 117 MB of etilqs temp files per discord channel-directory read (t_d24713d3).
+        keyed = f"""
+            SELECT sessions.id AS id,
                    {_sql_session_last_active("sessions")} AS last_active
             FROM sessions
-            LEFT JOIN system_prompts sp
-              ON sp.hash = sessions.system_prompt_hash
             WHERE session_key IS NOT NULL
               AND started_at = (
                   SELECT MAX(s2.started_at) FROM sessions s2
@@ -442,9 +449,25 @@ class SessionGatewayMixin:
               )
         """
         params: list = [platform] if platform else []
-        query += (" AND LOWER(source) = LOWER(?)" if platform else "") + (
-            " AND ended_at IS NULL" if active_only else "") + " ORDER BY last_active DESC"
-        return [self._session_row_dict(r) for r in self._read_all(query, params)]
+        keyed += (" AND LOWER(source) = LOWER(?)" if platform else "") + (
+            " AND ended_at IS NULL" if active_only else "")
+        query = f"""
+            SELECT sessions.*,
+                   COALESCE(sp.prompt, sessions.system_prompt)
+                       AS _system_prompt_resolved,
+                   k.last_active AS last_active,
+                   k.rn AS _gateway_list_rn
+            FROM (SELECT id, last_active, row_number() OVER (ORDER BY last_active DESC) AS rn
+                  FROM ({keyed})) k
+            JOIN sessions ON sessions.id = k.id
+            LEFT JOIN system_prompts sp
+              ON sp.hash = sessions.system_prompt_hash
+        """
+        rows = sorted((self._session_row_dict(r) for r in self._read_all(query, params)),
+                      key=lambda d: d["_gateway_list_rn"])
+        for row in rows:
+            del row["_gateway_list_rn"]
+        return rows
 
     def find_latest_gateway_session_for_peer(
         self, *, source: str, user_id: Optional[str] = None, session_key: Optional[str] = None,

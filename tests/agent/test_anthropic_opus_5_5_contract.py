@@ -58,6 +58,7 @@ NO_FORCED_TOOLS = [
     "claude-opus-5-5-fast",
     "anthropic/claude-opus-5.5",  # dot spelling normalizes onto the same family
     "claude-fable-5-1",
+    "claude-fable-5-2",
     "claude-mythos-5-1",
 ]
 

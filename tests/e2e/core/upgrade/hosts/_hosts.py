@@ -16,6 +16,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from tests import rig_parent_watch
 from tests.e2e.core.upgrade import _helpers as H
 from tests.e2e.core.upgrade import _install_helpers as I
 from tests.fakes.fake_llm_provider import FakeLLMServer
@@ -124,6 +125,8 @@ class Gateway:
             env=self.sb.env, cwd=str(self.sb.root), stdin=subprocess.DEVNULL, stdout=fh,
             stderr=subprocess.STDOUT, start_new_session=True)
         fh.close()
+        # Own session; bwrap's --die-with-parent covers only the sandboxed case.
+        rig_parent_watch.track(self.proc.pid)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             st = self.state()
@@ -158,3 +161,4 @@ class Gateway:
             except ProcessLookupError:
                 pass
         H.kill_tree(self.proc)
+        rig_parent_watch.untrack(self.proc.pid)

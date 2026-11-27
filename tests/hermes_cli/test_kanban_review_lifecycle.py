@@ -977,7 +977,7 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
     sentinel must not turn "unassigned" into a re-read of the row)."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unassigned handoff")
-        assert kb.block_task(conn, tid, reason="waiting on upstream") is True
+        assert kb.block_task(conn, tid, reason="waiting on upstream", kind="needs_input") is True
         run = conn.execute(
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()

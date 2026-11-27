@@ -51,6 +51,9 @@ def _spawn(monkeypatch, tmp_path, lane_yaml: str, **task_over):
     from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    # Pin the worker RLIMIT_NPROC ceiling so the launcher prefix is exact.
+    from hermes_cli import kanban_proc_bounds as kpb
+    monkeypatch.setattr(kpb, "resolve_worker_nproc_limit", lambda *a, **k: _NPROC)
     captured = {}
 
     class FakeProc:
@@ -68,9 +71,19 @@ def _spawn(monkeypatch, tmp_path, lane_yaml: str, **task_over):
     return captured
 
 
+_NPROC = 777
+
+
 def _module_tail(cmd):
-    """argv after the dispatcher's platform prefix (taskpolicy on darwin)."""
-    return cmd[cmd.index(sys.executable):] if sys.executable in cmd else cmd
+    """argv after the dispatcher's prefixes: taskpolicy on darwin, then the
+    worker-limits launcher (t_b9a61253), which must sit right before the
+    runner argv so it execs the runner in place."""
+    from hermes_cli import kanban_proc_bounds as kpb
+
+    launcher = kpb.worker_limits_launcher_argv(_NPROC, 0)
+    start = cmd.index(launcher[0])
+    assert cmd[start:start + len(launcher)] == launcher
+    return cmd[start + len(launcher):]
 
 
 # --------------------------------------------------------------------------
@@ -239,7 +252,9 @@ def test_runner_hands_back_block_reason_verbatim(monkeypatch, tmp_path):
     task, events = _card(kb, tid)
     assert task.status == "blocked"
     reasons = [(p or {}).get("reason") for k, p in events if k == "blocked"]
-    assert reasons == ["tests_match_claim false [run metadata: x/receipt.json]"]
+    # The lane's text stays first and verbatim; Need/Why/How follow it (t_2fecb5d0).
+    assert len(reasons) == 1
+    assert reasons[0].startswith("tests_match_claim false [run metadata: x/receipt.json]\nNeed: ")
 
 
 def test_runner_blocks_when_lane_exits_without_reporting(monkeypatch, tmp_path):

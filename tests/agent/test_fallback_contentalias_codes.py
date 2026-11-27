@@ -68,3 +68,32 @@ def test_bridge_error_code_reads_the_wrapped_contentalias_code():
 
 def test_table_covers_the_seen_codes():
     assert set(SEEN) - {"store_lock"} <= set(CONTENTALIAS_ERROR_CODES)
+
+
+_ST_HDRS = {**HDRS, "x-relay-seat": "sub-vps-19"}
+_ST_WIRE = ("the interactive session reported an upstream error row for this turn "
+            "(API Error: contentalias:stream_transport{})")
+
+
+def _st_row(detail):
+    return _row_for(_bridge_err("contentalias:stream_transport", 400, _ST_WIRE.format(detail),
+                                _ST_HDRS), 400)
+
+
+@pytest.mark.parametrize("detail", ["", ": connect: connection refused", ": read tcp 10.0.0.2:51234: i/o timeout",
+                                    ": read: connection reset by peer",
+                                    # Go's real format names the forwarder address for ANY failure on the leg
+                                    ": read tcp 100.112.250.39:51234->100.112.189.89:18814: i/o timeout",
+                                    ": read tcp 100.112.250.39:51234->100.112.189.89:18814: read: "
+                                    "connection reset by peer"])
+def test_stream_transport_names_the_leg_not_a_culprit(detail):
+    """t_6e7909d1: any non-EOF upstream read error is stream_transport; the unit reports only the code
+    (stored rows carry no dial text), so no row names the forwarder or claims "not Anthropic"."""
+    row = _st_row(detail)
+    assert fp.head_label_override(row) == "upstream connection failed"
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert "upstream connection failed on the box forwarder leg" in text, text
+    assert "on sub-vps-19" in text, text
+    assert "box forwarder refused" not in text, text
+    assert "not Anthropic" not in text, text
+    assert "alias layer refused" not in text and "at the DPX alias layer" not in text, text

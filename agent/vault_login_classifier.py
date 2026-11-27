@@ -247,18 +247,43 @@ def build_inspection_js(nonce: str) -> str:
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
-  const elements = Array.from(document.querySelectorAll("input, select"));
-  const forms = Array.from(document.forms);
+  // Same-origin frames (Apple's idmsa sign-in widget) are walked too; a cross-origin frame's document is
+  // unreadable and stays excluded. Each walked frame is stamped with the nonce so the fill can refuse if it
+  // left the origin in between.
+  // A same-origin frame is walked only while it RENDERS: a display:none, visibility:hidden, opacity:0 or
+  // under-10px frame is where an invisible credential sink would sit, so its inputs are never stamped.
+  const frameShown = (frame) => {
+    const v = frame.ownerDocument.defaultView;
+    for (let n = frame; n; n = n.parentElement) {
+      const st = v.getComputedStyle(n);
+      if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") return false;
+    }
+    const r = frame.getBoundingClientRect();
+    return r.width >= 10 && r.height >= 10;
+  };
+  const origin = window.location.origin;
+  const docs = [document];
+  for (let i = 0; i < docs.length; i++) {
+    for (const frame of Array.from(docs[i].querySelectorAll("iframe, frame"))) {
+      let child = null;
+      try { if (origin !== "null" && frame.contentWindow.location.origin === origin) child = frame.contentDocument; } catch (e) { child = null; }
+      if (!child || !frameShown(frame)) continue;
+      frame.setAttribute("data-hermes-vault-frame", nonce);
+      docs.push(child);
+    }
+  }
+  const elements = docs.flatMap((d) => Array.from(d.querySelectorAll("input, select")));
+  const forms = docs.flatMap((d) => Array.from(d.forms));
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
     if (element.disabled || element.readOnly) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
-    const style = getComputedStyle(element);
+    const style = element.ownerDocument.defaultView.getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
-      .map((id) => { const n = document.getElementById(id); return n ? (n.textContent || "") : ""; })
+      .map((id) => { const n = element.ownerDocument.getElementById(id); return n ? (n.textContent || "") : ""; })
       .join(" ");
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
     return [{
@@ -292,6 +317,8 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
     THIS inspection; a ``current-password`` fill additionally requires ``type=password``; ``<select>``
     controls (country, state, expiry month) match an option by value or visible text. No marker is
     left on filled controls so later model-driven DOM reads cannot address them deterministically.
+    Same-origin frames the inspection walked are searched too; each write also asserts the containing
+    frame's origin, and a walked frame that left ``expected_origin`` refuses the fill before any write.
     """
     payload = json.dumps(
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
@@ -307,27 +334,71 @@ _FILL_JS_TEMPLATE = """(() => {
   }
   const fills = __FILLS__;
   const nonce = __NONCE__;
+  // Re-walk the same-origin frames. A frame THIS inspection walked that is no longer on expectedOrigin
+  // (navigated away, now cross-origin) refuses the whole fill before any write.
+  // A same-origin frame is walked only while it RENDERS: a display:none, visibility:hidden, opacity:0 or
+  // under-10px frame is where an invisible credential sink would sit, so its inputs are never stamped.
+  // A walked frame that has since been hidden refuses the fill like one that navigated.
+  const frameShown = (frame) => {
+    const v = frame.ownerDocument.defaultView;
+    for (let n = frame; n; n = n.parentElement) {
+      const st = v.getComputedStyle(n);
+      if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") return false;
+    }
+    const r = frame.getBoundingClientRect();
+    return r.width >= 10 && r.height >= 10;
+  };
+  const docs = [document];
+  const touched = [document];
+  let frameMoved = null;
+  for (let i = 0; i < touched.length; i++) {
+    for (const frame of Array.from(touched[i].querySelectorAll("iframe, frame"))) {
+      let child = null;
+      let found = null;
+      try { found = frame.contentWindow.location.origin; if (found === expectedOrigin) child = frame.contentDocument; } catch (e) { found = "cross-origin frame"; }
+      if (child) touched.push(child);
+      const walked = frame.getAttribute("data-hermes-vault-frame") === nonce;
+      if (child && frameShown(frame)) { if (docs.includes(frame.ownerDocument)) docs.push(child); }
+      else if (walked) frameMoved = frameMoved || (child ? "frame:hidden" : "frame:" + (found || "unknown"));
+    }
+  }
+  const strip = () => touched.forEach((d) => {
+    d.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+    d.querySelectorAll("[data-hermes-vault-frame]").forEach((n) => n.removeAttribute("data-hermes-vault-frame"));
+  });
+  if (frameMoved) {
+    strip();
+    return JSON.stringify({ refused: "origin_changed", found: frameMoved });
+  }
   let filled = 0;
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
-    const el = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
+    let el = null;
+    for (const d of docs) { el = d.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]'); if (el) break; }
     if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+    const view = el.ownerDocument.defaultView;
+    if (!view) continue;
+    if (window.location.origin !== expectedOrigin || view.location.origin !== expectedOrigin) {
+      strip();
+      return JSON.stringify({ refused: "origin_changed", found: view.location.origin, filled });
+    }
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
         const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true })); filled += 1; }
+        if (opt) { el.value = opt.value; el.dispatchEvent(new view.Event("change", { bubbles: true })); filled += 1; }
         continue;
       }
       el.focus();
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+      // the frame's OWN prototype: a top-window HTMLInputElement setter is a different realm's
+      const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new view.InputEvent("input", { bubbles: true, inputType: "insertText" }));
+      el.dispatchEvent(new view.Event("change", { bubbles: true }));
       if (el.value.length > 0) filled += 1;
     } catch (e) { /* skip */ }
   }
-  document.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  strip();
   return JSON.stringify({ filled });
 })()"""

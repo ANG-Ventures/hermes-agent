@@ -16,7 +16,8 @@ policies:
   wall time (fall-back fold) fires once, on its first occurrence;
 * a missed recurring occurrence fires ONCE on the first tick after it (``catch_up_missed``
   default true), whether within grace (late) or beyond it (catch-up), then re-anchors on "now";
-* intervals re-anchor on the fire instant; a one-shot beyond ``ONESHOT_GRACE_SECONDS`` never
+* intervals re-anchor on the fire instant, armed half a tick (30 s) early so the slot is due on
+  the tick nearest ``fire + N`` (t_ed8ce7a2); a one-shot beyond ``ONESHOT_GRACE_SECONDS`` never
   fires; manual runs (direct or trigger) never consume or re-stamp the next scheduled occurrence.
 After every tick: the actual fires == expected fires, every stored ``next_run_at`` equals the
 model's pending occurrence and is strictly after virtual now, and the ticker reported no error.
@@ -135,13 +136,15 @@ class ModelJob:
     trigger: bool = False
     done: bool = False
 
-    def advance_from(self, t: float) -> None:
+    def advance_from(self, t: float, scheduled: bool = False) -> None:
         if self.times is not None and self.fired >= self.times:
             self.done, self.pending = True, None
         elif self.kind == "cron":
             self.pending = self.occ.first_after(t)
         elif self.kind == "interval":
-            self.pending = t + self.interval
+            # A tick fire (scheduled or trigger) re-arms half a tick early
+            # (cron.jobs._next_interval_slot); a direct run re-arms at finish + N.
+            self.pending = t + self.interval - (min(30.0, self.interval / 2) if scheduled else 0.0)
         else:
             self.done, self.pending = True, None
 
@@ -160,7 +163,7 @@ class Model:
                 job.trigger = False
                 job.fired += 1
                 self.fires.append((job.name, None, t))
-                job.advance_from(t)
+                job.advance_from(t, scheduled=True)
                 continue
             if job.pending is None or job.pending > t:
                 continue
@@ -169,7 +172,9 @@ class Model:
                 continue
             job.fired += 1
             self.fires.append((job.name, _iso(job.pending), t))
-            job.advance_from(t)
+            # A catch-up beyond grace (half the period, >= 120 s) is re-anchored by the due scan
+            # before the fire, so it carries no fire stamp and re-arms at finish + N.
+            job.advance_from(t, scheduled=t - job.pending <= max(120.0, job.interval // 2))
 
     def manual(self, name: str, t: float) -> None:
         job = self.jobs[name]

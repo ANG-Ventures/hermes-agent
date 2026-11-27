@@ -31,7 +31,8 @@ _OPENROUTER_DESCRIPTIONS = {
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     (mid, _OPENROUTER_DESCRIPTIONS.get(mid, "free" if mid.endswith(":free") else ""))
     for mid in (
-        "anthropic/claude-fable-5.1", "anthropic/claude-fable-5", "anthropic/claude-opus-5.5",
+        "anthropic/claude-fable-5.2", "anthropic/claude-fable-5.1", "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5.5",
         "anthropic/claude-opus-5.5-fast",  # fork #910: the dedicated fast SKU (OpenRouter-only)
         "anthropic/claude-opus-5", "anthropic/claude-opus-5-fast", "anthropic/claude-opus-4.8", "anthropic/claude-opus-4.8-fast",
         "anthropic/claude-sonnet-5.5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-5.5", "anthropic/claude-haiku-4.5",
@@ -170,7 +171,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Used by /model counts and provider_model_ids fallback when /v1/models is unavailable.
     "openai": list(_OPENAI_CHAT_MODELS),
     "openai-api": [
-        "gpt-6.1-sol", "gpt-6.1-sol-pro", "gpt-6.1-terra", "gpt-6.1-terra-pro", "gpt-6-sol", "gpt-6-sol-pro",
+        "gpt-6.1-sol", "gpt-6.1-sol-pro", "gpt-6.2-sol", "gpt-6.1-terra", "gpt-6.1-terra-pro", "gpt-6-sol", "gpt-6-sol-pro",
         "gpt-6-luna", "gpt-6-luna-pro", "gpt-5.6-sol", "gpt-5.6-sol-pro", "gpt-5.6-terra", "gpt-5.6-terra-pro", "gpt-5.6-luna",
         "gpt-5.6-luna-pro", "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
         "gpt-5-mini", "gpt-5.3-codex", "gpt-4.1", "gpt-4o", "gpt-4o-mini",
@@ -213,7 +214,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "minimax-oauth": ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
     "minimax-cn": list(_MINIMAX_MODELS),
     "anthropic": [
-        "claude-fable-5.1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5",
+        "claude-fable-5.2", "claude-fable-5.1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5",
         "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
         "claude-sonnet-4-6", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929",
         "claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-haiku-5-5", "claude-haiku-4-5-20251001",
@@ -279,6 +280,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "bedrock": [
         # [0] is the provider default (get_default_model_for_provider) — keep the cheaper Sonnet there.
         "us.anthropic.claude-sonnet-5", "us.anthropic.claude-opus-5-5", "us.anthropic.claude-sonnet-4-6",
+        # Fable 5.2: Anthropic's model page lists the Bedrock id as the global profile only
+        # (platform.claude.com/docs/en/models/fable-5-2/overview, checked 2026-11-11).
+        "global.anthropic.claude-fable-5-2",
         "us.anthropic.claude-opus-4-6-v1",
         "us.anthropic.claude-haiku-5-5", "us.anthropic.claude-haiku-4-5-20251001-v1:0", "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "openai.gpt-5.5", "openai.gpt-5.6-sol", "openai.gpt-5.6-terra", "openai.gpt-5.6-luna",
@@ -567,11 +571,12 @@ _LIVE_FIRST_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "openc
 # positives are harmless. Codex-series models are excluded — the Codex Responses API doesn't
 # expose service_tier.
 _OPENAI_FAST_MODE_PREFIXES: tuple[str, ...] = ("gpt-", "o1", "o3", "o4")
-# OpenAI Ultrafast (service_tier="ultrafast", 6x Standard): GPT-6 Astra and GPT-6.1 Sol
-# (developers.openai.com/api/docs/guides/ultrafast-mode, checked 2026-10-13; the Codex backend
-# /models advertises the ultrafast tier for gpt-6.1-sol too).
+# OpenAI Ultrafast (service_tier="ultrafast"): GPT-6 Astra, GPT-6.1 Sol, GPT-6.2 Sol, GPT-6.2 Astra
+# (developers.openai.com/api/docs/guides/ultrafast-mode, checked 2026-11-19; the Codex backend
+# /models advertises the ultrafast tier for gpt-6.1-sol too, and answered 200 to it for both 6.2
+# slugs on 2026-11-19). Same list as fast_mode_contracts.ULTRAFAST_CAPABILITY_CONTRACT.
 # Exact wire slugs, matched after stripping the vendor prefix and the Hermes-side ``-900k`` alias.
-_OPENAI_ULTRAFAST_MODELS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6.1-sol"})
+_OPENAI_ULTRAFAST_MODELS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra"})
 
 
 # Providers where models.dev is authoritative: the curated list is an offline fallback plus custom

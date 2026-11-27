@@ -299,7 +299,10 @@ def get_version_info() -> VersionInfo:
     if info is None:
         info = VersionInfo("unknown", "unknown", None, None, None, "unknown")
 
-    _cached_version_info = info
+    # A failed git read must not pin a missing SHA for the process lifetime.
+    # Once resolved, keep the boot identity cached even if the checkout moves.
+    if info.commit:
+        _cached_version_info = info
     return info
 
 

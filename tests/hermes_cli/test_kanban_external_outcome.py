@@ -36,7 +36,7 @@ def kanban_home(tmp_path, monkeypatch):
 def _blocked_task(conn, title="waiting on upstream #617") -> str:
     tid = kb.create_task(conn, title=title, assignee="coder")
     assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
-    assert kb.block_task(conn, tid, reason="EXTERNAL: upstream #617 still open")
+    assert kb.block_task(conn, tid, reason="EXTERNAL: upstream #617 still open", kind="needs_input")
     return tid
 
 

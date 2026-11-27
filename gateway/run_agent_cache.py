@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import threading
@@ -22,6 +23,53 @@ from gateway.session_prompt_pin import PROMPT_PIN_VERSION, sanitize_prompt_pin
 from gateway.run_shutdown import _log_suppressed
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli.local_runtime.endpoint import LLAMACPP_ALIASES
+
+
+def _default_pool_snapshot() -> str:
+    """``queued/threads/max`` of the loop's default executor (where ``asyncio.to_thread`` and
+    ``AsyncSessionDB`` calls run); ``-`` when unreadable. A /stop that waits on a saturated pool
+    shows a non-zero queue here."""
+    try:
+        import asyncio
+        ex = asyncio.get_running_loop()._default_executor  # noqa: SLF001 - diagnostic read only
+        if ex is None:
+            return "0/0/-"
+        return f"{ex._work_queue.qsize()}/{len(ex._threads)}/{ex._max_workers}"  # noqa: SLF001
+    except Exception:
+        return "-"
+
+
+class _StopStageClock:
+    """Per-stage wall clock for the /stop path, rendered as one ``PHASE=stop_stages`` line."""
+
+    def __init__(self, invoke_timing: Optional[dict] = None) -> None:
+        self._start = self._last = time.monotonic()
+        self._pool_at_start = _default_pool_snapshot()
+        self._stages: List[str] = []
+        self._notes: List[str] = []
+        # inv_lag: platform invoke (e.g. the Discord slash log line) -> this clock's start, i.e. the
+        # generation bump. inv_auth / inv_defer are the platform's own sub-stages inside it.
+        timing = invoke_timing if isinstance(invoke_timing, dict) else {}
+        at = timing.get("at")
+        self._invoke = (
+            f"inv_lag={self._start - at:.2f} " if isinstance(at, (int, float)) else "inv_lag=- ")
+        self._invoke += " ".join(
+            f"inv_{k}={float(timing[k]):.2f}" for k in ("auth", "defer")
+            if isinstance(timing.get(k), (int, float)))
+
+    def mark(self, name: str) -> None:
+        now = time.monotonic()
+        self._stages.append(f"{name}={now - self._last:.2f}")
+        self._last = now
+
+    def note(self, text: str) -> None:
+        if text:
+            self._notes.append(text)
+
+    def render(self) -> str:
+        return (f"total={time.monotonic() - self._start:.2f} {' '.join(self._stages)} "
+                f"{self._invoke.strip()} {' '.join(self._notes)} "
+                f"pool_start={self._pool_at_start} pool_end={_default_pool_snapshot()}")
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -294,8 +342,10 @@ class GatewayAgentCacheMixin:
         override names that model, or the Nous gateway moved the session off the ``nous/welcome``
         alias that *config_model* still carries (``anon_auth.apply_model_switch``)."""
         override = self._session_model_override(session_key)
-        if override is not None and override.get("model") == agent.model:
-            return True
+        if override is not None:
+            from hermes_cli.model_registry import slot_resolve  # /model sol stores the slot
+            if slot_resolve(override.get("model"))[0] == agent.model:
+                return True
         # Exactly the recorded move (alias -> backing): a later fallback onto some other model is
         # ordinary drift and still evicts.
         return getattr(agent, "_nous_model_switch", None) == (config_model, agent.model)
@@ -323,7 +373,7 @@ class GatewayAgentCacheMixin:
         if state is not None:
             if state.turn.lease is not None:
                 try:
-                    state.turn.lease.release()
+                    self._release_active_session_lease(state.turn.lease)
                 except Exception:
                     logger.debug("Failed to release active session slot", exc_info=True)
             # One structured reset instead of a drifting pop-list. Turn-lease tokens are deliberately NOT
@@ -522,6 +572,9 @@ class GatewayAgentCacheMixin:
         Settles a pending one-shot model override first: the displaced turn's finalizer is
         generation-guarded and would otherwise leave ``/moa`` / ``/model --once`` in force."""
         self._restore_pending_one_turn_model_override(session_key)
+        # A popped, unclaimed follow-up goes back to held before the bump makes its turn stale.
+        from gateway import queue_mgmt
+        queue_mgmt.reclaim_inflight(self, session_key)
         persistent = self._session_state(session_key).persistent
         # Every generation up to the one in flight is now "stopped and draining"; record it BEFORE
         # the bump so the turn-lease stale test (``_is_session_run_invalidated``) can tell this
@@ -627,16 +680,30 @@ class GatewayAgentCacheMixin:
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
         invalidation_reason: str, release_running_state: bool = True,
+        invoke_timing: Optional[dict] = None,
     ) -> None:
-        """Interrupt the current run and clear queued session state consistently."""
+        """Interrupt the current run and clear queued session state consistently.
+
+        ``invoke_timing``: the platform's invoke stamps (``{"at": monotonic, "auth": s,
+        "defer": s}``) for the ``inv_*`` fields of ``PHASE=stop_stages``."""
         if not session_key:
             return
+        _stop_clock = _StopStageClock(invoke_timing)
+        # Bind before interrupt/hook work can change the routing owner.
+        store = getattr(self, "session_store", None)
+        stopped_session_id = getattr(
+            getattr(store, "_entries", {}).get(session_key), "session_id", None)
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
+        _stop_clock.mark("bump")
         _reason = str(invalidation_reason or "")
+        if release_running_state and state is not None and state.turn.agent is not None:
+            # Synchronous, right after the bump: the slot stays held through the awaits below, and
+            # a command sent in that window waits for the release instead of being rejected.
+            state.turn.stopping = True
         if _reason.startswith("stop_command"):
             self._session_state(session_key).conversation.automatic_turns_paused = True
         if _reason.startswith("stop_command") or _reason == "queue_run":
@@ -652,14 +719,26 @@ class GatewayAgentCacheMixin:
                     queue_mgmt.hold_user_items(self, session_key, _hold_adapter)
             except Exception:
                 logger.warning("queue hold skipped on /stop for %s", session_key, exc_info=True)
+        _stop_clock.mark("hold")
         from gateway.run import _AGENT_PENDING_SENTINEL
-        # The turn's hard interrupt reaches only its in-turn children; background delegations were
-        # detached at dispatch and would otherwise run to completion and wake the session later.
-        # Each interrupted unit still returns as a completion (status=interrupted, partial output).
-        from tools.async_delegation import interrupt_for_session
-        interrupt_for_session(
-            session_key=session_key, reason=invalidation_reason,
-            parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
+        # The turn's hard interrupt reaches only its in-turn children. Background delegations were
+        # detached at dispatch and belong to the async registry: /stop (and /queue run) end the
+        # parent's TURN only, so those units keep running and deliver through the outbox (Ace
+        # 2026-11-08, t_8c4608e6; delegate_task action='stop' ends one). A session reset (/new)
+        # leaves them no return address, so it still cancels them.
+        # That cancel runs off the loop and fails open (#134): it takes a cross-process file lock (5 s
+        # timeout), and on 2026-11-08 15:38 a TimeoutError there escaped before the slot release.
+        if not (_reason.startswith("stop_command") or _reason == "queue_run"):
+            try:
+                from tools.async_delegation import interrupt_for_session
+                await asyncio.to_thread(
+                    interrupt_for_session,
+                    session_key=session_key, reason=invalidation_reason,
+                    parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
+            except Exception:
+                logger.warning("async delegation cancel skipped on %s for %s", invalidation_reason, session_key,
+                               exc_info=True)
+        _stop_clock.mark("deleg")
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             # Superseded-turn write gate (agent/session_persistence.py): the displaced turn's late
             # tool results must not land in the transcript the successor turn now owns.
@@ -683,13 +762,21 @@ class GatewayAgentCacheMixin:
                 )
             except Exception:
                 logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
+        _stop_clock.mark("hook")
         if str(invalidation_reason or "").startswith("stop_command"):
             # Durable /stop marker: the boot gate must never re-prompt a turn the user ended.
+            # The marker is on disk before /stop acks; its sub-stages go on the stage line
+            # (t_41843f70) so a slow write names its wait.
             try:
-                await self._mark_user_stopped(session_key)
+                _marker = self._mark_user_stopped_staged
+                _binding = {}
+                if stopped_session_id and _accepts_keyword(_marker, "expected_session_id"):
+                    _binding["expected_session_id"] = stopped_session_id
+                _stop_clock.note(await _marker(session_key, **_binding))
             except Exception:
                 logger.warning("Failed to persist user_stopped marker for stopped session %s",
                                session_key, exc_info=True)
+        _stop_clock.mark("marker")
         try:
             from tools.clarify_gateway import clear_session as _clear_clarify
             _cancelled = _clear_clarify(session_key)
@@ -706,6 +793,7 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
+        _stop_clock.mark("adapter")
         if (adapter and _reason.startswith("stop_command")
                 and self._session_state(session_key).persistent.run_generation == _generation_at_interrupt):
             # Catch arrivals during the interrupt awaits; no runnable wake survives /stop.
@@ -738,6 +826,7 @@ class GatewayAgentCacheMixin:
                 try:
                     from gateway import queue_mgmt as _qm
                     _qm.note_reset_drop(self, session_key, 1)
+                    _qm.log_items(self, "reset_drop", session_key, [parked])
                 except Exception:
                     logger.warning("reset-drop count skipped for %s", session_key, exc_info=True)
             wake = parked if getattr(parked, "internal", False) else None
@@ -770,6 +859,8 @@ class GatewayAgentCacheMixin:
             # Guarded release: a message that arrived during the awaits above may already run as
             # the successor generation — the displaced /stop tail must not wipe its slot.
             self._drop_turn_slot(session_key, run_generation=_generation_at_interrupt)
+        _stop_clock.mark("release")
+        logger.info("PHASE=stop_stages key=%s reason=%s %s", session_key, _reason, _stop_clock.render())
 
     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:
         """Re-baseline a cached agent's stored message_count after THIS turn — the coherence guard

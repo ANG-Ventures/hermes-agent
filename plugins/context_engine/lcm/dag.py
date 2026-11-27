@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from .sqlite_util import guard_connection
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
@@ -186,7 +187,7 @@ class SummaryDAG:
         return self._conn
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = guard_connection(sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.executescript("""

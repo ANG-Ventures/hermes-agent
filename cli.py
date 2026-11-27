@@ -1514,33 +1514,6 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             _cprint(f"  Failed to prepare the boomerang turn: {_boom_exc}")
         return True
 
-    def _handle_fork_fan_command(self, cmd_original: str) -> bool:
-        """/fork-fan [--kind K] [--board B] [--model M --provider P] <items>: queue a fork-fan skill
-        invocation as the next agent turn (the skill plans, dispatches chunks, folds)."""
-        from hermes_cli.fork_fan_command import USAGE, build_fork_fan_seed, parse_fork_fan_args
-        parts = cmd_original.split(None, 1)
-        try:
-            opts, items = parse_fork_fan_args(parts[1] if len(parts) > 1 else "")
-        except ValueError as _ff_arg_exc:
-            for _line in str(_ff_arg_exc).splitlines():
-                _cprint(f"  {_line}")
-            return True
-        if not items and not opts.get("where"):
-            for _line in USAGE.splitlines():
-                _cprint(f"  {_line}")
-            return True
-        try:
-            from agent.skill_commands import resolve_skill_command_key
-            cmd_key = resolve_skill_command_key("fork-fan")
-            self._pending_agent_seed = build_fork_fan_seed(
-                opts, items,
-                lambda instr: build_skill_invocation_message(cmd_key, instr) if cmd_key else None,
-            )
-            _cprint("  🔀 Fork-fan queued — the next turn plans the set and dispatches one chunk.")
-        except Exception as _ff_exc:
-            _cprint(f"  Failed to prepare the fork-fan turn: {_ff_exc}")
-        return True
-
     @staticmethod
     def _cache_ratio_unknown(snapshot: dict) -> bool:
         """True when a cache RATIO over this snapshot would be fabricated.

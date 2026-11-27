@@ -59,6 +59,8 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 0.0,
                                                     "psi_io_some10": 0.0})
     monkeypatch.setattr(klg, "sample_user_procs", lambda: (None, None))
+    monkeypatch.setattr(klg.os, "cpu_count", lambda: 32)
+    monkeypatch.setattr(ad, "read_slice_memory", lambda **kw: None)
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
     return home
 
@@ -230,3 +232,18 @@ def test_utilization_cli_counts_and_leases_across_boards(board, monkeypatch):
                                    {"spawn_limit": None}, lambda m: None, 1.0)
     assert seen["running"] == 3                           # 2 + 2 running, 1 of them on ace-ai
     assert len(booked) == 3                               # default's 2 local starts + other's 1 local start
+
+
+def test_saturated_cli_dispatch_still_places_portable_cards_remote(board, monkeypatch, capsys):
+    """Apollo scope add 2 (t_e604c0f9): a saturated Studio gate caps LOCAL spawns only. The one-shot CLI hands
+    dispatch_once spawn_paused + spawn_limit 0 (= local budget 0); the saturated gate's band is ``spilling``, so
+    plan_pool builds the pool plan and portable cards are placed remote in the same call."""
+    from gateway import kanban_gate_tick as kgt
+    from tests.hermes_cli.test_kanban_worker_pool import _plan
+    monkeypatch.setattr(kgt.GateTickBuilder, "build_pool_plan", lambda self, boards, rbh, cfg=None: _plan(free=3))
+    _load(monkeypatch, 1.0, cpu_busy=0.99)
+    _run(max=5)
+    out = capsys.readouterr().out
+    assert "utilization SATURATED" in out
+    assert _running() == 3, out  # the pool's 3 free slots, none local
+    assert "LOCAL" in out and "remote placement continues" in out

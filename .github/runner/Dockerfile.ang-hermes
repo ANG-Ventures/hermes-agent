@@ -28,11 +28,11 @@ RUN apt-get update -qq \
       ripgrep \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copy .github/scripts/install-ci-tool.sh from the reviewed repository into
+# Copy both CI installer scripts from the reviewed repository into
 # the build context. Jobs and images share the architecture/checksum map.
-COPY install-ci-tool.sh /tmp/install-ci-tool.sh
+COPY install-ci-tool.sh download-ci-asset.sh /tmp/
 RUN bash /tmp/install-ci-tool.sh gitleaks /usr/local/bin \
  && bash /tmp/install-ci-tool.sh hadolint /usr/local/bin \
- && rm /tmp/install-ci-tool.sh
+ && rm /tmp/install-ci-tool.sh /tmp/download-ci-asset.sh
 
 RUN rg --version && node --version

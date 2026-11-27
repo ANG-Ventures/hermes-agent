@@ -329,6 +329,55 @@ def _is_install_path(p: str) -> bool:
     return p.startswith(_INSTALL_PATHS) or p in _INSTALL_FILES or p.endswith(".ps1")
 
 
+# e2e-upgrade on a pull request: main-only unless the diff touches the upgrade path
+# itself (owner ruling 2026-11-12, t_4897b522). Every push to main still runs all 32
+# shards (empty diff -> every lane on), so a PR skip moves the catch to main; it does
+# not delete it. The PR runs the lane when the diff touches:
+#   * the upgrade/install code it exercises (_E2E_LANES["e2e_upgrade"] minus the shared
+#     pytest harness, plus _INSTALL_PATHS / _INSTALL_FILES / any .ps1);
+#   * the suite and what it imports: tests/e2e/core/upgrade, windows_update, tests/compat,
+#     tests/e2e/conftest.py, tests/e2e/core/_*, environ_snapshot, the fake LLM provider;
+#   * the runner the shard executes (scripts/run_tests.sh, run_tests_parallel.py);
+#   * the CI that selects and runs it (below).
+# It no longer runs for a shared-harness edit the PR's own unit slices already load
+# (tests/conftest.py, tests/_fixtures/, the rest of tests/fakes/) or for an unrelated
+# .github/ change. An empty diff and the run-e2e label still run it. Kill switch:
+# vars.CI_PR_E2E_UPGRADE=on runs the lane on every pull request (ci.yaml gate-lanes);
+# =off never runs it on a pull request; unset = this path rule.
+_E2E_UPGRADE_PR_SUITE = (
+    "tests/e2e/conftest.py",
+    "tests/e2e/core/_",
+    "tests/e2e/environ_snapshot",
+    "tests/fakes/fake_llm_provider",
+    "scripts/run_tests.sh",
+    "scripts/run_tests_parallel.py",
+)
+_E2E_UPGRADE_PR_CI = (
+    ".github/workflows/ci.yaml",
+    ".github/workflows/ci-local.yaml",
+    ".github/workflows/tests.yml",
+    ".github/workflows/tests-os.yml",
+    ".github/workflows/windows-install-update-e2e.yml",
+    ".github/actions/detect-changes/",
+    ".github/actions/retry/",
+    ".github/actions/setup-pm/",
+    ".github/scripts/install-ci-tool.sh",
+    ".github/scripts/download-ci-asset.sh",
+    "scripts/ci/classify_changes.py",
+)
+
+
+def _is_e2e_upgrade_pr_path(p: str) -> bool:
+    """Does ``p`` touch the upgrade path itself (see _E2E_UPGRADE_PR_SUITE)?"""
+    own = tuple(x for x in _E2E_LANES["e2e_upgrade"] if x not in _PY_TEST_HARNESS)
+    return (
+        p.startswith(own)
+        or _is_install_path(p)
+        or p.startswith(_E2E_UPGRADE_PR_SUITE)
+        or p.startswith(_E2E_UPGRADE_PR_CI)
+    )
+
+
 # The macOS + Windows unit lanes (tests-os.yml os-tests, t_04d4944a). On a pull
 # request they cost 21.4 of 81.2 job-minutes per run (26%, 30 runs 10-06..10-08)
 # and ran on 29 of 30 PRs. The merge_group run (the only required gate) and
@@ -536,6 +585,8 @@ def classify(files: list[str], run_e2e: bool = False, root: Path | None = None) 
         ret.update(dict.fromkeys(_slow_lanes([]), True))
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
+    if files:
+        ret["e2e_upgrade"] = run_e2e or any(_is_e2e_upgrade_pr_path(f) for f in files)
     return ret
 
 

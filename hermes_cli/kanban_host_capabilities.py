@@ -58,11 +58,21 @@ DEFAULT_MODE = WARN
 # from every SKILL.md and compares it against ``source_hash``.
 INDEX_GENERATOR = "fleet-host capabilities --sync"
 DEFAULT_ENFORCE = ("browser-session", "screen")
+# t_f935cb6f: ``browser-session`` split into ``browser-identity`` (a signed-in identity, by lease),
+# ``browser-public`` (the agent's own Chromium) and ``lan-reach``. The old word stays an alias of
+# ``browser-identity`` for one release (``capabilities.browser-session.alias_of`` in the map). Both
+# names of the identity capability: what ``browser_remote`` grants or vetoes on a pool host.
+BROWSER_IDENTITY_CAPS = frozenset({"browser-identity", "browser-session"})
 # kanban.placement.body_requires_mode (t_640a4ea0): ``advisory`` (default) = a
 # body-sniffed pin that no host may serve never holds the card; ``enforce`` =
 # the pre-t_640a4ea0 hold. An explicit ``requires:`` line is always enforced.
 ADVISORY = "advisory"
 BODY_MODES = (ADVISORY, ENFORCE)
+# kanban.placement.prose_pins_advisory (t_c82eded0, root config, read per tick, default on): a capability
+# inferred from card PROSE (a body sniff, a skill named in the body) that no pool host serves no longer
+# holds an unpinned card on the Studio; it is recorded as an advisory and the card starts on a pool host.
+# Only a declared ``requires:`` line, an attached skill or a structural fact holds it. false = the old hold.
+PROSE_KNOB = "prose_pins_advisory"
 BODY_IGNORED = "requires_body_ignored"
 BODY_IGNORED_EVENT = "placement_body_ignored"
 # ONE comment + ONE #logs line per card held at host=none past one tick.
@@ -73,7 +83,11 @@ NONE_WORD = "none"   # reserved: ``requires: none`` overrides every SOFT require
 HARD, SOFT = "hard", "soft"
 # matched_by values, in the order a pin is attributed (declared beats skill).
 DECLARED, SKILL, NAMED_SKILL, BODY = "declared", "skill", "named_skill", "body"
-_SOURCE_RANK = {DECLARED: 0, SKILL: 1, NAMED_SKILL: 2, BODY: 3}
+# ``ssh <alias> ... sudo`` on an alias a capability serves (t_79c2259b): a structural access fact, not
+# prose, so no body/prose advisory path may drop it while access_bound releases the alias (Prism 86b7cb2c2b27).
+ACCESS = "access"
+_SOURCE_RANK = {DECLARED: 0, ACCESS: 1, SKILL: 2, NAMED_SKILL: 3, BODY: 4}
+PROSE_SOURCES = frozenset({NAMED_SKILL, BODY})   # inferred from card text, never declared (t_c82eded0)
 
 RULE_PREFIX = "requires:"
 UNKNOWN_PREFIX = "unknown:"
@@ -131,10 +145,29 @@ class CapabilityMap:
     # only (``hosts.studio.studio_tier: {cap: "identity-only"}``, §3.4): an
     # unpinned card needing one waits for an advertising pool host.
     identity_only: frozenset = frozenset()
+    # Read-only per-host transport observations. Missing/malformed legs fail closed;
+    # advertising a browser daemon is not proof that an identity lease is reachable.
+    browser_remote: Mapping[str, Mapping[str, bool]] = field(default_factory=dict)
+    # ``ssh-root:<alias>`` access a capability serves (``capabilities.<cap>.ssh_root: [alias, ...]``,
+    # t_79c2259b): alias (lower) -> capability. An access-bound card on a mapped alias is judged as a
+    # HARD requirement of that capability, not pinned to the Studio.
+    ssh_root: Mapping[str, str] = field(default_factory=dict)
+    # ``capabilities.<old>.alias_of: <new>`` (t_f935cb6f): a renamed capability's old word, read as
+    # the new one in every declaration and index row. A host row naming either serves both.
+    aliases: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
         return self.error is None
+
+    def canonical(self, cap: str) -> str:
+        """The capability ``cap`` names: its ``alias_of`` target, else itself."""
+        return self.aliases.get(cap, cap)
+
+    def names(self, cap: str) -> frozenset:
+        """Every word for the capability ``cap`` names (the target and its aliases)."""
+        target = self.canonical(cap)
+        return frozenset({cap, target, *(a for a, t in self.aliases.items() if t == target)})
 
 
 @dataclass(frozen=True)
@@ -177,6 +210,7 @@ class CapabilityTick:
     enforce: Tuple[str, ...]
     pool_hosts: Tuple[str, ...]
     body_mode: str = ADVISORY
+    prose_advisory: bool = False
 
     def mode_of(self, cap: str) -> str:
         if self.mode == OFF:
@@ -185,9 +219,10 @@ class CapabilityTick:
             return WARN   # F11: a malformed map degrades every capability to warn
         if cap.startswith(UNKNOWN_PREFIX):
             return ENFORCE  # F4: an unknown word keeps the card local
-        if cap in self.cmap.soft:
-            return WARN if self.cmap.soft[cap] else ENFORCE   # the map's kill switch, per class
-        return ENFORCE if cap in self.enforce else WARN
+        soft = group_soft(self.cmap, cap)   # an alias and its target share one mode (t_f935cb6f)
+        if soft is not None:
+            return WARN if soft else ENFORCE   # the map's kill switch, per class
+        return ENFORCE if self.cmap.names(cap) & set(self.enforce) else WARN
 
     @property
     def error(self) -> Optional[str]:
@@ -236,6 +271,16 @@ def read_body_mode(kanban_cfg: Any) -> str:
     return mode if mode in BODY_MODES else ADVISORY
 
 
+def read_prose_advisory(kanban_cfg: Any) -> bool:
+    """``kanban.placement.prose_pins_advisory`` from the ROOT config (default on). False / "off" / "false" /
+    "no" / 0 is the kill switch; anything else (a typo included) reads as on, the documented default."""
+    pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, Mapping) else None
+    raw = pl.get(PROSE_KNOB, True) if isinstance(pl, Mapping) else True
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("off", "false", "no", "0")
+    return raw is not False and raw != 0
+
+
 def env_value(mode: str, enforce: Iterable[str]) -> str:
     """``KANBAN_PLACEMENT_CAPS``: the mode of every capability, ``*`` = the
     rest. Workers' rail gates (#1876) honour it instead of reading config."""
@@ -265,6 +310,9 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
             raise ValueError(f"capabilities.{cap} must be an object")
         if "soft" in row and not isinstance(row["soft"], bool):
             raise ValueError(f"capabilities.{cap}.soft must be true or false")
+        roots = row.get("ssh_root", [])
+        if not isinstance(roots, list) or not all(isinstance(a, str) and a for a in roots):
+            raise ValueError(f"capabilities.{cap}.ssh_root must be a list of ssh aliases")
         terms = row.get("sniff", [])
         if not isinstance(terms, list) or not all(isinstance(t, str) and t for t in terms):
             raise ValueError(f"capabilities.{cap}.sniff must be a list of regexes")
@@ -275,6 +323,7 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
                 raise ValueError(f"capabilities.{cap}.sniff {t!r}: {exc}") from None
         names.append(cap)
     known = set(names)
+    aliases = parse_aliases(caps)
     out: Dict[str, frozenset] = {}
     for hid, row in hosts.items():
         if not isinstance(hid, str) or not isinstance(row, dict) or not isinstance(row.get("capabilities"), list):
@@ -282,12 +331,39 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
         bad = [c for c in row["capabilities"] if c not in known]
         if bad:
             raise ValueError(f"hosts.{hid} names unknown capabilities {bad}")
-        out[hid.lower()] = frozenset(row["capabilities"])
+        have = set(row["capabilities"])
+        for alias, target in aliases.items():   # either word serves both (t_f935cb6f)
+            if alias in have or target in have:
+                have |= {alias, target}
+        out[hid.lower()] = frozenset(have)
     soft = {c: r["soft"] for c, r in caps.items() if "soft" in r}
     tier = (hosts.get(STUDIO_ROW) or {}).get("studio_tier", {})
     if not isinstance(tier, dict) or any(c not in known or v != IDENTITY_ONLY for c, v in tier.items()):
         raise ValueError(f"hosts.{STUDIO_ROW}.studio_tier must map known capabilities to {IDENTITY_ONLY!r}")
     return tuple(names), tuple(sniff), out, soft, frozenset(tier)
+
+
+def group_soft(cmap: "CapabilityMap", cap: str) -> Optional[bool]:
+    """The map's ``soft`` for ``cap``'s alias group (target and aliases share one mode, t_f935cb6f), the
+    first set one in name order; None when no name of the group sets it."""
+    for n in sorted(cmap.names(cap)):
+        if n in cmap.soft:
+            return cmap.soft[n]
+    return None
+
+
+def parse_aliases(caps: Mapping[str, Any]) -> Dict[str, str]:
+    """``{alias: target}`` from ``capabilities.<alias>.alias_of`` (t_f935cb6f). The target must be
+    a capability of the map that is not itself an alias; anything else is a malformed map."""
+    out: Dict[str, str] = {}
+    for cap, row in caps.items():
+        if isinstance(row, dict) and "alias_of" in row:
+            target = row["alias_of"]
+            if not isinstance(target, str) or target == cap or not isinstance(caps.get(target), dict) \
+                    or "alias_of" in caps[target]:
+                raise ValueError(f"capabilities.{cap}.alias_of must name another, non-alias capability")
+            out[cap] = target
+    return out
 
 
 def index_hash(skills: Mapping[str, Iterable[str]]) -> str:
@@ -377,6 +453,14 @@ def map_from_bytes(map_bytes: Optional[bytes], index_bytes: Optional[bytes], *,
     return CapabilityMap(capabilities=names, sniff=sniff, hosts=hosts, index=index,
                          error=error, index_error=index_error, soft=soft,
                          identity_only=identity_only,
+                         browser_remote={h.lower(): (row["browser_remote"]
+                                                     if isinstance(row["browser_remote"], dict) else {})
+                                         for h, row in (doc["hosts"].items() if error is None else ())
+                                         if "browser_remote" in row},
+                         ssh_root={a.lower(): cap for cap, row in (doc["capabilities"].items()
+                                                                   if error is None else ())
+                                   for a in row.get("ssh_root", ())},
+                         aliases=parse_aliases(doc["capabilities"]) if error is None else {},
                          index_unverified=unverified if index_error is None else None)
 
 
@@ -418,7 +502,8 @@ def tick(fleet_dir: Path, kanban_cfg: Any, pool_hosts: Iterable[str]) -> Optiona
         _note_demoted(cmap, _time.monotonic())
     return CapabilityTick(cmap=cmap, mode=eff, enforce=enforce,
                           pool_hosts=tuple(h.lower() for h in pool_hosts or ()),
-                          body_mode=read_body_mode(kanban_cfg))
+                          body_mode=read_body_mode(kanban_cfg),
+                          prose_advisory=read_prose_advisory(kanban_cfg))
 
 
 # -- derivation (s2.2) ------------------------------------------------------
@@ -461,6 +546,33 @@ def _named_skill_re(name: str):
                       rf"|(?<![\w-]){n}`?[ \t]+skill\b", re.IGNORECASE)
 
 
+def ssh_root_hits(body: Optional[str], cmap: CapabilityMap) -> List[Tuple[str, str]]:
+    """``[(alias, capability)]`` for every ``ssh <alias> ... sudo`` body line whose alias the
+    map's ``ssh_root`` lists, with the access-bound deriver's own parse (t_79c2259b)."""
+    if not cmap.ssh_root:
+        return []
+    from hermes_cli import kanban_worker_pool as _kwp
+    found: List[str] = []
+    while True:
+        hit = _kwp.access_bound_cap(body, cmap.ssh_root.keys(), served=found)
+        prefix = _kwp._reasons.ACCESS_SSH_ROOT + ":"
+        if not hit or not hit.startswith(prefix):
+            break
+        found.append(hit[len(prefix):])
+    return [(a, cmap.ssh_root[a]) for a in found]
+
+
+def served_ssh_root(ctx: Optional[CapabilityTick]) -> frozenset:
+    """Aliases whose ssh-root access a pool capability carries this tick, so :func:`access_bound_cap`
+    stops treating it as Studio-only: the capability is ENFORCED (a real hold, placed only on the hosts
+    that advertise it), or every pool host advertises it (nowhere to land without it). Layer off, a
+    malformed map, or a warn-mode capability some pool host lacks: empty (today's Studio-only rule)."""
+    if ctx is None or not ctx.cmap.valid or ctx.mode == OFF:
+        return frozenset()
+    return frozenset(a for a, cap in ctx.cmap.ssh_root.items()
+                     if ctx.mode_of(cap) == ENFORCE or _satisfied(cap, ctx, None))
+
+
 def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
            ) -> Tuple[List[Requirement], bool]:
     """``(requirements, none_declared)`` for one card, every source.
@@ -475,7 +587,8 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
         known = {c for caps in cmap.index.values() for c in caps}
 
     def cap_of(word: str) -> str:
-        return word if word in known else UNKNOWN_PREFIX + word
+        # An alias reads as its target (t_f935cb6f): `requires: browser-session` is browser-identity.
+        return cmap.canonical(word) if word in known else UNKNOWN_PREFIX + word
 
     reqs: List[Requirement] = []
     words = declared_words(body)
@@ -501,6 +614,10 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
             if _named_skill_re(name).search(text):
                 for c in caps:
                     reqs.append(Requirement(cap_of(c), SOFT, NAMED_SKILL, name))
+    for alias, cap in ssh_root_hits(body, cmap):
+        # ``ssh <alias> ... sudo`` on an alias a capability serves (t_79c2259b): HARD, like a
+        # declared word, because the work cannot run without that access.
+        reqs.append(Requirement(cap_of(cap), HARD, ACCESS, f"ssh-root:{alias}"))
     seen = set()
     for cap, rx in cmap.sniff:
         if cap in seen:
@@ -510,6 +627,38 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
             seen.add(cap)
             reqs.append(Requirement(cap, SOFT, BODY, m.group(0).strip()))
     return reqs, none
+
+
+def browser_remote_refusal(record: Any) -> Optional[str]:
+    """P3 contract: HTTPS data plane AND SSH control plane, strict booleans.
+
+    The reachability producer owns probing; placement never opens network
+    connections per card. An absent observation is not an admission grant.
+    """
+    record = record if isinstance(record, Mapping) else {}
+    for leg in ("front_door", "ssh"):
+        if record.get(leg) is not True:
+            return "BROWSER_REMOTE_UNREACHABLE:" + leg
+    return None
+
+
+def _host_caps(ctx: CapabilityTick, host: str) -> frozenset:
+    return mapped_caps(ctx.cmap, host)
+
+
+def mapped_caps(cmap: CapabilityMap, host: str) -> frozenset:
+    """``host``'s capabilities under ``cmap``, with the ``browser_remote`` grant/veto applied: the one
+    reading placement, worker boot, the attached-skill check (Layer 0b) and the mid-run gates share
+    (t_ce9bd5a3, t_6e8eac1c). No gate reads the static host rows directly."""
+    caps = cmap.hosts.get(host, frozenset())
+    record = cmap.browser_remote.get(host)
+    if cmap.browser_remote:
+        # Once remote probing is enabled, an unobserved host is not a grant.
+        # Failed legs also veto stale/static browser advertisements.
+        if browser_remote_refusal(record) is None:
+            return caps | BROWSER_IDENTITY_CAPS
+        return caps - BROWSER_IDENTITY_CAPS
+    return caps
 
 
 def _satisfied(cap: str, ctx: CapabilityTick, pin_host: Optional[str]) -> bool:
@@ -522,7 +671,13 @@ def _satisfied(cap: str, ctx: CapabilityTick, pin_host: Optional[str]) -> bool:
     hosts = (pin_host.lower(),) if pin_host else ctx.pool_hosts
     if not hosts:
         return False
-    return all(cap in ctx.cmap.hosts.get(h, frozenset()) for h in hosts)
+    return all(cap in _host_caps(ctx, h) for h in hosts)
+
+
+def _hard_class(ctx: CapabilityTick, cap: str) -> bool:
+    """A capability prose may still pin under ``prose_pins_advisory`` (t_c82eded0): the map marks it
+    ``soft: false`` (docker, fleet-ssh, studio-state) or the Studio serves it identity-only."""
+    return ctx.cmap.soft.get(cap) is False or cap in ctx.cmap.identity_only
 
 
 def _first(reqs: List[Requirement]) -> Optional[Requirement]:
@@ -546,7 +701,8 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
     # when the whole pool advertises it (spec v0.3 §3.4).
     live = [r for r in reqs if ctx.mode_of(r.cap) != OFF and (
         not _satisfied(r.cap, ctx, pin_host)
-        or (pin_host is None and r.cap in ctx.cmap.identity_only))]
+        or (pin_host is None and (r.cap in ctx.cmap.identity_only
+                                 or (r.cap in BROWSER_IDENTITY_CAPS and ctx.cmap.browser_remote))))]
     enforced = [r for r in live if ctx.mode_of(r.cap) == ENFORCE]
     ignored: Tuple[Requirement, ...] = ()
     if ctx.body_mode == ADVISORY and pin_host is None:
@@ -554,8 +710,19 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
         # no pool host advertises it) would hold the card at host=none forever
         # (t_640a4ea0: "docker run" held 3 cards 9.5 h). It is advice, not a pin.
         ignored = tuple(r for r in enforced if r.matched_by == BODY and r.cap in ctx.cmap.identity_only
-                        and not any(r.cap in ctx.cmap.hosts.get(h, frozenset()) for h in ctx.pool_hosts))
+                        and not any(r.cap in _host_caps(ctx, h) for h in ctx.pool_hosts))
         enforced = [r for r in enforced if r not in ignored]
+    if ctx.prose_advisory and pin_host is None:
+        # t_c82eded0: a capability inferred from PROSE (body sniff, a skill named in the body) that no pool
+        # host serves would hold the card on the Studio. It is advice: recorded, the card starts on a pool
+        # host. One a pool host does serve still narrows the take to those hosts (``only`` below).
+        # A HARD class (the map's ``soft: false``: docker, fleet-ssh, studio-state) or an identity-only
+        # capability is never dropped here: those keep their hold or wait (Apollo review of #255, F1).
+        prose = tuple(r for r in enforced if r.matched_by in PROSE_SOURCES
+                      and not _hard_class(ctx, r.cap)
+                      and not any(r.cap in _host_caps(ctx, h) for h in ctx.pool_hosts))
+        ignored += prose
+        enforced = [r for r in enforced if r not in prose]
     warned = [r for r in live if ctx.mode_of(r.cap) == WARN]
     hard = _first([r for r in enforced if r.strength == HARD])
     soft = _first([r for r in enforced if r.strength == SOFT])
@@ -565,7 +732,7 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
     binding = [r for r in enforced if r.strength == HARD] if any_pin else enforced
     if binding and pin_host is None and not any(r.unknown for r in binding):
         needed = {r.cap for r in binding}
-        servers = tuple(h for h in ctx.pool_hosts if needed <= ctx.cmap.hosts.get(h, frozenset()))
+        servers = tuple(h for h in ctx.pool_hosts if needed <= _host_caps(ctx, h))
         if servers:
             # Some pool host advertises everything the card needs: portable,
             # placed on those hosts only (t_90887924, AC-5 "host X").
@@ -584,6 +751,9 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
         enforced=tuple(enforced),
         observed=_first(warned),
         body_ignored=ignored,
+        wait=(browser_remote_refusal(ctx.cmap.browser_remote.get(pin_host.lower()))
+              if pin_host and ctx.cmap.browser_remote
+              and any(r.cap in BROWSER_IDENTITY_CAPS for r in binding) else None),
     )
 
 
@@ -608,6 +778,8 @@ def _source_text(req: Requirement) -> str:
         return f"skill {req.term} named in the body"
     if req.matched_by == DECLARED:
         return f"requires: {req.term}"
+    if req.matched_by == ACCESS:
+        return f"body {req.term} (ssh ... sudo)"
     return f'body "{req.term}"'
 
 
@@ -629,6 +801,8 @@ def pin_comment(req: Requirement, known: Iterable[str], *, host: str = STUDIO_HO
         undo = "To let it spill, add a line `host: any` or `requires: none`."
     elif req.matched_by == DECLARED:
         undo = "To let it spill, remove the `requires:` line."
+    elif req.matched_by == ACCESS:
+        undo = f"To let it spill, advertise {req.cap} on a pool host or remove the ssh ... sudo line."
     else:
         undo = f"To let it spill, remove the skill {req.term} from the card."
     return (f"{head}. This card needs a capability no pool host has, so it runs on the "
@@ -657,9 +831,12 @@ def spawn_env(fleet_dir: Path, kanban_cfg: Any) -> str:
     mode = effective_mode(mode, cmap)
     if mode == ENFORCE and cmap.soft:
         # The map's per-class hardness wins, exactly as CapabilityTick.mode_of
-        # decides placement (Prism b8ddb038892b on #1902).
+        # decides placement (Prism b8ddb038892b on #1902), judged per alias group (Prism 5f58fcfad85b).
         enforce = tuple(c for c in dict.fromkeys([*enforce, *(k for k, v in cmap.soft.items() if not v)])
-                        if not cmap.soft.get(c, False))
+                        if not group_soft(cmap, c))
+    if mode == ENFORCE and cmap.aliases:
+        # The worker's gates ask by either word (t_f935cb6f): every name of an enforced capability is enforced.
+        enforce = tuple(dict.fromkeys(n for c in enforce for n in (c, *sorted(cmap.names(c) - {c}))))
     return env_value(mode, enforce)
 
 
@@ -795,6 +972,54 @@ def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_
                         tid, req.cap, exc_info=True)
 
 
+# -- prose-only Studio signals: advisory, with the hand-back named (t_c82eded0) --
+
+PROSE_ADVISORY_PREFIX = "placement advisory:"
+
+
+def prose_advisory_comment(advisories: Iterable[Mapping[str, Any]]) -> str:
+    """The ONE card comment for prose-only Studio signals: what matched, and what a worker on a pool host does
+    when the work really needs the Studio."""
+    seen = []
+    for a in advisories:
+        what = a.get("need") or a.get("capability") or "?"
+        src = "skill named in the body" if a.get("source") == NAMED_SKILL else "body"
+        item = f'{what} ({src}: "{str(a.get("evidence") or "")[:80]}")'
+        if item not in seen:
+            seen.append(item)
+    return (f"{PROSE_ADVISORY_PREFIX} the card text suggests the Mac Studio ({'; '.join(seen)}), but prose no "
+            f"longer pins a card, so it may start on a pool host. If the work truly needs something only the "
+            f"Studio has, stop at once with kanban_block(kind=\"capability\", reason=\"needs <what> only the Studio "
+            f"has; re-run on the Studio\"): the dispatcher re-routes it there once with host: studio and a "
+            f"requires: line. Authors: a line `requires: <capability>` pins on purpose.")
+
+
+def record_prose_advisories(conn, advisories: Mapping[str, Any]) -> List[str]:
+    """Post :func:`prose_advisory_comment` once per card (any earlier advisory comment is the latch).
+    Best-effort: never breaks a tick. Returns the card ids commented this call."""
+    import logging
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as _kbc
+    posted: List[str] = []
+    for tid, adv in (advisories or {}).items():
+        if not adv:
+            continue
+        try:
+            exists = ("SELECT 1 FROM task_comments WHERE task_id = ? AND substr(body, 1, ?) = ? LIMIT 1",
+                      (tid, len(PROSE_ADVISORY_PREFIX), PROSE_ADVISORY_PREFIX))
+            if conn.execute(*exists).fetchone():
+                continue
+            with _kbc.write_txn(conn):
+                if conn.execute(*exists).fetchone():
+                    continue
+                _kb.add_comment(conn, tid, "dispatcher", prose_advisory_comment(adv))
+            posted.append(tid)
+        except Exception:
+            logging.getLogger(__name__).warning("kanban dispatch: could not post the prose advisory on %s", tid,
+                                                exc_info=True)
+    return posted
+
+
 # -- body-sniffed pins: advisory, and a held enforce pin is never silent (t_640a4ea0) --
 
 def body_ignored_payload(req: Requirement) -> Dict[str, Any]:
@@ -828,6 +1053,8 @@ def held_comment(affinity: Mapping[str, Any], line: Optional[str]) -> str:
         undo = "or replace that line with `requires: none`"
     elif req.matched_by == SKILL:
         undo = f"or remove the skill {req.term} from the card"
+    elif req.matched_by == ACCESS:
+        undo = "or remove the ssh ... sudo line"
     else:
         undo = "or add a line `requires: none`"
     return (f"{HELD_PREFIX} {cap} from {_source_text(req)}{where}. No host that may run this card "
@@ -839,8 +1066,8 @@ def _open_none_wait(conn, tid: str) -> bool:
     """Whether the card's latest ``placement_wait`` (written by an EARLIER tick)
     is an open host=none hold."""
     from hermes_cli import kanban_placement_reasons as _pr
-    row = conn.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'placement_wait' "
-                       "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+    row = conn.execute(f"SELECT id, payload FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks('placement_wait')}) "
+                       "ORDER BY id DESC LIMIT 1", (tid, *_pr.kind_names("placement_wait"))).fetchone()
     if row is None:
         return False
     try:

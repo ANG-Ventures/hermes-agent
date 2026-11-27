@@ -19,6 +19,7 @@ _HERMES_CORE_TOOLS = [
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+    "browser_lease_release",  # kanban workers only (its check_fn): ends this run's own identity lease
     "browser_vault_list", "browser_vault_unlock", "browser_vault_fill", "browser_vault_save_login", "browser_vault_enter_code",  # ride with the browser
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
     "text_to_speech",
@@ -39,7 +40,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
-    "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    "kanban_attach", "kanban_attach_url", "kanban_attachments", "kanban_attachment_read",
     "computer_use",
     # Service-gated connector account status and authorization links.
     "manage_connections",

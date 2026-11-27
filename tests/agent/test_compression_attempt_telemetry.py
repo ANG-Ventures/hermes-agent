@@ -187,6 +187,35 @@ def test_no_progress_telemetry_identifies_text_compression(caplog):
     assert payload["remediation"] == "text_compression"
 
 
+def test_unchanged_output_from_damaged_store_is_store_unavailable(caplog):
+    """An engine that failed open on a damaged store (t_5be6185c) is not a no-progress summariser."""
+    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        compressor = ContextCompressor(
+            model="test/main-model",
+            provider="test-provider",
+            threshold_percent=0.50,
+            quiet_mode=True,
+            config_context_length=100_000,
+        )
+    agent = _Agent(compressor)
+    messages = _messages()
+
+    def _store_down(value, **_kwargs):
+        compressor.last_compress_store_unavailable = True
+        return value
+
+    with (
+        patch.object(compressor, "compress", side_effect=_store_down),
+        caplog.at_level(logging.INFO, logger="agent.conversation_compression"),
+    ):
+        returned, _system_prompt = compress_context(
+            agent, messages, "system prompt", approx_tokens=75_000, force=True,
+        )
+
+    assert returned == messages
+    assert _extract_telemetry(caplog)["failure_class"] == "store_unavailable"
+
+
 def test_aux_call_telemetry_records_content_free_phase_timings():
     with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
         compressor = ContextCompressor(

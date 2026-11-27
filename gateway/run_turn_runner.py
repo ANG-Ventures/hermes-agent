@@ -24,6 +24,7 @@ from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
+from gateway.run_config_loaders import provider_routing_agent_kwargs
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.session import SessionSource
@@ -570,6 +571,15 @@ class TurnRunner:
         # Internal-wake header: line 0 of every new editable bubble ("separate" mode: first message only).
         wake_head: Optional[str] = None
         wake_head_sent: bool = False
+        # "still inside <tool> for Nm" line held as the LAST progress line while one call runs long.
+        inflight_line: Optional[str] = None
+        inflight_painted_at: float = float("-inf")
+        inflight_name: Optional[str] = None
+        inflight_since: float = 0.0   # monotonic start of the call the notice describes
+        # A delivery failed on a dead/superseded adapter: repaint the bubble once a live one is back.
+        repaint_pending: bool = False
+        # The original bubble could not be edited after a reconnect and was re-posted (at most once).
+        recreated_after_reconnect: bool = False
 
     def _fresh_progress_lines(self, st) -> list:
         return [st.wake_head] if st.wake_head and st.can_edit else []
@@ -600,6 +610,56 @@ class TurnRunner:
         )
         st.progress_lines = self._fresh_progress_lines(st)
         return st
+
+    def _live_progress_adapter(self):
+        """The adapter registered for this chat RIGHT NOW (None mid-reconnect or on a lookup error)."""
+        try:
+            return self._runner._delivery_adapter_for(self._ctx.source)
+        except Exception:
+            return None
+
+    def _progress_transport_stale(self, st) -> bool:
+        """True when ``st.adapter`` is dead or superseded (t_8783804a): a failure through it says nothing
+        about the message, so editing stays enabled. Discord's liveness probe closes the session and
+        the reconnect watcher installs a NEW adapter object; the old one answers "Session is closed"."""
+        if getattr(st.adapter, "has_fatal_error", False) is True:
+            return True
+        live = self._live_progress_adapter()
+        # Superseded = the registry no longer holds it AND it is down; identity alone is not proof of death.
+        return live is None or (live is not st.adapter and getattr(st.adapter, "is_connected", True) is False)
+
+    async def _rebind_progress_adapter(self, st) -> None:
+        """After a mid-turn reconnect, move the bubble onto the live adapter and repaint the SAME message;
+        re-post it once if the original can no longer be edited (t_8783804a)."""
+        live = self._live_progress_adapter()
+        if (live is not None and live is not st.adapter and getattr(live, "has_fatal_error", False) is not True
+                and (st.repaint_pending or self._progress_transport_stale(st))):
+            logger.info("[%s] Progress bubble re-bound to the reconnected adapter (message %s)",
+                        getattr(live, "name", "?"), st.progress_msg_id)
+            st.adapter = live
+            st._edit_accepts_metadata = bool(self._ctx._progress_metadata) and _accepts_keyword(
+                live.edit_message, "metadata")
+            st.repaint_pending = True
+        if not st.repaint_pending or self._progress_transport_stale(st):
+            return
+        if not (st.can_edit and st.progress_msg_id is not None and st.progress_lines):
+            st.repaint_pending = False
+            return
+        text = self._progress_text(st.progress_lines)
+        result = await self._edit_progress_message(st, st.progress_msg_id, text)
+        if result.success:
+            st.repaint_pending = False
+            return
+        if getattr(result, "retryable", False) or self._progress_transport_stale(st):
+            return  # still transient: next tick retries
+        st.repaint_pending = False
+        if st.recreated_after_reconnect:
+            st.can_edit = False
+            return
+        st.recreated_after_reconnect = True
+        sent = await self._send_progress_text(st, text)
+        if sent.success and sent.message_id:
+            st.progress_msg_id = sent.message_id
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
@@ -651,6 +711,9 @@ class TurnRunner:
                 if getattr(result, "retryable", False):
                     logger.debug("[%s] Transient overflow edit failure — keeping can_edit=True", st.adapter.name)
                     return True
+                if self._progress_transport_stale(st):
+                    st.repaint_pending = True   # dead adapter, not a dead message (t_8783804a)
+                    return True
                 st.can_edit = False
                 # Fall back to the existing non-edit behavior.
                 return False
@@ -676,6 +739,7 @@ class TurnRunner:
 
     def _progress_absorb(self, st, raw) -> Any:
         """Fold a queue item into the bubble buffer; returns the line to render this tick."""
+        self._drop_inflight_line(st)  # a real progress line supersedes the "still inside" line
         if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
             _, base_msg, count = raw
             if len(st.progress_lines) <= len(self._fresh_progress_lines(st)):
@@ -687,6 +751,65 @@ class TurnRunner:
         st.progress_lines.append(raw)
         return raw
 
+    @staticmethod
+    def _drop_inflight_line(st) -> bool:
+        """Remove the "still inside" line from the buffer; True when it was there."""
+        line, st.inflight_line = st.inflight_line, None
+        if line is not None and st.progress_lines and st.progress_lines[-1] == line:
+            st.progress_lines.pop()
+            return True
+        return False
+
+    def _retire_inflight_line(self, st) -> bool:
+        """The long call ended: remove its "still inside" line. If that leaves the bubble with nothing
+        but its header, put a "done" line in its place: _flush_progress_edit skips an empty buffer, so a
+        bare removal would leave the stale notice on screen (Prism 9c6bdb4bcd34). True when changed."""
+        name, since = st.inflight_name, st.inflight_since
+        if not self._drop_inflight_line(st):
+            return False
+        st.inflight_name = None
+        if len(st.progress_lines) <= len(self._fresh_progress_lines(st)) and name:
+            from gateway.inflight_tool_status import format_duration
+            st.progress_lines.append(f"✓ {name} done ({format_duration(max(0.0, time.monotonic() - since))})")
+        return True
+
+    def _inflight_notice_threshold(self) -> float:
+        from gateway.inflight_tool_status import DEFAULT_INFLIGHT_NOTICE_SECONDS
+        ctx = self._ctx
+        try:
+            platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
+            value = ctx.resolve_display_setting(ctx.user_config, platform_key, "tool_inflight_notice_seconds")
+            return float(DEFAULT_INFLIGHT_NOTICE_SECONDS if value is None else value)
+        except Exception:
+            return float(DEFAULT_INFLIGHT_NOTICE_SECONDS)
+
+    async def _paint_inflight_notice(self, st) -> None:
+        """Idle-tick hook: once one tool call runs past ``display.tool_inflight_notice_seconds``, keep a
+        single "still inside <tool> for Nm" line at the bottom of the bubble, re-edited (never re-posted)
+        every ``INFLIGHT_NOTICE_REPAINT_SECONDS``; removed again when the call ends (t_90e5c823)."""
+        from gateway.inflight_tool_status import INFLIGHT_NOTICE_REPAINT_SECONDS, inflight_tool, still_inside_line
+        ctx = self._ctx
+        if not st.can_edit or not ctx._run_still_current() or self._agent_interrupted():
+            return
+        agent = (ctx.agent_holder or [None])[0]
+        threshold = self._inflight_notice_threshold()
+        cur = inflight_tool(agent)
+        if threshold <= 0 or cur is None or cur[1] < threshold:
+            if self._retire_inflight_line(st):
+                await self._flush_progress_edit(st)
+            return
+        now = time.monotonic()
+        if st.inflight_line is not None and now - st.inflight_painted_at < INFLIGHT_NOTICE_REPAINT_SECONDS:
+            return
+        line = still_inside_line(agent, threshold)
+        if line is None:
+            return
+        self._drop_inflight_line(st)
+        st.progress_lines.append(line)
+        st.inflight_line, st.inflight_painted_at = line, now
+        st.inflight_name, st.inflight_since = cur[0], now - cur[1]
+        await self._progress_send_or_edit(st, line)
+
     async def _flush_progress_edit(self, st) -> None:
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             with suppress(Exception):
@@ -694,6 +817,7 @@ class TurnRunner:
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx
+        self._retire_inflight_line(st)   # the turn ended: no "still inside" line may outlive it
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
@@ -729,6 +853,13 @@ class TurnRunner:
                 return True
             if getattr(result, "retryable", False):
                 logger.debug("[%s] Transient edit failure — keeping can_edit=True", st.adapter.name)
+                return False
+            if self._progress_transport_stale(st):
+                # "Session is closed" from a dead/superseded adapter: the message is fine, the transport
+                # is not. Keep editing; _rebind_progress_adapter repaints once the live adapter is back.
+                logger.info("[%s] Progress edit failed on a dead adapter (%s) — repaint after reconnect",
+                            st.adapter.name, getattr(result, "error", ""))
+                st.repaint_pending = True
                 return False
             if any(w in (getattr(result, "error", "") or "").lower() for w in ("flood", "retry after")):
                 logger.info("[%s] Progress edit flood control, backing off", st.adapter.name)
@@ -794,7 +925,17 @@ class TurnRunner:
                 last_edit_ts = time.monotonic()
                 await self._progress_restore_typing(st)
             except queue.Empty:
-                await asyncio.sleep(0.3)
+                # A cancel raised in here does not reach the sibling CancelledError clause below, so the
+                # drain (and the notice's removal) would be skipped (Prism 3e31f1099cb9). Drain, then let the
+                # cancel propagate exactly as before: callers await the task and expect CancelledError.
+                try:
+                    await self._rebind_progress_adapter(st)
+                    await self._paint_inflight_notice(st)
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    with suppress(Exception):
+                        await self._drain_progress_on_cancel(st)
+                    raise
             except asyncio.CancelledError:
                 await self._drain_progress_on_cancel(st)
                 return
@@ -997,13 +1138,15 @@ class TurnRunner:
             _warn_route_drop("muted")
             return dropped
         if is_route_change:
-            from gateway.response_filters import route_notice_muted
+            from gateway.response_filters import route_notice_muted, write_route_notice_agent_log
             if route_notice_muted(ctx.source, ctx.user_config):
-                # Not a drop: a page channel does not take route telemetry (t_733b4104). INFO, and
-                # never queued for redelivery.
+                # Not a drop: a page channel does not take route telemetry (t_733b4104), and the
+                # #logs banner is agent-only (t_79c10430). INFO, one agent-log row, never queued
+                # for redelivery.
+                redacted = _redact_gateway_user_facing_secrets(str(message or ""))
                 logger.info("route-change status not posted to page channel %s: %s",
-                            ctx._status_chat_id,
-                            _redact_gateway_user_facing_secrets(str(message or ""))[:160])
+                            ctx._status_chat_id, redacted[:160])
+                write_route_notice_agent_log(ctx.source, redacted)
                 return False
         else:
             from gateway.response_filters import is_compaction_announce, lifecycle_notice_muted
@@ -1240,6 +1383,10 @@ class TurnRunner:
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
+                    # Fold can race setup from another thread. Publish first, then recheck:
+                    # either the folder sees this consumer or this check sees its promotion.
+                    if ctx.human_engaged:
+                        stream_consumer.on_human_engagement()
                     # #105341: a consumer created only for interim commentary (text streaming off)
                     # is never fed the final reply's deltas — mark it so the duplicate-risk
                     # diagnostic in ``_run_agent_mark_streamed_delivery`` stays silent.
@@ -1409,9 +1556,7 @@ class TurnRunner:
             prefill_messages=runner._prefill_messages or None,
             reasoning_config=reasoning_config, service_tier=runner._service_tier,
             request_overrides=turn_route.get("request_overrides"),
-            providers_allowed=pr.get("only"), providers_ignored=pr.get("ignore"), providers_order=pr.get("order"),
-            provider_sort=pr.get("sort"), provider_require_parameters=pr.get("require_parameters", False),
-            provider_data_collection=pr.get("data_collection"),
+            **provider_routing_agent_kwargs(pr),
             session_id=ctx.session_id, platform=platform_key,
             user_id=src.user_id, user_id_alt=src.user_id_alt, user_name=src.user_name,
             chat_id=src.chat_id, chat_name=src.chat_name, chat_type=src.chat_type, thread_id=src.thread_id,
@@ -1665,6 +1810,9 @@ class TurnRunner:
             agent.stream_delta_callback = None
             agent.interim_assistant_callback = None
             agent.thinking_progress = False
+        # Bind policy synchronously before accepting steering; the async slot tracker
+        # may still hold the previous context when this cached agent is reused.
+        agent._gateway_receiving_turn_context = ctx
         ctx.agent_holder[0] = agent  # interrupt support
         # The titler fires from the turn prologue, so attach the rename lane before the run.
         self._attach_session_title_callback(agent, ctx)
@@ -2429,8 +2577,12 @@ class TurnRunner:
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
+            # /goal reads this to tell a productive iteration-limit handoff from a failed turn.
+            "turn_exit_reason": result.get("turn_exit_reason"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
+            # e.g. "safeguard_refusal": the transcript-skip log names the real class (t_438a9c74).
+            "error_code": result.get("error_code"),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],

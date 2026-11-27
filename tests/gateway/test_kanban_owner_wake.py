@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -39,6 +41,7 @@ class Adapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+        event._gateway_accepted = True
 
 
 @pytest.fixture
@@ -100,13 +103,19 @@ def _tick(env):
 def _card(env, *, session="owner", title="card", body=None, parents=()):
     sid = env["owner"].session_id if session == "owner" else session
     with kb.connect_closing() as conn:
-        return kb.create_task(conn, title=title, assignee="worker", session_id=sid,
+        return kb.create_task(conn, boomerang_wake=False, title=title, assignee="worker", session_id=sid,
                               body=body, parents=parents)
 
 
 def _event(tid, kind, payload=None):
     with kb.connect_closing() as conn, kb.write_txn(conn):
         kb._append_event(conn, tid, kind, payload)
+
+
+def _blocked(tid):
+    """A real block leaves the card blocked; the notifier drops a block notice once it is not (t_05badfca)."""
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
 
 
 def _one_turn(env, handled):
@@ -178,6 +187,136 @@ def test_e_red_or_dirty_handback_wakes_owner(env):
     text = _one_turn(env, _tick(env))
     assert "ANG-Ventures/hermes-agent#1700" in text
     assert "red: tests (3.11)" in text and "dirty" in text
+
+
+_HEAD = "a" * 40
+_RAW_REDS = ["suite gateway", "suite tui", "lint-x"]
+
+
+def _labels_file(tmp_path, monkeypatch, entry):
+    import json as _json
+    path = tmp_path / "pr-red-labels.json"
+    path.write_text(_json.dumps({"ANG-Ventures/hermes-agent#1710": entry}))
+    monkeypatch.setenv(ow.RED_LABELS_STATE_ENV, str(path))
+    return path
+
+
+def _labelled_wake(env, number=1710):
+    env["health"][("ANG-Ventures/hermes-agent", number)] = {
+        "state": "open", "mergeable_state": "clean", "head": _HEAD, "failing": list(_RAW_REDS)}
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kb.request_review(conn, tid, force=True, summary=f"PR ANG-Ventures/hermes-agent#{number} ready")
+    return _one_turn(env, _tick(env))
+
+
+_ENTRY = {"head": _HEAD, "line": "CI reds at aaaaaaaa: OWN 1 (suite gateway) · MAIN 2",
+          "counts": {"OWN": 1, "MAIN": 2, "STALE-BASE": 0, "FLAKE": 0}, "own": ["suite gateway"]}
+
+
+def test_red_handback_with_labels_at_head_lists_own_reds_and_main_count(env, tmp_path, monkeypatch):
+    """t_8dc6df3d: a labelled PR's wake names only the OWN reds and counts the MAIN ones."""
+    _labels_file(tmp_path, monkeypatch, _ENTRY)
+    text = _labelled_wake(env)
+    assert "red (OWN): suite gateway; MAIN reds: 2" in text
+    assert "suite tui" not in text and "lint-x" not in text
+
+
+@pytest.mark.parametrize("case", ["other_head", "missing_file", "kill_switch", "all_zero"])
+def test_red_handback_labels_fail_open_to_the_full_list(env, tmp_path, monkeypatch, case):
+    entry = dict(_ENTRY, head="b" * 40) if case == "other_head" else dict(
+        _ENTRY, counts={"OWN": 0, "MAIN": 0}) if case == "all_zero" else _ENTRY
+    path = _labels_file(tmp_path, monkeypatch, entry)
+    if case == "missing_file":
+        path.unlink()
+    if case == "kill_switch":
+        monkeypatch.setenv(ow.RED_LABELS_ENV, "0")
+    text = _labelled_wake(env)
+    assert "red: suite gateway, suite tui, lint-x" in text and "OWN" not in text
+
+
+def test_labelled_red_text_shapes():
+    health = {"state": "open", "failing": ["x"], "mergeable_state": "dirty"}
+    only_main = {"counts": {"OWN": 0, "MAIN": 3}, "own": []}
+    assert ow.pr_is_red_or_dirty(health, only_main) == "red: 0 own (MAIN reds: 3); dirty (merge conflict)"
+    stale = {"counts": {"OWN": 7, "MAIN": 0, "STALE-BASE": 2}, "own": [f"s{i}" for i in range(7)]}
+    assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["x"]}, stale) == (
+        "red (OWN): s0, s1, s2, s3, s4, s5; MAIN reds: 0; STALE-BASE 2: rebase")
+    assert ow.pr_is_red_or_dirty({"state": "open", "failing": []}, stale) is None  # green read wins
+
+
+_CAP_TITLE = "ERROR: no further review: round cap reached, operator finalizes at this head"
+
+
+@pytest.mark.parametrize("title,want", [
+    (_CAP_TITLE, "Prism: no further review at this head (operator finalizes)"),
+    ("Prism errored", "Prism check failed"),
+    (None, "Prism check failed"),
+])
+def test_all_zero_label_at_head_with_failing_prism_is_never_red_prism(tmp_path, monkeypatch, title, want):
+    """t_265197b1 (home#12163 @ 94859564, 11-15 21:38): a same-head all-zero label entry plus a failing
+    Prism check is the round cap or a Prism refusal, not a red of the PR."""
+    _labels_file(tmp_path, monkeypatch, {"head": _HEAD, "counts": {"OWN": 0, "MAIN": 0, "STALE-BASE": 0,
+                                                                   "FLAKE": 0}, "own": [], "rows": []})
+    health = {"state": "open", "mergeable_state": "blocked", "head": _HEAD, "failing": ["prism"],
+              "failing_urls": ["https://github.com/o/r/runs/1"], "failing_titles": [title]}
+    labels = ow.red_labels_for("ANG-Ventures/hermes-agent", 1710, _HEAD)
+    text = ow.pr_is_red_or_dirty(health, labels)
+    assert text == f"{want} <https://github.com/o/r/runs/1>"
+    assert "red" not in text
+    # a non-Prism red next to it stays named (the label did not explain it); dirty still shows
+    mixed = dict(health, failing=["prism", "lint-x"], failing_titles=[title, None], mergeable_state="dirty")
+    assert ow.pr_is_red_or_dirty(mixed, labels) == (
+        f"red: lint-x; {want} <https://github.com/o/r/runs/1>; dirty (merge conflict)")
+
+
+def test_failing_prism_without_a_same_head_label_keeps_the_old_fallback(tmp_path, monkeypatch):
+    """Missing / other-head label entries keep the full failing list (Apollo's ruling on t_265197b1)."""
+    health = {"state": "open", "head": _HEAD, "failing": ["prism"], "failing_titles": [_CAP_TITLE]}
+    assert ow.pr_is_red_or_dirty(health, None) == "red: prism"
+    _labels_file(tmp_path, monkeypatch, {"head": "b" * 40, "counts": {"OWN": 0, "MAIN": 0}, "own": []})
+    assert ow.pr_is_red_or_dirty(health, ow.red_labels_for("ANG-Ventures/hermes-agent", 1710, _HEAD)) == (
+        "red: prism")
+
+
+def test_red_handback_on_review_hold_lane_does_not_wake(env):
+    """t_54f4fde6: a red handback parked on kanban.review_hold_assignee is no decision yet: no owner wake."""
+    _cfg(review_hold_assignee="review-hold")
+    env["health"][("ANG-Ventures/hermes-agent", 1702)] = {
+        "state": "open", "mergeable_state": "dirty", "failing": ["tests (3.11)"]}
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kb.request_review(conn, tid, force=True, reviewer="review-hold",
+                          summary="PR ANG-Ventures/hermes-agent#1702 ready")
+        assert conn.execute("SELECT assignee FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "review-hold"
+    assert _tick(env) == []
+
+
+def test_hold_handoff_to_operator_wakes_on_red_pr_from_run_metadata(env):
+    """t_1e4649b7: the hold -> operator hand-off writes a fresh review_requested; it keeps the implementation
+    run, so a PR named only in that run's metadata still wakes the owner when it is red."""
+    from hermes_cli import kanban_open_pr as op
+    _cfg(review_hold_assignee="review-hold", review_assignee="human:apollo")
+    env["monkeypatch"].setattr(op, "_default_query", lambda: (lambda repo, n: {"state": "OPEN"}))
+    url = "https://github.com/ANG-Ventures/hermes-agent/pull/1703"
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kb.claim_task(conn, tid)
+        run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        assert kb.complete_task(conn, tid, summary="shipped", metadata={"pr_url": url},
+                                expected_run_id=run_id) is True
+        assert conn.execute("SELECT assignee FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "review-hold"
+    assert _tick(env) == []   # parked on the hold: no decision yet
+    env["adapter"].handled.clear()
+    env["health"][("ANG-Ventures/hermes-agent", 1703)] = {
+        "state": "open", "mergeable_state": "clean", "failing": ["tests (3.11)"]}
+    with kb.connect_closing() as conn:
+        assert kb.assign_task(conn, tid, "human:apollo") is True
+        last = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested' "
+                            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0]
+        assert "1703" not in last, "the PR must come from the run metadata, not the hand-off summary"
+    text = _one_turn(env, _tick(env))
+    assert "ANG-Ventures/hermes-agent#1703" in text and "red: tests (3.11)" in text
 
 
 # --- the three non-triggers -----------------------------------------------------
@@ -286,6 +425,7 @@ def test_notify_wake_sub_on_owner_chat_is_not_doubled(env):
     # t_156cc147: the sub's wake must be DELIVERED (accepted) to cover the block; a
     # rejected or downgraded one leaves the owner-wake to fire.
     _wake_sub_on_owner_chat(env, tid)
+    _blocked(tid)
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
     handled = _tick(env)
     owner_turns = [e for e in handled if (e.metadata or {}).get("kanban_owner_wake")]
@@ -889,12 +1029,109 @@ def test_p1r2_profile_gate_applies_to_the_owner_session(env):
     assert env["runner"]._kanban_owner_wake_state.pending == {}, "dropped at the gate, not held"
 
 
+def test_unchanged_owner_wake_tick_does_not_write_or_sync(env, monkeypatch):
+    runner = env["runner"]
+    assert asyncio.run(ow.tick(runner, use_default_pr_health=False)) == 0
+    path = ow.state_path()
+    before = (path.stat().st_mtime_ns, path.parent.stat().st_mtime_ns)
+    # Exercise the actual idle scan after a reload, not just an in-memory cache hit.
+    runner._kanban_owner_wake_state = None
+    create_temp = Mock(wraps=ow.tempfile.mkstemp)
+    fsync = Mock(wraps=ow.os.fsync)
+    monkeypatch.setattr(ow.tempfile, "mkstemp", create_temp)
+    monkeypatch.setattr(ow.os, "fsync", fsync)
+    assert asyncio.run(ow.tick(runner, use_default_pr_health=False)) == 0
+    create_temp.assert_not_called()
+    fsync.assert_not_called()
+    assert (path.stat().st_mtime_ns, path.parent.stat().st_mtime_ns) == before
+
+
+@pytest.mark.skipif(ow._WINDOWS, reason="POSIX directory fsync")
 def test_p1r2_state_write_is_fsynced(env, monkeypatch):
     synced = []
     real = ow.os.fsync
     monkeypatch.setattr(ow.os, "fsync", lambda fd: (synced.append(fd), real(fd))[1])
-    ow.WakeState(Path(get_hermes_home()) / "gateway" / "fs.json").write_owner_wake_state(1.0)
+    path = Path(get_hermes_home()) / "gateway" / "fs.json"
+    state = ow.WakeState(path)
+    state.write_owner_wake_state(1.0)
     assert len(synced) == 2, "file and directory are both fsynced"
+    replace = Mock(wraps=ow.os.replace)
+    monkeypatch.setattr(ow.os, "replace", replace)
+    synced.clear()
+    state.cursors["default"] = 10
+    state.write_owner_wake_state(2.0)
+    state.write_owner_wake_state(3.0)
+    replace.assert_called_once()
+    assert len(synced) == 2
+    assert ow.WakeState(path).cursors == {"default": 10}
+
+
+def test_owner_wake_retries_directory_sync_failure(tmp_path, monkeypatch):
+    if ow._WINDOWS:
+        pytest.skip("POSIX directory fsync")
+    state = ow.WakeState(tmp_path / ow.STATE_FILENAME)
+    replace = Mock(wraps=ow.os.replace)
+    fsync = ow.os.fsync
+    sync = Mock(side_effect=[None, OSError("directory sync failed"), None, None])
+
+    def sync_fd(fd):
+        sync(fd)
+        fsync(fd)
+
+    monkeypatch.setattr(ow.os, "replace", replace)
+    monkeypatch.setattr(ow.os, "fsync", sync_fd)
+    state.write_owner_wake_state(1.0)
+    state.write_owner_wake_state(2.0)
+    state.write_owner_wake_state(3.0)
+    assert state.path.exists()
+    assert replace.call_count == 2 and sync.call_count == 4
+
+
+def test_owner_wake_delivers_during_state_write_failure(env, monkeypatch, caplog):
+    tid = _card(env)
+    _blocked(tid)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    runner = env["runner"]
+    state = _held_state(env, 0)
+    with monkeypatch.context() as mp:
+        mp.setattr(ow.os, "replace", Mock(side_effect=OSError("checkpoint unavailable")))
+        assert asyncio.run(ow.tick(runner, now=1000, state=state, use_default_pr_health=False)) == 1
+    assert tid in _one_turn(env, env["adapter"].handled)
+    assert "checkpoint unavailable" in caplog.text
+    assert not state.path.exists() and not state.pending and state.last_wake
+    assert not list(state.path.parent.glob(".owner-wake-*"))
+
+    assert asyncio.run(ow.tick(runner, now=1005, state=state, use_default_pr_health=False)) == 0
+    restored = ow.WakeState(state.path)
+    assert not restored.pending and restored.last_wake == state.last_wake
+    assert len(env["adapter"].handled) == 1
+
+
+def test_owner_wake_retries_rejected_turn_after_restart(env, monkeypatch):
+    tid = _card(env)
+    _blocked(tid)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    runner = env["runner"]
+    adapter = env["adapter"]
+    state = _held_state(env, 0)
+    rejected = []
+
+    async def reject(event):
+        rejected.append((event._gateway_accepted, bool(ow.WakeState(state.path).pending)))
+
+    with monkeypatch.context() as mp:
+        mp.setattr(adapter, "handle_message", reject)
+        assert asyncio.run(ow.tick(runner, now=1000, state=state, use_default_pr_health=False)) == 0
+    assert rejected == [(False, True)]
+
+    restored = ow.WakeState(state.path)
+    assert restored.pending and not restored.last_wake
+    assert asyncio.run(ow.tick(runner, now=1005, state=restored, use_default_pr_health=False)) == 1
+    assert tid in _one_turn(env, adapter.handled)
+    restored = ow.WakeState(state.path)
+    assert not restored.pending and restored.last_wake
+    assert asyncio.run(ow.tick(runner, now=1010, state=restored, use_default_pr_health=False)) == 0
+    assert len(adapter.handled) == 1
 
 
 def test_worker_only_gateway_skips_the_scan(env, monkeypatch):
@@ -1001,6 +1238,7 @@ def _replay_957601(env, monkeypatch, *, downgrade):
     assert env["store"].lookup_by_session_id(ROTATED_SID) is None, "home sid must be rotated"
     tid = _card(env, session=ROTATED_SID, title="skill re-layout C")
     _wake_sub_on_owner_chat(env, tid)
+    _blocked(tid)
     _event(tid, "blocked", {
         "kind": "needs_input", "recurrences": 1, "source_status": "ready",
         "reason": "Wave 1 (generative-art) committed locally: branch daedalus/t_e248dbe7-wave1 @ "
@@ -1044,9 +1282,19 @@ def test_needs_input_drop_logs_at_info(env, caplog):
     assert len(lines) == 1 and tid in lines[0] and "no live session-store entry" in lines[0], lines
 
 
-def test_rejected_sub_wake_falls_back_to_the_owner_wake(env):
+def test_rejected_sub_wake_falls_back_to_the_owner_wake(env, monkeypatch):
     """t_156cc147: a sub wake the adapter does not accept (WakeNotAccepted) marks nothing, so the
     owner still gets its turn. Before the fix the sub's existence alone withheld it."""
+    adapter = env["adapter"]
+    accept = adapter.handle_message
+
+    async def reject_sub(event):
+        if (event.metadata or {}).get("kanban_owner_wake"):
+            await accept(event)
+        else:
+            adapter.handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", reject_sub)
     tid = _card(env)
     with kb.connect_closing() as conn:
         kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
@@ -1055,3 +1303,91 @@ def test_rejected_sub_wake_falls_back_to_the_owner_wake(env):
     handled = _tick(env)
     owner_turns = [e for e in handled if (e.metadata or {}).get("kanban_owner_wake")]
     assert len(owner_turns) == 1 and tid in owner_turns[0].text, [e.text for e in handled]
+
+
+
+# --- t_3151f3fd: a routed review_deadman event wakes the recipient the producer resolved --------------------------
+def _recipient_session(env):
+    return env["store"].get_or_create_session(SessionSource(
+        platform=Platform.DISCORD, chat_id=OTHER_CHAT, chat_type="group", user_id=HUMAN))
+
+
+@pytest.mark.parametrize("route", ["alerts-home", "fallback"])
+def test_routed_review_deadman_wakes_the_named_recipient_not_the_home(env, route):
+    """hermes-home review deadman, card homed to an #alerts session: the event names the operator sub's session.
+    One turn into THAT session; the home session gets nothing."""
+    rcpt = _recipient_session(env)
+    tid = _card(env)
+    _event(tid, "review_deadman", {"by": "kanban-review-deadman", "waiting_min": 25, "episode": 1, "cycle": 0,
+                                   "recipient_route": route, "recipient_session_key": rcpt.session_key,
+                                   "recipient_chat": OTHER_CHAT, "recipient_profile": "default"})
+    handled = _tick(env)
+    assert len(handled) == 1, [e.text for e in handled]
+    ev = handled[0]
+    assert ev.metadata["gateway_session_key"] == rcpt.session_key
+    assert ev.source.chat_id == OTHER_CHAT and tid in ev.text
+    assert len(_tick(env)) == 1, "no second turn on the next tick"
+
+
+def test_home_route_review_deadman_still_wakes_the_home(env):
+    tid = _card(env)
+    _event(tid, "review_deadman", {"by": "kanban-review-deadman", "waiting_min": 25, "episode": 1, "cycle": 0})
+    [ev] = _tick(env)
+    assert ev.metadata["gateway_session_key"] == env["owner"].session_key
+
+
+def test_routed_recipient_is_read_only_from_review_deadman_events():
+    assert ow.routed_recipient({"kind": "review_deadman", "payload": {
+        "recipient_route": "alerts-home", "recipient_session_key": "k"}}) == "k"
+    assert ow.routed_recipient({"kind": "review_deadman", "payload": {
+        "recipient_route": "home", "recipient_session_key": "k"}}) == ""
+    assert ow.routed_recipient({"kind": "blocked", "payload": {
+        "recipient_route": "fallback", "recipient_session_key": "k"}}) == ""
+
+
+
+# --- t_6a70430e: a routed mechanical_wake event wakes the recipient the producer resolved --------------------------
+def _mech(tid, extra=None):
+    _event(tid, "mechanical_wake", dict({"by": "card-mechanical-wake", "source": "detached-run",
+                                         "episode": "detached:r1", "text": "job x rc=1"}, **(extra or {})))
+
+
+@pytest.mark.parametrize("route", ["alerts-home", "fallback"])
+def test_routed_mechanical_wake_wakes_the_named_recipient_not_the_home(env, route):
+    rcpt = _recipient_session(env)
+    tid = _card(env)
+    _mech(tid, {"recipient_route": route, "recipient_session_key": rcpt.session_key,
+                "recipient_chat": OTHER_CHAT, "recipient_profile": "default"})
+    handled = _tick(env)
+    assert len(handled) == 1, [e.text for e in handled]
+    assert handled[0].metadata["gateway_session_key"] == rcpt.session_key
+    assert handled[0].source.chat_id == OTHER_CHAT and tid in handled[0].text
+
+
+def test_home_route_mechanical_wake_wakes_the_home(env):
+    tid = _card(env)
+    _mech(tid, {"recipient_route": "home", "recipient_session_key": "ignored"})
+    [ev] = _tick(env)
+    assert ev.metadata["gateway_session_key"] == env["owner"].session_key
+
+
+def test_mechanical_wake_without_a_recipient_wakes_the_home(env):
+    tid = _card(env)
+    _mech(tid)
+    [ev] = _tick(env)
+    assert ev.metadata["gateway_session_key"] == env["owner"].session_key
+
+
+def test_routed_mechanical_wake_to_a_recipient_with_no_live_session_wakes_nobody_else(env):
+    tid = _card(env)
+    _mech(tid, {"recipient_route": "fallback", "recipient_session_key": "agent:main:discord:group:999:999"})
+    handled = _tick(env)
+    assert all(e.metadata.get("gateway_session_key") != env["owner"].session_key for e in handled), \
+        "a routed event never falls back to the home session"
+
+
+def test_routed_recipient_reads_both_producer_kinds():
+    p = {"recipient_route": "fallback", "recipient_session_key": "k"}
+    assert ow.routed_recipient({"kind": "mechanical_wake", "payload": p}) == "k"
+    assert ow.routed_recipient({"kind": "review_deadman", "payload": p}) == "k"
+    assert ow.routed_recipient({"kind": "mechanical_wake", "payload": dict(p, recipient_route="home")}) == ""

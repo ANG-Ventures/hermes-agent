@@ -31,6 +31,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
+import run_agent  # Bootstrap recovery before the per-test home-I/O guard.
 
 from gateway.session_context import set_session_vars
 from tools.process_registry import process_registry
@@ -95,7 +96,7 @@ def _interruptible_parent():
     return parent
 
 
-def _patch_delegate(monkeypatch, child_body):
+def _patch_delegate(monkeypatch, child_body, provider="openrouter", base_url="https://parent.invalid/v1"):
     """Patch delegate_tool's child build/run seams; ``child_body`` is the work."""
     import tools.delegate_tool as dt
 
@@ -103,9 +104,9 @@ def _patch_delegate(monkeypatch, child_body):
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
     fake_child.model = "m"
-    fake_child.provider = "openrouter"
+    fake_child.provider = provider
     fake_child.custom_provider = None
-    fake_child.base_url = "https://parent.invalid/v1"
+    fake_child.base_url = base_url
     fake_child.api_mode = "chat_completions"
     fake_child.acp_command = None
     fake_child.acp_args = None
@@ -121,6 +122,14 @@ def _patch_delegate(monkeypatch, child_body):
     fake_child.provider_data_collection = None
     fake_child.openrouter_min_coding_score = None
     fake_child.prefill_messages = None
+    fake_child._boomerang_route_source = "delegation-default"
+    fake_child._boomerang_parent_route = {
+        "source": "parent", "provider": provider, "model": "m", "base_url": base_url,
+        "api_mode": "chat_completions", "fallback_chain": [], "request_overrides": {},
+    }
+    fake_child.requested_provider = provider
+    fake_child.request_overrides = {}
+    fake_child._fallback_chain = []
     fake_child.terminal_cwd = "/tmp"
 
     creds = {
@@ -161,7 +170,11 @@ def _bind_tui_session(session_key="parent-sess"):
     )
 
 
-def test_background_child_survives_mid_turn_interrupt_and_delivers(monkeypatch):
+@pytest.mark.parametrize("provider,base_url", [
+    ("openrouter", "https://parent.invalid/v1"),
+    ("copilot-acp", "acp://copilot"), ("moa", "moa://local"),
+])
+def test_background_child_survives_mid_turn_interrupt_and_delivers(monkeypatch, provider, base_url):
     """New inbound message mid-turn → child keeps running → normal completion."""
     import run_agent
 
@@ -183,7 +196,7 @@ def test_background_child_survives_mid_turn_interrupt_and_delivers(monkeypatch):
             "duration_seconds": 0.1, "model": "m", "exit_reason": "completed",
         }
 
-    dt = _patch_delegate(monkeypatch, slow_child)
+    dt = _patch_delegate(monkeypatch, slow_child, provider, base_url)
     _bind_tui_session()
     parent = _interruptible_parent()
 
@@ -394,7 +407,7 @@ def detached_child(monkeypatch):
         job_dir.mkdir(parents=True, exist_ok=True)
         n = len((record.get("source") or {}).get("tasks") or [])
         proc = subprocess.Popen([sys.executable, "-c", _FAKE_CHILD, str(job_dir), str(n), str(dd.SCHEMA_VERSION)],
-                                start_new_session=True)
+                                stdin=subprocess.DEVNULL, start_new_session=True)
         box["procs"].append(proc)
         box["job_dir"] = job_dir
         return dd.DetachedSpawn(job_dir, proc.pid, dd.process_create_time(proc.pid), proc)

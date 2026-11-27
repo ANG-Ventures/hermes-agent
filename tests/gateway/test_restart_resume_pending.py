@@ -1597,7 +1597,11 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert len(adapter.sent) == 1
-    assert "restarting" in adapter.sent[0] and "Send any message" in adapter.sent[0]
+    text = adapter.sent[0]
+    assert text.count("Hermes is restarting") == 1
+    # An idle home gets lifecycle status, not an active-task claim or ping request.
+    assert "task" not in text.lower() and "work" not in text.lower()
+    assert "message" not in text.lower() and "online" not in text.lower()
 
 
 @pytest.mark.asyncio
@@ -1785,7 +1789,7 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     runner._begin_session_run_generation = lambda session_key: 1
     runner._is_session_run_current = lambda session_key, generation: True
     runner._invalidate_session_run_generation = lambda *a, **k: 0
-    runner._claim_active_session_slot = lambda session_key, source: (object(), None)
+    runner._claim_active_session_slot = lambda session_key, source: (None, None)
     runner._active_session_leases = {}
     runner._busy_ack_ts = {}
     runner._post_turn_goal_continuation = AsyncMock()
@@ -1818,10 +1822,14 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     # Pre-claim must be visible immediately.
     assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
 
-    # Let the guarded task, the background task, and the late-arrival
-    # drain task all settle.
-    for _ in range(20):
-        await asyncio.sleep(0.02)
+    # Join the resume owner first: its finally releases the pre-claim so
+    # the adapter's late-arrival drain can run the agent. Each adapter task
+    # can schedule a successor, so join successive snapshots until quiescent.
+    # A timeout bounds a broken lifecycle; elapsed time is not completion.
+    async with asyncio.timeout(10):
+        await asyncio.gather(*tuple(runner._background_tasks))
+        while adapter._background_tasks:
+            await asyncio.gather(*tuple(adapter._background_tasks))
 
     # Exactly one agent run for the resumed session — not zero (the
     # pre-claim did not swallow the resume) and not two (no duplicate).

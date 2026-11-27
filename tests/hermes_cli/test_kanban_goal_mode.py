@@ -616,7 +616,7 @@ def test_zombie_run_cannot_block_a_card_owned_by_a_live_successor(kanban_home):
 
     # POSITIVE CONTROL: the LIVE owner (run 2) can still block normally, so the
     # guard restricts only stale writers and does not break the real path.
-    blocked = kb.block_task(conn, tid, reason="real budget exhausted", expected_run_id=2)
+    blocked = kb.block_task(conn, tid, reason="real budget exhausted", kind="needs_input", expected_run_id=2)
     assert blocked is True
     row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
     assert row["status"] == "blocked"
@@ -675,8 +675,7 @@ def test_goal_loop_block_path_passes_the_ownership_guard(monkeypatch):
         c = _kb.connect()
         try:
             _kb.block_task(
-                c, task_id, reason=reason, expected_run_id=_cli._goal_loop_run_id(task_id)
-            )
+                c, task_id, reason=reason, expected_run_id=_cli._goal_loop_run_id(task_id), kind="needs_input")
         finally:
             c.close()
 

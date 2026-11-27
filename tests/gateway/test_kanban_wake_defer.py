@@ -134,7 +134,7 @@ def test_worker_owner_wake_still_downgrades_on_load1(board, monkeypatch):
                              session_id="agent:main:telegram:dm:chat-1")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
                           chat_type="dm", delivery_mode="notify+wake")
-        kb.block_task(conn, tid, reason="need a decision")
+        kb.block_task(conn, tid, reason="need a decision", kind="needs_input")
     finally:
         conn.close()
     adapter = RecordingAdapter()

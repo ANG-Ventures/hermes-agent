@@ -463,7 +463,7 @@ def test_goal_complete_operator_judge_500_fails_open_with_event(monkeypatch, tmp
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({"reason": "Need: x. Why: y. How to reply: z.", "kind": "needs_input"})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
@@ -876,6 +876,45 @@ def test_create_tool_without_session_is_unhomed(worker_env, monkeypatch):
         conn.close()
 
 
+def test_create_rewrites_retired_model_override(worker_env):
+    """G7 (t_1e1450d1): a RETIRED id on kanban_create is stored as its successor, with a note."""
+    import os
+    from pathlib import Path as _P
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    cfg = _P(os.environ["HERMES_HOME"]) / "config"
+    cfg.mkdir(exist_ok=True)
+    (cfg / "model-retired-ids.txt").write_text("claude-opus-4-7 cutover=2026-11-18T21:52-08:00\n", encoding="utf-8")
+    (cfg / "model-successors.json").write_text(json.dumps({"successors": {"claude-opus-4-7": "claude-opus-4-8"}}), encoding="utf-8")
+    d = json.loads(kt._handle_create({"board": "default", "title": "old id", "assignee": "peer",
+                                      "model_override": "claude-opus-4-7"}))
+    assert d["ok"] is True
+    assert d["model_rewritten"].startswith("model rewritten: claude-opus-4-7 -> claude-opus-4-8")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, d["task_id"]).model_override == "claude-opus-4-8"
+    finally:
+        conn.close()
+    # An idempotency hit returns the stored card: no rewrite note unless that card holds the successor.
+    (cfg / "model-successors.json").write_text(json.dumps({"successors": {"claude-opus-4-7": "claude-opus-4-9"}}), encoding="utf-8")
+    a = json.loads(kt._handle_create({"board": "default", "title": "keyed", "assignee": "peer",
+                                      "idempotency_key": "g7-k"}))
+    b = json.loads(kt._handle_create({"board": "default", "title": "keyed", "assignee": "peer",
+                                      "idempotency_key": "g7-k", "model_override": "claude-opus-4-7"}))
+    assert b["task_id"] == a["task_id"] and "model_rewritten" not in b
+    # A lane-prefixed id is split at storage (Studio runtime: cpa/gpt-6.2-sol -> ('gpt-6.2-sol', 'cpa'));
+    # the note must still be sent.
+    orig = kb._resolve_stored_model_pair
+    kb._resolve_stored_model_pair = lambda m, p: (m.split("/", 1)[1], "cpa") if m and m.startswith("cpa/") else orig(m, p)
+    try:
+        c = json.loads(kt._handle_create({"board": "default", "title": "prefixed", "assignee": "peer",
+                                          "model_override": "cpa/claude-opus-4-7"}))
+    finally:
+        kb._resolve_stored_model_pair = orig
+    assert c["ok"] is True
+    assert "cpa/claude-opus-4-9" in c.get("model_rewritten", ""), c
+
+
 def test_create_no_model_override_is_null(worker_env):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
@@ -1172,7 +1211,7 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="blocked", assignee="worker")
-        kb.block_task(conn, tid, reason="waiting")
+        kb.block_task(conn, tid, reason="waiting", kind="needs_input")
     finally:
         conn.close()
 
@@ -1373,6 +1412,31 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
         conn.close()
 
 
+def test_worker_foreign_close_refusal_names_board_and_operator_route(worker_env):
+    """pc-bee29201: a worker sent to close a card on another board is told where it is and
+    how to get it closed, not only that it may not."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    kb.create_board("ops")
+    conn = kbc.connect(board="ops")
+    try:
+        other = kb.create_task(conn, title="card on another board")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    err = json.loads(kt._handle_complete({"task_id": other, "summary": "close it"})).get("error", "")
+    assert "refusing to mutate" in err
+    assert f"{other} (on board ops)" in err
+    assert "kanban_block(kind='needs_input'" in err
+    assert f"hermes kanban --board ops complete {other}" in err
+    conn = kbc.connect(board="ops")
+    try:
+        assert kb.get_task(conn, other).status != "done"
+    finally:
+        conn.close()
+
+
 def test_worker_can_comment_on_foreign_task(worker_env):
     """Cross-task commenting must remain unrestricted (#19713 policy).
 
@@ -1423,7 +1487,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     conn = kbc.connect()
     try:
         other = kb.create_task(conn, title="blocked sibling", assignee="peer")
-        kb.block_task(conn, other, reason="waiting")
+        kb.block_task(conn, other, reason="waiting", kind="needs_input")
     finally:
         conn.close()
 
@@ -2175,3 +2239,84 @@ def test_operator_allow_flagship_creates_and_audits(worker_env, monkeypatch):
         conn.close()
     assert comments == [("apollo", "flagship override: delicate infra")], comments
     assert ok["task_id"] not in refused
+
+
+def test_show_keeps_newest_sendback_behind_four_long_older_ones(worker_env):
+    """Prism 36303e1376d8 repro (t_5949eafd): four 15,000-char sendbacks, then a fifth
+    ending in FIX-FIFTH; the bounded kanban_show still carries the fifth."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        for i in range(5):
+            text = ("older line of fix text\n" * 700)[:15_000] if i < 4 else "x" * 3_990 + " FIX-FIFTH"
+            assert kb.request_sendback(conn, worker_env, payload={
+                "v": 1, "key": f"example/repo#44@{'a' * 40}:ci-red:job{i}", "repo": "example/repo",
+                "pr": 44, "head": "a" * 40, "source": "ci-red", "reason": f"ci-red:job{i}",
+                "retry": "after_change", "summary": text, "evidence": {}, "round": 1})[0]
+    finally:
+        conn.close()
+    shown = json.loads(kt._handle_show({"task_id": worker_env}))
+    assert "FIX-FIFTH" in shown["worker_context"]
+
+
+def test_show_keeps_newest_sendback_behind_long_prior_attempts(worker_env):
+    """Prism 36303e1376d8 round 2 (t_5949eafd): ten prior attempts at the 4 KiB field caps
+    push the worker context past the show budget; the cut takes them, not the newest send-back."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        long = "attempt line of old history\n" * 300
+        for i in range(10):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, "
+                "summary, error, metadata) VALUES (?, 'test-worker', 'done', ?, ?, 'crashed', ?, ?, ?)",
+                (worker_env, 1_000 + i, 1_001 + i, long, long, json.dumps({"note": long})))
+        conn.commit()
+        assert kb.request_sendback(conn, worker_env, payload={
+            "v": 1, "key": f"example/repo#44@{'a' * 40}:ci-red:job", "repo": "example/repo",
+            "pr": 44, "head": "a" * 40, "source": "ci-red", "reason": "ci-red:job",
+            "retry": "after_change", "summary": "fix line\n" * 900 + "FIX-NEWEST", "evidence": {},
+            "round": 1})[0]
+    finally:
+        conn.close()
+    raw = kt._handle_show({"task_id": worker_env})
+    shown = json.loads(raw)
+    assert "FIX-NEWEST" in shown["worker_context"]
+    assert len(raw) < 100_000
+
+
+def test_show_keeps_newest_sendback_with_heading_in_summary(worker_env):
+    """Prism 37b4f309d6a8 (t_5949eafd): a `## ` line inside the send-back summary is not the
+    section end; the show-budget cut uses the builder's span, so the tail survives."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        long = "attempt line of old history\n" * 300
+        for i in range(10):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, "
+                "summary, error, metadata) VALUES (?, 'test-worker', 'done', ?, ?, 'crashed', ?, ?, ?)",
+                (worker_env, 1_000 + i, 1_001 + i, long, long, json.dumps({"note": long})))
+        conn.commit()
+        assert kb.request_sendback(conn, worker_env, payload={
+            "v": 1, "key": f"example/repo#44@{'a' * 40}:ci-red:job", "repo": "example/repo",
+            "pr": 44, "head": "a" * 40, "source": "ci-red", "reason": "ci-red:job",
+            "retry": "after_change",
+            "summary": "fix line\n" * 300 + "## Follow-up\n" + "fix line\n" * 600 + "FIX-NEWEST",
+            "evidence": {}, "round": 1})[0]
+    finally:
+        conn.close()
+    raw = kt._handle_show({"task_id": worker_env})
+    shown = json.loads(raw)
+    assert "## Follow-up" in shown["worker_context"]
+    assert "FIX-NEWEST" in shown["worker_context"]
+    assert len(raw) < 100_000

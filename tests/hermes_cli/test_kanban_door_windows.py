@@ -43,4 +43,5 @@ def test_registry_path_matches_the_vendored_library(fleet, monkeypatch):
     from hermes_cli.fleet_placement import admission_demand
     assert faults._registry_path() == Path(admission_demand._root()) / admission_demand.PRIORITY_REL
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
+    monkeypatch.delenv("ALLOCATION_HOME", raising=False)
     assert faults._registry_path() == Path(admission_demand._root()) / admission_demand.PRIORITY_REL

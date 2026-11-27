@@ -44,6 +44,12 @@ FIELDS = (
     # ``placement_default`` is the flag the tick ran under.
     "portable_waiting_with_room", "stranded_allowance", "pool_planned",
     "pool_reason", "placement_default",
+    # t_915b8d2d: the routing pass's wall and the carry size walks inside it (a stage split of tick_ms_wall).
+    "route_ms", "carry_scan_ms", "carry_scans_deferred",
+    # t_915b8d2d: wall the tick itself spent on pool-host worktree clones.
+    "clone_ms",
+    # t_97a78e19: wall ms per tick step, summed over boards, plus ``unattributed`` (kanban_tick_steps.record).
+    "steps_ms",
 )
 
 
@@ -137,11 +143,16 @@ def _append_all(path: Path, data: bytes) -> None:
         os.close(fd)
 
 
+def _steps_record(steps: Optional[Mapping[str, float]], wall_ms: float) -> dict:
+    from hermes_cli.kanban_tick_steps import record
+    return record(dict(steps or {}), wall_ms)
+
+
 def tick_record(*, ts: float, gate, tick, builder, allowance: Optional[int],
                 pool_budget: Optional[int],
                 spawn_paused: Optional[str], local_spawned: int, results,
                 tick_ms_cpu: float, tick_ms_wall: float, boards: int,
-                queries: Optional[int]) -> dict:
+                queries: Optional[int], steps: Optional[Mapping[str, float]] = None) -> dict:
     """The §3.6 line for one gateway tick.
 
     ``allowance_unused`` = the local allowance granted minus the local spawns
@@ -204,6 +215,11 @@ def tick_record(*, ts: float, gate, tick, builder, allowance: Optional[int],
         "pool_planned": plan is not None,
         "pool_reason": None if plan is not None else pool.get("reason"),
         "placement_default": "remote" if getattr(plan, "default_remote", False) else "local",
+        "route_ms": round(sum(float(getattr(r, "route_ms", 0) or 0) for r in res), 3),
+        "carry_scan_ms": round(sum(float(getattr(r, "carry_scan_ms", 0) or 0) for r in res), 3),
+        "carry_scans_deferred": sum(int(getattr(r, "carry_scans_deferred", 0) or 0) for r in res),
+        "clone_ms": round(sum(float(getattr(r, "clone_ms", 0) or 0) for r in res), 3),
+        "steps_ms": _steps_record(steps, tick_ms_wall),
     }
     pcore = getattr(gate, "pcore_busy", None)
     if pcore is not None:

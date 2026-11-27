@@ -585,8 +585,7 @@ def test_legacy_review_child_deadlock_is_reported_immediately(conn):
         conn,
         implementation_id,
         reason="review-required: implementation ready for independent review",
-        expected_run_id=implementation.current_run_id,
-    )
+        expected_run_id=implementation.current_run_id, kind="needs_input")
     reviewer_task = kb.get_task(conn, reviewer_id)
     assert reviewer_task is not None
     assert reviewer_task.status == "todo"
@@ -633,8 +632,7 @@ def test_hard_block_with_waiting_child_is_not_mislabeled_as_review_deadlock(conn
         conn,
         implementation_id,
         reason="needs_input: production credentials unavailable",
-        expected_run_id=implementation.current_run_id,
-    )
+        expected_run_id=implementation.current_run_id, kind="needs_input")
 
     diagnostics = kd.compute_task_diagnostics(
         kb.get_task(conn, implementation_id),

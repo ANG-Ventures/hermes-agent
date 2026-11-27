@@ -318,16 +318,8 @@ class TestPostStopInterruptSwallow:
         )
 
         assert agent.interrupt_reasons == [_INTERRUPT_REASON_STOP]
-        assert cancelled == [{
-            "session_key": session_key,
-            # /new-scope fix 2026-07-11: the call site now also passes the
-            # current session id (empty here — harness runner has no
-            # session_store entry), scoping durable cancels to THIS session.
-            "parent_session_id": "",
-            # parity 2026-10-01: upstream passes the machine-readable invalidation
-            # reason ("stop_command"), not the user-facing interrupt text.
-            "reason": "stop_command",
-        }]
+        # /stop ends the turn only; registry-owned background delegations keep running (t_8c4608e6).
+        assert cancelled == []
         assert released == [session_key]
         assert reaped_event.wait(1)
         assert reaped == [

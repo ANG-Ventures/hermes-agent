@@ -52,7 +52,9 @@ def _thinking_sigs(messages: list) -> list:
 
 @pytest.fixture
 def providers_cfg(monkeypatch):
-    """Point the flag resolver at an in-memory ``providers:`` map."""
+    """Point the flag resolver at an in-memory ``providers:`` map (no fleet-wide window default)."""
+    monkeypatch.setattr(pt, "_load_window_default", lambda: None)
+
     def _set(providers: dict):
         monkeypatch.setattr(pt, "_load_providers_config", lambda: providers)
     return _set
@@ -89,15 +91,20 @@ def test_contiguous_window_keeps_signed_blocks_on_every_turn():
     assert _thinking_sigs(out) == ["sig-1", "sig-2"]
 
 
-def test_contiguous_window_drops_unsigned_blocks_on_older_turns():
-    """An older turn's UNSIGNED thinking has nothing the API can bind: drop it (today's bytes),
-    never demote it to text, so the contiguous window changes nothing but the signed blocks."""
+def test_contiguous_window_sends_an_older_unsigned_block_as_it_was_sent_while_latest():
+    """An UNSIGNED thinking block has nothing the API can bind, so the latest turn sends it as text.
+    A contiguous window keeps sending it that way on every later request (t_d785218c): dropping it
+    once the turn is no longer the latest changed the turn's bytes and re-sent it uncached."""
     conv = _conversation()
     conv[1]["reasoning_details"] = [{"type": "thinking", "thinking": "unsigned"}]
+    as_latest = convert_messages_to_anthropic(
+        conv[:2], base_url=RELAY, model="claude-fable-5-1", preserve_thinking=True, thinking_window="contiguous",
+    )[1][1]
     _, out = convert_messages_to_anthropic(
         conv, base_url=RELAY, model="claude-fable-5-1", preserve_thinking=True, thinking_window="contiguous",
     )
-    assert out[1]["content"] == [{"type": "text", "text": "done one"}]
+    assert out[1] == as_latest
+    assert out[1]["content"] == [{"type": "text", "text": "unsigned"}, {"type": "text", "text": "done one"}]
     assert _thinking_sigs(out) == ["sig-2"]
 
 

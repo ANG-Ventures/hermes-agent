@@ -1,0 +1,42 @@
+{
+  "python": "3.12.3",
+  "platform": "linux",
+  "rss_mb": 2069,
+  "threads": 231,
+  "pid": 1016981,
+  "modes": {
+    "legacy": {
+      "calls": {
+        "fork_exec": 20,
+        "posix_spawn": 0
+      },
+      "gil_stall_ms_p50": 0.024,
+      "gil_stall_ms_p95": 0.07,
+      "gil_stall_ms_max": 0.071,
+      "spawn_wall_ms_p50": 3.787,
+      "spawn_wall_ms_p95": 4.853
+    },
+    "legacy-fork": {
+      "calls": {
+        "fork_exec": 20,
+        "posix_spawn": 0
+      },
+      "gil_stall_ms_p50": 25.052,
+      "gil_stall_ms_p95": 32.095,
+      "gil_stall_ms_max": 32.261,
+      "spawn_wall_ms_p50": 55.177,
+      "spawn_wall_ms_p95": 60.626
+    },
+    "nofork": {
+      "calls": {
+        "fork_exec": 0,
+        "posix_spawn": 20
+      },
+      "gil_stall_ms_p50": 0.04,
+      "gil_stall_ms_p95": 0.266,
+      "gil_stall_ms_max": 0.268,
+      "spawn_wall_ms_p50": 1.993,
+      "spawn_wall_ms_p95": 3.146
+    }
+  }
+}

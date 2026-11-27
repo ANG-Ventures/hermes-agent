@@ -98,11 +98,14 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
     source = Path(__file__).resolve().parents[2]
     repo = tmp_path / "source"
     repo.mkdir()
-    for name in ("pm", "hermes_cli"):
+    # The source-update completion the python3.11 case drives imports agent.i18n (hermes_cli.cli_output),
+    # hermes_platform and hermes_test_context (hermes_cli.managed_scope); without them it fails and the
+    # launch degrades to the bootstrap interpreter (ModuleNotFoundError in the probe's stderr).
+    for name in ("agent", "pm", "hermes_cli", "hermes_platform"):
         shutil.copytree(source / name, repo / name,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     for name in ("utils.py", "hermes_constants.py", "hermes_yaml.py",
-                 "hermes_bootstrap.py"):
+                 "hermes_bootstrap.py", "hermes_test_context.py"):
         shutil.copy2(source / name, repo / name)
     # No production application lock or metadata enters this source snapshot.
     recipe = tomllib.loads((repo / "pm" / "pyproject.toml").read_text())
@@ -111,7 +114,8 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
     (repo / "pyproject.toml").write_text(
         '[project]\nname="cold-pm-app"\nversion="0.0.0"\n'
         'requires-python=">=3.14,<3.15"\n'
-        f'dependencies=[{json.dumps(yaml_requirement)}]\n'
+        # python-dotenv: imported on the same completion path (hermes_cli.config), a runtime dependency of the app.
+        f'dependencies=[{json.dumps(yaml_requirement)}, "python-dotenv"]\n'
         '[project.optional-dependencies]\nall=[]\n'
         '[tool.uv]\npackage=false\n', encoding="utf-8",
     )
@@ -134,6 +138,10 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
         "TMPDIR": str(scratch), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
         "UV_PYTHON_DOWNLOADS": "never", "UV_NO_CONFIG": "1",
         "UV_CACHE_DIR": str(tmp_path / "seed-cache"),
+        # the hand-built env drops the session-wide MALLOC_ARENA_MAX (tests/_fixtures/bounds.py); uv needs it
+        # under the harness RLIMIT_AS on many-core hosts or `uv sync` aborts "memory allocation of 15 bytes
+        # failed" (rc -6, ACE-AI 32t)
+        "MALLOC_ARENA_MAX": "2",
     }
     # Keep TLS functional on Nix without inheriting any application settings.
     for key in ("SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE"):

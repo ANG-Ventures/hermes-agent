@@ -1051,6 +1051,9 @@ def _inflight_home_path(home_key: str) -> Path:
 # ids so host-wide consumers (shutdown drain, idle-exit, metrics) see the union across profiles.
 _running_job_ids: set = set()
 _running_fire_owners: dict[tuple, dict[object, tuple[Optional[str], Path]]] = {}
+# execution token -> executions.db row id of that run; the shutdown sweep stamps it on a one-shot's
+# replay marker (cron/shutdown_replay.py).
+_running_execution_ids: dict[object, str] = {}
 # Parent gateway threads synchronously waiting on restart-safe scope workers.
 # Shutdown must not misclassify these as ownerless in-process runs: the tool
 # process sweep cannot reach the worker's transient scope.
@@ -1148,6 +1151,11 @@ _refire_withheld_job_ids: set = set()
 # recorded as a failure and flagged for its one re-fire whatever its exit status: a script that
 # traps TERM and exits 0 or 143 was cut off all the same. Guarded by ``_script_procs_lock``.
 _skew_interrupted_job_ids: set = set()
+# The subset of ``_refire_withheld_job_ids`` withheld BEFORE the bounded skew kill because their
+# re-fire is spent on a failing streak (t_af461294): never re-fired. A tree that merely outlives
+# the kill is withheld in-process but re-fired later through a gated row (t_fa0b5cff). Read by
+# the run's failure text. Guarded by ``_script_procs_lock``.
+_refire_spent_withheld_job_ids: set = set()
 
 
 def signal_shutdown(reason: str = "") -> None:
@@ -1618,8 +1626,14 @@ def mark_running_jobs_interrupted(
     *,
     only_owners: Optional[set] = None,
     lock_timeout: Optional[float] = None,
+    replay_marker: bool = False,
 ) -> list:
     """Best-effort: mark every in-flight cron job interrupted; returns the job IDs marked.
+
+    ``replay_marker`` (gateway stop only, t_b5c315bb): a one-shot agent run still in flight
+    gets a ``replay_pending`` marker instead of the terminal interrupted write, so the next
+    boot fires it exactly once (``cron/shutdown_replay.py``). Recurring and script-lane jobs,
+    and a run whose marker is refused, keep the plain interrupted mark below.
 
     Called by the gateway shutdown path immediately after it force-kills
     tool subprocesses (``process_registry.kill_all()``). A job whose tool
@@ -1659,6 +1673,7 @@ def mark_running_jobs_interrupted(
     """
     with _running_lock:
         restart_safe_waiters = set(_restart_safe_waiter_job_ids)
+        execution_ids = dict(_running_execution_ids)
         active_fires = [
             (token, key, owner, profile_home)
             for key, executions in _running_fire_owners.items()
@@ -1697,6 +1712,15 @@ def mark_running_jobs_interrupted(
             continue
         try:
             with use_cron_store(profile_home):
+                if replay_marker:
+                    from cron.shutdown_replay import mark_replay_pending
+
+                    if mark_replay_pending(
+                        job_id, fire_owner=fire_owner, run_id=execution_ids.get(_token),
+                        lock_timeout=lock_timeout,
+                    ):
+                        marked.append(job_id)
+                        continue
                 if mark_job_run(
                     job_id,
                     False,
@@ -2254,17 +2278,20 @@ def _consume_restart_killed(job_id: Any) -> bool:
 
 
 def _job_script_kwargs(job: dict) -> dict[str, Any]:
-    """Per-job ceiling + name + id for ``_run_job_script`` (see resolve_job_script_timeout)."""
+    """Per-job ceiling + name + id (+ ``env``) for ``_run_job_script`` (see resolve_job_script_timeout)."""
     timeout, _source = scheduler_ext.resolve_job_script_timeout(
         job, _get_script_timeout()
     )
     name = job.get("name") or job.get("id") if isinstance(job, dict) else None
     job_id = job.get("id") if isinstance(job, dict) else None
-    return {
+    kwargs: dict[str, Any] = {
         "timeout_seconds": timeout,
         "job_name": str(name) if name else None,
         "job_id": str(job_id) if job_id else None,
     }
+    if isinstance(job, dict) and job.get("env") is not None:
+        kwargs["job_env"] = job["env"]  # the job's `env` field reaches its script (t_dbfaea4d)
+    return kwargs
 
 
 def _bind_cron_delivery_target_hint(prompt: str, target: Optional[dict]) -> str:
@@ -2326,6 +2353,18 @@ def _fallback_was_declared(job: dict, new_provider, new_model) -> bool:
     configured net caught it and the run SUCCEEDED — expected, calm telemetry.
     An undeclared switch is the genuine "shouldn't happen" case.
     """
+    # A run that ENDED on the job's own pinned provider/model (e.g. a mid-run
+    # step to a sibling model and back: P/X -> P/M) never left its declared
+    # primary, so it is not an undeclared switch (t_1fbc5271). Both halves must
+    # match: a job with no pinned provider cannot vouch for the provider.
+    # A slot (``opus``) in the job matches the id the run ended on (the agent sends the id).
+    from hermes_cli.model_registry import slot_resolve
+
+    own_provider = str(job.get("provider") or "").strip()
+    own_model = slot_resolve(_coerce_job_model(job.get("model")))[0]
+    if (own_provider and own_model and new_provider
+            and own_provider == str(new_provider).strip() and own_model == new_model):
+        return True
     chain = job.get("fallback")
     if not isinstance(chain, list):
         return False
@@ -2333,7 +2372,7 @@ def _fallback_was_declared(job: dict, new_provider, new_model) -> bool:
         if not isinstance(entry, dict):
             continue
         ep = entry.get("provider")
-        em = entry.get("model")
+        em = slot_resolve(entry.get("model"))[0]
         # Match on model (with optional provider) — provider labels can vary
         # (pool face vs sub) but the model slug is the stable identity.
         if em and em == new_model and (not ep or not new_provider or ep == new_provider):
@@ -2683,6 +2722,7 @@ class _CronJobConfig:
     model: str
     model_cfg: Any
     cron_default_provider: str
+    model_slot: str = ""  # the slot ``model`` resolved from (``sol``), '' for a literal id
 
 
 def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
@@ -2731,13 +2771,16 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             f"`hermes cron edit {job_id} --model <name>` or set a "
             "default with `hermes model <name>`."
         )
+    # A slot (``sol``, ``cpa/sol``) in the job, cron.model or the profile default runs as its id.
+    from hermes_cli.model_registry import slot_resolve
+    model, model_slot = slot_resolve(model)
 
     with contextlib.suppress(Exception):
         from hermes_constants import apply_ipv4_preference
         _net_cfg = _cfg.get("network", {})
         if isinstance(_net_cfg, dict) and _net_cfg.get("force_ipv4"):
             apply_ipv4_preference(force=True)
-    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider)
+    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider, model_slot or "")
 
 
 def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
@@ -3493,6 +3536,7 @@ class _CronAgentSetup:
     fallback_model: Any = None
     credential_pool: Any = None
     fallback_notice: Optional[str] = None
+    model_slot: str = ""
 
 
 def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
@@ -3519,6 +3563,9 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
     setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)
     setup.fallback_notice = setup.runtime.pop("_fallback_notice", None)
+    # The slot rides beside the resolved id for the turn row only; a resolve-time fallback rung
+    # replaced the model, so the slot no longer describes it.
+    setup.model_slot = getattr(jc, "model_slot", "") if setup.model == jc.model else ""
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
@@ -3538,9 +3585,10 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
 
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
+    from gateway.run_config_loaders import provider_routing_agent_kwargs
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
-    return AIAgent(
+    agent = AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -3555,10 +3603,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         prefill_messages=setup.prefill_messages,
         fallback_model=setup.fallback_model,
         credential_pool=setup.credential_pool,
-        providers_allowed=pr.get("only"),
-        providers_ignored=pr.get("ignore"),
-        providers_order=pr.get("order"),
-        provider_sort=pr.get("sort"),
+        **provider_routing_agent_kwargs(pr),
         openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
         enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
         disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
@@ -3572,6 +3617,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         session_id=session_id,
         session_db=session_db,
     )
+    if setup.model_slot:
+        from agent.model_slots import adopt_slot
+        adopt_slot(agent, setup.model_slot)
+    return agent
 
 
 class _FireAudit:
@@ -4166,6 +4215,7 @@ def run_one_job(
     with _running_lock:
         _running_fire_owners.setdefault(_fire_key, {})[execution_token] = (
             fire_owner or None, profile_home)
+        _running_execution_ids[execution_token] = execution_id
     try:
         with self_removal_delivery_scope(job["id"]):
             return _run_with_fire_claim_heartbeat(
@@ -4201,6 +4251,7 @@ def run_one_job(
                     "Job '%s': restart re-queue failed: %s", job["id"], e,
                 )
         with _running_lock:
+            _running_execution_ids.pop(execution_token, None)
             executions = _running_fire_owners.get(_fire_key)
             if executions is not None:
                 executions.pop(execution_token, None)
@@ -4481,9 +4532,14 @@ def _save_compose_deliver(
         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
 
-def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Optional[str]) -> None:
+def _finish_interrupted_run(
+    job: dict, execution_id: str, delivery_error: Optional[str], *, delivered: bool = False,
+) -> None:
     """Shutdown already wrote last_status, so mark_job_run is skipped (a second call would skip a
-    fire or auto-delete the job); an unsent notice is recorded via update_job instead."""
+    fire or auto-delete the job); an unsent notice is recorded via update_job instead.
+    ``delivered``: the result left before the interrupt landed. The row then carries a distinct
+    error, so a one-shot replay marker reads it as terminal and does not re-run delivered work."""
+    from cron.shutdown_replay import INTERRUPTED_AFTER_DELIVERY_ERROR, INTERRUPTED_ERROR
     if delivery_error:
         try:
             # The gateway shutdown already wrote last_status for this run, so mark_job_run is skipped below
@@ -4498,7 +4554,7 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
     finish_execution(
         execution_id, success=False,
-        error="Interrupted by gateway shutdown before terminal completion.")
+        error=INTERRUPTED_AFTER_DELIVERY_ERROR if delivered else INTERRUPTED_ERROR)
 
 
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
@@ -4654,6 +4710,15 @@ def _run_one_job_body(
     delivery_attempted = False
     delivery_error = None
 
+    def _finish_if_interrupted(delivered: bool) -> bool:
+        """The shutdown sweep sets the interrupt flag BEFORE its replay marker releases the
+        fire claim, so an ownership loss seen while the flag is set was caused by the stop:
+        record the interruption, not 'ownership lost', or the marker reads it as terminal."""
+        if not _consume_interrupted_flag(job["id"], execution_token):
+            return False
+        _finish_interrupted_run(job, execution_id, delivery_error, delivered=delivered)
+        return True
+
     _fire_scope_tokens = None
     _terminal_scope_token = None
     try:
@@ -4739,7 +4804,8 @@ def _run_one_job_body(
 
         if _fire_claim_ownership_lost():
             _teardown_deferred()
-            _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+            if not _finish_if_interrupted(delivered=False):
+                _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
 
         if shutdown_refused and record_shutdown_skip(job, fire_owner, execution_id):
@@ -4771,7 +4837,8 @@ def _run_one_job_body(
 
         if d.side_effect_ownership_lost:
             # The claim died inside a side-effect fence: the side effect did NOT complete.
-            _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+            if not _finish_if_interrupted(delivered=False):
+                _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
 
         # Empty final_response is a soft failure so last_status is not "ok".
@@ -4796,11 +4863,17 @@ def _run_one_job_body(
                         "Job '%s': transport cancellation arrived before terminal completion; "
                         "recording the interrupted run",
                         job["id"])
-                _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+                if not _finish_if_interrupted(
+                        delivered=bool(d.delivery_attempted and not d.delivery_error)):
+                    _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
                 return True
 
-        if _consume_interrupted_flag(job["id"], execution_token):
-            _finish_interrupted_run(job, execution_id, delivery_error)
+        # A flag alone is advisory: the sweep may have timed out without persisting.
+        # After delivery, the owner-fenced terminal write is authoritative.
+        if _consume_interrupted_flag(job["id"], execution_token) and fire_owner is None:
+            _finish_interrupted_run(
+                job, execution_id, delivery_error,
+                delivered=bool(d.delivery_attempted and not d.delivery_error))
             return True
 
         return _finish_completed_run(d, fire_owner, execution_id)
@@ -4834,9 +4907,12 @@ def _run_one_job_body(
         ):
             delivery_error, delivery_outcome = _deliver_crash_failure(
                 job, _err_text, adapters=adapters, loop=loop)
+        interrupted = False
+        marked = False
         try:
+            interrupted = _consume_interrupted_flag(job["id"], execution_token)
             if (
-                not _consume_interrupted_flag(job["id"], execution_token)
+                (not interrupted or fire_owner is not None)
                 and not self_removal_delivery_allowed(job["id"])  # no record left to mark
             ):
                 mark_kwargs = {}
@@ -4844,10 +4920,17 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
-                mark_job_run(job["id"], False, _err_text, **mark_kwargs)
+                marked = mark_job_run(job["id"], False, _err_text, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)
+        if interrupted and not marked:
+            # The stop's cancel surfaced as this exception: record the interruption, which a
+            # one-shot replay marker reads as "not an outcome" (t_b5c315bb).
+            from cron.shutdown_replay import INTERRUPTED_AFTER_DELIVERY_ERROR, INTERRUPTED_ERROR
+
+            _err_text = (INTERRUPTED_AFTER_DELIVERY_ERROR if delivery_attempted and not delivery_error
+                         else INTERRUPTED_ERROR)
         try:
             finish_execution(
                 execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)

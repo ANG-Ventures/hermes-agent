@@ -80,6 +80,15 @@ VIA_ALLOC_CLIENT = "alloc_client"
 # reservation id after the replacement lives here, read back by run_reservation /
 # running_reservations after a restart (Prism 43f676a1839e).
 RESERVATION_REPLACED_EVENT = "placement_reservation_replaced"
+# Run event of a LOCAL (this host) start that booked its lease on the shared ledger (t_02aa6d86, doctrine rule 15):
+# ``{"host", placement_reservation}``. Deliberately not worker_placed: "no worker_placed" still means "ran here".
+LOCAL_ADMITTED_EVENT = "local_admitted"
+# The run events that carry a ledger reservation the run owns (release at run end, renew while live).
+RESERVATION_EVENTS = ("worker_allocated", LOCAL_ADMITTED_EVENT)
+# Every name a reservation row is READ under (rename wave 3, t_7be48220): worker_placed and worker_allocated.
+RESERVATION_READ_KINDS = ("worker_placed", "worker_allocated", LOCAL_ADMITTED_EVENT)
+_PLACED_READ_KINDS = ("worker_placed", "worker_allocated")
+LOCAL_HOST_ALIAS = "local"
 SHADOW_REL = Path("var") / "alloc" / "shadow" / f"{CONSUMER}.jsonl"
 
 
@@ -141,6 +150,14 @@ def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str
         out["ncpu"] = _num(doc["ncpu"])
     if isinstance(doc.get("os"), str) and doc["os"]:
         out["os"] = doc["os"]
+    # the darwin sampler's power block, for a power_policy ac_only host (Prism 24ab4994fb91): dropped here, every
+    # such host read "power unmeasured" and was closed. Malformed = None (unmeasured), placement._power_fields' rule.
+    out.update(placement._power_fields(doc.get("power")))
+    # t_31911eb0 fleet_cap inputs (Prism ae0dcf2b0566): the sampler's ``fleet`` block and the MEASURED mem_total_gb
+    # (a percent RAM cap refuses a total filled from the host table). Dropped here, a capped host read
+    # ``unmeasured:fleet_cap_*`` on every probe. Malformed = None, placement._fleet_fields' rule.
+    out.update(placement._fleet_fields(doc.get("fleet")))
+    out["mem_total_gb"] = _num(doc.get("mem_total_gb"))
     at = _num(doc.get("at"))
     if at is None or remote_now is None or not math.isfinite(remote_now):
         out["sample_status"] = "stale"
@@ -163,6 +180,10 @@ def sample_from_detail(d: Mapping) -> Optional[placement.Sample]:
         note="" if status == "fresh" else str(d.get("pressure") or ""),
         ncpu=_num(d.get("ncpu")), os=d.get("os") if isinstance(d.get("os"), str) else None,
         slo_breach=d.get("slo_breach") if isinstance(d.get("slo_breach"), bool) else None,
+        power_source=d.get("power_source") if d.get("power_source") in ("ac", "battery", "ups") else None,
+        sleep_disabled=d.get("sleep_disabled") if isinstance(d.get("sleep_disabled"), bool) else None,
+        fleet_cpus=_num(d.get("fleet_cpus")), fleet_ram_gb=_num(d.get("fleet_ram_gb")),
+        mem_total_gb=_num(d.get("mem_total_gb")),
         **{k: _num(d.get(k)) for k in V2_FIELDS + UTIL_FIELDS})
 
 
@@ -181,8 +202,8 @@ def previous_host(conn, task_id: str) -> Optional[str]:
     from hermes_cli import kanban_placement_reasons as _pr
     try:
         row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
-            (task_id, _pr.WORKER_PLACED_EVENT)).fetchone()
+            f"SELECT payload FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks(_pr.WORKER_PLACED_EVENT)}) "
+            "ORDER BY id DESC LIMIT 1", (task_id, *_pr.kind_names(_pr.WORKER_PLACED_EVENT))).fetchone()
         host = json.loads(row[0] or "{}").get("host") if row else None
     except Exception:
         return None
@@ -232,11 +253,11 @@ def _inputs(plan, names):
         samples[canon[n]] = s
         if plan.slots.get(n, 0) <= 0 and (s is None or s.status == "fresh"):
             exclusions[canon[n]] = str(d.get("pressure") or "no free slot")
-    root = Path(sig.placement_reservations).parents[2] if sig.placement_reservations else None
+    # No exclusions_path: hermes-home #11416 (FWA B5-P3) retired var/placement/exclusions.json; a fleet pause closes a
+    # host through its fwa fence hold, which kanban_pause_hold reads for this dispatcher.
     kw = dict(candidates=[canon[n] for n in names],
               previous=table.resolve(plan.last_pick) if plan.last_pick else None,
-              exclusions=exclusions, require_axes=PROBE_AXES, stale_after_s=sig.policy.stale_after_s,
-              exclusions_path=None if root is None else root / placement.EXCLUSIONS_REL)
+              exclusions=exclusions, require_axes=PROBE_AXES, stale_after_s=sig.policy.stale_after_s)
     return table, samples, kw
 
 
@@ -377,6 +398,62 @@ def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[s
         return why
 
 
+def ledger_root() -> Path:
+    """THE root of the shared reservation ledger (Prism 681e7446f5d8): the fleet root every other consumer reads
+    (allocd, Prism, test-gate, LoadGate.shared_leases), never the board home. Booking, renewal and release all use it."""
+    return placement.fleet_root()
+
+
+def local_kind_pause(root: Optional[Path] = None, now: Optional[float] = None) -> Optional[str]:
+    """Prism b9b45a76cc17: the ``kind_paused:kanban@<scope> <id>`` reason when a live state/fleet-pause/kinds.json row
+    pauses kanban work on THIS host (scope = this host or ``all``), else None. The pool path closes the same hosts in
+    placement.choose(); a LOCAL start (LoadGate, then book_local) must refuse too. No table / no ``local`` host = None
+    (nothing to resolve the scope against). An unreadable or malformed kinds.json raises ExclusionsError: fail closed."""
+    root = Path(root) if root is not None else ledger_root()
+    table = load_table(root)
+    hid = table.resolve(LOCAL_HOST_ALIAS) if table is not None else None
+    if hid is None:
+        return None
+    return placement.kind_exclusions(table, CONSUMER, root / placement.KINDS_REL,
+                                     now=time.time() if now is None else float(now), root=root).get(hid)
+
+
+def book_local(job_id: Optional[str], job: Optional[placement.Job] = None, *, root: Optional[Path] = None,
+               now: Optional[float] = None) -> Optional[str]:
+    """Book a LOCAL start (this host, the ``local`` alias of the table) on the shared ledger BEFORE launch (t_02aa6d86,
+    doctrine rule 15): the LoadGate still decides WHETHER this host has room; the start books the lease every other
+    consumer's admission on this host reads (Prism, test-gate, allocd). The row books the measured estimate the
+    admitter uses (as book_pin(check=True) does). Returns the reservation id, or None when there is no table or the
+    table names no ``local`` host (nothing to book against, the pre-table behaviour). An unreadable ledger raises
+    PlacementError: the caller does not start the worker (fail closed)."""
+    root = Path(root) if root is not None else ledger_root()
+    table = load_table(root)
+    hid = table.resolve(LOCAL_HOST_ALIAS) if table is not None else None
+    if hid is None:
+        return None
+    rpath = root / placement.RESERVATIONS_REL
+    fp = table.footprint(CONSUMER, job.footprint if job is not None else None,
+                         profile=job.profile if job is not None else None)
+    with placement._locked(rpath):
+        t = time.time() if now is None else float(now)       # after the lock, as reserve() takes it
+        try:
+            ctx = placement.admit_context(CONSUMER, fp, now=t, job=job, table=table, root=root)
+            need, klass = ctx.need(hid), ctx.job_class
+        except placement.PlacementError:                     # no estimate inputs: the declared footprint, never nothing
+            need, klass = placement.need_of(fp), placement.job_class_for(CONSUMER, job)
+        booked = placement.Footprint(ram_gb=need.ram_gb, threads=need.cpus, scratch_gb=fp.scratch_gb,
+                                     gpu_mb=need.gpu_mib)
+        return placement._reserve_unlocked(rpath, hid, CONSUMER, booked, ttl_s=RESERVE_TTL_S, job_id=job_id, now=t,
+                                           admissions_path=rpath.parent / placement.ADMISSIONS_REL.name,
+                                           decision=None, job_class=klass)
+
+
+def release_local(rid: Optional[str], root: Optional[Path] = None) -> None:
+    """Refund a :func:`book_local` row whose start never launched (TTL bounds a failed refund)."""
+    if rid:
+        release_reservation(rid, root)
+
+
 def release_id(sig, rid: Optional[str]) -> None:
     if not rid or sig is None or getattr(sig, "placement_reservations", None) is None:
         return
@@ -419,11 +496,9 @@ def structural_free(plan, name: str) -> int:
     d = plan.detail.get(name) or {}
     if h is None or not (h.enabled and h.state == "active") or d.get("load1") is None:
         return 0
-    if h.slots is None:
-        # Count-free host (t_c834e0d8): only the per-tick stand-in, never running.
-        from hermes_cli.kanban_worker_pool import UNCOUNTED_TICK_FREE
-        return max(0, UNCOUNTED_TICK_FREE - plan.taken.get(name, 0))
-    return max(0, h.slots - int(d.get("running") or 0) - plan.taken.get(name, 0))
+    # The per-host count is legacy configuration, not an allocd admission budget.
+    from hermes_cli.kanban_worker_pool import UNCOUNTED_TICK_FREE
+    return max(0, UNCOUNTED_TICK_FREE - plan.taken.get(name, 0))
 
 
 def _job_kw(job: Optional[placement.Job]) -> Dict[str, Any]:
@@ -541,9 +616,34 @@ def allocd_admit(plan, names, job: Optional[placement.Job], job_id: Optional[str
     raises alloc_client.Refused on a terminal answer (never bypassed)."""
     from hermes_cli.fleet_placement import alloc_client
     unified = unified_active(plan)
-    return alloc_client.admit(CONSUMER, job_id=admission_key(job_id), ttl_s=RESERVE_TTL_S,
-                              unified=unified, stale_after_s=float(plan.signal.policy.stale_after_s) if unified else None,
-                              **allocd_request(plan, names, job))
+    key = _deferred_key(job_id) or admission_key(job_id)
+    r = alloc_client.admit(CONSUMER, job_id=key, ttl_s=RESERVE_TTL_S,
+                           unified=unified, stale_after_s=float(plan.signal.policy.stale_after_s) if unified else None,
+                           **allocd_request(plan, names, job))
+    if job_id is not None and getattr(r, "source", None) == "deferred" and getattr(r, "job_id", None):
+        _DEFERRED[job_id] = (r.job_id, time.time())
+    elif job_id is not None and getattr(r, "reservation_id", None):
+        _DEFERRED.pop(job_id, None)            # granted under the key: the only terminal end of a deferral
+    return r
+
+
+# Prism 6e478f43c7ea: a deferred admit (allocd slow, still healthy) may commit later. The card's next tick retries
+# with the SAME key, so allocd's reuse_job hands back that row instead of booking a second lease. {card job_id:
+# (admission key, when deferred)}; an entry older than the reservation TTL is dropped (its row has expired).
+# The key is kept across non-grant answers (409, fallback refusal, allocd_wedged_lock, a raise): none proves allocd
+# did not commit the deferred request late, so only a grant under the key clears it (Prism pr325-direct P2).
+_DEFERRED: Dict[str, Tuple[str, float]] = {}
+
+
+def _deferred_key(job_id: Optional[str]) -> Optional[str]:
+    """The key of this card's last DEFERRED admit (kept until a grant under it, or TTL), or None."""
+    if job_id is None:
+        return None
+    now = time.time()
+    for k in [k for k, (_, at) in _DEFERRED.items() if now - at > RESERVE_TTL_S]:
+        del _DEFERRED[k]
+    hit = _DEFERRED.get(job_id)
+    return hit[0] if hit else None
 
 
 def admission_key(job_id: Optional[str]) -> Optional[str]:
@@ -554,12 +654,20 @@ def admission_key(job_id: Optional[str]) -> Optional[str]:
     return None if job_id is None else f"{job_id}#{uuid.uuid4().hex[:12]}"
 
 
-def release_alloc(rid: str) -> bool:
-    """Release a reservation alloc_client booked (allocd, or its in-process fallback)."""
+def release_alloc(rid: str, actual: Optional[Mapping] = None) -> bool:
+    """Release a reservation alloc_client booked (allocd, or its in-process fallback). ``actual``: the run's
+    measured use (:func:`measure_run_footprint`), sent as ``actual_source`` :data:`FOOTPRINT_SOURCE`."""
     from hermes_cli.fleet_placement import alloc_client
     try:
-        return alloc_client.release(rid, consumer=CONSUMER)
+        if actual is None:
+            return alloc_client.release(rid, consumer=CONSUMER)
+        return alloc_client.release(rid, consumer=CONSUMER, actual=actual, actual_source=FOOTPRINT_SOURCE)
     except Exception as exc:  # Refused / an unreadable ledger: the TTL bounds the row
+        if (actual is not None and isinstance(exc, alloc_client.Refused)
+                and str(exc).startswith("actual refused after lease release")):
+            # allocd ended the lease and refused only the measurement (e.g. host-bound mismatch)
+            _log.warning("kanban pool: release of %s: actual not recorded: %s", rid, exc)
+            return True
         _log.warning("kanban pool: alloc_client release of %s failed (TTL bounds it): %s", rid, exc)
         return False
 
@@ -680,8 +788,8 @@ def run_reservation(conn, task_id: str, run_id: Optional[int]) -> Tuple[Optional
     from hermes_cli import kanban_placement_reasons as _pr
     try:
         row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? "
-            "ORDER BY id DESC LIMIT 1", (task_id, run_id, _pr.WORKER_PLACED_EVENT)).fetchone()
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind IN (?, ?, ?) "
+            "ORDER BY id DESC LIMIT 1", (task_id, run_id, *RESERVATION_READ_KINDS)).fetchone()
         doc = json.loads(row[0] or "{}") if row else {}
     except Exception as exc:
         _log.warning("kanban pool: placement reservation lookup failed for %s run %s: %s", task_id, run_id, exc)
@@ -739,9 +847,113 @@ def reservation_for_run(conn, task_id: str, run_id: Optional[int]) -> Optional[s
     return run_reservation(conn, task_id, run_id)[0]
 
 
-def release_run_reservation(rid: str, via: Optional[str]) -> bool:
-    """End a run's reservation through whoever booked it."""
-    return release_alloc(rid) if via == VIA_ALLOC_CLIENT else release_reservation(rid)
+def release_run_reservation(rid: str, via: Optional[str], footprint: Optional[Mapping] = None) -> bool:
+    """End a run's reservation through whoever booked it. ``footprint`` (:func:`run_footprint_target`): an
+    allocd-booked run's release carries the use measured on its host as ``actual`` (t_26acfaa2)."""
+    if via != VIA_ALLOC_CLIENT:
+        return release_reservation(rid)
+    actual = None
+    if footprint is not None:
+        try:
+            actual = measure_run_footprint(footprint)
+        except Exception as exc:  # never blocks the release: the lease ends unmeasured
+            _log.info("kanban pool: release of %s carries no actual (%s run %s): %s",
+                      rid, footprint.get("host"), footprint.get("run_id"), exc)
+    return release_alloc(rid, actual=actual)
+
+
+# t_26acfaa2 (FWA footprints): a placed run's tools all ride ONE ssh ControlMaster per run
+# (kanban_worker_hosts.placement_env TERMINAL_SSH_CONTROL_SCOPE), so on the pool host every command the run made
+# ran inside that connection's logind session scope. At release one more command over the same master reads that
+# scope: memory.peak (peak RAM of the run's commands), cpu.stat usage_usec over the session's age (cpus = average
+# cores, plus cpu_s / wall_s), and nvidia-smi memory of the scope's live pids. No live master = no measurement.
+FOOTPRINT_SOURCE = "cgroup"
+FOOTPRINT_TIMEOUT_S = 8
+# g = MiB of GPU memory the scope's pids hold, or "-" (unmeasured) when nvidia-smi is absent or fails: its exit
+# status is read before awk, so a failed query is never summed into a false 0 (Prism 79ecb88fb021).
+_FOOTPRINT_GPU_SH = (
+    'g=-; if command -v nvidia-smi >/dev/null 2>&1 && '
+    'q=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null); then '
+    'g=$(printf "%s\\n" "$q" | awk -F", *" \'NR==FNR{a[$1];next} ($1 in a){s+=$2} END{print s+0}\' '
+    '"$d/cgroup.procs" -) || g=-; fi; ')
+_FOOTPRINT_SH = (
+    'c=$(sed -n "s/^0:://p" /proc/self/cgroup); d=/sys/fs/cgroup$c; '
+    'case "$c" in */session-*.scope) ;; *) echo "no session scope: $c"; exit 3;; esac; '
+    'p=$(cat "$d/memory.peak") && u=$(sed -n "s/^usage_usec //p" "$d/cpu.stat") && '
+    'e=$(ps -o etimes= -p "$(head -n1 "$d/cgroup.procs")") || exit 4; ' + _FOOTPRINT_GPU_SH +
+    'echo "fp $p $u $e ${g:--}"')
+
+
+def run_footprint_target(conn, task_id: str, run_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """``{host, target, port, run_id}`` from the run's ``worker_placed`` (the pool host it ran on and the ssh
+    target its tools used); None for a run that was not placed on a pool host."""
+    if run_id is None:
+        return None
+    try:
+        row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind IN (?, ?) "
+                           "ORDER BY id DESC LIMIT 1", (task_id, run_id, *_PLACED_READ_KINDS)).fetchone()
+        doc = json.loads(row[0] or "{}") if row else {}
+    except Exception:
+        return None
+    host, target = doc.get("host"), doc.get("target")
+    if not (isinstance(host, str) and host and isinstance(target, str) and "@" in target):
+        return None
+    port = doc.get("ssh_port", 22)
+    return {"host": host, "target": target, "port": port if isinstance(port, int) else 22, "run_id": int(run_id)}
+
+
+def measure_run_footprint(fp: Mapping, *, runner=None) -> Dict[str, Any]:
+    """The run's measured use on its pool host (``actual`` for alloc_client.release). Raises on any failure.
+
+    A placed run's commands ride a SendEnv sibling master, not only the plain one (Prism c6c346b2d8e2;
+    ``SSHEnvironment._control_socket_for``), and each master is its own session scope. Every live master of
+    the run is read and summed: ram_gb is the sum of the scopes' peaks (an upper bound of their joint peak),
+    cpu_s the sum, wall_s the oldest. A master that is gone took its scope with it and is skipped."""
+    import subprocess
+    from tools.environments.ssh import control_socket_path, control_sockets
+    run = runner or subprocess.run
+    user, _, ssh_host = str(fp["target"]).partition("@")
+    plain = control_socket_path(user, ssh_host, int(fp["port"]), f"run{int(fp['run_id'])}")
+    socks = [s for s in control_sockets(plain) if s.exists()]
+    if not socks:
+        raise RuntimeError(f"no live ssh master for run {fp['run_id']} ({plain.name})")
+    reads, errors = [], []
+    for sock in socks:
+        try:
+            reads.append(_read_master(run, sock, fp))
+        except RuntimeError as exc:
+            errors.append(f"{sock.name}: {exc}")
+    if not reads:
+        raise RuntimeError("; ".join(errors))
+    peak, usage_us, wall = sum(r[0] for r in reads), sum(r[1] for r in reads), max(r[2] for r in reads)
+    cpu_s = usage_us / 1e6
+    actual: Dict[str, Any] = {"host": fp["host"], "cpus": round(cpu_s / wall, 3), "ram_gb": round(peak / 2 ** 30, 3),
+                              "cpu_s": round(cpu_s, 3), "wall_s": float(wall)}
+    gpus = [r[3] for r in reads if r[3] is not None]
+    if gpus:
+        actual["gpu_mib"] = float(sum(gpus))
+    return actual
+
+
+def _read_master(run, sock: Path, fp: Mapping) -> Tuple[int, int, int, Optional[float]]:
+    """``(peak bytes, usage usec, session age s, gpu MiB or None)`` of one live master's session scope."""
+    import subprocess
+    base = ["ssh", "-S", str(sock), "-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
+    if int(fp["port"]) != 22:
+        base += ["-p", str(int(fp["port"]))]
+    kw = dict(capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=FOOTPRINT_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    # a dead master would make ssh connect afresh and measure a NEW session: only a master that answers is read
+    if run(base + ["-O", "check", fp["target"]], **kw).returncode != 0:
+        raise RuntimeError(f"ssh master for run {fp['run_id']} is not running")
+    proc = run(base + [fp["target"], _FOOTPRINT_SH], **kw)
+    out = (proc.stdout or "").strip().splitlines()
+    parts = out[-1].split() if out else []
+    if proc.returncode != 0 or len(parts) != 5 or parts[0] != "fp":
+        raise RuntimeError(f"footprint read rc={proc.returncode}: {(proc.stdout or proc.stderr or '').strip()[:160]}")
+    peak, usage_us, wall = int(parts[1]), int(parts[2]), int(parts[3])
+    if wall <= 0:
+        raise RuntimeError(f"session age {wall}s")
+    return peak, usage_us, wall, (None if parts[4] == "-" else float(parts[4]))
 
 
 def release_reservation(rid: str, root: Optional[Path] = None) -> bool:
@@ -763,12 +975,11 @@ def running_reservations(conn) -> List[Tuple[str, str, Optional[str]]]:
     """``(task_id, reservation id, via)`` for every RUNNING card whose current run's
     ``worker_placed`` event carries a headroom reservation (``via`` as in
     :func:`run_reservation`)."""
-    from hermes_cli import kanban_placement_reasons as _pr
     out: List[Tuple[str, str, Optional[str]]] = []
     for tid, run_id, payload in conn.execute(
             "SELECT t.id, e.run_id, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
-            "WHERE t.status = 'running' AND e.kind = ? AND e.run_id IS NOT NULL "
-            "AND e.run_id = t.current_run_id", (_pr.WORKER_PLACED_EVENT,)).fetchall():
+            "WHERE t.status = 'running' AND e.kind IN (?, ?, ?) AND e.run_id IS NOT NULL "
+            "AND e.run_id = t.current_run_id", RESERVATION_READ_KINDS).fetchall():
         if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='door_authorized'",
                         (tid, run_id)).fetchone():
             continue

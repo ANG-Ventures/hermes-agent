@@ -254,7 +254,7 @@ def test_reviewer_swap_after_a_review_resume_counts(kanban_home: SimpleNamespace
         _tick(kanban_home)
         assert kb.request_review(conn, tid, summary="PR ready", reviewer="human",
                                  expected_run_id=claimed.current_run_id)
-        assert kb.block_task(conn, tid, reason="park")
+        assert kb.block_task(conn, tid, reason="park", kind="needs_input")
         assert kb.unblock_task(conn, tid)
         assert kb.get_task(conn, tid).status == "review"
         assert kb.assign_task(conn, tid, "argus", request_changes_reason=None,

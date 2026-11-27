@@ -143,6 +143,34 @@ def test_fork_first_request_prefix_byte_identical_to_parent_next_request():
     assert child_req["extra_headers"][_PIN] == _SEAT
 
 
+@pytest.mark.parametrize("mode", ["fork", "summary"])
+def test_parent_route_policy_survives_eligible_fork_and_summary(mode):
+    parent = _warm_parent()
+    parent._fallback_chain = [{"provider": "openai", "model": "cross-vendor"}]
+    parent.request_overrides = {"extra_body": {"nonce": "parent"}}
+    with ExitStack() as stack:
+        _patches(stack)
+        stack.enter_context(patch("tools.delegate_tool._load_config", return_value={
+            "model": "worker-default", "fallback_providers": []}))
+        child = _build_child_agent(
+            task_index=0, goal="verify inherited route", context=None, toolsets=None,
+            model="worker-default", override_provider="wrong-default-provider", max_iterations=5,
+            task_count=1, parent_agent=parent, inherit_mode=mode, inherit_parent_route=True,
+        )
+    try:
+        assert (child.provider, child.model) == (parent.provider, parent.model)
+        assert child._fallback_chain == parent._fallback_chain
+        if mode == "fork":
+            assert child._inherit_mode == "fork"
+        child._fallback_chain[0]["model"] = "child-only"
+        assert parent._fallback_chain[0]["model"] == "cross-vendor"
+        child.request_overrides["extra_body"]["nonce"] = "child"
+        assert parent.request_overrides["extra_body"]["nonce"] == "parent"
+    finally:
+        child.close()
+        parent.close()
+
+
 def test_fork_prefix_stops_at_last_complete_assistant_turn():
     """D-8: a delegate_task issued mid-turn sees the in-flight user row (and possibly an
     unfinished tool round) after the last complete assistant turn; none of it is copied."""

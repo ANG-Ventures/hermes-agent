@@ -87,10 +87,10 @@ def _elig(obj):
 
 
 def _sticky_on_fallback(store, key, *, primary_seat="sub-vps-6", last_primary=None,
-                        cls="conn", now=T0):
+                        cls="conn", now=T0, **arm_kw):
     fp.note_primary_success(store, key, last_primary if last_primary is not None else now - 60,
                             provider="claude-bpr", headers={"x-pool-served-by": primary_seat})
-    _arm(store, key, cls=cls, now=now)
+    _arm(store, key, cls=cls, now=now, **arm_kw)
     fp.note_fallback_success(store, key, now + 1, "sid-a")
     return store.get(key)
 
@@ -357,7 +357,9 @@ def test_compaction_marker_survives_db_only_restart(tmp_path, key):
 
 
 def test_nothing_but_fallback_failed_returns_before_until(store, key):
-    st = _sticky_on_fallback(store, key, cls="quota_model")
+    # Relay lane: the bench lasts only as long as the relay's stated reset
+    # (t_d780729d); here the relay said 6 h.
+    st = _sticky_on_fallback(store, key, cls="quota_model", stated_reset_s=6 * 3600)
     elig = _elig({"instance_id": "x", "bound_seat": "sub-vps-6", "bound_eligible": True,
                   "model_eligible": True})
     now = T0 + 3 * 3600  # fallback idle > 60 min, session rotated, seat warm-ish: still < until

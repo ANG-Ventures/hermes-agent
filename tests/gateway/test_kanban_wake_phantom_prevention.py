@@ -100,7 +100,7 @@ def _subscribed_completed_task(
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="worker card", assignee="worker", session_id=session_key,
+            conn, boomerang_wake=False, title="worker card", assignee="worker", session_id=session_key,
         )
         # delivery_mode: the merged schema gates wakes on delivery_mode
         # (upstream #73030); real gateway rows carry 'notify+wake' (stamped by

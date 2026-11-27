@@ -23,14 +23,25 @@ _REASON_LEASE_LOST = "session turn lease lost"
 
 LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
-# A refresh that RAISES (e.g. state.db "database is locked" behind a long VACUUM) is retried while
-# the lease is still valid; the turn is interrupted only this close to the lease's expiry.
+# A refresh that RAISES is retried. Lock contention (state.db "database is locked") is retried past
+# expiry while a lock-free read shows the row is still ours; anything else interrupts the turn only
+# this close to the lease's expiry.
 LEASE_REFRESH_SAFETY_MARGIN_SECONDS = 30.0
 _REFRESH_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
 
 
 def _now() -> float:
     return time.monotonic()
+
+
+def _is_lock_contention(exc: BaseException) -> bool:
+    """True when a refresh failed only because another writer held state.db. That says nothing
+    about who owns the row: an expired row stays this holder's until a successor claims it, and
+    the holder-qualified UPDATE answers that once the lock clears. Interrupting on it killed nine
+    kanban workers in two bursts on 2026-11-10 (t_61a89317) while sibling workers held the writer."""
+    from hermes_state import classify_persistence_error
+
+    return classify_persistence_error(exc) == "locked"
 
 
 class DurableTurnLease:
@@ -195,13 +206,32 @@ class DurableTurnLease:
         """Sleep between refresh retries; True when the turn ended meanwhile."""
         return self.stop.wait(seconds)
 
+    def _row_owner_while_locked(self) -> Optional[bool]:
+        """Whether the lease row still names this holder, read without the write lock.
+
+        True: still ours, keep retrying the renewal. False: another holder reclaimed it (or the
+        row is gone), so this turn must stop now rather than write beside a successor. None: the
+        read failed too; the caller falls back to the TTL-margin give-up."""
+        reader = getattr(type(self.db), "get_session_turn_lease_holder", None)
+        if not callable(reader):
+            return None
+        try:
+            return self.db.get_session_turn_lease_holder(self._current_session_id()) == self.holder
+        except Exception:
+            logger.debug("Session turn lease owner read failed while state.db was locked", exc_info=True)
+            return None
+
     def refresh_tick(self):
         """One periodic renewal (every ``refresh_interval`` via the shared scheduler). Returning
         False stops the timer.
 
         A refresh that returns False means the lease is gone: interrupt at once. A refresh that
-        RAISES (state.db write lock held past the busy timeout) proves nothing about ownership and
-        the lease is still valid, so retry on a short backoff and interrupt only once the lease
+        RAISES proves nothing about ownership, so retry on a short backoff. Lock contention (another
+        writer held state.db past the busy timeout) is retried past the TTL only while a WAL read
+        of the row still names this holder: an expired row is reclaimable, not taken. Once the row
+        names a successor the turn stops at once, so two owners never overlap by more than one
+        re-check step (and transcript writes are fenced on the holder meanwhile). If that read
+        fails too, or the error is not lock contention, the turn is interrupted once the lease
         could lapse (``LEASE_TTL_SECONDS - LEASE_REFRESH_SAFETY_MARGIN_SECONDS`` since the last
         successful refresh).
 
@@ -227,11 +257,25 @@ class DurableTurnLease:
                 )
                 self._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
                 return False
-            except Exception:
+            except Exception as exc:
                 if self.stop.is_set():
                     return False
                 elapsed = _now() - self.last_refresh_ok
-                if elapsed >= give_up_after:
+                past_ttl_margin = elapsed >= give_up_after
+                if past_ttl_margin and _is_lock_contention(exc):
+                    owner = self._row_owner_while_locked()
+                    if owner is False:
+                        logger.error(
+                            "Session turn lease %s was reclaimed by another holder while state.db "
+                            "was locked; interrupting the turn", self._current_session_id(),
+                        )
+                        self._interrupt_turn(
+                            "Session turn lease lost; stopping to protect the transcript."
+                        )
+                        return False
+                    if owner is True:
+                        past_ttl_margin = False
+                if past_ttl_margin:
                     logger.error(
                         "Failed to refresh session turn lease %s for %.0fs (%.0fs of validity "
                         "left); interrupting the turn", self._current_session_id(), elapsed,
@@ -241,10 +285,14 @@ class DurableTurnLease:
                         "Session turn lease could not be refreshed; stopping to protect the transcript."
                     )
                     return False
-                delay = min(
-                    _REFRESH_RETRY_BACKOFF_SECONDS[min(attempt, len(_REFRESH_RETRY_BACKOFF_SECONDS) - 1)],
-                    give_up_after - elapsed,
-                )
+                if elapsed < give_up_after:
+                    delay = min(
+                        _REFRESH_RETRY_BACKOFF_SECONDS[min(attempt, len(_REFRESH_RETRY_BACKOFF_SECONDS) - 1)],
+                        give_up_after - elapsed,
+                    )
+                else:
+                    # Past the margin the row is reclaimable: re-check ownership at the shortest step.
+                    delay = _REFRESH_RETRY_BACKOFF_SECONDS[0]
                 logger.warning(
                     "Failed to refresh session turn lease %s (%.0fs of validity left); retrying "
                     "in %.0fs", self._current_session_id(), LEASE_TTL_SECONDS - elapsed, delay,

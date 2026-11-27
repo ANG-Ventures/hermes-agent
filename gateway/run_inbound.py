@@ -26,6 +26,7 @@ from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
+from gateway import inbound_record
 from gateway.run_common import _UNSET
 from gateway.run_inbound_unauthorized import (
     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
@@ -45,6 +46,10 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Upper bound a busy-rejected slash command waits for an in-flight /stop to release the slot before
+# falling back to the "still finishing" reply. Live 2026-11-08 the release came 37 s after /stop.
+_STOP_SETTLE_WAIT_S = 120.0
+
 # Fork: chat id for the per-clip STT outcome lines (``stt: chat=<c> transcribed N chars in Ts`` /
 # ``stt FAILED: chat=<c> after Ts: <why>``), set by the inbound callers around transcription so the
 # lines pair with the ``[voice Ns]`` inbound line for log readers. Fork tests import it from
@@ -53,6 +58,10 @@ _STT_LOG_CHAT: "ContextVar[str]" = ContextVar("_STT_LOG_CHAT", default="unknown"
 # Mutable cell shared with the shielded STT task: the handler flips ``stopped`` when /stop (or
 # /new, /reset) cancels it mid-transcription, so the task's outcome lines say "after /stop".
 _STT_STOP_CELL: "ContextVar[Optional[Dict[str, bool]]]" = ContextVar("_STT_STOP_CELL", default=None)
+# t_239103a9: per-clip STT results (``{"path", "transcript", "provider"}``) for the event being transcribed, so
+# its inbound_record carries the STT output itself, never the composed turn text. A list shared by reference with
+# the shielded STT task (its context is a copy made at creation).
+_STT_CLIPS: "ContextVar[Optional[List[Dict[str, Any]]]]" = ContextVar("_STT_CLIPS", default=None)
 
 # How long a cancelled turn waits for its in-flight voice STT before giving up on the transcript
 # and persisting the "could not be transcribed" marker instead (2026-10-19: a 281 s note was lost
@@ -683,8 +692,9 @@ class GatewayInboundMixin:
             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
 
         # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
-        # photo-only follow-up; adapter-level batching absorbs them.
-        if event.message_type == MessageType.PHOTO:
+        # photo-only follow-up; adapter-level batching absorbs them. Steer mode is exempt: an image
+        # is steered into the running turn like text (t_086da8be, Ace's ruling on #569).
+        if event.message_type == MessageType.PHOTO and self._effective_busy_input_mode(source) != "steer":
             logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
             self._hm_merge_pending_for_source(source, _quick_key, event)
             return True, None
@@ -718,18 +728,16 @@ class GatewayInboundMixin:
     def _hm_text_only(event: "MessageEvent") -> bool:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
-    def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
-        """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
-        steer_text = (event.text or "").strip()
-        steered = False
-        if self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"):
+    async def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
+        """Steer mode: inject the follow-up mid-run via ``agent.steer()`` (text, voice transcript, or
+        image description + cached path, in arrival order), else fall back to queue semantics."""
+        outcome = "unsteerable"
+        if hasattr(running_agent, "steer"):
             try:
-                steered = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event),
-                                                    internal=bool(getattr(event, "internal", False)))
+                outcome = await self._steer_busy_followup(event, _quick_key, running_agent)
             except Exception as exc:
                 logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
-        if steered:
-            self._fold_into_running_turn(running_agent, _quick_key, event)
+        if outcome == "steered":
             logger.debug("PRIORITY steer for session %s", _quick_key)
             return
         logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
@@ -743,10 +751,21 @@ class GatewayInboundMixin:
         # Text-only corrections redirect the live turn (preserving displayed context) when the
         # runtime supports it; media/voice and older runtimes use the interrupt path below.
         _can_redirect = getattr(running_agent, "_supports_active_turn_redirect", False) is True
-        if self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect"):
-            if self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):
-                logger.debug("PRIORITY redirect for session %s", _quick_key)
-                return
+        _redirectable = self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect")
+        if _redirectable and self._has_queued_human_followup(_quick_key, self._delivery_adapter_for(source)):
+            # t_086da8be: a redirect would overtake the earlier queued message. Queue this one
+            # behind it, then interrupt: with a pending event the turn runner drains the queue
+            # and ignores the bare interrupt text, so queueing is what keeps the text.
+            self._log_busy_followup_held(_quick_key, "redirect")
+            self._queue_or_replace_pending_event(_quick_key, event)
+        elif _redirectable and self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):
+            logger.debug("PRIORITY redirect for session %s", _quick_key)
+            return
+        elif self._session_has_queued_event(_quick_key, self._delivery_adapter_for(source)):
+            # The turn runner reads the bare interrupt text only when nothing is pending
+            # (run_turn ``not pending_event and interrupt_message``); with anything queued it would
+            # be dropped, so queue the event itself (its STT result is cached on it below).
+            self._queue_or_replace_pending_event(_quick_key, event)
         logger.debug("PRIORITY interrupt for session %s", _quick_key)
         _interrupt_text = event.text
         if self._pending_event_audio_paths(event):
@@ -819,6 +838,33 @@ class GatewayInboundMixin:
             logger.debug("lease-flush queue gate failed for %s; dispatching", _quick_key, exc_info=True)
             return None
 
+    async def _hm_wait_for_stop_to_settle(self, event: "MessageEvent", _quick_key: str) -> None:
+        """/stop then /model (or any command the busy path would REJECT) in quick succession: wait,
+        bounded, for the stop to release the slot, so the command takes the idle path exactly as if
+        it had been sent after the stop finished. Commands the busy path already handles mid-run
+        (/stop, /new, /queue, /status, dispatch-policy commands) and plain text are untouched."""
+        state = self._peek_session_state(_quick_key)
+        if state is None or not getattr(state.turn, "stopping", False):
+            return
+        _cmd = event.get_command()
+        if not _cmd:
+            return
+        from hermes_cli.commands import resolve_command
+        cmd_def = resolve_command(_cmd)
+        if cmd_def is None or not self._busy_slash_would_reject(cmd_def):
+            return
+        started = time.monotonic()
+        deadline = started + _STOP_SETTLE_WAIT_S
+        while self._is_session_running(_quick_key) and time.monotonic() < deadline:
+            current = self._peek_session_state(_quick_key)
+            if current is None or not getattr(current.turn, "stopping", False):
+                break
+            await asyncio.sleep(0.05)
+        logger.info(
+            "PHASE=stop_settle_wait key=%s cmd=/%s waited=%.2fs released=%s",
+            _quick_key, cmd_def.name, time.monotonic() - started, not self._is_session_running(_quick_key),
+        )
+
     async def _hm_handle_running_session_message(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Optional[str]:
@@ -856,7 +902,7 @@ class GatewayInboundMixin:
             self._queue_or_replace_pending_event(_quick_key, event)
             return None
         if effective_busy_input_mode == "steer":
-            self._hm_busy_steer(event, running_agent, _quick_key)
+            await self._hm_busy_steer(event, running_agent, _quick_key)
             return None
         # Subagent protection: an interrupt cascades through ``_active_children`` and aborts
         # in-flight delegate_task work (/stop reached its handler above — still an escape hatch).
@@ -1082,7 +1128,7 @@ class GatewayInboundMixin:
     # payload as a regular user turn; an empty payload surfaces the usage hint.
     async def _hm_cmd_queue(self, event, source, _quick_key):
         # Idle /queue: management verbs (list/edit/rm/move/clear/run/help) are handled here; a prompt
-        # joins the held store if one exists (D14), else it is sent as a normal turn (unchanged).
+        # is sent as a normal turn now, even with items held (D14, Ace 2026-11-26); held items stay.
         from gateway import queue_mgmt
         adapter = self._delivery_adapter_for(source)
         op = queue_mgmt.classify(event)
@@ -1096,15 +1142,17 @@ class GatewayInboundMixin:
         refused = queue_mgmt.refuse_command_prompt(op.text)
         if refused:
             return True, refused
-        if queue_mgmt.held_list(self, _quick_key):
-            cap = queue_mgmt.cap_reply(self, _quick_key, adapter)
-            if cap:
-                return True, cap
-            with suppress(Exception):
-                event.text = op.text
-            return True, queue_mgmt.append_if_held(self, _quick_key, event)
         with suppress(Exception):
             event.text = op.text  # strips the /queue prefix (and an explicit `add`)
+        note = queue_mgmt.held_note(self, _quick_key)
+        if note:
+            # No await before the session claim: a second /queue must find the session busy (Prism
+            # 03e7f19cf6dc). The note goes out in the background.
+            task = asyncio.ensure_future(self._send_command_ack(source, note.lstrip("\n"), "queue"))
+            tasks = getattr(self, "_background_tasks", None)
+            if isinstance(tasks, set):
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
         return False, None
 
     async def _hm_cmd_steer(self, event, source, _quick_key):
@@ -1173,34 +1221,11 @@ class GatewayInboundMixin:
             return True, "Failed to prepare the boomerang turn."
         return False, None
 
-    async def _hm_cmd_fork_fan(self, event, source, _quick_key):
-        # Fork: /fork-fan <items> rewrites into a fork-fan skill invocation and falls through to normal
-        # dispatch (the /boomerang pattern). The skill runs plan -> one granted chunk per turn -> fold ->
-        # run; this handler never calls delegate_task itself.
-        from hermes_cli.fork_fan_command import USAGE, build_fork_fan_seed, parse_fork_fan_args
-        try:
-            opts, items = parse_fork_fan_args(event.get_command_args())
-        except ValueError as _ff_arg_exc:
-            return True, str(_ff_arg_exc)
-        if not items and not opts.get("where"):
-            return True, USAGE
-        try:
-            from agent.skill_commands import build_skill_invocation_message, resolve_skill_command_key
-            cmd_key = resolve_skill_command_key("fork-fan")
-            event.text = build_fork_fan_seed(
-                opts, items,
-                lambda instr: build_skill_invocation_message(cmd_key, instr) if cmd_key else None,
-            )
-        except Exception as _ff_exc:
-            logger.warning("fork-fan command rewrite failed: %s", _ff_exc)
-            return True, "Failed to prepare the fork-fan turn."
-        return False, None
-
     # Idle-path built-ins with bespoke flow (confirmations, prompt rewrites, one-shot MoA), each
     # handled by ``_hm_cmd_<name>`` → ``(handled, result)``; ``(False, None)`` falls through to the agent.
     _HM_CANONICAL_COMMANDS = frozenset({
         "new", "start", "egress", "learn", "plan", "init", "blueprint", "undo", "queue", "steer", "moa",
-        "boomerang", "fork-fan",
+        "boomerang",
     })
 
     async def _hm_dispatch_canonical_command(
@@ -1227,7 +1252,7 @@ class GatewayInboundMixin:
             async with self._async_profile_scope_for_source(source):
                 return True, await plain_handler(event)
         if canonical in self._HM_CANONICAL_COMMANDS:
-            return await getattr(self, f"_hm_cmd_{canonical.replace('-', '_')}")(event, source, _quick_key)
+            return await getattr(self, f"_hm_cmd_{canonical}")(event, source, _quick_key)
         return False, None
 
     async def _hm_run_exec_quick_command(self, command: str, exec_cmd: str) -> str:
@@ -1551,6 +1576,8 @@ class GatewayInboundMixin:
         if self._is_session_running(_quick_key):
             # Reads state.db (``_is_session_ended_in_db``) under the store lock: off the loop.
             await asyncio.to_thread(self._hm_evict_reaped_agent, _quick_key)
+        if self._is_session_running(_quick_key) and not is_internal:
+            await self._hm_wait_for_stop_to_settle(event, _quick_key)
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
         # Flush window (t_d659b247): ``_run_agent``'s finally released the SLOT, but the previous
@@ -1602,18 +1629,14 @@ class GatewayInboundMixin:
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
+        _limit_message = self._active_session_limit_message(_quick_key)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             if _checkout_ticket is not None:
                 _checkout_ticket.release()
             return _limit_message
 
-        event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
-
         _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
@@ -1625,12 +1648,26 @@ class GatewayInboundMixin:
         if not hasattr(self, "_running_agent_tasks"):
             self._running_agent_tasks = {}  # self-heal for object.__new__ partials
         self._running_agent_tasks[_quick_key] = asyncio.current_task()
-        from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
-        start_reply_clock(source, internal=is_internal)
-        self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _active_session_lease = None
 
         try:
+            _active_session_lease, _limit_message = await self._claim_active_session_slot_off_loop(
+                _quick_key, source,
+            )
+            if not self._is_session_run_current(_quick_key, _run_generation):
+                if _active_session_lease is not None:
+                    self._release_active_session_lease(_active_session_lease)
+                raise asyncio.CancelledError
+            if _limit_message is not None:
+                return _limit_message
+            _claim_state.turn.lease = _active_session_lease
+            # Registry refusal must leave the orphan FIFO untouched.
+            event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+            _claim_state.turn.event = event
+            from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
+            start_reply_clock(source, internal=is_internal)
+            self._persist_active_agents()
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
@@ -1677,6 +1714,11 @@ class GatewayInboundMixin:
                 finally:
                     if _checkout_ticket is not None:
                         _checkout_ticket.release()
+                    if _active_session_lease is not None:
+                        # Runner-owned cleanup is joined at shutdown, not here:
+                        # delayed registry I/O must not hold the completed reply
+                        # outside the adapter's delivery/recovery lifecycle.
+                        self._release_active_session_lease(_active_session_lease)
 
     def _hm_lease_rejection_reply(self, event: "MessageEvent", source: SessionSource, _quick_key: str) -> str:
         """The fail-closed turn-lease rejection reply (``gateway.busy.another_turn_running``), after
@@ -1796,12 +1838,25 @@ class GatewayInboundMixin:
             "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
             _img_mode, len(image_paths),
         )
+        return await self._describe_images_as_text(source, session_key, message_text, image_paths)
+
+    async def _describe_images_as_text(
+        self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str],
+        *, failures_out: Optional[List[str]] = None,
+    ) -> str:
+        """The text-mode image step: each image's vision description and cached path, prepended to
+        ``message_text``. Shared by turn start and the mid-turn image steer (run_busy), so a steered
+        image reaches the model with exactly the block a queued image gets. ``failures_out`` collects
+        the paths whose description failed."""
         # Vision enrichment runs before AIAgent.run_conversation(), so bind this session's resolved
         # runtime explicitly rather than consulting process-global compatibility mirrors.
         vision_runtime = None
         try:
-            turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
-                source=source, session_key=session_key,
+            # Off the loop: provider resolution can probe a local model server over HTTP
+            # (_auto_detect_local_model), and the mid-turn image steer runs this inside the busy
+            # handler (tests/gateway/test_no_network_reachable_from_loop.py).
+            turn_model, runtime_kwargs = await asyncio.to_thread(
+                self._resolve_session_agent_runtime, source=source, session_key=session_key,
             )
             vision_runtime = {**(runtime_kwargs or {}), "model": turn_model}
         except Exception:
@@ -1810,7 +1865,7 @@ class GatewayInboundMixin:
         from agent.auxiliary_client import scoped_runtime_main
 
         with scoped_runtime_main(vision_runtime):
-            return await self._enrich_message_with_vision(message_text, image_paths)
+            return await self._enrich_message_with_vision(message_text, image_paths, failures_out=failures_out)
 
     async def _echo_stt_transcripts(
         self, adapter, source: SessionSource, transcripts: List[str], *, metadata=None, log_context: str = "Transcript"
@@ -1827,12 +1882,16 @@ class GatewayInboundMixin:
         *, session_id: Optional[str] = None, owner_key: Optional[str] = None,
     ) -> str:
         _stt_chat_token = _STT_LOG_CHAT.set(str(getattr(source, "chat_id", None) or "unknown"))
+        _clips: List[Dict[str, Any]] = []
+        _clips_token = _STT_CLIPS.set(_clips)
         try:
             message_text, _successful_transcripts = await self._stt_surviving_stop(
                 event, message_text, audio_paths, session_id, owner_key,
             )
         finally:
+            _STT_CLIPS.reset(_clips_token)
             _STT_LOG_CHAT.reset(_stt_chat_token)
+        inbound_record.attach_transcript(event, audio_paths, _clips)
         # Echo each successful transcript back immediately when configured so users can verify STT
         # quality in real time. On transcription failure do NOT send a hardcoded notice: that
         # bypassed the LLM and produced two replies; enrichment leaves one neutral marker instead.
@@ -2434,8 +2493,9 @@ class GatewayInboundMixin:
 
         await adapter.handle_message(MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
-            allow_gateway_control=False,
+            allow_gateway_control=False, wake_kind="plugin",
             metadata={
+                "wake_name": str(plugin_id or "")[:60],
                 "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                 "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
@@ -2492,10 +2552,13 @@ class GatewayInboundMixin:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
 
-    async def _enrich_message_with_vision(self, user_text: str, image_paths: List[str]) -> str:
+    async def _enrich_message_with_vision(
+        self, user_text: str, image_paths: List[str], *, failures_out: Optional[List[str]] = None,
+    ) -> str:
         """Auto-analyze user-attached images with the vision tool and prepend the descriptions.
         Description *and* local cache path are injected so the model understands the image without
-        a tool call and can re-examine it with vision_analyze."""
+        a tool call and can re-examine it with vision_analyze. A path whose analysis failed is
+        appended to ``failures_out`` when given."""
         from tools.vision_tools import vision_analyze_tool
         from agent.memory_manager import sanitize_context
 
@@ -2519,6 +2582,8 @@ class GatewayInboundMixin:
                         f"image_url: {path} ~]"
                     )
                 else:
+                    if failures_out is not None:
+                        failures_out.append(path)
                     note = (
                         "[The user sent an image but I couldn't quite see it "
                         "this time (>_<) You can try looking at it yourself "
@@ -2526,6 +2591,8 @@ class GatewayInboundMixin:
                     )
             except Exception as e:
                 logger.error("Vision auto-analysis error: %s", e)
+                if failures_out is not None:
+                    failures_out.append(path)
                 note = (
                     f"[The user sent an image but something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "
@@ -2567,6 +2634,10 @@ class GatewayInboundMixin:
             if fallback.get("success"):
                 logger.info("Configured STT failed for %s; recovered with local STT", path)
                 result = fallback
+        clips = _STT_CLIPS.get()
+        if clips is not None:
+            clips.append({"path": path, "transcript": result.get("transcript") if result.get("success") else None,
+                          "provider": result.get("provider")})
         if not result["success"]:
             logger.info("Voice transcription failed for %s: %s", path, result.get("error", "unknown error"))
             _stt_log_failed(str(result.get("error", "unknown error"))[:200], started)
@@ -2672,6 +2743,8 @@ class GatewayInboundMixin:
         _stt_chat_token = _STT_LOG_CHAT.set(
             str(getattr(getattr(event, "source", None), "chat_id", None) or "unknown")
         )
+        _clips: List[Dict[str, Any]] = []
+        _clips_token = _STT_CLIPS.set(_clips)
         try:
             if persist_session_id:
                 enriched_text, successful_transcripts = await self._stt_surviving_stop(
@@ -2680,7 +2753,9 @@ class GatewayInboundMixin:
             else:
                 enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
         finally:
+            _STT_CLIPS.reset(_clips_token)
             _STT_LOG_CHAT.reset(_stt_chat_token)
+        inbound_record.attach_transcript(event, audio_paths, _clips)
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)
         return enriched_text, successful_transcripts

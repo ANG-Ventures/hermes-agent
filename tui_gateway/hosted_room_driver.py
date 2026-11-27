@@ -9,6 +9,7 @@ sessions reuse ``Group: <room_id>`` so a local-to-hosted migration keeps one tra
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 import uuid
@@ -419,9 +420,28 @@ class HostedRoomRuntime:
         return False
 
     # ------------------------------------------------------------------ scheduling
+    def _open_wal_anchor(self) -> sqlite3.Connection | None:
+        """One idle connection held for the worker's life (t_dd40e9f2). Every driver call
+        opens and closes its own connection, and the last close of a WAL database
+        checkpoints and unlinks ``-wal``/``-shm``, so each 5 s idle poll re-created and
+        deleted both files (~2.1k create+unlink per 30 min on ACE-AI's OS drive). While
+        this reader is open no call is the last one. It never holds a transaction, so it
+        blocks no writer or checkpoint. Best-effort: no store yet, no anchor."""
+        if not self.db_path.is_file():
+            return None
+        try:
+            conn = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()  # map the WAL index
+            return conn
+        except sqlite3.Error:
+            return None
+
     def _worker_loop(self) -> None:
+        anchor = None
         try:
             while not self._stop.is_set():
+                if anchor is None:
+                    anchor = self._open_wal_anchor()
                 # Clear before work so a write racing the cycle forces a follow-up pass.
                 self._wake.clear()
                 try:
@@ -440,6 +460,8 @@ class HostedRoomRuntime:
                 for room_thread in room_threads:
                     room_thread.join(self.active_poll_interval_seconds)
             self._release_idle_leases()
+            if anchor is not None:
+                anchor.close()
 
     def _run_cycle(self) -> None:
         with self._status_lock:

@@ -1364,3 +1364,42 @@ agent_version = "test"
         assert {"agent", "llm", "tool"} <= observed_categories
 
     assert observed_runtime_ids == set(runtime_ids.values())
+
+
+class _PreZeroNineRelay(_FakeRelay):
+    """NeMo Relay 0.7.x: ``plugin.initialize(config)`` has no ``additional_plugins_toml``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.plugin = SimpleNamespace(initialize=self._initialize_0_7)
+
+    async def _initialize_0_7(self, config: dict[str, Any]) -> Any:
+        self.events.append(("plugin.initialize-0.7", config))
+        raise AssertionError("a pre-0.9 initialize() must not be called")
+
+
+def test_pre_0_9_relay_is_skipped_with_one_info_line_not_a_traceback(monkeypatch, caplog):
+    # t_da3c5285: the 3.11 runtime venv carried nemo_relay 0.7.3; every boot logged
+    # "TypeError: initialize() got an unexpected keyword argument 'additional_plugins_toml'".
+    monkeypatch.delenv(relay_runtime.RELAY_PLUGINS_CONFIG_ENV, raising=False)
+    relay = _PreZeroNineRelay()
+    with caplog.at_level("DEBUG", logger=relay_runtime.logger.name):
+        host = relay_runtime.RelayRuntime(relay=relay, profile_key="profile")
+        other = relay_runtime.RelayRuntime(relay=relay, profile_key="other")
+    try:
+        assert host._plugin_configuration_state is relay_runtime._RelayPluginConfigurationState.DISABLED
+        assert not host.managed_execution_enabled()
+        assert relay.events == []
+    finally:
+        other.shutdown()
+        host.shutdown()
+    lines = [r for r in caplog.records if "plugin-host API" in r.getMessage()]
+    assert [r.levelname for r in lines] == ["INFO"]
+    assert not [r for r in caplog.records if r.levelno >= 30 or r.exc_info]
+
+
+def test_plugin_host_api_detection_reads_the_signature():
+    assert relay_runtime._has_plugin_host_api(_FakeRelay())
+    assert not relay_runtime._has_plugin_host_api(_PreZeroNineRelay())
+    kw = SimpleNamespace(plugin=SimpleNamespace(initialize=lambda config, **kwargs: None))
+    assert relay_runtime._has_plugin_host_api(kw)

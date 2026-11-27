@@ -157,8 +157,14 @@ def enrich_model_switch_warnings_for_gateway(
     store = getattr(runner, "session_store", None)
     if db is not None and store is not None:
         try:
-            entry = store.get_or_create_session(source)
-            messages = db.get_messages_as_conversation(entry.session_id)
+            # Warning enrichment is a read, not an activity/routing update. A model
+            # confirmation must not wait for get_or_create_session's durable writes.
+            entry = store.lookup_by_session_key(session_key)
+            if entry is not None:
+                from hermes_state import AsyncSessionDB
+
+                reader = db._db if isinstance(db, AsyncSessionDB) else db
+                messages = reader.get_messages_as_conversation(entry.session_id)
         except Exception:
             pass
 

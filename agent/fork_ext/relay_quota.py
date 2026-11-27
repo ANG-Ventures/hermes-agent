@@ -22,6 +22,11 @@ def relay_quota_outlasts_retry_window(agent, error, classified) -> bool:
         return False
     headers = getattr(getattr(error, "response", None), "headers", None)
     retry_after = parse_retry_after_seconds(headers)
+    if retry_after is None and relay_error_class(error)[0] == "quota_model":
+        # The model is capped on every seat and the relay has no dated reset
+        # (claude-pool#421 sends no Retry-After then). No same-lane wait can
+        # outlast that; the pool-capacity jittered retry only burns seconds.
+        return True
     if retry_after is None or not retry_after > RETRY_AFTER_CAP_RATE_LIMIT_S:
         return False
     relay_class, _ = relay_error_class(error)

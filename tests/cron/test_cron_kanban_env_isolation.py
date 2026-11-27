@@ -59,7 +59,7 @@ def worker_env(monkeypatch):
 
 class TestDispatcherOwnedPredicate:
 
-    def test_false_inside_non_dispatcher_context(self):
+    def test_false_inside_non_dispatcher_context(self, worker_env):
         from agent.delegation_context import (
             is_dispatcher_owned_worker_context,
             non_dispatcher_owned_context,
@@ -69,7 +69,7 @@ class TestDispatcherOwnedPredicate:
             assert is_dispatcher_owned_worker_context() is False
         assert is_dispatcher_owned_worker_context() is True
 
-    def test_token_form_restores(self):
+    def test_token_form_restores(self, worker_env):
         from agent.delegation_context import (
             enter_non_dispatcher_owned_context,
             exit_non_dispatcher_owned_context,
@@ -81,7 +81,7 @@ class TestDispatcherOwnedPredicate:
         exit_non_dispatcher_owned_context(token)
         assert is_dispatcher_owned_worker_context() is True
 
-    def test_nesting_restores_outer_value(self):
+    def test_nesting_restores_outer_value(self, worker_env):
         from agent.delegation_context import (
             is_dispatcher_owned_worker_context,
             non_dispatcher_owned_context,

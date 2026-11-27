@@ -89,16 +89,17 @@ def test_late_older_stop_waits_for_blocked_newer_write(tmp_path, monkeypatch):
     runner, _adapter, db = _runner(tmp_path, monkeypatch)
     store = runner.session_store
     key = store.get_or_create_session(_source()).session_key
-    real_replace = db.replace_gateway_routing_entries
+    # The marker is a one-row UPSERT (#135); block it, the write the newer stop really makes.
+    real_upsert = db.save_gateway_routing_entry
     entered, release = threading.Event(), threading.Event()
 
-    def blocking_replace(*args, **kwargs):
+    def blocking_upsert(*args, **kwargs):
         if not release.is_set():
             entered.set()
             release.wait(10)
-        return real_replace(*args, **kwargs)
+        return real_upsert(*args, **kwargs)
 
-    monkeypatch.setattr(db, "replace_gateway_routing_entries", blocking_replace)
+    monkeypatch.setattr(db, "save_gateway_routing_entry", blocking_upsert)
     newer = threading.Thread(target=store.mark_user_stopped, args=(key,), kwargs={"generation": 6})
     newer.start()
     assert entered.wait(10)
@@ -133,6 +134,9 @@ def test_late_older_stop_persists_after_newer_write_failed(tmp_path, monkeypatch
             return real(*args, **kwargs)
         return wrapper
 
+    # The marker is a one-row UPSERT (#135) that falls back to the full rewrite when it fails, so
+    # fail all three writes: the newer stop's marker must reach no disk at all.
+    monkeypatch.setattr(db, "save_gateway_routing_entry", maybe_fail(db.save_gateway_routing_entry))
     monkeypatch.setattr(db, "replace_gateway_routing_entries", maybe_fail(real_replace))
     monkeypatch.setattr(store, "_save_sessions_json", maybe_fail(real_json))
     with pytest.raises(OSError):

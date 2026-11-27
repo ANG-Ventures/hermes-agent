@@ -877,9 +877,6 @@ class _GuardStuckNotifier:
         an unsent page is not recorded and goes out on a later tick."""
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
-        # A land-request is tracked apart from the page (``<key>|land``) so an
-        # enqueue does not spend the (card, PR) page slot (Prism #1545).
-        current |= {f"{key}|land" for key in current}
         if observed_boards is None:
             observed_boards = {board for board, _ in cards}
         before = dict(self._sent)
@@ -905,12 +902,9 @@ class _GuardStuckNotifier:
             # An active_pr episode (card + PR) pages ONCE: the hold is correct and
             # the verb does not change, so a 6h reminder restates the same page
             # (Ace r31 G: house-voice t_82169667 paged 19:02, 02:39, 08:40).
-            # The land-request still runs: a PR paged while red/unfinished must
-            # be enqueued once it turns mergeable (Prism #1631 7279b2c05f7a).
-            land_only = last is not None and "|active_pr|pr=" in key
-            if land_only and not _land_candidate(item):
+            if last is not None and "|active_pr|pr=" in key:
                 continue
-            if not land_only and last is not None and now - last < self._remind:
+            if last is not None and now - last < self._remind:
                 continue
             if item.get("reason") == "prior_worker_still_alive":
                 alive_due.append((board, item, key))
@@ -927,37 +921,24 @@ class _GuardStuckNotifier:
                 delivered += 1
         # The per-card sends get their own budget, started AFTER the cohort
         # page: a cohort send that hits notify.py's 30 s timeout must not spend
-        # it, or the land-requests behind it never run while notify is down
+        # it, or the per-card pages behind it never go out while notify is down
         # (Prism a6b3974d616e). Least-recently-attempted first: a failing send
         # stays due, and in list order it would hold the head and spend the
         # budget every tick, starving every card behind it.
         deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         self._attempted = {k: at for k, at in self._attempted.items() if k in current}
-        rest.sort(key=lambda row: self._attempted.get(row[2], -1))
+        # A finished card's own mergeable PR was enqueued (no page) before the
+        # retired-lander deletion; its page now goes after every page that was
+        # already sent, so it cannot spend the budget those pages had.
+        rest.sort(key=lambda row: (_page_replaces_enqueue(row[1]), self._attempted.get(row[2], -1)))
         for board, item, key, last in rest:
-            land_only = last is not None and "|active_pr|pr=" in key
             if time.monotonic() >= deadline:
                 break
             self._attempt_seq += 1
             self._attempted[key] = self._attempt_seq
-            land_key = f"{key}|land"
-            land_at = self._sent.get(land_key)
-            probe = dict(item)
-            if land_at is not None and now - land_at < self._remind:
-                probe["land_enqueued_at"] = land_at
-            if land_only:
-                probe["land_only"] = True
-                if send(board, probe) and probe.get("land_request") == "enqueued":
-                    self._sent[land_key] = now
-                continue
-            if send(board, probe):
-                if probe.get("land_request") == "enqueued":
-                    # Enqueued, nobody paged: a later non-merged queue outcome
-                    # still pages once on the next tick (Prism #1545).
-                    self._sent[land_key] = now
-                elif probe.get("land_request") != "pending":
-                    self._sent[key] = now
-                    delivered += 1
+            if send(board, item):
+                self._sent[key] = now
+                delivered += 1
         if self._sent != before:
             self._save()
         return delivered
@@ -985,20 +966,33 @@ def _github_pr(pr_url) -> Optional[tuple[str, int]]:
     return f"{m.group(1)}/{m.group(2)}", int(m.group(3))
 
 
-def _land_verb(pr_url: str) -> Optional[str]:
-    """``fleet-merge.sh <owner/repo> <n> …`` for a GitHub PR URL, else None.
+def _page_replaces_enqueue(item: dict) -> bool:
+    """A hold the retired land queue was handed instead of a page: active_pr,
+    mergeable, last run finished, PR owned by the card, legal GitHub PR URL."""
+    from hermes_cli import kanban_db as kb
 
-    The URL comes from card text, so owner/repo must be GitHub-legal names
-    (no shell metacharacters) and every argument is shell-quoted; anything
-    else renders no LAND command at all (Prism #1530).
+    return (item.get("reason") in (None, "active_pr")
+            and item.get("hold") == kb.RESPAWN_GUARD_HOLD_MERGEABLE
+            and item.get("last_outcome") in _FINISHED_RUN_OUTCOMES
+            and item.get("pr_owned") is True
+            and _github_pr(item.get("pr")) is not None)
+
+
+def _land_verb(pr_url: str, card=None) -> Optional[str]:
+    """The operator stamp verb for a GitHub PR URL, else None.
+
+    ``operator_approve.py`` writes the APPROVE at the head; land_on_approve
+    merges it within a minute. The URL comes from card text, so owner/repo
+    must be GitHub-legal names (no shell metacharacters) and every argument
+    is shell-quoted; anything else renders no LAND command at all (Prism #1530).
     """
     import shlex
 
     parsed = _github_pr(pr_url)
     if parsed is None:
         return None
-    return "~/.hermes/scripts/fleet-merge.sh " + shlex.join(
-        [parsed[0], str(parsed[1]), "--by", "<you>", "--reason", "<why safe>"])
+    return "python3 ~/.hermes/scripts/lib/operator_approve.py " + shlex.join(
+        ["--card", str(card or "<card>"), "--head", "<head sha>", "--pr", f"{parsed[0]}#{parsed[1]}", "--by", "apollo/operator"])
 
 
 def _active_pr_detail(board: str, item: dict) -> str:
@@ -1011,127 +1005,27 @@ def _active_pr_detail(board: str, item: dict) -> str:
     decides the recommendation; both commands are given (r19, t_f1af5dcd).
     """
     outcome = item.get("last_outcome")
-    land = _land_verb(item.get("pr"))
+    # A PR the card only mentions gets no stamp verb: a stamp names this card,
+    # and for another card's PR it is refused or recorded against the wrong card.
+    owned = item.get("pr_owned") is True
+    land = _land_verb(item.get("pr"), item.get("task_id")) if owned else None
     unfinished = outcome not in _FINISHED_RUN_OUTCOMES or land is None
     lines = ["READY card held behind its open PR (active_pr >30 min)"]
     if item.get("pr"):
         lines.append(f"Holding PR: {item['pr']} · last run: `{outcome or 'none'}`")
-    if item.get("land_queue"):
-        lines.append(f"Land queue already stopped on this PR: `{item['land_queue']}` (see the card comment)")
+        if not owned:
+            lines.append(f"That PR is not this card's (the card only mentions it): {item['pr']}")
+    head_rule = "Read the diff at a full 40-character head first and paste only that head."
     if unfinished:
         lines.append(f"Wanted: **REQUEUE** (worker resumes on its PR): `{item['clear_verb']}`")
         if land:
+            lines.append(head_rule)
             lines.append(f"Or, if the PR is complete + CI-green, LAND it: `{land}`")
     else:
+        lines.append(head_rule)
         lines.append(f"Wanted: **LAND** the PR if CI is green, then complete the card: `{land}`")
         lines.append(f"Or, if it needs more work, REQUEUE: `{item['clear_verb']}`")
     return "\n".join(lines)
-
-
-def _land_queue_prior_outcome(root: Path, repo: str, number: int) -> Optional[str]:
-    """Status of a FINISHED land-queue row for ``repo#number``, else None.
-
-    A finished row that is not ``merged`` means the queue already tried and
-    stopped (FAILED / DIRTY / GAVE UP, card commented): a human is needed, so
-    the hold pages instead of enqueueing the same PR again.
-    """
-    import json
-
-    done = root / "state" / "apollo-land-queue.done"
-    found = None
-    try:
-        paths = sorted(done.glob("*.json"))
-    except OSError:
-        return None
-    for path in paths:
-        try:
-            row = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            continue
-        if (isinstance(row, dict) and str(row.get("repo", "")).lower() == repo.lower()
-                and str(row.get("pr")) == str(number)):
-            found = str(row.get("status") or "finished")
-    return found
-
-
-def _enqueue_active_pr_land(board: str, item: dict) -> Optional[bool]:
-    """Enqueue a land-request for a finished card's mergeable holding PR.
-
-    None: not landable here (page the operator). True: enqueued (or already
-    queued); ``item["land_request"]`` says which (``enqueued`` /
-    ``pending``) so the page slot stays free for a later queue failure
-    (Prism #1545). False: the enqueue failed (page instead). Landable means the
-    guard held on ``RESPAWN_GUARD_HOLD_MERGEABLE`` (OPEN, mergeable, no red
-    check), the last run FINISHED its deliverable, the PR's head branch names
-    this card (``pr_owned``), the URL is a legal GitHub
-    PR, and the land queue has not already given up on this PR. The queue
-    waits for CI green and lands through fleet-merge.sh, so fleet policy
-    still decides; a refusal comments the card. r19 spec (t_f1af5dcd), wired
-    t_5a9deed5: a green holding PR needs a land-request, not a human.
-    """
-    from hermes_cli import kanban_db as kb
-
-    if item.get("reason") not in (None, "active_pr"):
-        return None
-    if item.get("hold") != kb.RESPAWN_GUARD_HOLD_MERGEABLE:
-        return None
-    if item.get("last_outcome") not in _FINISHED_RUN_OUTCOMES:
-        return None
-    if item.get("pr_owned") is not True:
-        # A card comment may name any PR: land only a PR whose head branch
-        # names this card; unknown ownership pages (Prism #1545 cd0457757028).
-        return None
-    parsed = _github_pr(item.get("pr"))
-    if parsed is None:
-        return None
-    repo, number = parsed
-    try:
-        from hermes_constants import get_hermes_home
-
-        root = Path(get_hermes_home())
-    except Exception:
-        logger.debug("kanban dispatcher: hermes home unresolved; no land-request", exc_info=True)
-        return None
-    script = root / "scripts" / "apollo_land_queue.py"
-    if not script.is_file():
-        return None
-    prior = _land_queue_prior_outcome(root, repo, number)
-    if prior is not None and prior != "merged":
-        item["land_queue"] = prior
-        return None
-    if item.get("land_enqueued_at") is not None:
-        # Already enqueued in this reminder window and the queue has not
-        # stopped on the PR: wait silently, no second enqueue (Prism #1545).
-        item["land_request"] = "pending"
-        return True
-    argv = [sys.executable, str(script), "enqueue", "--card", str(item["task_id"]),
-            "--repo", repo, "--pr", str(number), "--board", str(board),
-            "--item", f"{item['task_id']}: active_pr hold, PR mergeable, "
-                      f"last run {item.get('last_outcome')} (dispatcher land-request)"]
-    try:
-        proc = subprocess.run(argv, check=False, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
-    except Exception:
-        logger.exception("kanban dispatcher: active_pr land-request enqueue failed")
-        return False
-    if proc.returncode != 0:
-        logger.error("kanban dispatcher: active_pr land-request enqueue rc=%s for %s#%s: %s",
-                     proc.returncode, repo, number, (proc.stderr or proc.stdout or "").strip()[:200])
-        return False
-    logger.info("kanban dispatcher [%s]: active_pr hold %s -> land-request enqueued for %s#%s (%s)",
-                board, item["task_id"], repo, number, (proc.stdout or "").strip()[:160])
-    item["land_request"] = "enqueued"
-    return True
-
-
-def _land_candidate(item: dict) -> bool:
-    """Cheap pre-check: could ``_enqueue_active_pr_land`` act on this hold?"""
-    from hermes_cli import kanban_db as kb
-
-    return (item.get("reason") in (None, "active_pr")
-            and item.get("hold") == kb.RESPAWN_GUARD_HOLD_MERGEABLE
-            and item.get("last_outcome") in _FINISHED_RUN_OUTCOMES
-            and item.get("pr_owned") is True)
 
 
 _PRIOR_WORKER_BATCH_SHOWN = 10
@@ -1157,14 +1051,7 @@ def _prior_worker_batch_message(batch: list) -> str:
 
 
 def _send_guard_stuck_alert(board: str, item: dict) -> bool:
-    """Land a finished card's mergeable PR, else page #alerts with the verb.
-
-    ``land_only``: the (card, PR) episode already paged; try the land-request,
-    never page again."""
-    if item.get("reason") != "prior_worker_still_alive":
-        enqueued = _enqueue_active_pr_land(board, item)
-        if enqueued or item.get("land_only"):
-            return bool(enqueued)
+    """Page #alerts with the verb for a stuck guard hold."""
     script = _alert_notify_script()
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
@@ -1230,6 +1117,12 @@ def _resolve_needs_input_pager_settings(load_config: Callable[[], Any]) -> "tupl
 # Failure lines (gave_up/crashed/timed_out/stalled), changes_requested and
 # triage routing stay in the subscriber's chat: they need a human.
 LIFECYCLE_CHANNEL_KINDS = frozenset({"completed", "review_requested", "blocked"})
+# Event kinds the notifier turns into a wake turn (see ``_WAKE_KINDS`` in the loop).
+_NOTIFIER_WAKE_KINDS = (
+    "completed", "gave_up", "crashed", "timed_out",
+    "blocked", "review_requested", "changes_requested",
+    "block_loop_detected",
+)
 # A needs_input block on a card at or above this priority stays in the origin
 # chat (the needs-input pager pages there too).
 LIFECYCLE_CHANNEL_KEEP_PRIORITY = 100
@@ -1313,6 +1206,21 @@ def _needs_input_cards(results, include_dependency: bool = False
     return cards, observed_boards
 
 
+_NEEDS_INPUT_GROUP_LIST_CAP = 8
+
+
+def _needs_input_reason_text(item: dict) -> str:
+    """The reason as a page prints it: whitespace-collapsed, 300 chars."""
+    return " ".join(str(item.get("reason") or "").split())[:300]
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 class _NeedsInputPager(_GuardStuckNotifier):
     """Page once per ``(board, card, reason-hash)``; re-page "still waiting"
     every 2 h while the card stays blocked. A new reason is a new page. The
@@ -1371,27 +1279,49 @@ class _NeedsInputPager(_GuardStuckNotifier):
             start = self._rotation % len(cards)
             cards = cards[start:] + cards[:start]
             self._rotation += 1
+        # t_98cdaa01: one tick sends ONE line per (board, reason, home,
+        # still-waiting) group that lists its card ids, not one line per card
+        # (5 of 13 #alerts lines on 2026-11-12 were one tick paging the same
+        # "pin host lacks studio-state" reason for 5 cards). Distinct reasons
+        # stay distinct lines; the ledger stays per card.
+        groups: "dict[tuple, list]" = {}
         for board, item in cards:
             key = self._key(board, item)
             last = self._sent.get(key)
             if last is not None and now - last < self._remind:
                 continue
+            gkey = (str(board), _needs_input_reason_text(item),
+                    str(item.get("channel") or ""), str(item.get("session_id") or ""),
+                    last is not None)
+            groups.setdefault(gkey, []).append((board, item, key))
+        for gkey, members in groups.items():
             if time.monotonic() >= deadline:
                 break
-            first_key = key + self._ALERTS_FIRST_SUFFIX
-            card_key = self._card_key(board, item)
-            card_at = self._sent.get(card_key)
-            page = dict(item, alerts_first_due=first_key not in self._sent,
-                        alerts_card_quiet=card_at is not None
-                        and now - card_at < _NEEDS_INPUT_ALERTS_CARD_WINDOW_S)
-            if send(board, page, last is not None):
-                self._sent[key] = now
-                delivered += 1
-                if page.get("alerts_withheld"):
-                    self._sent[first_key] = now
+            still_waiting = gkey[-1]
+            board = members[0][0]
+            entries = []
+            for _board, item, key in members:
+                card_key = self._card_key(board, item)
+                card_at = self._sent.get(card_key)
+                entries.append((item, key, key + self._ALERTS_FIRST_SUFFIX, card_key,
+                                card_at is not None
+                                and now - card_at < _NEEDS_INPUT_ALERTS_CARD_WINDOW_S))
+            page = dict(members[0][1],
+                        alerts_first_due=any(e[2] not in self._sent for e in entries),
+                        alerts_card_quiet=all(e[4] for e in entries))
+            if len(entries) > 1:
+                page["task_ids"] = [str(e[0]["task_id"]) for e in entries]
+                page["priority"] = max((_int_or_zero(e[0].get("priority")) for e in entries))
+            if send(board, page, still_waiting):
+                for _item, key, first_key, _card_key, _quiet in entries:
+                    self._sent[key] = now
+                    if page.get("alerts_withheld"):
+                        self._sent[first_key] = now
+                delivered += len(entries)
             if page.get("alerts_first_delivered"):
-                self._sent[first_key] = now
-                self._sent[card_key] = now
+                for _item, _key, first_key, card_key, _quiet in entries:
+                    self._sent[first_key] = now
+                    self._sent[card_key] = now
         if self._sent != before:
             self._save()
         return delivered
@@ -1444,13 +1374,26 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
         return False
     tid = str(item["task_id"])
     board_flag = "" if board in ("", "default", None) else f"--board {board} "
-    reason = " ".join(str(item.get("reason") or "").split())[:300]
+    reason = _needs_input_reason_text(item)
     lead = "⚠️ still waiting: " if still_waiting else "⚠️ "
-    message = (
-        f"{lead}`{tid}` needs a ruling: {reason} — `hermes kanban {board_flag}show {tid}`\n"
-        f"-# p{item.get('priority', 0)} · {str(item.get('title') or '')[:120]} · "
-        f"re-pages every 2 h while blocked · opt out: `hermes kanban {board_flag}edit {tid} --no-page`"
-    )
+    ids = [str(t) for t in (item.get("task_ids") or [])]
+    if len(ids) > 1:
+        # One line for a tick's same-reason, same-home cards (t_98cdaa01).
+        shown = ", ".join(f"`{t}`" for t in ids[:_NEEDS_INPUT_GROUP_LIST_CAP])
+        if len(ids) > _NEEDS_INPUT_GROUP_LIST_CAP:
+            shown += f" +{len(ids) - _NEEDS_INPUT_GROUP_LIST_CAP} more"
+        message = (
+            f"{lead}{len(ids)} cards need a ruling: {reason} — {shown} — "
+            f"`hermes kanban {board_flag}show <id>`\n"
+            f"-# p{item.get('priority', 0)} max · re-pages every 2 h while blocked · "
+            f"opt out per card: `hermes kanban {board_flag}edit <id> --no-page`"
+        )
+    else:
+        message = (
+            f"{lead}`{tid}` needs a ruling: {reason} — `hermes kanban {board_flag}show {tid}`\n"
+            f"-# p{item.get('priority', 0)} · {str(item.get('title') or '')[:120]} · "
+            f"re-pages every 2 h while blocked · opt out: `hermes kanban {board_flag}edit {tid} --no-page`"
+        )
     channel = item.get("channel")
     if channel is not None and not str(channel).isdigit():
         channel = None  # numeric channel ids only
@@ -1910,7 +1853,13 @@ class GatewayKanbanWatchersMixin:
             )
             from gateway.kanban_wake_freshness import obligation_wake
             text, wake_metadata = obligation_wake(text)
-            await deliver_wake(adapter, text=text, source=source, metadata=wake_metadata)
+            # An external caller (a script/cron watcher) names itself: ``wake_name`` (else its
+            # text's own bracket tag), optional ``wake_kind`` from the vocabulary (default
+            # ``watcher``), ``wake_sub`` and ``card_id`` (t_17ba87a6).
+            from gateway.wake_kind import control_wake_identity
+            _wake_kind, _wake_detail = control_wake_identity(params, text)
+            await deliver_wake(adapter, text=text, source=source, wake_kind=_wake_kind,
+                               metadata={**(wake_metadata or {}), **_wake_detail})
         except Exception as exc:
             logger.warning(
                 "control wake failed on %s/%s: %s", platform_str, chat_id, exc,
@@ -1937,6 +1886,13 @@ class GatewayKanbanWatchersMixin:
         """Clear notifier-visible ownership before releasing the OS lock."""
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
+        anchor = getattr(self, "_kanban_board_anchor", None)
+        self._kanban_board_anchor = None
+        if anchor is not None:
+            try:
+                anchor.stop(timeout=1.0)
+            except Exception:
+                pass
         try:
             from tools.async_delegation_kanban import clear_dispatcher_heartbeat, set_dispatcher_active
             set_dispatcher_active(False)
@@ -2108,6 +2064,8 @@ class GatewayKanbanWatchersMixin:
                         _gc_retention_days = 30
 
                 def _collect():
+                    from hermes_cli.kanban_db_ioerr import note_board_ioerr
+
                     deliveries: list[dict] = []
                     # t_dcc4ed08: one memoised REST oracle per tick for the
                     # landed-close-gate check on changes_requested events.
@@ -2231,6 +2189,7 @@ class GatewayKanbanWatchersMixin:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
+                            note_board_ioerr(exc, where="notifier:connect", board=slug)
                             continue
                         try:
                             if _gc_due:
@@ -2391,6 +2350,12 @@ class GatewayKanbanWatchersMixin:
                                     _red_seen = _ow.runner_state(self).red_seen if _s5 else {}
                                     if _wake_mode:
                                         for _ev in events:
+                                            # t_54f4fde6: a handback parked on the review-hold lane is no
+                                            # decision yet; the hand-off to the operator wakes it later.
+                                            if _ev.kind == "review_requested" and _kb.is_review_hold_assignee(
+                                                    (_ev.payload or {}).get("reviewer")):
+                                                wake_noise[_ev.id] = "review-hold"
+                                                continue
                                             # t_fa08b93d: an operator-homed card has no home
                                             # chat; the operator's own transition is still an echo.
                                             if (_s5_home and _ns.is_own_echo(_ev, _home_sid, True)) or (
@@ -2493,6 +2458,10 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: subscription for %s on board %s failed: %s",
                                         sub.get("task_id"), slug, sub_exc,
                                     )
+                                    note_board_ioerr(sub_exc, where="notifier:collect", board=slug, conn=conn)
+                        except Exception as exc:
+                            note_board_ioerr(exc, where="notifier:collect", board=slug, conn=conn)
+                            raise
                         finally:
                             conn.close()
                     return deliveries
@@ -2629,6 +2598,33 @@ class GatewayKanbanWatchersMixin:
                         and str(wake_downgrade).startswith(("host load", "host cpu"))
                     )
                     send_passive = mode != "wake"
+                    # t_5763e008: a card homed in a LIVE #alerts session wakes that session itself;
+                    # its wake kinds post no line anywhere. Boomerang-claimed events keep their path.
+                    _alerts_entry = None
+                    _alerts_ids: set = set()
+                    _alerts_own_ids: set = set()
+                    if wake_agent and sub["platform"] != "api_server":
+                        from gateway import kanban_alerts_home as _alh
+
+                        _alerts_home_sid = getattr(task, "session_id", None) if task else None
+                        _alerts_entry = await asyncio.to_thread(
+                            _alh.live_alerts_home, getattr(self, "session_store", None),
+                            _alerts_home_sid, _hr.read_session_row,
+                        )
+                        if _alerts_entry is not None:
+                            _alerts_ids = {
+                                ev.id for ev in d["events"]
+                                if ev.kind in _NOTIFIER_WAKE_KINDS and ev.id not in (d.get("auto") or {})
+                            }
+                            _own = _alh.own_session_ids(_alerts_entry, _alerts_home_sid)
+                            _alerts_own_ids = {
+                                ev.id for ev in d["events"]
+                                if ev.id in _alerts_ids and ev.actor_session_id in _own
+                            }
+                            # Prism P2 07f3aaae5246: self-echo was judged against the subscriber;
+                            # the recipient is the home, so only the home's own events stay echoes.
+                            for _eid in (_alerts_ids & set(d.get("self_event_ids") or ())) - _alerts_own_ids:
+                                (d.get("suppressed") or {}).pop(_eid, None)
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -2907,6 +2903,8 @@ class GatewayKanbanWatchersMixin:
                             msg = _hr.format_for_platform(
                                 lifecycle_channel[0], _hr.tag_line(msg, f"suppressed:{_why_suppressed}"),
                             )
+                        elif ev.id in _alerts_ids:
+                            continue  # t_5763e008: the wake into the #alerts home is the delivery
                         # Handoff artifacts upload only beside a line posted
                         # NOW to a conversation (subscriber chat or an
                         # immediate home line). A log-channel line or a held
@@ -3156,11 +3154,7 @@ class GatewayKanbanWatchersMixin:
                         # (routed to triage) belong here for the same reason
                         # ``blocked`` does. ``status`` / ``archived`` /
                         # ``unblocked`` stay out: bookkeeping.
-                        _WAKE_KINDS = (
-                            "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested",
-                            "block_loop_detected",
-                        )
+                        _WAKE_KINDS = _NOTIFIER_WAKE_KINDS
                         # A transition made from this chat's own session is
                         # not news to it: post the line, skip the wake
                         # (t_a4890a77). Only for events whose passive line was
@@ -3168,7 +3162,7 @@ class GatewayKanbanWatchersMixin:
                         # (api_server) subs and events skipped without a send
                         # never land in _sent_event_ids, so their wake (the
                         # sole delivery) stays.
-                        _self_ids = set(d.get("self_event_ids") or ()) & _sent_event_ids
+                        _self_ids = (set(d.get("self_event_ids") or ()) & _sent_event_ids) | _alerts_own_ids
                         # t_4c7da648: a suppressed event never wakes, sent or not.
                         _suppressed_ids = set(d.get("suppressed") or ())
                         # S5 (t_4f6afb67): an event whose wake is no decision for the
@@ -3212,7 +3206,7 @@ class GatewayKanbanWatchersMixin:
                                 _now_status = None
                             _ev_ts = {ev.kind: ev.created_at for ev in d["events"]}
                             for _k in sorted(_wake_kinds):
-                                if _fresh.is_stale(_now_status, _k):
+                                if _fresh.is_stale_notice(_now_status, _k):
                                     _fresh.log_dropped(sub["task_id"], _k, _ev_ts.get(_k),
                                                        "notifier", _now_status)
                                     _wake_kinds.discard(_k)
@@ -3405,6 +3399,7 @@ class GatewayKanbanWatchersMixin:
                                         text=_synth,
                                         session_id=_session_key,
                                         profile=_served_profile,
+                                        wake_kind="kanban",
                                     )
                                 _mark_red_carried()
                                 logger.info(
@@ -3452,6 +3447,22 @@ class GatewayKanbanWatchersMixin:
                             """
                             from gateway.wake import deliver_wake
 
+                            if _alerts_entry is not None:
+                                # t_5763e008: the card's live #alerts home, not the sub's chat.
+                                await _alh.wake_home(
+                                    self, _alerts_entry, _synth, board=board_slug, task_id=sub["task_id"],
+                                    title=(task.title if task else "") or "", kinds=_wake_kinds,
+                                    event_ts=max((ev.created_at for ev in d["events"]), default=None),
+                                    carried_ids=_red_ids,
+                                )
+                                if _red_ids:
+                                    from gateway import kanban_owner_wake as _ow_home
+
+                                    _seen = _ow_home.runner_state(self).red_seen
+                                    for _rid in _red_ids:
+                                        _ns.note_red_seen(_seen, (d.get("red_keys") or {}).get(_rid) or (), time.time())
+                                return
+
                             _source, _wake_identity = self._build_wake_source(
                                 plat, adapter, sub,
                                 profile=sub_profile or None,
@@ -3474,12 +3485,16 @@ class GatewayKanbanWatchersMixin:
                             # self-post branch is handled BEFORE the
                             # cursor advance above).
                             from gateway import kanban_wake_freshness as _fresh
+                            from gateway.wake_kind import kanban_wake_sub, wake_meta
                             await deliver_wake(
                                 adapter,
                                 text=_synth,
                                 session_id=_session_key,
                                 source=_source,
-                                metadata={_fresh.META_KEY: [_fresh.card_entry(
+                                wake_kind="kanban",
+                                metadata={**wake_meta(sub=kanban_wake_sub(_wake_kinds),
+                                                      card_id=sub["task_id"]),
+                                          _fresh.META_KEY: [_fresh.card_entry(
                                     board_slug, sub["task_id"], _wake_kinds,
                                     max((ev.created_at for ev in d["events"]), default=None),
                                     _synth,
@@ -3491,8 +3506,9 @@ class GatewayKanbanWatchersMixin:
                                 sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                             )
 
-                        if _is_push_adapter and not send_passive and _wake_kinds:
-                            # Wake-only (delivery_mode='wake') push sub: the
+                        if _is_push_adapter and (not send_passive or _alerts_entry is not None) and _wake_kinds:
+                            # Wake-only (delivery_mode='wake') push sub, or a card
+                            # whose #alerts home is woken (t_5763e008): the
                             # text ping was intentionally skipped above, so
                             # the wake IS the sole delivery. It must succeed
                             # BEFORE the cursor advances — advancing first
@@ -3550,7 +3566,7 @@ class GatewayKanbanWatchersMixin:
                         # before reaching here). A reopened ``done`` card is
                         # re-subscribed explicitly by its controller; leaving
                         # the row would keep waking the origin session.
-                        if _is_push_adapter and send_passive and _wake_kinds:
+                        if _is_push_adapter and send_passive and _alerts_entry is None and _wake_kinds:
                             # notify+wake: the text ping above was the
                             # delivery and the cursor has advanced; the wake
                             # injection stays best-effort.
@@ -3616,7 +3632,10 @@ class GatewayKanbanWatchersMixin:
     def _kanban_route_adapter(self, platform: str, profile: Optional[str]):
         """Live adapter for a lifecycle-line destination platform, or None."""
         from gateway.config import Platform
+        from gateway import kanban_lifecycle_file_sink as _fs
 
+        if platform == _fs.FILE_PLATFORM:  # t_89bfcd1f: local file, no chat
+            return _fs.LifecycleFileSink()
         try:
             return self._authorization_adapter(Platform(platform), profile or None)
         except ValueError:
@@ -3626,14 +3645,20 @@ class GatewayKanbanWatchersMixin:
         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_notify as _kbn
-        conn = _kbc.connect(board=board)
+        from hermes_cli.kanban_db_ioerr import note_board_ioerr
+        conn = None
         try:
+            conn = _kbc.connect(board=board)
             getattr(_kbn, op)(
                 conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "", **extra,
             )
+        except Exception as exc:
+            note_board_ioerr(exc, where=f"notifier:{op}", board=board, conn=conn)
+            raise
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def _kanban_advance(self, sub: dict, cursor: int, board: Optional[str] = None) -> None:
         self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
@@ -3804,6 +3829,14 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        try:  # t_77aa2e0e: name a missing fleet-root receipt once at boot, not once per refused write
+            from hermes_cli.fleet_placement import root_receipt_missing
+
+            _missing = root_receipt_missing()
+        except Exception:
+            _missing = None
+        if _missing:
+            logger.error("kanban dispatcher: %s", _missing)
 
         try:
             from hermes_cli import kanban_db as _kb
@@ -3874,6 +3907,13 @@ class GatewayKanbanWatchersMixin:
         else:
             return
         self._kanban_dispatcher_lock_handle = _lock_handle
+        # The dispatcher leader holds an idle read-only connection on every live board, so no
+        # other opener on this host rebuilds a board's -shm on open (t_1460fa32).
+        try:
+            from hermes_cli import kanban_board_anchor as _kba
+            self._kanban_board_anchor = _kba.start_if_enabled(kanban_cfg)
+        except Exception:
+            logger.debug("kanban dispatcher: board anchor unavailable", exc_info=True)
         write_dispatcher_heartbeat = lambda _interval: None  # noqa: E731 - bound if the import fails
         try:
             from tools.async_delegation_kanban import set_dispatcher_active, write_dispatcher_heartbeat
@@ -4139,6 +4179,10 @@ class GatewayKanbanWatchersMixin:
             return (q is not None and q[0] == _board_db_fingerprint(slug)
                     and time.monotonic() - q[1] < CORRUPT_BOARD_RETRY_AFTER_SECONDS)
 
+        def _kba_sidecar_identity(db_path: str) -> str:
+            from hermes_cli import kanban_board_anchor as _kba
+            return _kba.sidecar_identity(db_path)
+
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
             # The guard class lives in ``kanban_db_connect`` since upstream's
             # extraction; the facade no longer re-exports it, and a missing
@@ -4166,6 +4210,8 @@ class GatewayKanbanWatchersMixin:
             connection handle or accidentally claim across each other.
             """
             conn = None
+            from hermes_cli import kanban_tick_steps as _kts
+            _open_t0 = time.monotonic()
             fingerprint = _board_db_fingerprint(slug)
             disabled_entry = disabled_corrupt_boards.get(slug)
             if disabled_entry is not None:
@@ -4192,6 +4238,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 conn = _kb.connect(board=slug)
                 _requeue_host_transient_on(conn, slug, requeue_note)
+                _kts.add("board_open", (time.monotonic() - _open_t0) * 1000.0)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
@@ -4213,6 +4260,10 @@ class GatewayKanbanWatchersMixin:
                     reconcile_orphans=reconcile_orphans,
                     budget_cache=budget_cache,
                     spillover=spillover,
+                    # The long-lived gateway tick runs pool-host clones in the background (t_915b8d2d).
+                    defer_pool_clone=True,
+                    # ...and the orphan sweep (t_97a78e19).
+                    defer_maintenance=True,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -4222,12 +4273,16 @@ class GatewayKanbanWatchersMixin:
                         "SQLite database; pausing dispatch for this board until "
                         "the file changes, the gateway restarts, or the "
                         "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
+                        "then run `hermes kanban init` if you need a fresh board. "
+                        "sidecars: %s",
                         slug,
                         fingerprint[0],
+                        _kba_sidecar_identity(fingerprint[0]),
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                from hermes_cli.kanban_db_ioerr import note_board_ioerr
+                note_board_ioerr(exc, where="dispatcher", board=slug, conn=conn)
                 return None
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -4237,12 +4292,16 @@ class GatewayKanbanWatchersMixin:
                         "SQLite database; pausing dispatch for this board until "
                         "the file changes, the gateway restarts, or the "
                         "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
+                        "then run `hermes kanban init` if you need a fresh board. "
+                        "sidecars: %s",
                         slug,
                         fingerprint[0],
+                        _kba_sidecar_identity(fingerprint[0]),
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                from hermes_cli.kanban_db_ioerr import note_board_ioerr
+                note_board_ioerr(exc, where="dispatcher", board=slug, conn=conn)
                 return None
             finally:
                 if conn is not None:
@@ -4265,8 +4324,10 @@ class GatewayKanbanWatchersMixin:
             # Tick-series cost (spec v0.3 §3.6 / I-7): the WHOLE tick, build()
             # through the end of the board loop, on this thread's CPU clock.
             _t_cpu0, _t_wall0 = time.thread_time(), time.perf_counter()
-            with _kbc_tick.count_statements() as _queries:
+            from hermes_cli import kanban_tick_steps as _kts
+            with _kbc_tick.count_statements() as _queries, _kts.scope() as _steps:
                 out = _tick_body(boards)
+            _series_tick["steps"] = _steps
             _write_gate_series(boards, out, time.thread_time() - _t_cpu0,
                                time.perf_counter() - _t_wall0, _queries[0])
             return out
@@ -4283,7 +4344,9 @@ class GatewayKanbanWatchersMixin:
             # that have spawnable work, rotating the first pick every tick
             # (t_f78d1938: consumed in fixed board order, default first, the
             # subs-ace board got 0 spawns for 93 min with 7 ready P1 cards).
-            _tick = _gate_ticks.build(boards)
+            from hermes_cli import kanban_tick_steps as _kts
+            with _kts.step("gate_build"):
+                _tick = _gate_ticks.build(boards)
             _series_tick["tick"] = _tick
             _series_tick["pool_budget"] = (
                 None if _tick.remote_plan is None else _tick.remote_plan.budget)
@@ -4294,6 +4357,7 @@ class GatewayKanbanWatchersMixin:
             _requeue_note = _host_recovery_note(load_gate)
             _tick_spawned = 0
             _demand: list[tuple[str, int]] = []
+            _demand_t0 = time.monotonic()
             if _allowance is not None and not _spawn_paused:
                 _review_on = _kbd.review_dispatch_enabled()
                 for b in _kb.enumerating_each(boards):
@@ -4327,6 +4391,7 @@ class GatewayKanbanWatchersMixin:
                             except Exception:
                                 pass
                     _demand.append((slug, _n))
+            _kts.add("demand_scan", (time.monotonic() - _demand_t0) * 1000.0)
             _quotas = _klg.split_allowance(
                 _allowance, _demand, start=_board_rr["tick"],
             )
@@ -4432,7 +4497,7 @@ class GatewayKanbanWatchersMixin:
                     local_spawned=int(_series_tick.get("local") or 0),
                     results=results, tick_ms_cpu=cpu_s * 1000.0,
                     tick_ms_wall=wall_s * 1000.0, boards=len(boards or ()),
-                    queries=queries,
+                    queries=queries, steps=_series_tick.get("steps"),
                 )
                 _gate_series.append_record(_gate_series.series_path(_kb.kanban_home()), rec)
             except Exception as exc:

@@ -56,7 +56,7 @@ def test_backfill_then_write_path_tracks_create_and_status(home):
     assert _ids() == {("default", old, "ready")}
     new = kb.create_task(conn, title="after install", session_id=SID)
     assert ("default", new, "ready") in _ids()
-    assert kb.block_task(conn, new, reason="r")
+    assert kb.block_task(conn, new, reason="r", kind="needs_input")
     assert ("default", new, "blocked") in _ids()
     assert kb.complete_task(conn, old, summary="done")
     assert {t for _, t, _ in _ids()} == {new}  # closed cards drop out of the read
@@ -150,7 +150,7 @@ def test_older_snapshot_never_overwrites_newer(home):
     hi.resync()
     with _conn(home) as conn:
         tid = kb.create_task(conn, title="x", session_id=SID)
-        kb.block_task(conn, tid, reason="r")
+        kb.block_task(conn, tid, reason="r", kind="needs_input")
     idx = hi._open_rw(hi.index_path())
     ev = idx.execute("SELECT ev FROM cards WHERE task_id = ?", (tid,)).fetchone()[0]
     hi._apply_rows(idx, "default", [(tid, SID, "ready", "x", None, 1, ev - 1)])

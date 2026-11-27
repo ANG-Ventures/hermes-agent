@@ -200,6 +200,17 @@ def test_resolve_needs_a_real_resolution(conn):
             ob.resolve(conn, a.id, bad, now=T0 + 1)
 
 
+def test_receipt_refuses_resolved_row_without_changing_wake_columns(conn):
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:resolved-receipt", now=T0)
+    ob.receipt(conn, a.id, "answered", now=T0 + 1)
+    a = ob.resolve(conn, a.id, "card-closed", now=T0 + 2)
+    before = a.to_dict(T0 + 3)
+    with pytest.raises(ob.ObligationError, match="resolved"):
+        ob.receipt(conn, a.id, "reconciler: delivered", now=T0 + 3)
+    assert ob.get(conn, a.id).to_dict(T0 + 3) == before
+
+
 def test_receipt_never_moves_state_or_gen(conn):
     tid = _card(conn)
     a, _ = ob.open_obligation(conn, tid, "detached:r6", now=T0)
@@ -401,6 +412,13 @@ def _cli(home: Path, tmp_path: Path, *argv: str, env_extra=None) -> subprocess.C
                           cwd=REPO_ROOT, timeout=120)
 
 
+@pytest.mark.slow_test(
+    180,
+    reason="13 sequential `hermes kanban obligation` CLI subprocesses, each paying full CLI startup (git "
+    "provenance probes); measured 44.9 s call + 7.7 s setup on the Studio at load ~30, past the 60 s cap on "
+    "the 4-way CI runner (run 41967745813 attempt 1). Events are written by exited subprocesses, so order is "
+    "serial; the overrun was wall time, not a race (t_741fc5c0)",
+)
 def test_cli_e2e_open_claim_progress_resolve_with_events_in_order(conn, home, tmp_path):
     _operator_state_db(home, "s-op")
     tid = _card(conn, session="s-op")

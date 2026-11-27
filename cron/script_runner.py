@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +43,15 @@ _SHUTDOWN_WAIT_S = 20.0
 _SKEW_CONFIRM_S = 2.0
 _WARN_EVERY_S = 3600.0
 _REFUSED_ENV = ("HERMES_MACHINE_ID", "_HERMES_CRON_EXTERNAL_WORKER")
+# Land hold before the bounded skew drain kills (t_3c08d829): the fleet's home helper, relative to
+# the fleet root. It publishes the restart-pending record (the home-reconcile tick starts no new
+# land), waits while a live land marker exists (bounded by SGR_LAND_WAIT_SECS) and always exits 0.
+_LAND_WAIT_HELPER = ("skills-shared", "hermes-harness", "safe-gateway-restart", "scripts",
+                     "land_wait.py")
+# Past the helper's own bound (SGR_LAND_WAIT_SECS) the runner stops waiting for it and kills it.
+_LAND_WAIT_SLACK_S = 30.0
+# The exit-path release of the restart-pending record is one file unlink; never hold the exit long.
+_LAND_RELEASE_TIMEOUT_S = 10.0
 
 
 def _now_iso() -> str:
@@ -60,11 +70,139 @@ def _home_label(home: Path) -> str:
     return home.name if home.parent.name == "profiles" else "default"
 
 
+EXIT_RECORD_NAME = "script_runner_exit.json"
+
+
+def _exit_record_path() -> Path:
+    return trip_marker_path().parent / EXIT_RECORD_NAME
+
+
+def note_start() -> None:
+    """Log an exit-reason line for a previous runner that left none (SIGKILL, launchd exit timeout,
+    hard crash), then record this start (t_2ddabbc4: every start in the log has a cause). Never
+    raises."""
+    try:
+        path = _exit_record_path()
+        try:
+            prev = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            prev = None
+        if isinstance(prev, dict) and prev.get("exit") is None and prev.get("pid") != os.getpid():
+            logger.warning("cron script runner exit: reason=unrecorded code=? pid %s (started %s; "
+                           "no exit line: SIGKILL, launchd exit timeout or a hard crash)",
+                           prev.get("pid"), prev.get("started_at"))
+        from utils import atomic_write_text
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, json.dumps({"pid": os.getpid(), "started_at": _now_iso(),
+                                            "exit": None}) + "\n",
+                          tmp_prefix=".script_runner_exit_", mode=0o600)
+    except Exception:
+        logger.debug("script runner: exit record start failed", exc_info=True)
+
+
+def note_exit(reason: str, code) -> None:
+    """One ``cron script runner exit: reason=<r> code=<n>`` line on every exit path, and the exit
+    record that tells the next start this one was logged. Never raises."""
+    try:
+        logger.warning("cron script runner exit: reason=%s code=%s pid %d", reason, code,
+                       os.getpid())
+        for handler in logging.getLogger().handlers:
+            with contextlib.suppress(Exception):
+                handler.flush()
+        from utils import atomic_write_text
+
+        path = _exit_record_path()
+        try:
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            record = None
+        if not isinstance(record, dict) or record.get("pid") != os.getpid():
+            record = {"pid": os.getpid(), "started_at": None}
+        record["exit"] = {"at": _now_iso(), "reason": reason, "code": code}
+        atomic_write_text(path, json.dumps(record) + "\n", tmp_prefix=".script_runner_exit_",
+                          mode=0o600)
+    except Exception:
+        logger.debug("script runner: exit record failed", exc_info=True)
+
+
 def _detect_code_skew():
     try:
         from gateway.code_skew import detect_code_skew
 
         return detect_code_skew()
+    except Exception:
+        return None
+
+
+def _skew_shas() -> tuple:
+    """``(project root, boot sha, disk sha)``; a sha is None when unresolved."""
+    from gateway import code_skew
+
+    boot = code_skew._boot_fingerprint
+    boot_sha = boot.rsplit(":", 1)[-1] if boot else None
+    if boot_sha == "unresolved":
+        boot_sha = None
+    return code_skew._PROJECT_ROOT, boot_sha, code_skew.current_code_sha()
+
+
+def _loaded_repo_files(root: Path) -> set:
+    """Repo-relative posix paths of every module file in ``sys.modules`` under ``root``."""
+    root = Path(root).resolve()
+    out = set()
+    for module in list(sys.modules.values()):
+        path = getattr(module, "__file__", None)
+        if not path:
+            continue
+        try:
+            out.add(Path(path).resolve().relative_to(root).as_posix())
+        except (ValueError, OSError):
+            continue
+    return out
+
+
+SKEW_LOADED_ONLY_ENV = "HERMES_CRON_SKEW_LOADED_ONLY"
+SKEW_ANY_MARKER_NAME = "script_runner_skew_any"
+
+
+def _skew_any_forced() -> bool:
+    """Kill switch for the loaded-module skew filter; either one restores drain on any skew.
+
+    - the file ``<home>/cron/script_runner_skew_any``: the LIVE switch, honoured by a running
+      runner on its next skew check (``touch`` to set, ``rm`` to clear);
+    - env ``HERMES_CRON_SKEW_LOADED_ONLY=0``: a LAUNCH-time switch. The runner reads its own
+      environment, so exporting it elsewhere after start does nothing until the runner restarts.
+
+    A marker that cannot be stat'ed for any reason other than absence counts as set (drain)."""
+    if os.environ.get(SKEW_LOADED_ONLY_ENV, "").strip() == "0":
+        return True
+    try:
+        (trip_marker_path().parent / SKEW_ANY_MARKER_NAME).stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+
+
+def _skew_loaded_changes(base: Optional[str] = None) -> Optional[List[str]]:
+    """Loaded module files changed between ``base`` (the last accepted sha; default the boot sha)
+    and the disk sha (t_2ddabbc4): ``[]`` when the diff touches none of them, None when the diff
+    cannot be read (the caller drains)."""
+    try:
+        root, boot, disk = _skew_shas()
+        base = base or boot
+        if not base or not disk or base == disk:
+            return None
+        # --no-renames: a renamed loaded module must show its old path.
+        p = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "--no-renames",
+                            f"{base}..{disk}"], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=10,
+                           check=False)
+        if p.returncode != 0:
+            return None
+        changed = {line.strip() for line in p.stdout.splitlines() if line.strip()}
+        return sorted(changed & _loaded_repo_files(root))
     except Exception:
         return None
 
@@ -125,6 +263,54 @@ def _inflight_refire_status() -> tuple:
         started = since.get(key)
         spent.append((job_id, round(now - started) if started else None))
     return spent, failed
+
+
+def _inflight_finish_requested() -> List[tuple]:
+    """``(job_id, elapsed_s, max_s)`` per in-flight run whose row sets ``drain_finish_s`` and has
+    run for less than that (t_fa0b5cff): the bounded skew drain waits for it instead of cutting it
+    at ``RUNNER_SKEW_DRAIN_MAX_S``. A run past its own maximum is cut like any other."""
+    import cron.scheduler as sched
+    from cron.jobs import drain_finish_seconds, get_job
+    from cron.scheduler_provider import _profile_cron_scope
+
+    with sched._running_lock:
+        keys = sorted(sched._running_job_ids | sched._running_fire_owners.keys())
+        since = {k: sched._running_since.get(k) for k in keys}
+    now = time.time()
+    out = []
+    for key in keys:
+        home_key, job_id = key
+        try:
+            with _profile_cron_scope(sched._inflight_home_path(home_key)):
+                max_s = drain_finish_seconds(get_job(job_id))
+        except Exception:
+            logger.debug("drain-finish lookup failed for %s", job_id, exc_info=True)
+            continue
+        started = since.get(key)
+        if max_s is None or started is None:
+            continue
+        elapsed = now - started
+        if elapsed < max_s:
+            out.append((job_id, round(elapsed), max_s))
+    return out
+
+
+def _land_wait_helper() -> Path:
+    """``<fleet root>/skills-shared/.../land_wait.py``; the fleet root is the process home with a
+    ``profiles/<p>`` suffix stripped."""
+    from hermes_constants import get_process_hermes_home
+
+    home = get_process_hermes_home()
+    if home.parent.name == "profiles":
+        home = home.parent.parent
+    return home.joinpath(*_LAND_WAIT_HELPER)
+
+
+def _land_wait_budget_s() -> float:
+    try:
+        return float(os.environ.get("SGR_LAND_WAIT_SECS", "1200")) + _LAND_WAIT_SLACK_S
+    except ValueError:
+        return 1200.0 + _LAND_WAIT_SLACK_S
 
 
 def _boot_code_sha() -> Optional[str]:
@@ -203,8 +389,18 @@ class ScriptRunner:
         self._draining_mono = float("-inf")
         self.sigterm = False
         self._skew_bounded = False
+        # The last disk sha accepted without a drain (None = the boot sha). Later skews diff
+        # against it, so a commit that reverts code imported after the accept still drains.
+        self._skew_base_sha: Optional[str] = None
+        self.exit_reason: Optional[str] = None
         self._skew_withhold: set = set()
         self._bound_polled = False
+        # Land hold (t_3c08d829): None = not started; a Popen = helper running; True = settled.
+        self._land_hold: Any = None
+        self._land_hold_deadline = 0.0
+        self._land_hold_spawned = False  # a helper was started, so a record may exist
+        self._land_hold_started = float("-inf")  # monotonic start of the helper, a timestamp only
+        self._land_hold_lock = threading.Lock()
         self._reasons: Dict[str, Optional[str]] = {}
         self._last_ok: Dict[str, str] = {}
         self._tick_started: Dict[str, str] = {}
@@ -266,6 +462,13 @@ class ScriptRunner:
 
         self._last_homes = [_profile_entry(e) for e in _existing_profile_homes(homes)]
         self._check_skew()
+        if not self.draining:
+            # A gated re-fire waits for the drain-killed tree to go (t_fa0b5cff); checked every
+            # cycle so it fires within one cycle of that, not at the next restart.
+            with contextlib.suppress(Exception):
+                from cron import script_runner_rearm as rearm_policy
+
+                rearm_policy.apply_gated_refires()
         if not lanes.knob_enabled():
             marker = trip_marker_path()
             if marker.exists():
@@ -351,8 +554,52 @@ class ScriptRunner:
             return time.monotonic() - started
         return out[0]
 
+    def _skew_pending(self) -> bool:
+        """Disk differs from the code this process runs: the boot sha, or the last sha accepted
+        without a drain (also when the checkout returns to the boot sha)."""
+        if self._skew_base_sha is None:
+            return _detect_code_skew() is not None
+        try:
+            disk = _skew_shas()[2]
+        except Exception:
+            disk = None
+        if disk is None:
+            return _detect_code_skew() is not None
+        return disk != self._skew_base_sha
+
+    def _skew_needs_drain(self) -> bool:
+        """A code skew drains only when the base..disk diff touches a module this process loaded,
+        or the diff cannot be read (t_2ddabbc4: 84 of 152 drains changed no loaded module). The
+        base is the last accepted sha, so a kept skew is diffed once and a later revert of code
+        imported from it still drains.
+
+        Kill switch (no deploy needed, see ``_skew_any_forced``): the file
+        ``<home>/cron/script_runner_skew_any`` (next to the trip marker) is read on every skew
+        check and works on a running runner; env ``HERMES_CRON_SKEW_LOADED_ONLY=0`` is read from
+        the runner's own environment, so it takes effect from the next runner start."""
+        if _skew_any_forced():
+            logger.warning("script runner code skew: kill switch set (%s=0 or %s); draining",
+                           SKEW_LOADED_ONLY_ENV, SKEW_ANY_MARKER_NAME)
+            return True
+        try:
+            disk = _skew_shas()[2]
+        except Exception:
+            disk = None
+        changed = _skew_loaded_changes(self._skew_base_sha)
+        if changed is None:
+            logger.warning("script runner code skew: base..disk diff unreadable; draining")
+            return True
+        if changed:
+            logger.warning("script runner code skew touches %d loaded module(s): %s", len(changed),
+                           ", ".join(changed[:10]) + (" ..." if len(changed) > 10 else ""))
+            return True
+        self._skew_base_sha = disk
+        logger.warning("script runner code skew: disk %s changes no loaded module; not draining",
+                       (disk or "?")[:12])
+        return False
+
     def _check_skew(self) -> None:
-        if not self.draining and _detect_code_skew() is not None:
+        if not self.draining and self._skew_pending() and self._skew_needs_drain():
             self.draining = True
             self.draining_since = _now_iso()
             self._draining_mono = time.monotonic()
@@ -362,6 +609,7 @@ class ScriptRunner:
             return
         if _inflight_count() == 0:
             self.exit_code = 0
+            self.exit_reason = self.exit_reason or "code skew drain (no script in flight)"
             if self._stop is not None:
                 self._stop.set()
         else:
@@ -371,6 +619,11 @@ class ScriptRunner:
         """Called from ``main``'s 0.5 s stop poll: evaluate the drain bound once, the moment it is
         crossed. The ticker cycle (``RUNNER_CYCLE_S`` = 60) alone can land a few ms short of it and
         hold the drain another whole cycle (t_af461294 drill: 180 s, not 120 s)."""
+        if self.draining and not self.sigterm and self._land_hold not in (None, True):
+            # A land hold is running: proceed within 0.5 s of the helper's exit (t_3c08d829).
+            if self._land_hold.poll() is not None or time.monotonic() >= self._land_hold_deadline:
+                self._check_skew_bound()
+            return
         if (not self.draining or self._bound_polled or self.sigterm
                 or time.monotonic() - self._draining_mono < float(lanes.RUNNER_SKEW_DRAIN_MAX_S)):
             return
@@ -389,6 +642,16 @@ class ScriptRunner:
                 self._warn_hourly("skew_wait", tuple(j for j, _ in spent),
                                   "script runner code-skew drain waiting: re-fire spent, %s", names)
                 return
+            finishing = _inflight_finish_requested()
+            if finishing:
+                names = ", ".join(f"{job_id} {elapsed}s of {max_s}s"
+                                  for job_id, elapsed, max_s in finishing)
+                self._warn_hourly("skew_finish", tuple(j for j, _e, _m in finishing),
+                                  "script runner code-skew drain waiting: finish requested, %s",
+                                  names)
+                return
+            if not self._land_hold_settled():
+                return
             logger.warning("script runner code-skew drain bounded: re-fire available; %d script(s) "
                            "in flight past %s s, terminating them (one re-fire each) and exiting 0; "
                            "re-fire withheld for re-fire-spent failing job(s): %s",
@@ -396,7 +659,108 @@ class ScriptRunner:
                            ", ".join(sorted(j for _h, j in failed)) or "-")
             self._skew_withhold = failed
             self._skew_bounded = True
-            self.request_shutdown()
+            self.request_shutdown("code skew drain bounded (in-flight scripts terminated)")
+
+    def _land_hold_settled(self) -> bool:
+        """Hold the bounded kill while a home-reconcile land is writing the live tree (t_3c08d829).
+
+        A kill inside that write leaves the tick's land-killed latch, and every later tick refuses
+        until an operator clears it. Starts ``land_wait.py default --owner <runner pid>`` once
+        (non-blocking: the ticker and main's 0.5 s poll come back here) and returns True once it
+        has exited. A missing helper, a start failure, a non-zero exit or a helper past
+        ``SGR_LAND_WAIT_SECS`` + slack never blocks the drain: one log line, then True. The
+        restart-pending record it leaves is owned by this pid; ``main`` removes it on exit
+        (``release_land_hold``). ``SGR_LAND_WAIT=0`` makes the helper return at once."""
+        with self._land_hold_lock:
+            hold = self._land_hold
+            if hold is True:
+                return True
+            if hold is None:
+                helper = _land_wait_helper()
+                if not helper.is_file():
+                    logger.warning("script runner code-skew drain: land hold skipped: no helper at "
+                                   "%s", helper)
+                    self._land_hold = True
+                    return True
+                try:
+                    self._land_hold = subprocess.Popen(
+                        [sys.executable, str(helper), "default", "--owner", str(os.getpid())],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, start_new_session=True)
+                except Exception as exc:  # noqa: BLE001 - the hold must never block the drain
+                    logger.warning("script runner code-skew drain: land hold skipped: helper "
+                                   "start failed (%s: %s)", type(exc).__name__, exc)
+                    self._land_hold = True
+                    return True
+                self._land_hold_spawned = True
+                self._land_hold_started = time.monotonic()
+                self._land_hold_deadline = self._land_hold_started + _land_wait_budget_s()
+                return False
+            rc = hold.poll()
+            if rc is None and time.monotonic() < self._land_hold_deadline:
+                return False
+            if rc is None:
+                with contextlib.suppress(Exception):
+                    os.killpg(hold.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
+                with contextlib.suppress(Exception):
+                    hold.wait(5)
+            out = ""
+            with contextlib.suppress(Exception):
+                out = (hold.stdout.read() or b"").decode("utf-8", "replace").strip()
+                hold.stdout.close()
+            waited = round(time.monotonic() - self._land_hold_started)
+            if rc is None:
+                logger.warning("script runner code-skew drain: land hold helper still running "
+                               "after %d s; killed it, proceeding%s", waited,
+                               f" ({out})" if out else "")
+            elif rc != 0:
+                logger.warning("script runner code-skew drain: land hold helper exited %d after "
+                               "%d s; proceeding%s", rc, waited, f" ({out})" if out else "")
+            elif out:
+                logger.warning("script runner code-skew drain: land hold %d s: %s", waited,
+                               " | ".join(out.splitlines()))
+            self._land_hold = True
+            return True
+
+    def end_land_hold(self) -> None:
+        """Kill a still-running land-hold helper on exit (the drain ended without a kill), and reap
+        it so it cannot publish its record after ``release_land_hold`` removed it."""
+        hold = self._land_hold
+        if hold not in (None, True) and hold.poll() is None:
+            with contextlib.suppress(Exception):
+                os.killpg(hold.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
+            with contextlib.suppress(Exception):
+                hold.wait(5)
+
+    def release_land_hold(self) -> None:
+        """Remove this runner's restart-pending record: ``land_wait.py default --release --owner
+        <pid>``. ``main`` calls it as the LAST exit step, after in-flight scripts were terminated
+        (until then the record is what stops a new land). Best effort: a missing helper, a failure
+        or a timeout logs one line and never blocks or fails the exit.
+
+        The record cannot be left to lapse with the runner: the tick reads a record whose owner pid
+        is alive as live, and on the Studio the pid space wraps in minutes (427 pids/s measured
+        2026-11-11), so a reused pid would hold every land until the record is 1800 s old.
+        Residual: a runner SIGKILLed (launchd exit timeout) before this step leaves the record for
+        up to 1800 s."""
+        if not self._land_hold_spawned:
+            return  # the helper never started: no record was published
+        helper = _land_wait_helper()
+        try:
+            p = subprocess.run(
+                [sys.executable, str(helper), "default", "--release", "--owner", str(os.getpid())],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=_LAND_RELEASE_TIMEOUT_S,
+                check=False)
+        except Exception as exc:  # noqa: BLE001 - the release must never block or fail the exit
+            logger.warning("script runner: land hold release failed (%s: %s)",
+                           type(exc).__name__, exc)
+            return
+        out = ((p.stdout or b"") + (p.stderr or b"")).decode("utf-8", "replace").strip()
+        if p.returncode != 0:
+            logger.warning("script runner: land hold release exited %d%s", p.returncode,
+                           f" ({out})" if out else "")
+        elif out:
+            logger.warning("script runner: land hold release: %s", " | ".join(out.splitlines()))
 
     def _check_host(self) -> None:
         try:
@@ -423,7 +787,7 @@ class ScriptRunner:
         self._recovered.add(key)
         try:
             with _profile_cron_scope(home):
-                InProcessCronScheduler().recover_interrupted()
+                InProcessCronScheduler().recover_interrupted(replay_pass=False)
         except Exception:
             logger.error("script runner startup recovery failed for %s", home, exc_info=True)
 
@@ -570,6 +934,7 @@ class ScriptRunner:
             self._tree_kill(grace)
             self._await_inflight(min(time.monotonic() + 1.5, hard_exit_at - 0.5))
             notify.join(max(0.0, hard_exit_at - 0.3 - time.monotonic()))
+            note_exit("watchdog trip", EXIT_WATCHDOG)
             for handler in logging.getLogger().handlers:
                 with contextlib.suppress(Exception):
                     handler.flush()
@@ -752,11 +1117,14 @@ class ScriptRunner:
         import cron.scheduler as sched
         from cron import scheduler_script as ss
 
+        with sched._running_lock:  # run starts, before any worker can release its key
+            since = dict(sched._running_since)
         with sched._script_procs_lock:
             sched.signal_shutdown("cron script runner code-skew drain bound")
             # Re-fire-spent jobs whose last run failed were not waited for (t_af461294): their cut
             # run is recorded as a failure with no re-fire.
             sched._refire_withheld_job_ids.update(self._skew_withhold)
+            sched._refire_spent_withheld_job_ids.update(self._skew_withhold)
             trees = [(key, proc, ss._script_tree_snapshot(proc))
                      for key, proc in sched._active_script_procs.items() if proc.returncode is None]
             # returncode stays None until the worker reaps its script, so an exited run reads as in
@@ -797,11 +1165,92 @@ class ScriptRunner:
             withheld = {sched._script_proc_job_ids.get(key) for key, _p, _s in alive} - {None}
             sched._refire_withheld_job_ids.update(withheld)
             sched._restart_killed_job_ids.difference_update(withheld)
+            # Withheld here only DEFERS the re-fire (t_fa0b5cff): it used to drop it for good, so
+            # sub-vps-backup (2026-11-11 02:55, "12 script tree(s) survived SIGKILL") never re-ran.
+            # Record the surviving members; the next runner re-fires once they are gone or the
+            # run's own script timeout has passed. A spent failing job stays withheld.
+            gates = [(sched._script_proc_job_ids.get(key), self._gate_members(proc, snap))
+                     for key, proc, snap in alive
+                     if sched._script_proc_job_ids.get(key) in withheld
+                     and sched._script_proc_job_ids.get(key) not in self._skew_withhold]
+        if gates:
+            self._record_gated_refires(gates, since)
         if alive:
             logger.error("script runner code-skew drain: %d script tree(s) survived SIGKILL (%s); "
                          "re-fire withheld for %s", len(alive),
                          ", ".join(str(proc.pid) for _k, proc, _s in alive),
                          ", ".join(sorted(f"{j}@{h}" for h, j in withheld)) or "-")
+
+    @staticmethod
+    def _gate_members(proc, snap) -> dict:
+        """``{"members": [[pid, create_time]...], "unsure": [...]}`` for a survivor tree's
+        still-running members. ``unsure`` are ``_UnreadableMember`` hits: a same-user orphan with
+        an unreadable environ that MAY be ours (on macOS every launchd job has ppid 1, so a long
+        run collects unrelated ones; the likely source of 02:55's "12 survived"). They hold the
+        re-fire only for ``RUNNER_GATED_UNSURE_S``; a real member holds it to the run's deadline.
+        ``unproven``: a failed scan, or nothing re-identifiable in a tree that was alive; the
+        re-fire then waits for the run's deadline (``until``), never less."""
+        import psutil
+        from cron import scheduler_script as ss
+
+        out: Dict[str, Any] = {"members": [], "unsure": [], "unproven": False}
+        for member in snap or []:
+            if isinstance(member, ss._UnprovenMember):
+                out["unproven"] = True  # a failed scan: an escapee cannot be ruled out
+                continue
+            unsure = isinstance(member, ss._UnreadableMember)
+            target = getattr(member, "_process", member)
+            try:
+                if member.pid <= 0 or not target.is_running() \
+                        or target.status() == psutil.STATUS_ZOMBIE:
+                    continue
+                out["unsure" if unsure else "members"].append(
+                    [int(member.pid), float(target.create_time())])
+            except Exception:
+                out["unproven"] = True  # alive at the check, unidentifiable now
+                continue
+        if snap is None:
+            try:
+                out["members"].append([int(proc.pid),
+                                       float(psutil.Process(proc.pid).create_time())])
+            except Exception:
+                out["unproven"] = True
+        if not out["members"] and not out["unsure"]:
+            # The tree was alive at the final check but nothing in it can be re-identified: never
+            # read that as gone (Prism 28e1906cda71, 68af07493f6b). Hold to the run's deadline.
+            out["unproven"] = True
+        return out
+
+    @staticmethod
+    def _record_gated_refires(gates: list, since: dict) -> None:
+        """Persist one gated re-fire per survivor job: it fires once its members are gone or the
+        run's own script timeout (from the run's start) has passed. Never raises."""
+        import cron.scheduler as sched
+        from cron import script_runner_rearm as rearm_policy
+
+        rows = []
+        now = time.time()
+        for key, members in gates:
+            try:
+                home = sched._inflight_home_path(key[0])
+                from cron.jobs import get_job
+                from cron.scheduler_provider import _profile_cron_scope
+
+                with _profile_cron_scope(home):
+                    timeout = int(sched._job_script_kwargs(get_job(key[1]) or {})
+                                  .get("timeout_seconds") or 0)
+                    if timeout <= 0:
+                        from cron.scheduler_script import _get_script_timeout
+                        timeout = int(_get_script_timeout())
+                started = since.get(key) or now
+                rows.append({"home": str(home), "job_id": key[1], "start": started,
+                             "until": max(started + timeout, now),
+                             "unsure_until": now + float(lanes.RUNNER_GATED_UNSURE_S),
+                             **members})
+            except Exception:
+                logger.error("script runner: gated re-fire for %s not recorded", key,
+                             exc_info=True)
+        rearm_policy.record_gated_refires(rows)
 
     @staticmethod
     def _skew_terminate(trees: list) -> list:
@@ -837,7 +1286,8 @@ class ScriptRunner:
 
     # --- SIGTERM shutdown (§5.4) -----------------------------------------------------------
 
-    def request_shutdown(self) -> None:
+    def request_shutdown(self, reason: str = "signal SIGTERM") -> None:
+        self.exit_reason = self.exit_reason or reason
         self.sigterm = True
         if self._stop is not None:
             self._stop.set()
@@ -898,19 +1348,37 @@ def _setup_logging() -> None:
 
 
 def main(argv: Optional[list] = None) -> int:
-    """``hermes cron runner``. Exit 78: config refusal; 70: watchdog trip; 0: SIGTERM or skew."""
+    """``hermes cron runner``. Exit 78: config refusal; 70: watchdog trip; 0: SIGTERM or skew.
+    Every exit path logs one ``cron script runner exit: reason=...`` line (t_2ddabbc4)."""
+    _setup_logging()
+    note_start()
+    exit_info: Dict[str, Any] = {"reason": None, "code": None}
+    try:
+        code = _run(exit_info)
+        exit_info["code"] = code
+        return code
+    except BaseException as exc:
+        exit_info["reason"] = f"crash {type(exc).__name__}: {exc}"[:300]
+        exit_info["code"] = "exception"
+        raise
+    finally:
+        note_exit(exit_info["reason"] or "unknown", exit_info["code"])
+
+
+def _run(exit_info: Dict[str, Any]) -> int:
     from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
 
-    _setup_logging()
     _bootstrap_env()
     for key in _REFUSED_ENV:
         if key in os.environ:
             logger.error("cron script runner refusing to start: %s is set (I6: no outbox, no "
                          "shared claim identity)", key)
+            exit_info["reason"] = f"config refused ({key} set)"
             return EXIT_CONFIG
     if not isinstance(resolve_cron_scheduler(), InProcessCronScheduler):
         logger.error("cron script runner refusing to start: cron.provider is not the built-in "
                      "in-process scheduler")
+        exit_info["reason"] = "config refused (cron.provider is not in-process)"
         return EXIT_CONFIG
     with contextlib.suppress(Exception):
         from gateway.code_skew import record_boot_fingerprint
@@ -923,9 +1391,13 @@ def main(argv: Optional[list] = None) -> int:
         from cron import script_runner_rearm
 
         script_runner_rearm.apply_pending_requeues()
+        # Drain-killed runs whose tree outlived SIGKILL re-fire once it is gone (t_fa0b5cff).
+        script_runner_rearm.apply_gated_refires()
     stop = threading.Event()
     kwargs = runner.start_kwargs(stop)
-    signal.signal(signal.SIGTERM, lambda *_a: runner.request_shutdown())
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
+        signal.signal(signum, lambda num, _f: runner.request_shutdown(
+            f"signal {signal.Signals(num).name}"))
     homes = list(runner._profile_homes())
     with contextlib.suppress(Exception):
         from hermes_logging import enable_profile_log_routing
@@ -939,15 +1411,23 @@ def main(argv: Optional[list] = None) -> int:
     thread = threading.Thread(target=InProcessCronScheduler().start, args=(stop,), kwargs=kwargs,
                               name="cron-script-runner", daemon=True)
     thread.start()
-    while not stop.wait(0.5):
-        if not thread.is_alive():
-            logger.error("cron script runner ticker thread exited; exiting 1")
-            return 1
-        runner.poll_skew_bound()
-    if runner.sigterm:
-        return runner.shutdown()
-    thread.join(timeout=_SHUTDOWN_WAIT_S)
-    return runner.exit_code
+    try:
+        while not stop.wait(0.5):
+            if not thread.is_alive():
+                logger.error("cron script runner ticker thread exited; exiting 1")
+                exit_info["reason"] = "ticker thread exited"
+                runner.end_land_hold()
+                return 1
+            runner.poll_skew_bound()
+        runner.end_land_hold()
+        exit_info["reason"] = runner.exit_reason or "stop requested"
+        if runner.sigterm:
+            return runner.shutdown()
+        thread.join(timeout=_SHUTDOWN_WAIT_S)
+        return runner.exit_code
+    finally:
+        # Last step, after shutdown() terminated the scripts (t_3c08d829 round 2).
+        runner.release_land_hold()
 
 
 if __name__ == "__main__":

@@ -94,7 +94,7 @@ def test_plain_guarded_write_with_unwritable_foreign_ok_journals_nothing(kanban_
     """The general case: a plain (non-send-back) guarded write."""
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="card", assignee="worker-a", session_id=HOME)
-        assert kb.block_task(conn, tid, reason="needs input")
+        assert kb.block_task(conn, tid, reason="needs input", kind="needs_input")
         _release_line_guard_on(monkeypatch)
         mark = _journal_len(conn)
         with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
@@ -127,7 +127,7 @@ def test_writable_foreign_ok_still_records_takeover(kanban_home, monkeypatch):
     """A reason the guard accepts keeps today's behaviour."""
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="card", assignee="worker-a", session_id=HOME)
-        assert kb.block_task(conn, tid, reason="needs input")
+        assert kb.block_task(conn, tid, reason="needs input", kind="needs_input")
         _release_line_guard_on(monkeypatch)
         with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
                                foreign_ok="home session is gone"):

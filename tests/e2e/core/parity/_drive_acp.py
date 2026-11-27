@@ -11,7 +11,9 @@ EOF — the way an editor host closes the server.
 from __future__ import annotations
 
 import json
+import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -22,6 +24,18 @@ from tests.fakes.fake_llm_provider import FakeLLMServer
 
 ACP_TOOLSET = "hermes-acp"  # acp_adapter/session.py::_expand_acp_enabled_toolsets default
 EOF_EXIT_TIMEOUT = 30.0
+
+
+def _dump_stacks(proc: subprocess.Popen) -> None:
+    """The host overstayed stdin EOF: SIGABRT makes its faulthandler (PYTHONFAULTHANDLER=1 in its env) write every
+    thread's stack to the stderr log, so a red graceful_exit cell names what held the exit (t_e103294a)."""
+    if os.name != "posix" or proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGABRT)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 class _AcpClient:
@@ -103,7 +117,7 @@ def drive_acp(ph: ParityHome, srv: FakeLLMServer, prompt: str) -> DriveResult:
     stderr_path = ph.root / "acp_stderr.log"
     with open(stderr_path, "w", encoding="utf-8") as stderr_fh:
         proc = subprocess.Popen(
-            hermes_argv("acp"), cwd=ph.project, env=ph.env(), stdin=subprocess.PIPE,
+            hermes_argv("acp"), cwd=ph.project, env=ph.env({"PYTHONFAULTHANDLER": "1"}), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=stderr_fh, text=True, bufsize=1,
         )
         client = _AcpClient(proc)
@@ -132,6 +146,7 @@ def drive_acp(ph: ParityHome, srv: FakeLLMServer, prompt: str) -> DriveResult:
                 proc.wait(timeout=EOF_EXIT_TIMEOUT)
             except subprocess.TimeoutExpired:
                 graceful = False
+                _dump_stacks(proc)
                 terminate(proc)
     return DriveResult(
         final_text="".join(client.chunks),

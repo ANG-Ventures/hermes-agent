@@ -306,9 +306,15 @@ _ONE_OFF_COPY: Dict[str, str] = {
     # Wording deliberately avoids the overflow phrases gateway/run_turn.py matches on
     # (``_CONTEXT_OVERFLOW_ERROR_PHRASES``): this failure is transient, so the user's
     # message must stay in the transcript and the session must not be auto-reset.
+    "provider_context_rejection": (
+        "The provider rejected this request as too large, but it is only about {tokens:,} tokens ({basis}), "
+        "far below the {window:,}-token window Hermes knows for {model}, and automatic "
+        "compression did not get it through. Your conversation is kept. Send /retry, or run "
+        "/compress to shrink it further and then /retry."
+    ),
     "server_context_rejection": (
         "The model server rejected this request as too large, but this conversation is only "
-        "about {tokens:,} tokens — well under the {window:,}-token window Hermes knows for "
+        "about {tokens:,} tokens ({basis}) — well under the {window:,}-token window Hermes knows for "
         "{model} — so shrinking it would not help. Another request on the same server (for "
         "example a background memory review from an earlier session) was probably holding its "
         "capacity, or the server runs {model} with a smaller window than Hermes assumes. Wait a "

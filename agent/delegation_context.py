@@ -163,14 +163,20 @@ def owns_kanban_worker_authority() -> bool:
     at exactly one process. Authorization becomes explicit and non-transitive
     instead of ambient.
 
-    Fails OPEN when the marker is absent so pre-existing surfaces keep working:
-    a hand-driven ``HERMES_KANBAN_TASK=... hermes chat``, an older dispatcher
-    that predates the stamp, and every test that sets only the task var. Those
-    callers are unchanged. Once the stamp IS present it is authoritative, which
-    is what makes a dispatcher-spawned worker's children fail closed.
+    No ``HERMES_KANBAN_TASK`` means no grant exists, so the answer is False:
+    a script or cron ``hermes kanban create`` is an operator, not a worker
+    (t_39f5f042; failing open there skipped the boomerang home default).
+
+    With a task var but no marker it fails OPEN so pre-existing surfaces keep
+    working: a hand-driven ``HERMES_KANBAN_TASK=... hermes chat``, an older
+    dispatcher that predates the stamp, and every test that sets only the task
+    var. Once the stamp IS present it is authoritative, which is what makes a
+    dispatcher-spawned worker's children fail closed.
     """
     import os
 
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
     owner = (os.environ.get(KANBAN_OWNER_PID_ENV) or "").strip()
     if not owner:
         return True

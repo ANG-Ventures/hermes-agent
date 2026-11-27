@@ -431,6 +431,30 @@ def _wait_for(predicate, *, timeout: float = 5.0) -> None:
     raise AssertionError("condition was not reached before timeout")
 
 
+def test_idle_poll_does_not_recreate_the_wal_files(db: Path):
+    """t_dd40e9f2: each idle poll opened and closed its own connection, and the last
+    close of a WAL store unlinks -wal/-shm, so every 5 s tick created and deleted both
+    (~2.1k create+unlink per 30 min on ACE-AI's OS drive). With the worker's anchor
+    open, an unchanged tick leaves the same -wal inode in place."""
+    wal = Path(f"{db}-wal")
+    seen: list[int | None] = []
+
+    def rooms():
+        hosted_rooms.list_rooms(db)  # the service's bindings() read, every tick
+        seen.append(wal.stat().st_ino if wal.exists() else None)
+        return ()
+
+    runtime = HostedRoomRuntime(
+        db_path=db, rooms=rooms, rpc=FakeSessionRPC(), turn_lock=RecordingTurnLocks(),
+        poll_interval_seconds=0.01)
+    runtime.start()
+    try:
+        _wait_for(lambda: len(seen) >= 6)
+    finally:
+        assert runtime.stop(timeout=5.0)
+    assert None not in seen and len(set(seen)) == 1, seen
+
+
 def test_runtime_uses_unique_process_generation(db: Path):
     first = _runtime(db, FakeSessionRPC())
     second = _runtime(db, FakeSessionRPC())

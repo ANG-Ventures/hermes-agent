@@ -186,11 +186,11 @@ def test_running_scope_can_come_from_structured_run_metadata(conn):
 def test_recently_blocked_scope_is_checked_but_stale_block_is_ignored(conn):
     recent = _running_task(conn)
     _comment_changed_files(conn, recent, "src/shared.py")
-    assert kb.block_task(conn, recent, reason="review-required")
+    assert kb.block_task(conn, recent, reason="review-required", kind="needs_input")
 
     stale = _running_task(conn)
     _comment_changed_files(conn, stale, "src/stale.py")
-    assert kb.block_task(conn, stale, reason="review-required")
+    assert kb.block_task(conn, stale, reason="review-required", kind="needs_input")
     conn.execute(
         "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'blocked'",
         (int(time.time()) - kb.DISPATCH_COLLISION_RECENT_BLOCKED_SECONDS - 1, stale),

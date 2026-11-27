@@ -484,8 +484,9 @@ def test_optional_import_table_only_names_optional_or_platform_deps():
     assert all(reason.strip() for reason in _PLATFORM_ALLOWLIST.values()), "every allowlist entry needs a reason"
 
 
-@pytest.mark.slow_test(180, reason="2,229 fresh-process imports, ~126 s of child time; the CI guest runs ~3x ACE-AI")
-def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path):
+@pytest.mark.parametrize("batch", range(8))
+@pytest.mark.slow_test(180, reason="One eighth of the shipped-module graph, each import in its own clean fork")
+def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path, batch):
     _sandbox_or_skip()
     entries, first_party = _shipped_modules()
     ids = [e["id"] for e in entries]
@@ -496,6 +497,10 @@ def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path):
     covered_tops = {i.split(".")[0] if not i.endswith(".py") else i.split("/")[0] for i in ids}
     assert find_tops <= covered_tops, f"packages.find tops with no module enumerated: {find_tops - covered_tops}"
 
+    # Bound each pytest item without dropping coverage or sharing first-party
+    # imports: strided batches partition the complete packaging-derived graph.
+    entries = entries[batch::8]
+    ids = [entry["id"] for entry in entries]
     runner = _write_script(tmp_path / "runner", "import_runner.py", _IMPORT_RUNNER)
     out = tmp_path / "results.json"
     spec = {

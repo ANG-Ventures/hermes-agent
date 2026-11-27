@@ -474,3 +474,37 @@ async def test_probe_exit_after_mark_disconnected_is_logged_at_info(monkeypatch,
     handler.assert_not_called()
 
     await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", [False, True])
+async def test_forced_reconnect_says_whether_a_blocked_site_line_exists(monkeypatch, caplog, blocked):
+    """t_8783804a: the 2026-11-09 04:56:45 reconnect told the operator to grep for PHASE=event_loop_blocked,
+    but discord.py only reports a block when ONE heartbeat send waits >= 10 s, and none had. The reconnect
+    line now says whether such a line was written during the unhealthy streak; when none was, it names
+    host load instead of sending triage after a line that does not exist."""
+    adapter = _make_adapter(monkeypatch, interval=0.01, threshold=2)
+    handler = AsyncMock()
+    adapter.set_fatal_error_handler(handler)
+
+    def _probe(client):
+        if blocked and discord_platform._HEARTBEAT_BLOCKED_EMITTED == start:
+            discord_platform._HEARTBEAT_BLOCKED_EMITTED += 1   # the mirror wrote one line mid-streak
+        return False, "latency_exceeded"
+
+    start = discord_platform._HEARTBEAT_BLOCKED_EMITTED
+    monkeypatch.setattr(discord_platform, "_HEARTBEAT_BLOCKED_EMITTED", start)
+    monkeypatch.setattr(adapter, "_read_websocket_health", _probe)
+    with caplog.at_level("INFO", logger="plugins.platforms.discord.adapter"):
+        await _connect(adapter, monkeypatch, _live_bot_factory())
+        await _wait_until(lambda: handler.called, "fatal handler not called")
+
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert not any("If this repeats, grep" in m for m in errors)
+    if blocked:
+        assert any("1 PHASE=event_loop_blocked line(s) logged during this unhealthy streak" in m for m in errors)
+    else:
+        line = next(m for m in errors if "No PHASE=event_loop_blocked during this unhealthy streak" in m)
+        assert "load1=" in line and "ncpu=" in line
+
+    await adapter.disconnect()

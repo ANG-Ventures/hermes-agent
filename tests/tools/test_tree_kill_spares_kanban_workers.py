@@ -232,6 +232,12 @@ def test_forged_worker_is_killed_without_a_live_board_row(tmp_path, owner, title
             _wait_pid(tmp_path / "titled", timeout=20)
         kill_process_tree(spawner.pid)
         spawner.wait(timeout=5)
+        # SIGKILL is queued when kill_process_tree returns, but on a loaded runner the worker can
+        # still read `running` until it is scheduled (t_7c61c59d: 1/50 on a contended core, gone
+        # 5 ms later). A spared worker sleeps 60 s, so a 5 s bound still fails it.
+        deadline = time.monotonic() + 5
+        while _alive(worker) and time.monotonic() < deadline:
+            time.sleep(0.05)
         assert not _alive(worker), "child-controlled worker markers bypassed tree cleanup"
     finally:
         _cleanup(spawner.pid, worker)

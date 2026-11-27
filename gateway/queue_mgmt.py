@@ -9,14 +9,24 @@ Stores (spec 2026-10-12_gateway-queue-management-spec.md):
 * **active** — today's queue: the adapter slot ``adapter._pending_messages[key]`` (item 1, a
   run-next trigger several drains consume) + ``SessionState.conversation.queued_events``.
 * **held** — ``SessionState.conversation.held_queue``. ``/stop`` moves every user item here (D14).
-  No drain, rescue, or promotion path reads it; only ``/queue run`` / ``/queue clear`` /
-  a session boundary empty it.
+  No drain, rescue, or promotion path reads it; ``/queue run`` / ``/queue clear`` / a session
+  boundary empty it, and so does the next human turn of the session that completes normally
+  (D5, Ace 2026-11-26, Discord 1575714860740907081): ``release_on_turn_end``, called from that
+  turn's own post-turn drain after its run generation proved current.
 
-While ``held`` is non-empty, new ``/queue`` items append to it, and the verbs (list numbering, rm,
-edit, move, clear) operate on the held store. The active store can still gain user items at the
-same time: a plain message under ``busy_input_mode: queue`` is a normal message (D14: it runs
-normally; held items keep waiting). ``/queue list`` shows those in a second, unnumbered section and
-``/queue run`` restages oldest first: held, then those later active items.
+A user follow-up the drain popped but no turn has claimed yet (the first reply is still being sent)
+is marked ``conversation.inflight_followup``; an invalidation, scope clear or cancel puts it back at
+the front of held (``reclaim_inflight``, Prism 50373862d991).
+
+Every transition logs one ``queue_mgmt item op=...`` line per item moved (``log_items``; Ace
+2026-11-26, Discord 1575715843738705972) next to its summary line.
+
+A new ``/queue <prompt>`` (and ``/queue add``) always joins the ACTIVE queue, held or not (D14,
+Ace 2026-11-26, Discord 1575705667786776607): busy it runs after the current turn, idle it runs now;
+held items stay held and the reply says how many. While ``held`` is non-empty the verbs (list
+numbering, rm, edit, move, clear) operate on the held store; ``/queue list`` shows later active
+items in a second, unnumbered section and ``/queue run`` restages oldest first: held, then those
+later active items.
 """
 
 from __future__ import annotations
@@ -26,6 +36,7 @@ import logging
 from typing import Any, List, Optional, Tuple
 
 from agent.i18n import t
+from gateway import inbound_record
 from hermes_cli.queue_verbs import QueueOp, parse_queue_payload
 
 logger = logging.getLogger(__name__)
@@ -49,6 +60,27 @@ def preview(event: Any) -> str:
 
 
 # --------------------------------------------------------------------------- stores
+
+def log_items(runner: Any, op: str, key: str, items: Any, *, with_preview: bool = True) -> None:
+    """One line per item, so gateway.log alone answers what was held and where it went. Never raises.
+    ``with_preview=False`` for the restart sweeps: they log under the launch profile's home, so a
+    secondary profile's prompt text stays out of it (its hold line already carries the preview)."""
+    try:
+        for pos, e in enumerate(list(items or ()), 1):
+            kind = "system" if is_system_event(runner, e) else "user"
+            text = "-"
+            if with_preview:   # redact the FULL text first: a cut can drop the delimiter a pattern needs
+                from types import SimpleNamespace
+
+                from agent.redact import redact_sensitive_text
+                full = SimpleNamespace(text=redact_sensitive_text(str(getattr(e, "text", "") or "")),
+                                       media_urls=getattr(e, "media_urls", None))
+                text = "".join(c if c.isprintable() else "?" for c in preview(full))
+            logger.info("queue_mgmt item op=%s session=%s pos=%d msg_id=%s kind=%s preview=%s",
+                        op, key, pos, getattr(e, "message_id", None), kind, text)
+    except Exception:
+        logger.debug("queue_mgmt item log failed for %s (%s)", key, op, exc_info=True)
+
 
 def held_list(runner: Any, key: str) -> Optional[List[Any]]:
     state = runner._peek_session_state(key)
@@ -110,6 +142,7 @@ def hold_user_items(runner: Any, key: str, adapter: Any) -> int:
                 del held_store[before:]
                 return before
             logger.info("queue_mgmt op=hold session=%s moved=%d held=%d", key, len(users), len(held_store))
+            log_items(runner, "hold", key, users)
         return len(held_list(runner, key) or [])
     except Exception:
         logger.warning("queue_mgmt hold failed for %s; queue left as-is", key, exc_info=True)
@@ -131,6 +164,7 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
     if is_system_event(runner, event):
         state.held_queue.append(event)
         logger.info("queue_mgmt op=hold_wake session=%s held=%d", key, len(state.held_queue))
+        log_items(runner, "hold_wake", key, [event])
         return True
     if event.get_command():
         return False
@@ -171,6 +205,57 @@ def _unpark(runner: Any, key: str, event: Any) -> bool:
             del held[i]
             return True
     return False
+
+
+# Pop-to-claim span (Apollo send-back on PR 573, Prism 50373862d991): the post-turn drain pops the
+# next user follow-up, then awaits the first reply's delivery before the follow-up turn claims it.
+# Meanwhile the event is in no store, so it is marked here; any generation invalidation (/stop, /new,
+# /queue run busy, lease reject), a scope clear or a cancelled task puts it back at the FRONT of held.
+
+def mark_inflight(runner: Any, key: str, event: Any) -> None:
+    """The ONE record of a popped, unclaimed user follow-up (Apollo ruling on PR 573): a user event
+    sets it, None or a system event clears it. Nothing is written on the event. Never raises."""
+    try:
+        state = runner._session_state(key).conversation
+        state.inflight_followup = event if event is not None and not is_system_event(runner, event) else None
+    except Exception:
+        logger.debug("queue_mgmt inflight mark failed for %s", key, exc_info=True)
+
+
+def claim_inflight(runner: Any, key: str, event: Any) -> bool:
+    """The follow-up turn takes ``event``: True only when the mark IS this event (then cleared). A
+    reclaim cleared the mark, so a reclaimed event is refused and never runs twice. System events
+    are never marked and always pass."""
+    if is_system_event(runner, event):
+        return True
+    state = runner._peek_session_state(key)
+    if state is None or getattr(state.conversation, "inflight_followup", None) is not event:
+        return False
+    state.conversation.inflight_followup = None
+    return True
+
+
+def reclaim_inflight(runner: Any, key: str, *, only: Any = None) -> int:
+    """Clear the mark and put that event back at the FRONT of held (a merged release goes back as
+    the one merged item it is), unless held already has it; ``only`` limits it to that event.
+    Returns 1 or 0. Never raises."""
+    try:
+        state = runner._peek_session_state(key)
+        event = getattr(state.conversation, "inflight_followup", None) if state else None
+        if event is None or (only is not None and event is not only):
+            return 0
+        state.conversation.inflight_followup = None
+        held = state.conversation.held_queue
+        if any(h is event for h in held):
+            return 0
+        event._queue_released = False
+        held.insert(0, event)
+        logger.info("queue_mgmt op=hold session=%s moved=1 held=%d from=inflight", key, len(held))
+        log_items(runner, "hold", key, [event])
+        return 1
+    except Exception:
+        logger.warning("queue_mgmt inflight reclaim failed for %s", key, exc_info=True)
+        return 0
 
 
 # --------------------------------------------------------------------------- verbs
@@ -235,6 +320,7 @@ def apply_management(runner: Any, op: QueueOp, key: str, adapter: Any) -> str:
         if not _write_store(runner, key, adapter, which, kept):
             return t("gateway.queue.unavailable")
         logger.info("queue_mgmt op=clear session=%s store=%s depth_before=%d depth_after=%d", key, which, before, len(kept))
+        log_items(runner, "clear", key, [e for e in items if not is_system_event(runner, e)])
         if not dropped:
             return t("gateway.queue.empty")
         return t("gateway.queue.cleared_one" if dropped == 1 else "gateway.queue.cleared_other", count=dropped)
@@ -249,6 +335,7 @@ def apply_management(runner: Any, op: QueueOp, key: str, adapter: Any) -> str:
         if not _write_store(runner, key, adapter, which, items):
             return t("gateway.queue.unavailable")
         logger.info("queue_mgmt op=rm session=%s store=%s depth_before=%d depth_after=%d", key, which, before, len(items))
+        log_items(runner, "rm", key, [removed])
         return t("gateway.queue.removed", index=idx, preview=preview(removed))
     if op.kind == "edit":
         if not op.text:
@@ -311,14 +398,11 @@ def cap_reply(runner: Any, key: str, adapter: Any) -> Optional[str]:
     return None
 
 
-def append_if_held(runner: Any, key: str, event: Any) -> Optional[str]:
-    """D14: while held items exist, a new /queue item joins them (FIFO), never the active queue."""
-    held = held_list(runner, key)
-    if not held:
-        return None
-    held.append(event)
-    logger.info("queue_mgmt op=add store=held session=%s depth=%d", key, len(held))
-    return t("gateway.queue.added_to_held", count=len(held))
+def held_note(runner: Any, key: str) -> str:
+    """D14 (Ace 2026-11-26): a new /queue item goes to the active queue; this line tells the user
+    the older held prompts are still waiting. Counts user items only; empty when none is held."""
+    count = sum(1 for e in held_list(runner, key) or () if not is_system_event(runner, e))
+    return ("\n" + t("gateway.queue.still_held", count=count)) if count else ""
 
 
 MERGE_SEPARATOR = "\n\n"
@@ -347,6 +431,8 @@ def merge_user_events(events: List[Any]) -> Any:
         head.__dict__.pop(attr, None)
     texts = [str(getattr(e, "text", "") or "").strip() for e in events]
     head.text = MERGE_SEPARATOR.join(t for t in texts if t)
+    if len(events) > 1:
+        inbound_record.mark_merged(head)   # t_118d31b1 / Prism 7fb14e749eb2: no longer one message
     for e in events[1:]:
         if getattr(e, "media_urls", None):
             head.media_urls.extend(e.media_urls)
@@ -361,7 +447,7 @@ def merge_user_events(events: List[Any]) -> Any:
     return head
 
 
-def restage_held(runner: Any, key: str, adapter: Any) -> Optional[int]:
+def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_run") -> Optional[int]:
     """Move held items back into the active store (slot = item 1) and return the user-item count
     released. The adapter's existing end-of-task / post-command drain is the ONLY dispatcher
     (spec D16/I9: single door); this function never starts a task. None = no slot storage.
@@ -377,7 +463,8 @@ def restage_held(runner: Any, key: str, adapter: Any) -> Optional[int]:
     if not users and not system:
         return 0
     released = len(users) + len(system)
-    if release_mode(runner) == "merged" and len(users) > 1:
+    merged = release_mode(runner) == "merged" and len(users) > 1
+    if merged:
         users = [merge_user_events(users)]
     for e in users:
         try:
@@ -393,9 +480,29 @@ def restage_held(runner: Any, key: str, adapter: Any) -> Optional[int]:
         return None
     if held:
         del held[:]
-    logger.info("queue_mgmt op=release session=%s released=%d mode=%s armed=%d", key, released,
-                release_mode(runner), len(system) + len(users))
+    logger.info("queue_mgmt op=release session=%s released=%d mode=%s armed=%d trigger=%s", key, released,
+                release_mode(runner), len(system) + len(users), trigger)
+    log_items(runner, "release", key, [e for e in combined if is_system_event(runner, e)]
+              + [e for e in combined if not is_system_event(runner, e)])
     return released
+
+
+def release_on_turn_end(runner: Any, key: str, adapter: Any) -> int:
+    """D5 (Ace 2026-11-26, Discord 1575714860740907081): the next completed human turn releases the
+    held store through ``restage_held`` (same writer as ``/queue run``), oldest first; that turn's
+    own post-turn drain then dispatches item 1. The caller has already checked the turn's run
+    generation is current, its reply was produced and a human started it. Nothing to release while
+    automatic work is paused or when only ``[system]`` items are held. Never raises."""
+    try:
+        state = runner._peek_session_state(key)
+        if state is None or state.conversation.automatic_turns_paused is True:
+            return 0
+        if not any(not is_system_event(runner, e) for e in state.conversation.held_queue):
+            return 0
+        return restage_held(runner, key, adapter, trigger="turn_end") or 0
+    except Exception:
+        logger.warning("queue_mgmt turn-end release failed for %s; items stay held", key, exc_info=True)
+        return 0
 
 
 async def release(runner: Any, key: str, source: Any, adapter: Any, *, busy: bool) -> str:
@@ -442,7 +549,7 @@ def stop_reply_suffix(runner: Any, key: str, adapter: Any) -> str:
             return ""
         if (getattr(runner, "_stop_releases_queue", False) is True
                 and runner._session_state(key).conversation.automatic_turns_paused is not True):
-            count = restage_held(runner, key, adapter)
+            count = restage_held(runner, key, adapter, trigger="stop")
             if count:
                 return "\n" + t("gateway.stop.queue_released", count=count)
         return "\n" + t("gateway.stop.queue_held", count=len(held_list(runner, key) or []))
@@ -483,6 +590,7 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
     # This runs inside THE conversation-boundary funnel: it must never raise, or a /new would fail
     # half-way. Any surprise (odd state shape) fails open: no carry, no count, the clear proceeds.
     try:
+        reclaim_inflight(runner, key)   # the clear below would wipe the mark: count/carry it as held
         state = runner._peek_session_state(key)
         if state is None:
             return None
@@ -493,6 +601,7 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
         users_overflow = [e for e in overflow if not is_system_event(runner, e)]
         if reason in USER_RESET_REASONS:
             note_reset_drop(runner, key, len(held) + len(users_overflow))
+            log_items(runner, "reset_drop", key, held + users_overflow)
             return None
         # Automatic resets have no reply target, so they must not drop anything (D5/D21): carry the
         # held items AND any active user items into the held store. An unknown reason is treated
@@ -504,6 +613,7 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
         elif users_overflow:
             logger.info("queue_mgmt op=auto_reset session=%s carried %d active item(s) into held",
                         key, len(users_overflow))
+        log_items(runner, "auto_reset", key, carried)
         return carried or None
     except Exception:
         logger.warning("queue_mgmt before_scope_clear failed for %s (%s); clearing without carry",

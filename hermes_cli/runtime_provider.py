@@ -1024,7 +1024,13 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
     OpenCode Zen/Go where different models route through different API surfaces)."""
     # Hot registration: publish the requested provider (only) if newly configured.
-    provider_seam.refresh("request", (requested or "").strip() or None)
+    refusal = provider_seam.refresh("request", (requested or "").strip() or None)
+    if refusal:
+        # t_5d8a357f: a plugin recognised the requested name as its own provider grammar and will not
+        # serve it (an unserved seat pin). ValueError, not AuthError: misconfiguration, so no caller's
+        # fallback chain reroutes it onto a provider the operator did not ask for.
+        raise ValueError(f"Unknown provider '{requested.strip()}': {refusal}. No fallback was tried. "
+                         "See 'hermes model' for the providers this process serves.")
     requested_provider = resolve_requested_provider(requested)
     _raise_if_provider_disabled(requested_provider)
     # Same alias expansion the auxiliary client applies, so ``provider: openai`` means one thing on

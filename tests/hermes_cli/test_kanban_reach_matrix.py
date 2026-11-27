@@ -108,9 +108,9 @@ def test_stale_rows_keep_their_aliases_in_the_vocabulary(tmp_path):
     pool = _pool(fleet)
     assert pool.reach_status == "ok" and set(pool.reach) == {"ci-box"}
     assert set(pool.reach_aliases) == {"ace-ai", "mac-studio-m3u"}
-    assert kwp.reach_allowed_hosts(body="ssh ace-ai", skills=(), pool=pool) == ("ci-box",)
-    # Both hosts in ssh TARGET position (t_f1b135a8: a word after the target is prose).
-    assert kwp.reach_allowed_hosts(body="ssh ace-ai, then ssh mac-studio-m3u", skills=(), pool=pool) == ()
+    assert kwp.reach_allowed_hosts(body="reach: ace-ai", skills=(), pool=pool) == ("ci-box",)
+    # Both hosts declared (t_efd1497a: only a reach: line binds).
+    assert kwp.reach_allowed_hosts(body="reach: ace-ai, mac-studio-m3u", skills=(), pool=pool) == ()
 
 
 def test_body_only_card_is_recognised_without_a_fresh_sample(tmp_path):
@@ -120,11 +120,11 @@ def test_body_only_card_is_recognised_without_a_fresh_sample(tmp_path):
     fleet = tmp_path / "fleet"
     pool = _pool(fleet)
     assert pool.reach_status == "absent"
-    assert _portable(pool, body="ssh ace-ai nvidia-smi") == (False, "host_reach", None)
+    assert _portable(pool, body="reach: ace-ai\nssh ace-ai nvidia-smi") == (False, "host_reach", None)
     _matrix(fleet, {"ci-box": _row(at=NOW - 40 * 3600, ace_ai=0, unifi=0, mac_studio_m3u=0)})
     pool = _pool(fleet)
     assert pool.reach_status == "stale" and pool.reach == {} and "unifi" in pool.reach_aliases
-    assert _portable(pool, body="ssh unifi 'unifi-os restart'") == (False, "host_reach", None)
+    assert _portable(pool, body="reach: unifi\nssh unifi 'unifi-os restart'") == (False, "host_reach", None)
     assert _portable(pool, body="write a doc") == (True, None, "policy")
 
 
@@ -154,22 +154,22 @@ def test_host_bound_card_portable_only_to_a_reaching_host(tmp_path):
     fleet = tmp_path / "fleet"
     _matrix(fleet, {"ci-box": _row(ace_ai=0), "ace-ai": _row(), "ace-media": _row(ace_ai=0, unifi=0)})
     pool = _pool(fleet)
-    body = "fix the GPU fan curve: ssh ace-ai"
+    body = "reach: ace-ai\nfix the GPU fan curve: ssh ace-ai"
     assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ("ci-box", "ace-media")
     assert _portable(pool, body=body) == (True, None, "policy")
     # Two targets: only the host that reaches both.
-    assert kwp.reach_allowed_hosts(body=body + "\nssh unifi", skills=(), pool=pool) == ("ace-media",)
+    assert kwp.reach_allowed_hosts(body=body + "\nreach: unifi", skills=(), pool=pool) == ("ace-media",)
     # Nobody reaches mac-studio-m3u: local.
-    assert _portable(pool, body="ssh mac-studio-m3u 'uptime'") == (False, "host_reach", None)
+    assert _portable(pool, body="reach: mac-studio-m3u\nssh mac-studio-m3u 'uptime'") == (False, "host_reach", None)
     # A skill-bound card with no named alias needs a host reaching every alias
     # SOME pool host reaches (t_641d1ab8: ace-ai + unifi here; mac-studio-m3u
     # and ace-media, reached by nobody, cannot hold it forever).
     assert kwp.reach_allowed_hosts(body=None, skills=("ssh-machines",), pool=pool) == ("ace-media",)
     assert _portable(pool, skills=("ssh-machines",)) == (True, None, "policy")
     # A remote pin to a non-reaching host is refused (waits), host:any rides the rule.
-    assert _portable(pool, body="host: ace-ai\nssh ace-ai", ) == (False, "host_reach", None)
-    assert _portable(pool, body="host: ci-box\nssh ace-ai") == (True, None, "pin")
-    assert _portable(pool, body="host:any\nssh ace-ai") == (True, None, "any")
+    assert _portable(pool, body="host: ace-ai\nreach: ace-ai", ) == (False, "host_reach", None)
+    assert _portable(pool, body="host: ci-box\nreach: ace-ai") == (True, None, "pin")
+    assert _portable(pool, body="host:any\nreach: ace-ai") == (True, None, "any")
 
 
 def test_prose_host_line_naming_a_non_pool_alias_is_scanned(tmp_path):
@@ -185,8 +185,8 @@ def test_prose_host_line_naming_a_non_pool_alias_is_scanned(tmp_path):
                                   pin_hosts=pool.hosts) == (False, ())
     assert kwp.host_bound_targets("host: ci-box\nwrite a doc", (), pool.reach_aliases,
                                   pin_hosts=pool.hosts) == (False, ())
-    # Nobody reaches unifi: the card stays local instead of spilling on policy.
-    assert _portable(pool, body="ssh unifi 'restart'") == (False, "host_reach", None)
+    # Nobody reaches unifi: a card that DECLARES it stays local instead of spilling on policy.
+    assert _portable(pool, body="reach: unifi\nssh unifi 'restart'") == (False, "host_reach", None)
     # ``host: unifi`` is no pin a worker host can take: held local, named (t_cb2b888d).
     assert _portable(pool, body="host: unifi\nssh unifi 'restart'") == (False, "pin_unknown_host", None)
 
@@ -222,15 +222,21 @@ def test_bare_alias_mention_is_not_host_bound(tmp_path, body):
     ("docker -H ssh://ace-ai ps", "ace-ai"),
     ("host: ci-box\nthen `ssh ace-ai 'dmesg'`", "ace-ai"),
 ])
-def test_ssh_shaped_mention_is_host_bound_and_held_on_an_empty_matrix(tmp_path, body, target):
-    """The property t_1e9ea7e9 bought survives: an ssh-shaped card is still
-    host-bound, and with no proven route it never spills."""
+def test_ssh_shaped_mention_is_reported_not_pinned_and_a_reach_line_holds(tmp_path, body, target):
+    """t_efd1497a (Apollo 2026-11-19, t_a0f9580e): an ssh-shaped mention in prose is read (host_bound_targets)
+    and reported (host_reach_prose) but no longer binds host_reach. The same body with ``reach: <target>`` keeps
+    the property t_1e9ea7e9 bought: host-bound, and with no proven route it never spills."""
     pool = _pool(tmp_path / "fleet")
-    bound, targets = kwp.host_bound_targets(body, (), (*pool.reach_aliases, *pool.hosts),
-                                            pin_hosts=pool.hosts)
+    vocab = (*pool.reach_aliases, *pool.hosts)
+    bound, targets = kwp.host_bound_targets(body, (), vocab, pin_hosts=pool.hosts)
     assert bound and target in targets
-    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ()
-    ok, rule, _ = _portable(pool, body=body)
+    assert target in kwp.host_reach_prose(body, vocab, pin_hosts=pool.hosts)
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) is None
+    assert _portable(pool, body=body)[1] != "host_reach"
+    declared = f"reach: {target}\n{body}"
+    assert kwp.host_reach_prose(declared, vocab, pin_hosts=pool.hosts) == ()
+    assert kwp.reach_allowed_hosts(body=declared, skills=(), pool=pool) == ()
+    ok, rule, _ = _portable(pool, body=declared)
     assert (ok, rule) == (False, "host_reach")
 
 
@@ -337,8 +343,11 @@ def test_pool_ssh_hosts_threads_into_reach_allowed_hosts(tmp_path):
     reach, aliases, status = kwp.read_reach(fleet, now=NOW)
     pool = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), reach=reach,
                           reach_aliases=aliases, reach_status=status, ssh_hosts=frozenset({"ci"}))
-    assert kwp.reach_allowed_hosts(body="ssh ci sudo reboot", skills=(), pool=pool) == ("ci-box",)
-    assert kwp.reach_allowed_hosts(body="ssh in and run the ci suite", skills=(), pool=pool) is None
+    # The ssh-shape reader keeps its word-alias rule (reported, t_efd1497a); only a reach: line binds.
+    assert kwp.host_reach_prose("ssh ci sudo reboot", aliases, ssh_hosts=pool.ssh_hosts) == ("ci",)
+    assert kwp.host_reach_prose("ssh in and run the ci suite", aliases, ssh_hosts=pool.ssh_hosts) == ()
+    assert kwp.reach_allowed_hosts(body="ssh ci sudo reboot", skills=(), pool=pool) is None
+    assert kwp.reach_allowed_hosts(body="reach: ci\nssh ci sudo reboot", skills=(), pool=pool) == ("ci-box",)
 
 
 def test_known_ssh_hosts_adds_every_alias_a_matrix_row_ever_reached(tmp_path):
@@ -363,7 +372,9 @@ def test_burst_card_pinned_to_ci_box_places_on_a_members_reach_nothing_matrix(ka
     nothing, only the Studio row is green; a ci-box-pinned burst card spawns
     on ci-box while an ``ssh ace-ai`` card is still held."""
     fleet = kanban_home / "fleet"
-    _matrix(fleet, {"ci-box": _row(), "ace-ai": _row(),
+    # ace-ai is a pool host that is DOWN (no row), so it is no candidate for its own
+    # card: the self rule (t_8c580b20) cannot place it.
+    _matrix(fleet, {"ci-box": _row(),
                     "mac-studio-m3u": _row(ace_ai=0, ci_box=0, ace_media=0, mac_studio_m3u=0)})
     reach, aliases, status = kwp.read_reach(fleet, now=NOW)
     cfg = kwp.PoolConfig(hosts=("ci-box", "ace-ai"), profiles=("alpha",),
@@ -374,12 +385,15 @@ def test_burst_card_pinned_to_ci_box_places_on_a_members_reach_nothing_matrix(ka
     with kb.connect_closing() as conn:
         burst = kb.create_task(conn, title="ci-box burst 2/6 (t_40282b7b): hostname; sleep 90",
                                assignee="alpha", body=BURST)
-        bound = kb.create_task(conn, title="gpu", assignee="alpha", body="ssh ace-ai 'nvidia-smi'")
+        bound = kb.create_task(conn, title="gpu", assignee="alpha", body="reach: ace-ai\nssh ace-ai 'nvidia-smi'")
+        # ace-media is a host outside the pool: same property, no self rule in play.
+        outside = kb.create_task(conn, title="gpu2", assignee="alpha", body="reach: ace-media\nssh ace-media 'nvidia-smi'")
         res, spawned = _tick(conn, plan)
     assert spawned == [(burst, "ci-box")]
-    assert bound not in dict(spawned)
-    # Only the Studio (no pool host) proves ace-ai: held, never spilled.
+    assert bound not in dict(spawned) and outside not in dict(spawned)
+    # Only the Studio (no pool host) proves ace-ai / ace-media: held, never spilled.
     assert res.placement_waits[bound] == "host_reach"
+    assert res.placement_waits[outside] == "host_reach"
 
 
 def test_path_qualified_skill_id_is_host_bound(tmp_path):
@@ -398,12 +412,12 @@ def test_reach_rows_and_pool_hosts_compare_case_folded(tmp_path):
     reach, aliases, status = kwp.read_reach(fleet, now=NOW)
     cfg = kwp.PoolConfig(hosts=("CI-Box",), profiles=("alpha",), reach=reach,
                          reach_aliases=aliases, reach_status=status)
-    assert _portable(cfg, body="host: CI-Box\nssh ace-ai") == (True, None, "pin")
+    assert _portable(cfg, body="host: CI-Box\nreach: ace-ai") == (True, None, "pin")
     host = kwp.PoolHost(name="CI-Box", ssh_host="CI-Box", ssh_user=kwp.SSH_USER, slots=2,
                         capacity_pct=0.8, absence="required", profiles=("alpha",),
                         state="active", enabled=True, priority=0)
     p = kwp.plan([host], {}, probe=lambda h: (1.0, 16), config=cfg)
-    only = kwp.reach_allowed_hosts(body="ssh ace-ai", skills=(), pool=cfg)
+    only = kwp.reach_allowed_hosts(body="reach: ace-ai", skills=(), pool=cfg)
     assert only == ("ci-box",)
     assert p.take("alpha", only=only).name == "CI-Box"
     assert p.take("alpha", pin="ci-box").name == "CI-Box"
@@ -473,6 +487,414 @@ def test_host_bound_card_spills_only_to_the_reaching_host(kanban_home):
                     probe=lambda h: (1.0, 16), config=cfg)
     plan.band, plan.spill_reason = "paused", "load"
     with kb.connect_closing() as conn:
-        bound = kb.create_task(conn, title="gpu", assignee="alpha", body="ssh ace-ai nvidia-smi")
+        bound = kb.create_task(conn, title="gpu", assignee="alpha", body="reach: ace-ai\nssh ace-ai nvidia-smi")
         res, spawned = _tick(conn, plan)
     assert spawned == [(bound, "ace-media")]
+
+
+# -- t_efd1497a: the create/edit notice that replaced the prose bind ---------------------------
+# t_a0f9580e as created 2026-11-19 22:59 (design only) quoted the doctor-row command; it was held host_reach.
+DELL_DESIGN = ("This card is design and code only: it needs no access to that machine. A doctor row proves "
+               "`ssh root@dell-rugged true` from each granted host.")
+
+
+def _notes(conn, tid, prefix):
+    return [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,))
+            if r[0].startswith(prefix)]
+
+
+def test_create_names_the_ssh_alias_and_the_fix_and_does_not_pin(kanban_home, monkeypatch, capsys):
+    from hermes_cli import kanban_create_placement as kcp
+    from hermes_cli import kanban_studio_pin as ksp
+    fleet = kanban_home / "fleet"
+    _matrix(fleet, {"ci-box": _row(), "ace-ai": _row()})
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    aliases = (*aliases, "dell-rugged")
+    cfg = kwp.PoolConfig(hosts=("ci-box", "ace-ai"), profiles=("alpha",), reach=reach,
+                         reach_aliases=aliases, reach_status=status)
+    monkeypatch.setattr(kcp, "_pool_config", lambda: cfg)
+    assert kwp.reach_allowed_hosts(body=DELL_DESIGN, skills=(), pool=cfg) is None   # RED ON BASE: () = held
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="dell-admin design", assignee="alpha", body=DELL_DESIGN)
+        notes = _notes(conn, tid, ksp.HR_PROSE_PREFIX)
+        assert len(notes) == 1 and "`dell-rugged`" in notes[0] and "`reach: dell-rugged`" in notes[0]
+        declared = kb.create_task(conn, title="dell-admin run", assignee="alpha",
+                                  body="reach: dell-rugged\n" + DELL_DESIGN)
+        assert _notes(conn, declared, ksp.HR_PROSE_PREFIX) == []
+    assert ksp.HR_PROSE_PREFIX in capsys.readouterr().err
+    assert kwp.reach_allowed_hosts(body="reach: dell-rugged\n" + DELL_DESIGN, skills=(), pool=cfg) == ()
+
+
+def test_declared_reach_reads_the_line_only():
+    vocab = ("dell-rugged", "ci-box", "ace-ai")
+    assert kwp.declared_reach("reach: dell-rugged, ci-box -- admin shell", vocab) == ("dell-rugged", "ci-box")
+    assert kwp.declared_reach("  REACH: `ace-ai`", vocab) == ("ace-ai",)
+    assert kwp.declared_reach("we reach: dell-rugged later", vocab) == ()     # not line-anchored
+    assert kwp.declared_reach("reach: nowhere", vocab) == ()                  # not in the vocabulary
+
+
+def test_skill_bound_card_keeps_its_ssh_named_target(tmp_path):
+    """Prism ac47bd4b21d9: ssh-machines + `ssh mac-studio-m3u uptime` must still need mac-studio-m3u (nobody
+    reaches it: held), not fall back to the aliases some host reaches and spill."""
+    fleet = tmp_path / "fleet"
+    _matrix(fleet, {"ci-box": _row(ace_ai=0), "ace-media": _row(ace_ai=0, unifi=0)})
+    pool = _pool(fleet)
+    body = "ssh mac-studio-m3u uptime"
+    assert kwp.reach_allowed_hosts(body=body, skills=("ssh-machines",), pool=pool) == ()
+    assert _portable(pool, body=body, skills=("ssh-machines",)) == (False, "host_reach", None)
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) is None     # prose alone: not bound
+
+
+# -- t_efd1497a round 2 (Apollo 2026-11-20): prose is a SOFT narrowing, never a hold -------------------------
+def _soft_pool(tmp_path, rows, hosts):
+    fleet = tmp_path / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwp.REACH_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        h: {"at": NOW, "reach": r} for h, r in rows.items()}}))
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    return kwp.PoolConfig(hosts=hosts, profiles=("alpha",), reach=reach, reach_aliases=aliases,
+                          reach_status=status)
+
+
+class _Plan:
+    def __init__(self, config):
+        self.config = config
+        self.prose_advisory = False
+
+
+def _only(pool, body, skills=()):
+    row = {"body": body, "skills": json.dumps(list(skills))}
+    return kbd._portable_only(None, row, "alpha", _Plan(pool), None, None, None)[0]
+
+
+SOFT_HOSTS = ("ci-box", "ace-ai", "ace-media", "mbp-2026")
+NAS_ROWS = {"ci-box": {"nas-fleet": 255}, "ace-ai": {"nas-fleet": 255}, "ace-media": {"nas-fleet": 255},
+            "mbp-2026": {"nas-fleet": 0}}
+
+
+def test_prose_alias_narrows_to_the_hosts_that_reach_it(tmp_path):
+    """t_a0d8ac3e / t_592555dd shape: only mbp-2026 reaches nas-fleet. The card lands only there, and prose
+    never makes portable() hold it."""
+    pool = _soft_pool(tmp_path, NAS_ROWS, SOFT_HOSTS)
+    body = "scp out nas-fleet:/srv/drop/"
+    assert _only(pool, body) == ("mbp-2026",)
+    assert _portable(pool, body=body)[1] != "host_reach"
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) is None
+    # a host: line decides placement on its own; the preference does not apply
+    assert _only(pool, "host: ci-box\n" + body) is None
+
+
+def test_prose_alias_no_host_reaches_places_anywhere(tmp_path):
+    pool = _soft_pool(tmp_path, {"ci-box": {"dell-rugged": 255}, "ace-ai": {"dell-rugged": 255}},
+                      ("ci-box", "ace-ai"))
+    body = "ssh dell-rugged true"
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) is None
+    assert kwp.prose_reach_preference(body=body, skills=(), pool=pool) is None
+    assert _only(pool, body) is None
+    assert _portable(pool, body=body)[0] is True
+
+
+def test_prose_preference_never_empties_a_narrower_set(tmp_path, monkeypatch):
+    """Soft: if another rule already narrowed to hosts that do not reach the alias, the preference is dropped."""
+    pool = _soft_pool(tmp_path, NAS_ROWS, SOFT_HOSTS)
+    monkeypatch.setattr(kwp, "needs_allowed_hosts", lambda *a, **k: ("ci-box",))
+    assert _only(pool, "scp out nas-fleet:/srv/drop/") == ("ci-box",)
+
+
+def test_skill_path_ignores_the_reach_line_note(tmp_path):
+    """Prism ac47bd4b21d9 repro: the reach: line's own note is not ssh prose."""
+    fleet = tmp_path / "fleet"
+    _matrix(fleet, {"ci-box": _row(ace_ai=0), "ace-media": _row(ace_ai=0, unifi=0)})
+    pool = _pool(fleet)
+    body = "reach: ace-ai -- example: ssh mac-studio-m3u uptime"
+    assert kwp.reach_allowed_hosts(body=body, skills=("ssh-machines",), pool=pool) == ("ci-box", "ace-media")
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ("ci-box", "ace-media")
+
+
+@pytest.mark.parametrize("body", ["Use ace-media:~/drop/ as the destination.", "pdsh -Hace-media uptime"])
+def test_notice_fires_for_every_shape_the_reader_binds(kanban_home, monkeypatch, body):
+    """Prism 703b3483074b: the prefilter must not skip `alias:~/path` or an attached `-Halias`."""
+    from hermes_cli import kanban_create_placement as kcp
+    from hermes_cli import kanban_studio_pin as ksp
+    fleet = kanban_home / "fleet"
+    _matrix(fleet, {"ci-box": _row(ace_media=0)})
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    cfg = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), reach=reach, reach_aliases=aliases,
+                         reach_status=status)
+    monkeypatch.setattr(kcp, "_pool_config", lambda: cfg)
+    assert ksp.host_reach_prose(body) == ("ace-media",)
+
+
+# -- t_8c580b20: a host reaches itself, as the worker account -------------------
+
+W = "kanbanw"
+# What `ssh -G <alias>` resolves to for the worker on each host when the alias sets no User (the worker itself).
+SELF_LOGINS = {"ci-box": {"ci-box": W, "ci.ace": W}, "ace-ai": {"ace-ai": W},
+               "ace-media": {"ace-media": W, "ace-media-ubuntu": W}}
+
+
+def _live_shape(fleet: Path, extra=None, logins=SELF_LOGINS) -> kwp.PoolConfig:
+    """The live matrix shape (2026-11-19): every pool row is rc 255 to its own
+    alias, and the second names (ci.ace, ace-media-ubuntu) are vocabulary only.
+    ``logins`` is each row's ``{alias: ssh -G user}`` (None: the row has none)."""
+    rows = {}
+    pool_hosts = ("ci-box", "ace-ai", "ace-media")
+    for h in pool_hosts:
+        rows[h] = {"at": NOW, "reach": {a: (255 if a == h else 0) for a in pool_hosts}}
+        if logins is not None and h in logins:
+            rows[h]["logins"] = logins[h]
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwp.REACH_FILE).write_text(json.dumps({
+        "schema": 1, "hosts": rows, "aliases": [*pool_hosts, "ci.ace", "ace-media-ubuntu", *(extra or ())]}))
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    return kwp.PoolConfig(hosts=pool_hosts, profiles=("alpha",), reach=reach, reach_aliases=aliases,
+                          reach_status=status, reach_logins=kwp.read_reach_logins(fleet),
+                          pin_aliases={"ci-box": "ci-box", "ci.ace": "ci-box", "ci": "ci-box",
+                                       "ace-ai": "ace-ai", "ace-media": "ace-media",
+                                       "ace-media-ubuntu": "ace-media"})
+
+
+def test_a_card_reading_ci_box_is_placed_on_ci_box(tmp_path):
+    """t_b58d9b08's target, ci-box by its second name. No row probes ci.ace, so
+    before t_8c580b20 no pool host reached it and the card needed a Studio
+    override (host_reach). ci-box reaches itself AS THE WORKER ACCOUNT: the alias
+    resolves to kanbanw there, or the line names kanbanw.
+    Mutation: drop the self rule in reaching_hosts -> () and host_reach (RED)."""
+    pool = _live_shape(tmp_path / "fleet")
+    body = "reach: ci.ace\n2. Check the preconditions on ci-box (ssh ci.ace, read-only): free space.\n"
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ("ci-box",)
+    assert _portable(pool, body=body) == (True, None, "policy")
+    assert kwp.reach_allowed_hosts(body="reach: ci.ace\nssh kanbanw@ci.ace df", skills=(), pool=pool) == ("ci-box",)
+    # The canonical id works the same way, and a pin to it is honoured.
+    assert kwp.reach_allowed_hosts(body="reach: ci-box", skills=(), pool=pool) == ("ci-box", "ace-ai", "ace-media")
+    assert _portable(pool, body="host: ci-box\nreach: ci-box") == (True, None, "pin")
+
+
+@pytest.mark.parametrize("body", [
+    "2. Check the preconditions on ci-box (ssh ace@ci.ace, read-only): free space.\n",  # t_b58d9b08 verbatim
+    "ssh -l ace ci.ace df",
+    "ssh -lace ci.ace df",
+    "ssh -oUser=ace ci.ace df",       # Prism 5ffa30ab3a7a
+    "ssh -o User=ace ci.ace df",
+    "ssh -o 'User ace' ci.ace df",
+    "scp ace@ci.ace:/var/log/syslog .",
+    "ssh ci.ace df\nssh ace@ci.ace cat /etc/hostname",
+])
+def test_self_reach_only_as_the_worker_account(tmp_path, body):
+    """Send-back 2 (t_8c580b20): `ssh ace@ci.ace` is user ace on ci-box. A worker
+    placed on ci-box is kanbanw, so ci-box does not reach that target by being it.
+    A peer's rc 0 is still the proof for a named foreign login.
+    Mutation: drop the login check in reaching_hosts -> ("ci-box",) (RED)."""
+    pool = _live_shape(tmp_path / "fleet")
+    body = "reach: ci.ace\n" + body
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ()
+    assert _portable(pool, body=body) == (False, "host_reach", None)
+    # A peer whose fresh row proves ci.ace still takes it: the probe, not the self rule.
+    rows = dict(pool.reach)
+    rows["ace-ai"] = {**rows["ace-ai"], "ci.ace": 0}
+    routed = kwp.PoolConfig(**{**pool.__dict__, "reach": rows})
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=routed) == ("ace-ai",)
+
+
+@pytest.mark.parametrize("sibling", [
+    "ssh ace@ci.ace cat /etc/hostname",
+    "ssh -l ace ci.ace cat /etc/hostname",
+    "ssh -o User=ace ci.ace cat /etc/hostname",
+    "scp ace@ci.ace:/var/log/syslog .",
+    "ssh ci.ace cat /etc/hostname",      # ci.ace's ssh config User is fleetw on ci-box
+])
+def test_a_foreign_login_on_a_sibling_alias_blocks_self_reach(tmp_path, sibling):
+    """Round-4 reader repro (Apollo 2026-11-20 02:3x): `reach: ci-box` logs in as the worker (alias A), but the
+    body also runs a step on ci.ace (alias B of the same host) as another account. Self-reach for a host holds
+    only if EVERY alias of it the body names resolves to the worker; one foreign login on any alias and the
+    host needs a real rc 0 like any peer.
+    Mutation: judge only the declared targets' logins in reaching_hosts -> ci-box admitted (RED)."""
+    logins = {**SELF_LOGINS, "ci-box": {"ci-box": W, "ci.ace": "fleetw"}}
+    pool = _live_shape(tmp_path / "fleet", logins=logins)
+    body = "reach: ci-box\nssh ci-box df\n" + sibling
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ("ace-ai", "ace-media")
+    assert _portable(pool, body="host: ci-box\n" + body) == (False, "host_reach", None)
+    # With every alias of ci-box resolving to the worker, ci-box self-reaches again.
+    assert kwp.reach_allowed_hosts(body="reach: ci-box\nssh ci-box df\nssh kanbanw@ci.ace df", skills=(),
+                                   pool=pool) == ("ci-box", "ace-ai", "ace-media")
+    # A real probe still counts: ci-box's own row proving ci.ace (rc 0) admits it as written.
+    rows = dict(pool.reach)
+    rows["ci-box"] = {**rows["ci-box"], "ci.ace": 0}
+    routed = kwp.PoolConfig(**{**pool.__dict__, "reach": rows})
+    assert "ci-box" in kwp.reach_allowed_hosts(body=body, skills=(), pool=routed)
+    # The same rule through the soft prose preference (no reach: line).
+    prose = "ssh ci-box df\n" + sibling
+    assert "ci-box" not in (kwp.prose_reach_preference(body=prose, skills=(), pool=pool) or ())
+
+
+def test_self_reach_follows_the_alias_ssh_config_login(tmp_path):
+    """Operator ruling (Apollo 2026-11-20 01:3x): a bare `ssh ci.ace` whose ssh config
+    on ci-box sets User fleetw is fleetw, not the worker: ci-box does not self-reach
+    it; a peer that reaches it as written takes the card. No recorded config login
+    (an older matrix row) proves nothing. An explicit kanbanw@ login is the worker.
+    Mutation: ignore config_logins in reaching_hosts -> ("ci-box",) (RED)."""
+    fleetw = {**SELF_LOGINS, "ci-box": {"ci-box": "fleetw", "ci.ace": "fleetw"}}
+    pool = _live_shape(tmp_path / "a", logins=fleetw)
+    body = "reach: ci.ace\nssh ci.ace df"
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ()
+    assert _portable(pool, body=body) == (False, "host_reach", None)
+    rows = dict(pool.reach)
+    rows["ace-ai"] = {**rows["ace-ai"], "ci.ace": 0}
+    routed = kwp.PoolConfig(**{**pool.__dict__, "reach": rows})
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=routed) == ("ace-ai",)
+    assert kwp.reach_allowed_hosts(body="reach: ci.ace\nssh kanbanw@ci.ace df", skills=(),
+                                   pool=pool) == ("ci-box",)
+    # A row with no logins table: fail closed.
+    bare = _live_shape(tmp_path / "b", logins=None)
+    assert bare.reach_logins == {}
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=bare) == ()
+    assert kwp.reaching_hosts({"ci-box": {}}, ("ci.ace",), (), {"ci.ace": "ci-box"},
+                              config_logins={"ci-box": {"ci.ace": "fleetw"}}) == ()
+    assert kwp.reaching_hosts({"ci-box": {}}, ("ci.ace",), (), {"ci.ace": "ci-box"},
+                              config_logins={"CI-Box": {"CI.ACE": W}}) == ("ci-box",)
+
+
+def test_self_reach_uses_each_hosts_own_worker_login(tmp_path):
+    """Option A (t_5e87455b): a host cut over to its owner account (hosts.ci-box.ssh_user = ace) self-reaches
+    as ace, not as kanbanw; a host still on the default keeps kanbanw.
+    Mutation: compare against the module SSH_USER instead of PoolHost.ssh_user -> () for ace@ (RED)."""
+    pool = _live_shape(tmp_path / "fleet")
+    hosts = tuple(kwp.PoolHost(name=h, ssh_host=h, ssh_user=("ace" if h == "ci-box" else W), slots=None,
+                               capacity_pct=1.0, absence="optional", profiles=("alpha",), state="active",
+                               enabled=True, priority=i) for i, h in enumerate(pool.hosts))
+    cut = kwp.PoolConfig(**{**pool.__dict__, "pool_hosts": hosts})
+    assert kwp.reach_allowed_hosts(body="reach: ci.ace\nssh ace@ci.ace df", skills=(), pool=cut) == ("ci-box",)
+    assert kwp.reach_allowed_hosts(body="reach: ci.ace\nssh kanbanw@ci.ace df", skills=(), pool=cut) == ()
+    assert "ci-box" in (kwp.prose_reach_preference(body="ssh ace@ci.ace df", skills=(), pool=cut) or ())
+    # ace-ai stays on kanbanw: unchanged.
+    assert kwp.reach_allowed_hosts(body="reach: ace-ai\nssh kanbanw@ace-ai df", skills=(),
+                                   pool=cut) == ("ci-box", "ace-ai", "ace-media")
+
+
+def test_prose_preference_applies_the_self_and_login_rules(tmp_path):
+    """Row-17 reader (Apollo 2026-11-20): prose_reach_preference passed only 3 arguments to
+    reaching_hosts, so prose `ssh ci.ace` had no self-reach (canon) and no login rule.
+    Mutation: drop canon/logins/config_logins from that call -> None (RED)."""
+    pool = _live_shape(tmp_path / "a")
+    assert kwp.prose_reach_preference(body="ssh ci.ace df", skills=(), pool=pool) == ("ci-box",)
+    # A named foreign login: ci-box is no self match; nobody else reaches ci.ace -> no preference.
+    assert kwp.prose_reach_preference(body="ssh ace@ci.ace df", skills=(), pool=pool) is None
+    fleetw = {**SELF_LOGINS, "ci-box": {"ci-box": "fleetw", "ci.ace": "fleetw"}}
+    pool = _live_shape(tmp_path / "b", logins=fleetw)
+    rows = dict(pool.reach)
+    rows["ace-ai"] = {**rows["ace-ai"], "ci.ace": 0}
+    routed = kwp.PoolConfig(**{**pool.__dict__, "reach": rows})
+    assert kwp.prose_reach_preference(body="ssh ci.ace df", skills=(), pool=routed) == ("ace-ai",)
+
+
+def test_read_reach_logins_is_fail_closed(tmp_path):
+    fleet = tmp_path / "fleet"
+    assert kwp.read_reach_logins(fleet) == {}
+    fleet.mkdir()
+    (fleet / kwp.REACH_FILE).write_text("{not json")
+    assert kwp.read_reach_logins(fleet) == {}
+    (fleet / kwp.REACH_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        "CI-Box": {"logins": {"CI.ACE": "fleetw", "x": 3, "": "u"}}, "ace-ai": {"logins": []}, "n": 1}}))
+    assert kwp.read_reach_logins(fleet) == {"ci-box": {"ci.ace": "fleetw"}}
+
+
+def test_ssh_target_logins_reads_user_at_and_dash_l():
+    got = kwp.ssh_target_logins("ssh ace@ci.ace df\nssh -l root ace-ai uptime\nrsync -a bob@nas:/x .\n"
+                                "ssh ci-box true\nmail kyz@example.com")
+    assert got == {"ci.ace": {"ace"}, "ace-ai": {"root"}, "nas": {"bob"}, "example.com": {"kyz"}}
+    assert kwp._ssh_target("-l root ace-ai uptime") == "ace-ai"
+    assert kwp._ssh_target_login("-p 22 -lroot ace-ai") == ("ace-ai", "root")
+    assert kwp._ssh_target_login("ace@ci.ace") == ("ci.ace", "ace")
+    assert kwp._ssh_target_login("ci.ace df") == ("ci.ace", None)
+    assert kwp._ssh_target_login("-oUser=ace ci.ace df") == ("ci.ace", "ace")
+    assert kwp._ssh_target_login("-o user=ace ci.ace") == ("ci.ace", "ace")
+    assert kwp._ssh_target_login("-o 'User ace' ci.ace") == ("ci.ace", "ace")
+    assert kwp._ssh_target_login("-o BatchMode=yes ci.ace") == ("ci.ace", None)
+
+
+def test_a_card_naming_a_second_alias_of_a_pool_host_is_placed_on_a_pool_host(tmp_path):
+    """`reach: ace-media-ubuntu` names ace-media by its second registry name: ace-media
+    reaches itself. Two targets on two hosts still need ONE host reaching both, and
+    an alias no registry row claims never self-matches (fail closed)."""
+    pool = _live_shape(tmp_path / "fleet", extra=("unifi",))
+    body = "reach: ace-media-ubuntu\nssh ace-media-ubuntu 'df -h'"
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ("ace-media",)
+    assert _portable(pool, body=body) == (True, None, "policy")
+    assert kwp.reach_allowed_hosts(body="reach: ace-media-ubuntu, ci.ace", skills=(), pool=pool) == ()
+    assert _portable(pool, body="reach: unifi\nssh unifi 'uptime'") == (False, "host_reach", None)
+    # A stale row proves nothing, its own host included.
+    stale = kwp.PoolConfig(hosts=pool.hosts, profiles=pool.profiles, reach={}, reach_aliases=pool.reach_aliases,
+                           reach_status="stale", pin_aliases=pool.pin_aliases, reach_logins=pool.reach_logins)
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=stale) == ()
+
+
+def test_reaching_hosts_self_rule_is_canonical_and_case_folded():
+    reach = {"ci-box": {"ace-ai": 0}, "ace-ai": {"ci-box": 0}}
+    cfg = {"ci-box": {"ci.ace": W, "ci-box": W}, "ace-ai": {"ace-ai": W}}
+    assert kwp.reaching_hosts(reach, ("ci.ace",), (), {"CI.ACE": "CI-Box"}, config_logins=cfg) == ("ci-box",)
+    assert kwp.reaching_hosts(reach, ("ci.ace",), (), config_logins=cfg) == ()   # no alias map: no self match
+    assert kwp.reaching_hosts(reach, ("ace-ai",), (), config_logins=cfg) == ("ci-box", "ace-ai")
+    # Prism 1fb15e606226: a mixed-case target folds like the host id it names.
+    assert kwp.reaching_hosts({"CI-Box": {"CI-Box": 255}}, ("CI-Box",), (), config_logins=cfg) == ("CI-Box",)
+    assert kwp.reaching_hosts({"ci-box": {}}, ("ci-box",), (), logins={"CI-BOX": {"ace"}}, config_logins=cfg) == ()
+
+
+# -- Prism 77c519869eff (deferred to t_8c580b20): the prose preference is soft in take() too ---------------------
+
+def _soft_plan(kanban_home, profiles_mbp=("alpha",)):
+    fleet = kanban_home / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwp.REACH_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        "ci-box": {"at": NOW, "reach": {"nas-fleet": 255}}, "mbp-2026": {"at": NOW, "reach": {"nas-fleet": 0}}}}))
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    cfg = kwp.PoolConfig(hosts=("ci-box", "mbp-2026"), profiles=("alpha",), reach=reach,
+                         reach_aliases=aliases, reach_status=status)
+    mbp = kwp.PoolHost(name="mbp-2026", ssh_host="mbp-2026", ssh_user=kwp.SSH_USER, slots=4, capacity_pct=0.8,
+                       absence="required", profiles=profiles_mbp, state="active", enabled=True, priority=1)
+    plan = kwp.plan([_fleet_host("ci-box", 0), mbp], {}, probe=lambda h: (1.0, 16), config=cfg)
+    plan.band, plan.spill_reason = "paused", "load"
+    return plan
+
+
+def test_prose_preference_lands_on_the_preferred_host_when_it_can(kanban_home):
+    plan = _soft_plan(kanban_home)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="drop", assignee="alpha", body="scp out nas-fleet:/srv/drop/")
+        res, spawned = _tick(conn, plan)
+    assert spawned == [(tid, "mbp-2026")]
+
+
+def test_prose_preference_falls_back_when_the_preferred_host_cannot_take(kanban_home):
+    """mbp-2026 alone reaches nas-fleet but does not serve alpha: take(only=pref) said pool_full and the card
+    waited. A preference falls back to the other eligible hosts.
+    Mutation: pass only=_prefer to take() with no fallback -> placement_waits pool_full (RED)."""
+    plan = _soft_plan(kanban_home, profiles_mbp=("beta",))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="drop", assignee="alpha", body="scp out nas-fleet:/srv/drop/")
+        res, spawned = _tick(conn, plan)
+    assert spawned == [(tid, "ci-box")], res.placement_waits
+
+
+def test_take_prefer_is_tried_first_then_only(kanban_home):
+    plan = _soft_plan(kanban_home, profiles_mbp=("beta",))
+    assert plan.take("alpha", prefer=("mbp-2026",)).name == "ci-box"
+    plan = _soft_plan(kanban_home)
+    assert plan.take("alpha", prefer=("mbp-2026",)).name == "mbp-2026"
+    # prefer never widens a hard set
+    plan = _soft_plan(kanban_home)
+    assert plan.take("alpha", only=("ci-box",), prefer=("mbp-2026",)).name == "ci-box"
+
+
+def test_admit_outside_the_prose_preference_is_not_host_reach(kanban_home):
+    """`kanban admit --host ci-box` on a card whose prose prefers mbp-2026: the preference is not eligibility."""
+    plan = _soft_plan(kanban_home)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="drop", assignee="alpha", body="scp out nas-fleet:/srv/drop/")
+        spawned = []
+
+        def spawn(task, workspace, *, board=None, placement=None):
+            spawned.append((task.id, placement.name if placement else None))
+            return 4242
+
+        res = kbd.admit_once(conn, tid, "ci-box", spawn_fn=spawn, spillover=plan, max_spawn=64)
+    assert spawned == [(tid, "ci-box")], res.placement_waits

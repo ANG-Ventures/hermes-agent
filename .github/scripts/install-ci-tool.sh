@@ -8,21 +8,27 @@ arch=$(uname -m)
 case "$tool:$arch" in
   ripgrep:x86_64)
     asset=ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz
+    asset_id=307306614
     sha=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599 ;;
   ripgrep:aarch64)
     asset=ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz
+    asset_id=307306472
     sha=2b661c6ef508e902f388e9098d9c4c5aca72c87b55922d94abdba830b4dc885e ;;
   gitleaks:x86_64)
     asset=gitleaks_8.18.4_linux_x64.tar.gz
+    asset_id=173813554
     sha=ba6dbb656933921c775ee5a2d1c13a91046e7952e9d919f9bac4cec61d628e7d ;;
   gitleaks:aarch64)
     asset=gitleaks_8.18.4_linux_arm64.tar.gz
+    asset_id=173813549
     sha=bf5f7f466ebfade1296c8bd32cf7d3f592c2aa78836aa9980ffbe2cadca7a861 ;;
   hadolint:x86_64)
     asset=hadolint-Linux-x86_64
+    asset_id=84037697
     sha=56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010 ;;
   hadolint:aarch64)
     asset=hadolint-Linux-arm64
+    asset_id=84037701
     sha=5798551bf19f33951881f15eb238f90aef023f11e7ec7e9f4c37961cb87c5df6 ;;
   *) printf 'Unsupported CI tool/architecture: %s:%s\n' "$tool" "$arch" >&2; exit 1 ;;
 esac
@@ -33,19 +39,11 @@ case "$tool" in
 esac
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
-# github.com release downloads blip (HTTP 500 for 15+ s, connection resets curl --retry skips);
-# each one ejected a merge-queue batch (t_eef956b2). Retry every curl failure for ~2 min.
-attempts=6
-for ((n = 1; ; n++)); do
-  curl -fsSL --connect-timeout 20 --max-time 120 -o "$scratch/$asset" "https://github.com/$release/$asset" && break
-  if ((n >= attempts)); then
-    printf 'download failed after %s attempts: %s\n' "$attempts" "$asset" >&2
-    exit 1
-  fi
-  printf 'download attempt %s/%s failed; retrying in %ss\n' "$n" "$attempts" "$((n * 5))" >&2
-  sleep "$((n * 5))"
-done
-printf '%s  %s\n' "$sha" "$scratch/$asset" | sha256sum -c -
+# Switch transport after a failed release GET, retaining the same integrity pin.
+bash "$(dirname "${BASH_SOURCE[0]}")/download-ci-asset.sh" \
+  "https://github.com/$release/$asset" \
+  "https://api.github.com/repos/${release%%/releases/*}/releases/assets/$asset_id" \
+  "$sha" "$scratch/$asset"
 case "$tool" in
   ripgrep) tar -xzf "$scratch/$asset" -C "$scratch" --strip-components=1 "${asset%.tar.gz}/rg" ;;
   gitleaks) tar -xzf "$scratch/$asset" -C "$scratch" gitleaks ;;

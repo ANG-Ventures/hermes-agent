@@ -134,6 +134,15 @@ def format_model_for_display(model_name: str) -> str:
     return model_name
 
 
+def format_switch_target(model_name: str) -> str:
+    """/model confirmation text: ``sol -> gpt-6.2-sol`` for a slot, else :func:`format_model_for_display`."""
+    from hermes_cli.model_registry import slot_resolve
+    resolved, slot = slot_resolve(model_name)
+    if slot:
+        return f"{format_model_for_display(slot)} -> {format_model_for_display(resolved)}"
+    return format_model_for_display(model_name)
+
+
 def is_nous_hermes_non_agentic(model_name: str) -> bool:
     """True if *model_name* is a real Nous Hermes 3/4 chat model (single owner; cli.py uses it too)."""
     return bool(model_name and _NOUS_HERMES_NON_AGENTIC_RE.search(model_name))
@@ -769,17 +778,19 @@ class ModelFlagParseResult:
     force_refresh: bool = False
     is_session: bool = False
     is_once: bool = False
+    exact: bool = False
 
 
 # --- Flag parsing
 
-_BOOL_FLAGS = {"--global": "is_global", "--session": "is_session", "--refresh": "force_refresh", "--once": "is_once"}
+_BOOL_FLAGS = {"--global": "is_global", "--session": "is_session", "--refresh": "force_refresh", "--once": "is_once",
+               "--exact": "exact"}
 _VALUE_FLAGS = {"--provider": "explicit_provider", "--reasoning": "reasoning_effort"}
 
 
 def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     """Parse /model flags: ``--provider X``, ``--reasoning <level>``, ``--global``, ``--session``,
-    ``--refresh``, ``--once``.
+    ``--refresh``, ``--once``, ``--exact`` (store the literal id, never its slot: t_efde9d1a).
 
     ``--once`` is parsed here but interpreted by each caller (each frontend has its own
     live-session restore hook). ``is_global`` / ``is_session`` are raw flag presences; the
@@ -796,7 +807,7 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     """
     # Telegram/iOS auto-convert ``--`` to an em/en dash: normalize a single Unicode dash before
     # a flag keyword.
-    raw_args = re.sub(r'[\u2012\u2013\u2014\u2015](provider|reasoning|global|session|refresh|once)', r'--\1', raw_args)
+    raw_args = re.sub(r'[\u2012\u2013\u2014\u2015](provider|reasoning|global|session|refresh|once|exact)', r'--\1', raw_args)
 
     # Hand-rolled: model IDs may contain colons/slashes and the historical parser did not
     # require shell quoting.
@@ -895,6 +906,7 @@ class ModelSwitchRequest:
     is_session: bool = False
     is_once: bool = False
     force_refresh: bool = False
+    exact: bool = False
     scope: str = "default"
     errors: tuple = ()
 
@@ -932,7 +944,8 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
     return ModelSwitchRequest(
         raw=raw, target=parsed.model_input, scope=scope, errors=tuple(errors),
         **{f: getattr(parsed, f)
-           for f in ("explicit_provider", "reasoning_effort", "is_global", "is_session", "is_once", "force_refresh")})
+           for f in ("explicit_provider", "reasoning_effort", "is_global", "is_session", "is_once", "force_refresh",
+                     "exact")})
 
 
 def _effective_model_candidate(value: Any) -> str:
@@ -1930,10 +1943,17 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
     from hermes_cli.models_local import _get_ollama_request_headers
     from hermes_cli import models as _models_facade  # validate_requested_model is a patch seam there
     st.new_model = _resolve_named_custom_model_id(st.new_model, st.target_provider, st.custom_providers)
-    st.new_model = normalize_model_for_provider(st.new_model, st.target_provider)
+    # A slot (``sol``, e.g. from ``sol: cpa/sol``) is stored as the slot, unnormalized (the
+    # normalizer would prefix it, ``gemini`` -> ``google/gemini``), and probed as its current id.
+    from hermes_cli.model_registry import slot_resolve
+    slot_id, slot = slot_resolve(st.new_model)
+    if slot:
+        probe_id = normalize_model_for_provider(slot_id, st.target_provider)
+    else:
+        st.new_model = probe_id = normalize_model_for_provider(st.new_model, st.target_provider)
 
     from hermes_cli.chat_catalog import is_known_non_chat_model
-    if is_known_non_chat_model(st.new_model):
+    if is_known_non_chat_model(probe_id):
         return st.fail(
             f"`{st.new_model}` is a generation model and cannot be used for chat. "
             "Pick a chat model, or use image generation for image models.",
@@ -1964,7 +1984,7 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
             # Re-resolution of an already-accepted route: no live probe.
             raise _SkipCatalogProbe
         validation = _models_facade._validate_requested_model_seam()(
-            st.new_model, validate_as, api_key=st.api_key, base_url=st.base_url,
+            probe_id, validate_as, api_key=st.api_key, base_url=st.base_url,
             api_mode=st.api_mode or None, headers=headers)
     except _SkipCatalogProbe:
         validation = {"accepted": True, "persist": True, "recognized": False, "message": None}
@@ -2134,8 +2154,15 @@ def switch_model(
     # candidate itself: the callback only accepts provider-name grammar, so a plain model id is a
     # no-op. Pinned by tests/fork_canaries/test_fork_canary_provider_seam.py.
     _typed = re.split(r"[:/]", st.new_model, maxsplit=1)
-    provider_seam.refresh(
-        "typed", explicit_provider or (_typed[0] if len(_typed) > 1 else (st.new_model or None)))
+    _typed_name = explicit_provider or (_typed[0] if len(_typed) > 1 else (st.new_model or None))
+    refusal = provider_seam.refresh("typed", _typed_name)
+    if refusal:
+        # t_f1cd7951: a plugin recognised the typed name as a provider name it will not serve.
+        # Refuse here; otherwise a bare token falls through to PATH B as a model id on the
+        # current provider and the switch "succeeds" onto the wrong lane.
+        return st.fail(
+            f"Unknown provider '{_typed_name}': {refusal}. No model switch was made. "
+            f"See 'hermes model' for the providers this process serves.")
 
     # Inline provider qualification (``xai-oauth:grok-4.6`` / ``xai-oauth/grok-4.6`` off an
     # aggregator) routes like ``--provider``: the left-hand side must be an EXACT provider id.
@@ -2161,6 +2188,22 @@ def switch_model(
         if fail is not None:
             return fail
     return _build_switch_result(st)
+
+
+def canonicalise_switch_result(result: ModelSwitchResult, *, exact: bool = False) -> None:
+    """Slot aliases P6 (t_efde9d1a): a /model pick of exactly a slot's CURRENT id on a lane that
+    serves it stores the slot name (``gpt-6.2-sol`` -> ``sol``), so the next rollout moves the pin
+    with no sweep. The confirmation gains one line (``stored as slot sol, currently id
+    gpt-6.2-sol``). ``--exact`` keeps the literal. Can read the lane's model list (network on a
+    cold cache): call it off the event loop."""
+    if not getattr(result, "success", False) or not result.new_model:
+        return
+    from hermes_cli.model_registry import slot_canonicalise
+
+    stored, note = slot_canonicalise(result.new_model, result.target_provider, exact=exact)
+    if note:
+        result.new_model = stored
+        result.warning_message = " | ".join(w for w in (result.warning_message, note) if w)
 
 
 def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg: Any) -> dict[str, Any]:

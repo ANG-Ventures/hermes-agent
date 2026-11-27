@@ -131,7 +131,9 @@ dependencies = [
   # wrapper over it). Pure Python, and its pins match Pillow/websockets above,
   # so it rides in the main venv and every install, Desktop bundle included,
   # ships it without a separate tool environment.
-  "browser-harness==0.1.13; python_version >= '3.14'",
+  # Fleet fork commit adding the daemon selection-lease IPC (lease_acquire/
+  # lease_check/lease_release) that tools/browser_use_target.py requires.
+  "browser-harness @ git+https://github.com/Kyzcreig/browser-harness@502ea1299c8b2568b1179e564fa7327abb2f8498 ; python_version >= '3.14'",
   # .gitignore-aware file matching for desktop build stamp.
   "pathspec==1.1.1; python_version >= '3.14'",
   "fastapi>=0.104.0,<1; python_version >= '3.14'",
@@ -872,6 +874,7 @@ markers = [
   "real_posix_descendants: opt out of the tests/hermes_cli autouse stub that empties dashboard_procs._posix_descendants",
   "real_agent_prewarm: opt out of the autouse stub that disables the tui_gateway deferred agent pre-warm timer",
   "real_retry_backoff: opt out of the tests/agent autouse stub that zeroes jittered_backoff",
+  "real_agent_browser: opt out of the tests/tools autouse stub that makes _find_agent_browser raise (it would spawn a real daemon)",
   "requires_wal: needs the runtime to actually enable SQLite WAL mode (skipped where Hermes falls back to journal_mode=DELETE)",
   "no_isolate: opt out of per-file subprocess isolation (tests share mutable module-level state)",
   "ssh: marks tests requiring a reachable SSH server (skipped in normal CI)",

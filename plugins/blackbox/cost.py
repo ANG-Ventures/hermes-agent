@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Optional
 
-from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+from agent.usage_pricing import USAGE_UNKNOWN_FIELDS, CanonicalUsage, estimate_usage_cost
 
 
 _STATUS_RANK = {
@@ -131,11 +131,30 @@ def compute_turn_cost(
                 cache_write_tokens_unknown=bool(call.get("cache_write_tokens_unknown")),
                 usage_unknown=bool(call.get("usage_unknown")),
             )
+            # A multi-request relay row bills several requests; the tier is one request's prompt.
+            tier_basis = call.get("tier_prompt_tokens")
+            tier_kw: dict[str, Any] = (
+                {} if tier_basis is None else {"tier_prompt_tokens": _int_value(tier_basis)}
+            )
+            if tier_kw:
+                # The last request's own buckets + N price a bill whose requests straddle the
+                # tier per request; without them pricing refuses it as unknown (t_044f701c).
+                last = call.get("tier_last_usage")
+                if isinstance(last, dict):
+                    tier_kw["tier_last_usage"] = CanonicalUsage(
+                        input_tokens=_int_value(last.get("input_tokens")),
+                        cache_read_tokens=_int_value(last.get("cache_read_tokens")),
+                        cache_write_tokens=_int_value(last.get("cache_write_tokens")),
+                        **{key: bool(last.get(key)) for key in USAGE_UNKNOWN_FIELDS},
+                    )
+                if call.get("tier_requests") is not None:
+                    tier_kw["tier_requests"] = _int_value(call.get("tier_requests"))
             result = estimate_usage_cost(
                 call.get("model") or model,
                 usage,
                 provider=call.get("provider") or provider,
                 base_url=call.get("base_url") or base_url,
+                **tier_kw,
             )
         except Exception:
             unknown_count += 1

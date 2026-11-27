@@ -41,6 +41,7 @@ from agent.confab_notice import (
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
+from agent.relay_lanes import is_relay_backed
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 # Remote endpoints must never be fingerprinted: the probe waterfall is only valid for local/LM-Studio/Ollama
@@ -3256,9 +3257,27 @@ def _format_model_route_label(provider, model, effort=None):
     return f"{base} ({effort})" if effort else base
 
 
+def _slot_resolved(model, provider):
+    """``model`` through the slot view: a pin of ``opus`` matches the slot's current id.
+
+    The pin's own lane prefix is dropped (``cpa/sol`` -> ``cpa/gpt-6.2-sol`` -> ``gpt-6.2-sol``):
+    agent init may normalize it off the live id. Other prefixes (``vendor/model``) are kept."""
+    try:
+        from hermes_cli.model_registry import _bare_id, slot_resolve
+        resolved = slot_resolve(model)[0]
+        return _bare_id(provider or "", resolved) if isinstance(resolved, str) else resolved
+    except Exception:
+        return model
+
+
+def _model_matches_pin(model, pin) -> bool:
+    pinned, lane = pin.get("model"), pin.get("provider")
+    return bool(model) and (model == pinned or _slot_resolved(model, lane) == _slot_resolved(pinned, lane))
+
+
 def _route_matches_pin(route, pin) -> bool:
     return (isinstance(route, dict) and bool(route.get("model"))
-            and route.get("model") == pin.get("model")
+            and _model_matches_pin(route.get("model"), pin)
             and route.get("provider") == pin.get("provider"))
 
 
@@ -3286,7 +3305,7 @@ def format_chat_pin_notice(model, provider, pin, *, reason=None, own_fallback=Fa
     replied on its own failover route (t_40a9186f: that read "emitting session
     uses a different route"). ``fallback_label`` is the 🔄 line's head label."""
     if not model or not pin or (
-        model == pin.get("model") and provider == pin.get("provider")
+        _model_matches_pin(model, pin) and provider == pin.get("provider")
     ):
         return None
     live = _format_model_route_label(provider, model)
@@ -3668,7 +3687,7 @@ _SWITCH_STATE_ATTRS = (
     "_anthropic_client", "_is_anthropic_oauth", "client", "_client_kwargs",
     "_use_prompt_caching", "_use_native_cache_layout", "request_overrides",
     "_cached_system_prompt", "_provider_fallback_active",
-    "_provider_fallback_route",
+    "_provider_fallback_route", "_fallback_model_slot",
 )
 
 
@@ -3753,6 +3772,35 @@ def _same_provider_entry(agent, fb: Dict[str, Any]) -> bool:
     return bool(cur_provider) and fb_provider == cur_provider
 
 
+# Sources where the RELAY itself stated ``quota_model`` (its error-class header or stream
+# field, or the harness's capacity probe reading the relay's exhausted N of M). A bare
+# "no eligible sub" body classed from text alone can be a lane fact (bridge mode, pool
+# exclusion: a seat eligible on one face and not another), so it never skips the pool.
+_POOL_WIDE_QUOTA_SOURCES = frozenset(("relay_header", "relay_stream", "relay_probe"))
+
+
+def _note_pool_exhausted_model(agent) -> None:
+    """The relay stated the failing call is the pool's ``quota_model`` (no seat can serve
+    the model): remember the model for this turn so the walk skips every other face of
+    the same pool for it (t_5188f4ed)."""
+    from agent import fallback_events as _fbe
+
+    if not is_relay_backed(getattr(agent, "provider", None)):
+        return
+    trig = _fbe.pending_trigger(agent)
+    if not trig or trig[0] != "quota_model" or trig[1] not in _POOL_WIDE_QUOTA_SOURCES:
+        return
+    model = str(getattr(agent, "model", "") or "").strip()
+    if model:
+        if not isinstance(getattr(agent, "_pool_exhausted_models", None), set):
+            agent._pool_exhausted_models = set()
+        agent._pool_exhausted_models.add(model)
+
+
+from agent.route_snapshot import route_mutation
+
+
+@route_mutation
 def try_activate_fallback(
     agent,
     reason: "FailoverReason | None" = None,
@@ -3788,6 +3836,7 @@ def try_activate_fallback(
     _resuming = getattr(agent, "_sticky_resume_in_progress", False) is True
     if not _resuming:
         reason = _resolve_failover_reason(agent, reason)
+        _note_pool_exhausted_model(agent)
     # A seat-level quota (`quota_seat`: one seat's 5h / weekly / Fable limit)
     # on a pool relay is the relay's to rotate around, so it does not bench
     # the model (fallback spec §4.1 / Phase 1b); apply_quota_gate skips it at
@@ -3884,6 +3933,11 @@ def try_activate_fallback(
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
+        # A rung named by slot (``sol``) runs on the slot's current id: every check below, the
+        # client and the wire see the id.
+        from hermes_cli.model_registry import slot_resolve
+        _fb_resolved, _fb_slot = slot_resolve(fb_model)
+        fb_model = _fb_resolved or fb_model
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
         quota_skipped = getattr(agent, "_quota_gate_skipped_providers", set()) or set()
@@ -3904,12 +3958,34 @@ def try_activate_fallback(
         # A relay deploy-drain refuses EVERY model on the failing provider, so a
         # same-provider entry (a MODEL fallback, e.g. fable -> opus on claude-bpr)
         # only collects the same 503 (2026-09-30 13:03, 5 sessions). Skip entries
-        # on the failing provider or its base_url.
-        if getattr(reason, "value", reason) == "relay_draining" and _same_provider_entry(agent, fb):
+        # on the failing provider or its base_url, and every lane of the same relay
+        # pool: one claude-pool deploy drains them all (2026-11-17 08:03, alr + dtlr).
+        # Families a-d are claude-pool relays that deploy (and drain) together over one
+        # seat set (2026-11-17: alr/dlr/bpr/apr reported the same fable 20/26 on /health);
+        # family e (API credit, its own relay) is not relay-backed.
+        if getattr(reason, "value", reason) == "relay_draining" and (
+            _same_provider_entry(agent, fb)
+            or (is_relay_backed(agent.provider) and is_relay_backed(fb_provider))
+        ):
             logger.warning(
-                "Fallback skip: %s/%s is on the relay that is draining for deploy",
+                "Fallback skip: %s/%s is on the relay pool that is draining for deploy",
                 fb_provider, fb_model,
             )
+            continue
+        # The pool already said it has no capacity for this model on any seat: another
+        # face of the same pool would answer the same (2026-11-16 22:23, alr -> dtlr).
+        if fb_model in (getattr(agent, "_pool_exhausted_models", None) or ()) and is_relay_backed(fb_provider):
+            logger.warning("Fallback skip: %s/%s is on the relay pool that has no capacity for %s",
+                           fb_provider, fb_model, fb_model)
+            continue
+        # A lane that rejected a request at least this large as too long (its own ceiling,
+        # far below the model window) would reject it again (t_5188f4ed).
+        from agent.context_ceilings import request_tokens, too_large_for
+
+        _req = request_tokens(agent)
+        if too_large_for(fb_provider, fb_model, fb.get("base_url"), _req):
+            logger.warning("Fallback skip: %s/%s rejected a request this size (%d tokens) as too long",
+                           fb_provider, fb_model, _req)
             continue
         # A card-pinned kanban worker never leaves its pinned provider mid-turn
         # (t_ed0289e3): a card pinned to openai-codex to escape a bridge fault must
@@ -4008,6 +4084,7 @@ def try_activate_fallback(
             if hasattr(agent, "_transport_cache"):
                 agent._transport_cache.clear()
             agent._fallback_activated = True
+            agent._fallback_model_slot = _fb_slot or ""  # the turn row's model_slot on this rung
 
             # Per-entry reasoning effort override (#21256), else ONLY a per-MODEL
             # override — never the global default (the 2026-08-05 xhigh→medium
@@ -6196,9 +6273,11 @@ class _StreamingCall(StreamingWaitMonitor):
         in the chain: abort this attempt like an interrupt (no in-place retry), and let
         ``run`` raise ``FallbackWallBudgetExceeded`` so the loop fails over to the next
         lane in chain order, same model or not (t_452c6ead, t_778185f3)."""
-        logger.warning("No first byte from %s/%s within the fallback wall budget (%.0fs); cutting the attempt.",
-                       self.agent.provider, self.api_kwargs.get("model", "unknown"),
-                       (getattr(self.agent, "_wall_budget", None) or {}).get("budget_s", 0.0))
+        _wb_state = getattr(self.agent, "_wall_budget", None) or {}
+        if "cut_capacity" not in _wb_state:  # the early no-capacity cut logs its own line
+            logger.warning("No first byte from %s/%s within the fallback wall budget (%.0fs); cutting the attempt.",
+                           self.agent.provider, self.api_kwargs.get("model", "unknown"),
+                           _wb_state.get("budget_s", 0.0))
         # The banner names the lane, the budget clock and (if the relay sent headers
         # before the cut) the seat: captured before the teardown resets the attempt.
         from agent.fallback_wall_budget import elapsed as _wb_elapsed
@@ -6354,11 +6433,10 @@ class _StreamingCall(StreamingWaitMonitor):
             self.worker.start()
             self._monitor_loop()
         if self._wall_budget_cut:
-            from agent.fallback_wall_budget import FallbackWallBudgetExceeded
-            raise FallbackWallBudgetExceeded(
-                f"no first byte from {self.api_kwargs.get('model', 'the provider')} within the turn's "
-                "fallback wall budget (fallback.no_first_byte_budget_seconds); moving to the next lane",
-                **(getattr(self, "_wall_budget_cut_evidence", None) or {}))
+            # The budget cut, or the early cut for a model the relay says it cannot serve.
+            from agent.fallback_wall_budget import cut_exception
+            raise cut_exception(self.agent, self.api_kwargs.get("model"),
+                                **(getattr(self, "_wall_budget_cut_evidence", None) or {}))
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag

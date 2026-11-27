@@ -1716,6 +1716,50 @@ def test_gemini_4_argon_prices_at_introductory_rate_bare_and_bridge():
         assert got.amount_usd == Decimal("12.10"), (model, provider, got.amount_usd)
 
 
+def test_gemini_4_carbon_prices_intro_then_standard_rate(monkeypatch):
+    """gemini-4-carbon (ai.google.dev pricing, read 2026-11-11): $2 in / $10 out /
+    $0.10 cached input per 1M through 2026-11-30, $4 / $20 / $0.20 from
+    2026-12-01. cpa serves it as gemini-4-carbon-high (subs-bake price_coverage
+    gate red since 2026-11-10, t_fed0d5bb); effort suffixes price as the base id."""
+    from datetime import datetime, timezone
+
+    import agent.usage_pricing as up
+
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000,
+                           cache_read_tokens=1_000_000)
+    cases = [("gemini-4-carbon", "google")] + [
+        (f"gemini-4-carbon-{s}", p)
+        for s in ("low", "medium", "high")
+        for p in ("google", "gemini-bridge", "cpa")
+    ]
+    for now, want in ((datetime(2026, 11, 30, 23, 59, tzinfo=timezone.utc), Decimal("12.10")),
+                      (datetime(2026, 12, 1, tzinfo=timezone.utc), Decimal("24.20"))):
+        monkeypatch.setattr(up, "_UTC_NOW", lambda now=now: now)
+        for model, provider in cases:
+            got = estimate_usage_cost(model, usage, provider=provider)
+            assert got.status == "estimated", (now, model, provider, got.status)
+            assert got.amount_usd == want, (now, model, provider, got.amount_usd)
+
+
+def test_gemini_4_neon_and_hydrogen_price_bare_and_bridge():
+    """gemini-4-neon $3 / $15 / $0.15 cached and gemini-4-hydrogen $1.50 / $7.50 /
+    $0.075 per 1M (ai.google.dev pricing, read 2026-11-26, flat). The gemini-bridge
+    serves them as gemini-4-<family>-<effort> (subs-bake price_coverage red on
+    gemini-4-hydrogen-low / gemini-4-neon-low, t_469fa2ce); each prices as its base id."""
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000,
+                           cache_read_tokens=1_000_000)
+    for family, want in (("neon", Decimal("18.15")), ("hydrogen", Decimal("9.075"))):
+        cases = [(f"gemini-4-{family}", "google")] + [
+            (f"gemini-4-{family}-{s}", p)
+            for s in ("low", "medium", "high")
+            for p in ("google", "gemini-bridge")
+        ]
+        for model, provider in cases:
+            got = estimate_usage_cost(model, usage, provider=provider)
+            assert got.status == "estimated", (model, provider, got.status)
+            assert got.amount_usd == want, (model, provider, got.amount_usd)
+
+
 def test_gemini_bridge_effort_suffix_prices_as_base_model():
     """The gemini-bridge appends agy's effort tier (-low/-medium/-high). Effort is
     not a SKU, so each suffixed id prices exactly like its base id, and via the

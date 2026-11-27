@@ -46,6 +46,9 @@ def _root() -> Path:
 #: test_registry_path_matches_the_vendored_library). Computed here so the fault-state and registry-read path never
 #: imports the vendored admission_demand, whose module top imports POSIX-only fcntl/pwd (Prism 3e3d55eb04a0).
 PRIORITY_REL = Path("fleet") / "admission-priority.json"
+#: admission_demand._NONCE, the root's generation file (same no-import rule; pinned by
+#: test_a_root_generation_repair_clears_the_latch).
+ROOT_GENERATION_REL = ".placement-root-generation"
 
 
 def _registry_path() -> Path:
@@ -74,6 +77,10 @@ def registry_state() -> str:
 #: credentials the door path reads besides the kanban@<host> pair tokens: ``kanban`` authenticates the
 #: existing-owner reservation upgrade (authorize_start existing_consumer), ``asap-operator`` the urgency verb.
 _OTHER_TOKENS = ("kanban", "asap-operator")
+#: what the fcfs flip demands of the OTHER door on this root (t_dd8c53c4, P7 re-flip 2026-11-14 21:1x): scripts/test-gate
+#: on the Studio upgrades its capacity lease with existing_consumer=test-gate, and `test-gate --local` on a host the
+#: table excludes sends the local-venue capability. Checked, never part of this door's latch fingerprint.
+_FCFS_PEER_TOKENS = ("test-gate", "test-gate-local-venue")
 
 
 def _kanban_tokens():
@@ -91,6 +98,114 @@ def _door_credentials():
     return [*_kanban_tokens(), *(d / name for name in _OTHER_TOKENS)]
 
 
+#: what a missing credential costs, for the page (t_793ef0f6)
+_CREDENTIAL_EFFECT = {
+    "kanban": "the first reservation upgrade (authorize_start existing_consumer=kanban) latches the door",
+    "asap-operator": "ASAP marks are refused and ignored (mark_asap_if_set); starts are unaffected",
+    "test-gate": "every Studio test-gate run whose lease allocd placed refuses rc 78 at the door upgrade",
+    "test-gate-local-venue": "`test-gate --local` on the Studio refuses rc 78 at the door",
+}
+
+
+def _mint_command(name: str) -> str:
+    if name.startswith("kanban@"):
+        return (f"python3 scripts/allocd.py --mint-demand kanban {name.split('@', 1)[1]} "
+                "(on the Studio; copy the token + protected marker to that client)")
+    return f"python3 scripts/allocd.py --mint {name} (on the Studio, in the fleet root)"
+
+
+def _credential_problem(p: Path):
+    """None when ``p`` holds a usable token, else ``missing`` | ``empty`` | ``unreadable`` | ``malformed``. Reads the
+    file the way alloc_client._token does, but never records the protected marker and never returns the value."""
+    try:
+        tok = p.read_text(encoding="utf-8-sig").strip()
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, ValueError):
+        return "unreadable"
+    if not tok:
+        return "empty"
+    # alloc_client has only stdlib imports at module top (admission_demand loads lazily), so this is safe on Windows
+    from hermes_cli.fleet_placement import alloc_client
+    return None if alloc_client._TOKEN_SHAPE.fullmatch(tok) else "malformed"
+
+
+def _expected_pair_tokens():
+    """kanban@<host> for every host the door can authorize a kanban start on: the table's hosts that pass the
+    operator policy for consumer kanban (canonical_host resolves them; policy_refusal is the eligibility rule). An
+    unreadable table yields none here: that is a class-2 config fault the start path already latches on."""
+    from hermes_cli.fleet_placement import placement
+    try:
+        table = placement.load_hosts()
+    except Exception:
+        return []
+    d = _root() / TOKENS_REL
+    return [d / f"kanban@{hid}" for hid, spec in sorted(table.hosts.items())
+            if placement.policy_refusal(spec, "kanban", None) is None]
+
+
+def credential_problems() -> dict:
+    """{path: problem} for every credential an fcfs start on this root reads: this door's, its expected pairs, and
+    the test-gate door's (_FCFS_PEER_TOKENS). Reads only; no page, no state."""
+    d = _root() / TOKENS_REL
+    bad = {}
+    for p in sorted(set(_door_credentials()) | set(_expected_pair_tokens()) | {d / n for n in _FCFS_PEER_TOKENS}):
+        problem = _credential_problem(p)
+        if problem:
+            bad[str(p)] = problem
+    return bad
+
+
+def preflight() -> int:
+    """The P7 pre-flip check (t_dd8c53c4): run it in spawn-only BEFORE setting priority_mode fcfs. Prints each bad
+    credential with its effect and mint command, never a value; no page, no state. 0 green, 1 a credential is bad."""
+    d = _root() / TOKENS_REL
+    names = sorted({p.name for p in (*_door_credentials(), *_expected_pair_tokens())} | set(_FCFS_PEER_TOKENS))
+    bad = credential_problems()
+    for path, problem in sorted(bad.items()):
+        name = Path(path).name
+        effect = _CREDENTIAL_EFFECT.get(name, "every door verb for that host is refused and latches the door")
+        print(f"{problem} {path}: {effect}; mint: {_mint_command(name)}")
+    verdict = "RED %d of %d" % (len(bad), len(names)) if bad else "GREEN %d of %d" % (len(names), len(names))
+    print(f"fcfs preflight: {verdict} credentials under {d}")
+    return 1 if bad else 0
+
+
+def check_credentials() -> dict:
+    """Once per tick while the door is armed (fcfs/classes): every _door_credentials() file must exist and hold a
+    token BEFORE a start needs it (t_793ef0f6: an unminted var/alloc/tokens/kanban latched the board 15 min on
+    2026-11-14). Logs each problem every tick, pages ONCE per bad file naming the mint command, pages once when it is
+    fixed. Returns {path: problem} for the bad files."""
+    bad = credential_problems()
+    if not bad and not (_root() / STATE_REL).exists():
+        return bad                        # steady state: no lock, no write
+    with _state() as doc:
+        paged = doc.get("credentials_paged")
+        paged = dict(paged) if isinstance(paged, dict) else {}
+        for path, problem in sorted(bad.items()):
+            name = Path(path).name
+            effect = _CREDENTIAL_EFFECT.get(name, "every door verb for that host is refused and latches the door")
+            _log.warning("kanban door: credential %s %s; %s; mint: %s", path, problem, effect, _mint_command(name))
+            # recorded only once the page went out: a failed notifier retries next tick (Prism a492fc587bb2)
+            if path not in paged and _page(f"kanban door credential {problem}: {path}; {effect}. "
+                                           f"Mint: {_mint_command(name)}"):
+                paged[path] = _now()
+        for path in sorted(set(paged) - set(bad)):
+            if not Path(path).exists():
+                # an extra pair file of a host the door does not use, removed: nothing is back, nothing to page
+                paged.pop(path)
+                _log.warning("kanban door: credential %s removed (host not in the door's table); page dropped", path)
+                continue
+            _log.warning("kanban door: credential %s is back", path)
+            if _page(f"kanban door credential is back: {path}; page cleared"):
+                paged.pop(path)
+        if paged:
+            doc["credentials_paged"] = paged
+        else:
+            doc.pop("credentials_paged", None)
+    return bad
+
+
 def door_config_present() -> bool:
     """Any door config on this box: the host table or a kanban pair token."""
     return _table_path().exists() or bool(_kanban_tokens())
@@ -100,7 +215,12 @@ def fingerprint() -> str:
     """Changes when any door credential, the host table or the registry changes (path, mtime, size, mode, owner,
     ctime): a permission-only repair (chmod 000 -> 600) moves mode and ctime only (Prism 917208e77049)."""
     h = hashlib.sha256()
-    for p in (_registry_path(), _table_path(), *_door_credentials()):
+    # Root provisioning (#9789) gates every token read, so repairing it must clear the latch it caused
+    # (Prism f6e8a5c31293): the receipt env value, the receipt file it names, and the root's generation file.
+    receipt = (os.environ.get("PLACEMENT_ROOT_RECEIPT") or "").strip()
+    h.update(f"receipt-env:{receipt};".encode())
+    for p in (_registry_path(), _table_path(), *_door_credentials(), *((Path(receipt),) if receipt else ()),
+              _root() / ROOT_GENERATION_REL):
         try:
             st = p.stat()
             h.update(f"{p}:{st.st_mtime_ns}:{st.st_size}:{st.st_mode}:{st.st_uid}:{st.st_ctime_ns};".encode())
@@ -295,3 +415,7 @@ def hold_reason():
     if left:
         return f"door transport backoff {int(left)} s"
     return None
+
+
+if __name__ == "__main__":
+    raise SystemExit(preflight())

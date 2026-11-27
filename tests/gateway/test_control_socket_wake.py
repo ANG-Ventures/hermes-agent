@@ -23,6 +23,7 @@ from gateway.control_socket import (
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
 from hermes_state import SessionDB
+from run_agent import AIAgent
 
 CHAT = "1535189663533506600"
 HUMAN = "117431298246705156"
@@ -83,6 +84,144 @@ def _params(**kw):
          "text": "dispatch finished: brief at /tmp/x.md"}
     p.update(kw)
     return p
+
+
+# -- completion fallback admission (t_4f28d7a7) -------------------------------
+
+@pytest.fixture
+def capped_primary_routes(store, tmp_path, monkeypatch):
+    """Real profile config/chain and health selector; only provider I/O is fake."""
+    from hermes_cli import kanban_provider_health as health
+    from hermes_cli import profiles
+
+    home = tmp_path / "route-home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "model:\n  provider: zai\n  default: glm-5.1\n"
+        "fallback_providers:\n  - provider: deepseek\n    model: deepseek-v4-flash\n"
+    )
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda p: str(home))
+    monkeypatch.setattr(health, "configured_probes", lambda: {
+        "zai": "https://primary.invalid/health", "deepseek": "https://fallback.invalid/health"})
+    monkeypatch.setattr(health, "configured_pool_health_urls", lambda: {})
+    monkeypatch.setattr(health, "configured_min_eligible", lambda: 1)
+    monkeypatch.setattr(health, "configured_box_health", lambda: False)
+    available = {"deepseek": True}
+    seen = []
+
+    def fetch(url, cache, provider):
+        seen.append(provider)
+        return {"eligible_count": int(available.get(provider, False))}
+
+    monkeypatch.setattr(health, "_fetch", fetch)
+    return available, seen
+
+
+def test_capped_primary_admits_completion_and_executes_configured_fallback(
+    store, tmp_path, monkeypatch, capped_primary_routes,
+):
+    """Actual wake handler -> admitted event -> real agent loop/fallback activation.
+
+    Do not rewrite the wake's route: execution retains normal provider/context
+    resolution and selects the configured rung after the primary's quota error.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+    from hermes_cli.kanban_wake_gate import WakeGate
+    from hermes_cli.config import load_config
+    from hermes_cli.fallback_config import get_fallback_chain
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_cli.profiles import resolve_profile_env
+
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *a, **k: 200000)
+    token = set_hermes_home_override(resolve_profile_env("default"))
+    try:
+        chain = get_fallback_chain(load_config())
+    finally:
+        reset_hermes_home_override(token)
+    with (patch("model_tools.get_tool_definitions", return_value=[]),
+          patch("model_tools.check_toolset_requirements", return_value={}),
+          patch("agent.process_bootstrap.OpenAI", return_value=MagicMock())):
+        agent = AIAgent(api_key="fixture-primary", base_url="https://primary.invalid/v1",
+                        provider="zai", model="glm-5.1", quiet_mode=True,
+                        skip_context_files=True, skip_memory=True, fallback_model=chain)
+    calls = []
+
+    class QuotaError(Exception):
+        status_code = 429
+        response = SimpleNamespace(headers={})
+        body = {"error": {"message": "rate limit exceeded"}}
+
+    def api_call(kwargs):
+        calls.append((agent.provider, agent.model))
+        if agent.provider == "zai":
+            raise QuotaError("rate limit exceeded")
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="completion synthesized", tool_calls=None),
+            finish_reason="stop")], model=agent.model, usage=None)
+
+    client = MagicMock()
+    client.api_key = "fixture-fallback"
+    client.base_url = "https://fallback.invalid/v1"
+    client._custom_headers = client.default_headers = None
+    monkeypatch.setattr(agent, "_interruptible_api_call", api_call)
+    monkeypatch.setattr(agent, "_persist_session", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_save_trajectory", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_cleanup_task_resources", lambda *a, **k: None)
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda *a, **k: (client, k["model"]))
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *a, **k: 200000)
+
+    class ExecutingAdapter(RecordingAdapter):
+        async def handle_message(self, event):
+            await super().handle_message(event)
+            self.result = await asyncio.to_thread(agent.run_conversation, event.text)
+
+    adapter = ExecutingAdapter()
+    runner = _runner(store, adapter)
+    runner._kanban_wake_gate = WakeGate(
+        cpu_sampler=lambda prev: (0.1, object()),
+        state_file=tmp_path / "wake-gate.json")
+    result = asyncio.run(runner._deliver_control_wake(_params(user_id=HUMAN)))
+    assert result["delivered"] is True, result
+    assert len(adapter.handled) == 1
+    assert adapter.result["completed"] is True
+    assert adapter.result["final_response"] == "completion synthesized"
+    assert calls == [("zai", "glm-5.1"), ("deepseek", "deepseek-v4-flash")]
+    assert capped_primary_routes[1] == ["zai", "deepseek"]
+
+
+@pytest.mark.parametrize("fallback", [False, None])
+def test_all_configured_routes_capped_defers_without_execution(store, tmp_path, capped_primary_routes, fallback):
+    from hermes_cli.kanban_wake_gate import WakeGate
+    from hermes_cli.profiles import resolve_profile_env
+    capped_primary_routes[0]["deepseek"] = False
+    if fallback is None:
+        (Path(resolve_profile_env("default")) / "config.yaml").write_text(
+            "model:\n  provider: zai\n  default: glm-5.1\nfallback_providers: []\n")
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._kanban_wake_gate = WakeGate(
+        cpu_sampler=lambda prev: (0.1, object()), state_file=tmp_path / "gate.json")
+    for _ in range(2):
+        result = asyncio.run(runner._deliver_control_wake(_params(user_id=HUMAN)))
+        assert result["delivered"] is False
+        assert "capped" in result["downgraded"]
+    assert adapter.handled == []
+
+
+def test_saturation_still_defers_with_healthy_fallback(store, tmp_path, capped_primary_routes):
+    from hermes_cli.kanban_wake_gate import WakeGate
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._kanban_wake_gate = WakeGate(
+        cpu_sampler=lambda prev: (0.99, object()),
+        dispatcher_state=lambda: {"state": "proc_paused"},
+        state_file=tmp_path / "saturated.json")
+    result = asyncio.run(runner._deliver_control_wake(_params(user_id=HUMAN, human_owner=True)))
+    assert result["delivered"] is False
+    assert result["downgraded"] == "dispatcher proc_paused"
+    assert adapter.handled == []
+    assert capped_primary_routes[1] == []  # host gate short-circuits before route probes
 
 
 # -- routing through the shared helper ---------------------------------------

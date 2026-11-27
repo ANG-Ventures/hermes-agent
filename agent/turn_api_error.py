@@ -89,6 +89,10 @@ def handle_api_error(
         return _verdict("continue")
 
     status_code = getattr(api_error, "status_code", None)
+    # A refused fork pin accepted no upstream work. Let its supervisor rebuild
+    # context once from the already-selected route, before generic retries/fallback.
+    from tools.delegate_tool_fork import raise_if_fork_pin_refused
+    raise_if_fork_pin_refused(agent, api_error)
     error_context = agent._extract_api_error_context(api_error)
     # Fallback ledger evidence (fork, spec Phase 1): consumed by the next failover, cleared by the next
     # successful call. Never raises. elapsed_s: since this call's FIRST attempt (#1613).

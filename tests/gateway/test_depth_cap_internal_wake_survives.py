@@ -295,7 +295,7 @@ class _BufferAgent:
 def _steer(agent, text, *, internal):
     from gateway.run_busy import GatewayBusySessionMixin
     runner = SimpleNamespace(_steer_active_subagents=lambda running_agent, text: 0)
-    assert GatewayBusySessionMixin._steer_running_agent(runner, agent, text, internal=internal)
+    assert GatewayBusySessionMixin._steer_running_agent(runner, agent, text, event=None, internal=internal)
 
 
 def test_internal_steer_drained_without_leftover_does_not_mark_a_later_human_steer():

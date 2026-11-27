@@ -152,16 +152,25 @@ def _extend_canonical_from_plugins() -> None:
             pass
         _canonical_extend_active = True
         added: list[ProviderEntry] = []
+        plugin_labels: dict[str, str] = {}
         try:
             from providers import list_providers as _list_providers_for_canonical
+            # Discovery FIRST, then read what is listed: plugins imported by this
+            # call (and the post-discovery catalog sync) list their own rows, and
+            # a ``known`` captured before them re-appended every plugin-only slug.
+            _profiles = _list_providers_for_canonical()
             known = {p.slug for p in provider_seam.current().CANONICAL_PROVIDERS}
-            for _pp in _list_providers_for_canonical():
-                if _pp.name in known:
-                    continue
+            for _pp in _profiles:
                 # Admission is by slug, not auth_type (upstream #102421, parity 2026-10-01): an
                 # out-of-tree external-process / OAuth profile must reach every shared picker;
                 # visibility is gated downstream by credentials (``_provider_has_credentials``).
                 _label = _pp.display_name or _pp.name
+                # Label / parser backfill covers EVERY profile, including one that
+                # listed its own row during discovery: it never depends on whether
+                # this pass is the one that appends the row (t_169d0cee, Prism c26fac2582c4).
+                plugin_labels.setdefault(_pp.name, _label)
+                if _pp.name in known:
+                    continue
                 _desc = _pp.description or f"{_label} (direct API)"
                 entry = ProviderEntry(_pp.name, _label, _desc)
                 known.add(_pp.name)
@@ -170,20 +179,22 @@ def _extend_canonical_from_plugins() -> None:
             pass
         finally:
             _canonical_extend_active = False
-        if added:
-            # One generation swap for all three surfaces, so a plugin provider
-            # is never on the canonical list without its label / parser
-            # membership. The derived surfaces are defined below this function
-            # in the module body; a read that reaches here before they exist
-            # extends the list alone.
-            delta: dict = {"CANONICAL_PROVIDERS": added}
-            if "_PROVIDER_LABELS" in globals():
-                labels = provider_seam.current()._PROVIDER_LABELS
-                delta["_PROVIDER_LABELS"] = {
-                    e.slug: e.label for e in added if e.slug not in labels
-                }
-            if "_KNOWN_PROVIDER_NAMES" in globals():
-                delta["_KNOWN_PROVIDER_NAMES"] = {e.slug for e in added}
+        # One generation swap for all three surfaces, so a plugin provider
+        # is never on the canonical list without its label / parser
+        # membership. The derived surfaces are defined below this function
+        # in the module body; a read that reaches here before they exist
+        # extends the list alone.
+        delta: dict = {"CANONICAL_PROVIDERS": added} if added else {}
+        cur = provider_seam.current()
+        if "_PROVIDER_LABELS" in globals():
+            new_labels = {s: lb for s, lb in plugin_labels.items() if s not in cur._PROVIDER_LABELS}
+            if new_labels:
+                delta["_PROVIDER_LABELS"] = new_labels
+        if "_KNOWN_PROVIDER_NAMES" in globals():
+            new_names = set(plugin_labels) - set(cur._KNOWN_PROVIDER_NAMES)
+            if new_names:
+                delta["_KNOWN_PROVIDER_NAMES"] = new_names
+        if delta:
             try:
                 provider_seam.publish(delta)
             except provider_seam.SeamCollision:
@@ -950,13 +961,16 @@ def list_available_providers() -> list[dict[str, str]]:
     aliases_for: dict[str, list[str]] = {}
     for alias, canonical in g._PROVIDER_ALIASES.items():
         aliases_for.setdefault(canonical, []).append(alias)
+    slugs = [p.slug for p in g.CANONICAL_PROVIDERS]
+    if "custom" not in slugs:  # the bundled ``custom`` plugin may already list it
+        slugs.append("custom")
     return [
         {
             "id": pid,
             "label": _PROVIDER_LABELS.get(pid, pid),
             "aliases": aliases_for.get(pid, []),
             "authenticated": _provider_has_credentials(pid)}
-        for pid in [p.slug for p in g.CANONICAL_PROVIDERS] + ["custom"]]
+        for pid in slugs]
 
 
 def parse_model_input(
@@ -2389,7 +2403,8 @@ def _provider_models_cache_path() -> Path:
 def _credential_fingerprint(provider: str) -> str:
     """Short hash of the credentials ``provider_model_ids(provider)`` would see right now.
 
-    API-key providers include their configured values and credential-file mtimes. Codex uses the
+    API-key providers include their configured values and credential-file mtimes; one probed by the
+    generic profile path uses only the key + base URL that probe resolves. Codex uses the
     stable principal selected by its read-only resolver: routine token and pool-state writes must
     not discard an account-scoped catalog, while a real account switch must invalidate it.
     """
@@ -2464,10 +2479,15 @@ def _credential_fingerprint(provider: str) -> str:
         except Exception:
             pass
 
+    profile_credential = _profile_probe_credential(provider)
     if provider == "openai-codex":
         from hermes_cli.codex_models import codex_catalog_credential_identity
 
         parts.append(f"codex_identity={codex_catalog_credential_identity()}")
+    elif profile_credential is not None:
+        # The generic profile probe reads exactly this key + base URL; a write to an unrelated
+        # shared credential file (auth.json pool state) must not orphan its live row (t_9523d203).
+        parts.append(f"profile_credential={profile_credential}")
     else:
         try:
             from hermes_constants import get_hermes_home
@@ -2484,6 +2504,25 @@ def _credential_fingerprint(provider: str) -> str:
     # blake2b, not sha256: fingerprint only (collisions = a harmless cache miss), and CodeQL's
     # weak-sensitive-data-hashing rule flags sha256 over env vars named *API_KEY*/*TOKEN*.
     return hashlib.blake2b(blob, digest_size=8).hexdigest()
+
+
+def _profile_probe_credential(provider: str) -> Optional[str]:
+    """``api_key|base_url`` that :func:`_profile_live_catalog` probes *provider* with, or ``None``
+    when its catalog comes from somewhere else (a dedicated fetcher, a relay, a non-api-key auth)."""
+    if provider in _PROVIDER_CATALOG_FETCHERS:
+        return None
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider)
+        if profile is None or profile.auth_type != "api_key" or not profile.base_url:
+            return None
+        if _configured_relay_base_url(provider):
+            return None
+        api_key, base_url = _api_key_credentials(provider)
+        return f"{api_key}|{base_url or profile.base_url}"
+    except Exception:
+        return None
 
 
 def _load_provider_models_cache() -> dict:
@@ -2515,14 +2554,18 @@ def _store_cache_entry(cache_key: str, entry: dict, cache: Optional[dict] = None
 
 def update_provider_cache_entry(provider: str, models: list[str]) -> None:
     """Thread-safe single-entry update for parallel prefetch workers: load-modify-save under a lock
-    so concurrent fetches don't clobber each other's rows. Best-effort, silent on any error."""
+    so concurrent fetches don't clobber each other's rows. Best-effort, silent on any error.
+    A :class:`CuratedFallbackModels` result keeps its ``fallback`` flag and never replaces a live row."""
     try:
         normalized = normalize_provider(provider) or (provider or "")
         if not normalized or not models:
             return
         fp = _credential_fingerprint(normalized)
         with _cache_write_lock:
-            _store_cache_entry(normalized, _cache_entry(fp, models))
+            cache = _load_provider_models_cache()
+            entry = _live_result_entry(fp, models, cache.get(normalized))
+            if entry is not None:
+                _store_cache_entry(normalized, entry, cache)
     except Exception:
         pass
 
@@ -2563,7 +2606,7 @@ def cached_provider_model_ids(
         if tier is not None:
             if tier == "stale":
                 _spawn_swr_refresh(normalized)
-            return _chat_catalog_rows(list(entry["models"]))
+            return _chat_catalog_rows(_cached_rows(entry))
 
     if non_blocking and not force_refresh:
         # Read path: never touch the network in the caller's thread. A same-credentials row past the
@@ -2583,7 +2626,7 @@ def cached_provider_model_ids(
             # The live fetch degraded to the curated list; the account's real catalog is on disk.
             return _chat_catalog_rows([model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)])
         _store_cache_entry(normalized, fresh, cache)
-        return _chat_catalog_rows(list(live))
+        return _chat_catalog_rows(type(live)(live))
 
     if is_ollama:
         if _ollama_native_probe_reachable():
@@ -2600,8 +2643,15 @@ def cached_provider_model_ids(
     # models, which only a successful discovery may advertise (the entry itself is untouched, so the
     # next successful fetch restores them).
     if _cache_entry_valid(entry, fp):
-        return _chat_catalog_rows([model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)])
+        return _chat_catalog_rows(type(_cached_rows(entry))(
+            model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)))
     return []
+
+
+def _cached_rows(entry: dict) -> list[str]:
+    """A disk row's models, still marked :class:`CuratedFallbackModels` when the row is a fallback
+    placeholder, so a caller that must not trust a placeholder (the model registry) can tell."""
+    return (CuratedFallbackModels if entry.get("fallback") else list)(entry["models"])
 
 
 def clear_provider_models_cache(provider: Optional[str] = None) -> None:

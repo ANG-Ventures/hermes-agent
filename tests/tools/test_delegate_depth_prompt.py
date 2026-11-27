@@ -27,6 +27,10 @@ def test_dispatched_child_prompt_matches_depth_capability(
     parent.enabled_toolsets = ["terminal", "file", "delegation"]
     parent.disabled_toolsets = []
     parent.request_overrides = {}
+    parent._fallback_chain = []
+    for name in ("providers_allowed", "providers_ignored", "providers_order", "provider_sort",
+                 "provider_require_parameters", "provider_data_collection"):
+        setattr(parent, name, None)
     parent.provider = "custom"
     parent.base_url = "https://fixture.invalid/v1"
     parent.api_key = "fixture-only"

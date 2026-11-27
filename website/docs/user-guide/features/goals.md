@@ -254,12 +254,18 @@ goals:
   # raise it for long-running refactors.
   max_turns: 20
   # Idle wakes for a quiet goal: first check-in after N minutes, then 2x, 4x.
-  # 0 turns idle wakes (and timed-park resumes) off in the gateway.
+  # 0 turns ordinary idle wakes (and timed-park resumes) off in the gateway.
+  # Incomplete-turn retry timers still wake at their deadline.
   checkin_minutes: 30
   # Check-ins between real events (a user message or a worker/process result).
   max_idle_checkins: 3
   # Pause after this many judged-continue turns in a row with no tool call (0 = off).
   no_progress_turns: 4
+  # Gateway: park after consecutive incomplete agent turns (minimum 1).
+  # Retry after 60s, then double up to 30 min; one notice per failure streak.
+  # A completed turn or human message resets the streak, not unrelated wait barriers.
+  # Failed turns skip gates/judging; resumable iteration-limit handoffs still count.
+  max_incomplete_turns: 3
   # true = queue a continuation even after a read-only / no-tool turn nobody asked for.
   nudge_on_read_only_turns: false
 ```

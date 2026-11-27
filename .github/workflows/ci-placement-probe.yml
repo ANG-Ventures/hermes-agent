@@ -65,6 +65,7 @@ jobs:
         env:
           # ci.yaml's merge_group slice_count branch, verbatim (contract-pinned).
           SLICES: ${{ vars.CI_MERGE_GROUP_SLICES == '' && 16 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) < 4 && 4 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) > 16 && 16 || fromJSON(vars.CI_MERGE_GROUP_SLICES))) }}
+          CI_SELF_HOSTED_LAST_N: ${{ vars.CI_SELF_HOSTED_LAST_N }}
           CI_SELF_HOSTED_SLOTS: ${{ vars.CI_SELF_HOSTED_SLOTS }}
           CI_RUNNER_LABELS: ${{ vars.CI_RUNNER_LABELS }}
           CI_X64_HOSTED_MIN: ${{ vars.CI_X64_HOSTED_MIN || '2' }}
@@ -73,6 +74,7 @@ jobs:
           python3 scripts/run_tests_parallel.py \
             --generate-slices "$SLICES" \
             --test-scope full \
+            --self-hosted-last-n="$CI_SELF_HOSTED_LAST_N" \
             --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
             --self-hosted-labels "$CI_RUNNER_LABELS" \
             --x64-hosted-min="$CI_X64_HOSTED_MIN" \
@@ -114,7 +116,7 @@ jobs:
     name: Placement
     needs: generate
     if: vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
     permissions:
@@ -126,7 +128,7 @@ jobs:
       plan_attempt: ${{ steps.plan.outputs.plan_attempt }}
     steps:
       - name: Download local matrix and plan-read script
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ci-overflow-local-matrix-${{ github.run_id }}-${{ github.run_attempt }}
           path: .

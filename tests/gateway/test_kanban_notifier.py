@@ -59,7 +59,7 @@ def _make_runner(adapter):
 def _create_completed_subscription(summary="done once"):
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="notify once", assignee="worker")
+        tid = kb.create_task(conn, boomerang_wake=False, title="notify once", assignee="worker")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb.complete_task(conn, tid, summary=summary)
         return tid
@@ -86,7 +86,7 @@ def test_stalled_event_pages_subscription_once(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "stall-notify.db"))
     kb.init_db()
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title="idle worker", assignee="worker")
+        tid = kb.create_task(conn, boomerang_wake=False, title="idle worker", assignee="worker")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         with kb.write_txn(conn):
             kb._append_event(conn, tid, "stalled", {"progress_age_seconds": 900})
@@ -109,6 +109,7 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     try:
         tid = kb.create_task(
             conn,
+            boomerang_wake=False,
             title="dm topic task",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",
@@ -163,7 +164,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     reason = "AGE-39 — https://linear.example/AGE-39 — publishing verified."
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="approval", assignee="publisher")
+        tid = kb.create_task(conn, boomerang_wake=False, title="approval", assignee="publisher")
         kbn.add_notify_sub(
             conn,
             task_id=tid,
@@ -197,7 +198,7 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     conn = kbc.connect()
     try:
         foreign_tid = kb.create_task(
-            conn, title="default-owned", assignee="worker",
+            conn, boomerang_wake=False, title="default-owned", assignee="worker",
         )
         kbn.add_notify_sub(
             conn,
@@ -209,7 +210,7 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
         kb.complete_task(conn, foreign_tid, summary="default done")
 
         owned_tid = kb.create_task(
-            conn, title="writer-owned", assignee="worker",
+            conn, boomerang_wake=False, title="writer-owned", assignee="worker",
         )
         kbn.add_notify_sub(
             conn,
@@ -243,7 +244,7 @@ def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
     kb.init_db()
     conn = kbc.connect()
     try:
-        task_id = kb.create_task(conn, title="legacy", assignee="worker")
+        task_id = kb.create_task(conn, boomerang_wake=False, title="legacy", assignee="worker")
         kbn.add_notify_sub(
             conn,
             task_id=task_id,
@@ -329,7 +330,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
 
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="cycle test", assignee="worker")
+        tid = kb.create_task(conn, boomerang_wake=False, title="cycle test", assignee="worker")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         # First crash — fired by the dispatcher when the worker PID dies.
         kb._append_event(conn, tid, kind="crashed")
@@ -387,6 +388,7 @@ def test_notifier_unsubscribes_after_delivering_done(tmp_path, monkeypatch):
     try:
         tid = kb.create_task(
             conn,
+            boomerang_wake=False,
             title="review continuation",
             assignee="worker",
             session_id="origin-session",
@@ -462,6 +464,7 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     try:
         tid = kb.create_task(
             conn,
+            boomerang_wake=False,
             title="dm requester",
             assignee="worker",
             session_id="origin-session",
@@ -531,11 +534,11 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     # scan order entirely.
     conn = kbc.connect()
     try:
-        tid_bad = kb.create_task(conn, title="bad task", assignee="worker")
+        tid_bad = kb.create_task(conn, boomerang_wake=False, title="bad task", assignee="worker")
         kbn.add_notify_sub(conn, task_id=tid_bad, platform="telegram", chat_id="chat-bad")
         kb.complete_task(conn, tid_bad, summary="done")
 
-        tid_good = kb.create_task(conn, title="good task", assignee="worker")
+        tid_good = kb.create_task(conn, boomerang_wake=False, title="good task", assignee="worker")
         kbn.add_notify_sub(conn, task_id=tid_good, platform="telegram", chat_id="chat-good")
         kb.complete_task(conn, tid_good, summary="done")
     finally:
@@ -587,7 +590,7 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="loops forever", assignee="worker")
+        tid = kb.create_task(conn, boomerang_wake=False, title="loops forever", assignee="worker")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb._append_event(
             conn, tid, "block_loop_detected",
@@ -695,6 +698,7 @@ def _review_handoff_task(
     try:
         tid = kb.create_task(
             conn,
+            boomerang_wake=False,
             title="implement the thing",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",
@@ -746,6 +750,7 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
     try:
         tid = kb.create_task(
             conn,
+            boomerang_wake=False,
             title="loops forever",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",
@@ -758,6 +763,7 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
             chat_type="dm",
             delivery_mode="notify+wake",
         )
+        conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))  # where the loop breaker routes it
         kb._append_event(
             conn, tid, "block_loop_detected",
             {"reason": "needs credentials", "kind": "needs_input",
@@ -846,6 +852,7 @@ def _self_caused_completion(actor_session_id, delivery_mode="notify+wake"):
     try:
         tid = kb.create_task(
             conn,
+            boomerang_wake=False,
             title="closed from chat",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",
@@ -972,7 +979,7 @@ def test_self_caused_event_whose_line_was_not_sent_still_wakes(tmp_path, monkeyp
     _origins(monkeypatch, {"sess-chat-1": {"platform": "telegram", "chat_id": "chat-1", "thread_id": "", "user_id": "u1", "profile": "default"}})
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="self crash", assignee="worker")
+        tid = kb.create_task(conn, boomerang_wake=False, title="self crash", assignee="worker")
         kbn.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
             chat_type="dm", delivery_mode="notify+wake", user_id="u1",
@@ -1028,7 +1035,7 @@ def test_self_caused_event_on_apiserver_sub_still_wakes(tmp_path, monkeypatch):
     _origins(monkeypatch, {"origin-session": {"platform": "api_server", "chat_id": "origin-session", "thread_id": "", "user_id": "u1", "profile": "default"}})
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="child work", assignee="worker")
+        tid = kb.create_task(conn, boomerang_wake=False, title="child work", assignee="worker")
         kbn.add_notify_sub(
             conn, task_id=tid, platform="api_server", chat_id="origin-session",
             delivery_mode="notify+wake",

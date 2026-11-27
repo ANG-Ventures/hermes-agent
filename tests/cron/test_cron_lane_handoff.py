@@ -690,7 +690,10 @@ def test_ac4b_takeover_runner_failing_every_tick(root, tmp_path, procs, fault):
     hb = read_runner_heartbeat(root)
     assert pid == gw.pid, (pid, hb, _tail(tmp_path))
     assert hb["state"] == "active" and hb["pid"] == runner.pid, hb  # alive, heartbeating
-    assert (STALE_CYCLES - 2) * CYCLE_S <= took <= (STALE_CYCLES + 2.5) * CYCLE_S, (took, _tail(tmp_path))
+    # Upper slack is 3.5 cycles, not 2.5: on a loaded CI runner (main run 42543184289, 3ca216e7b) both
+    # variants took over correctly at 8.9 s / 9.0 s against an 8.5 s bound. The "never takes back"
+    # mutations still go RED via the 60 s _wait_for above; the lower bound ("not before") is unchanged.
+    assert (STALE_CYCLES - 2) * CYCLE_S <= took <= (STALE_CYCLES + 3.5) * CYCLE_S, (took, _tail(tmp_path))
     assert runner.poll() is None
     assert _ac3_duplicates(root) == []
 

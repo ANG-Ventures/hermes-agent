@@ -254,6 +254,21 @@ class TestSessionDBIntegration:
         finally:
             db.close()
 
+    def test_sessiondb_repairs_readonly_dir_with_no_db(self, hermes_home):
+        """No state.db takes the quarantine-lock path; the lock file lives in the db's directory, so the
+        directory repair must run before the lock opens (Prism 26a59b3bfb21)."""
+        sub = hermes_home / "profiles" / "p"
+        sub.mkdir(parents=True)
+        os.chmod(sub, 0o555)
+        try:
+            db = SessionDB(sub / "state.db")  # must not raise PermissionError on the lock file
+            try:
+                assert os.access(sub, os.W_OK)
+            finally:
+                db.close()
+        finally:
+            os.chmod(sub, 0o755)
+
     def test_sessiondb_actionable_error_outside_home(
         self, hermes_home, tmp_path
     ):

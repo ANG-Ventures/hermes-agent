@@ -910,6 +910,10 @@ def _ensure_cron_dir(cron_dir: Path) -> None:
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
     store = _current_cron_store()
+    from hermes_cli.config_home import refuse_release_root
+    refusal = refuse_release_root(store.cron_dir.parent, "keep cron state (chmod, fire locks) in")
+    if refusal:
+        raise PermissionError(refusal)
     _ensure_cron_dir(store.cron_dir)
     _ensure_cron_dir(store.output_dir)
     _secure_dir(store.cron_dir)
@@ -1524,17 +1528,23 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 # the job was only due on tick k+N+1 and every ``every N m`` job ran every N+1
 # minutes. Why not the old ``next_run_at`` value: its phase is arbitrary, so a
 # slot a few seconds after the tick phase fires ~1 tick late and the skip rule
-# below then drops the next slot. The fire time IS a tick, and successive scans
-# are >= 60 s apart, so ``fire_at + N`` is due no later than tick k+N.
+# below then drops the next slot. The fire time is a tick, but scans run on a
+# fixed 60 s cadence and the stamp is taken after the scan, so a TICKER fire
+# (``INTERVAL_FIRE_TICK_KEY``) is re-armed half a tick early to be due on tick
+# k+N. An external provider (Chronos) re-arms its callback at the exact stored
+# slot with no poll to absorb an offset, so it is re-armed at ``fire_at + N``.
 INTERVAL_FIRE_AT_KEY = "interval_fire_at"
+INTERVAL_FIRE_TICK_KEY = "interval_fire_tick"
 
 
-def _record_interval_fire(job: Dict[str, Any], now: datetime) -> None:
+def _record_interval_fire(job: Dict[str, Any], now: datetime, *, tick: bool = False) -> None:
     """Stash when an interval fire started (see INTERVAL_FIRE_AT_KEY).
 
     Only recorded when the job is actually due (``next_run_at <= now``), so a
     second fire-path call for the same fire (the ticker advances, then claims)
     sees the already-advanced future value and keeps the first stamp.
+    ``tick`` marks a built-in ticker fire (``advance_next_runs``), which is re-armed half a
+    tick early; an external provider's claim leaves it unset.
     """
     if (job.get("schedule") or {}).get("kind") != "interval":
         return
@@ -1544,14 +1554,22 @@ def _record_interval_fire(job: Dict[str, Any], now: datetime) -> None:
     try:
         if _ensure_aware(datetime.fromisoformat(slot)) <= now:
             job[INTERVAL_FIRE_AT_KEY] = now.isoformat()
+            if tick:
+                job[INTERVAL_FIRE_TICK_KEY] = True
+            else:
+                job.pop(INTERVAL_FIRE_TICK_KEY, None)
     except (TypeError, ValueError):
         pass
 
 
 def _next_interval_slot(
-    schedule: Dict[str, Any], fire_at: Optional[str], now: datetime
+    schedule: Dict[str, Any], fire_at: Optional[str], now: datetime, tick: bool = False
 ) -> Optional[str]:
-    """First ``fire_at + k*interval`` (k >= 1) strictly after ``now``.
+    """First ``fire_at + k*interval`` (k >= 1) strictly after ``now``, less the half-tick slack
+    for a ticker fire (``tick``). With the slack, a run that outlasts half a tick is re-armed up to
+    30 s BEFORE ``now``: it is due on the next tick and runs there once. Readers that treat a past
+    ``next_run_at`` as late all allow at least 120 s (``_compute_grace_seconds``: catch-up
+    fast-forward, ``cron_health._is_overdue``; ``_classify_dispatch_lateness``: 300 s).
 
     Slots that elapsed while an over-long run was in flight are skipped, never
     fired, so a slot cannot fire twice and missed slots do not burst. Returns
@@ -1573,7 +1591,12 @@ def _next_interval_slot(
     anchor_utc = anchor.astimezone(timezone.utc)
     now_utc = now.astimezone(timezone.utc)
     k = int((now_utc - anchor_utc) // period) + 1 if now_utc >= anchor_utc else 1
-    return (anchor_utc + k * period).astimezone(anchor.tzinfo).isoformat()
+    # A ticker fire is armed half a tick early (t_ed8ce7a2). The ticker runs on a fixed cadence,
+    # so tick k+N starts exactly N minutes after tick k, while ``fire_at`` was stamped a moment
+    # after tick k's due scan: ``fire_at + N`` landed just after tick k+N's scan and every row
+    # ran one tick late. External providers re-arm at the exact slot, so they get no slack.
+    slack = min(timedelta(seconds=TICKER_INTERVAL_SECONDS / 2), period / 2) if tick else timedelta(0)
+    return (anchor_utc + k * period - slack).astimezone(anchor.tzinfo).isoformat()
 
 
 def _write_marker(name: str, text: str, tmp_prefix: str) -> None:
@@ -4161,15 +4184,20 @@ def _apply_a_lane_default_fallback(job: Dict[str, Any]) -> None:
     ``_require_known_job_route`` does."""
     provider = str(job.get("provider") or "").strip().lower()
     model = job.get("model")
-    if (job.get("no_agent") or not model or not _A_LANE_RE.fullmatch(provider)
+    from cron.lanes import job_lane
+
+    if (job_lane(job) == "script" or not model or not _A_LANE_RE.fullmatch(provider)
             or job.get("fallback") or "allow_cross_provider_fallback" in job):
         return
-    from hermes_cli.model_registry import resolve
+    from hermes_cli.model_registry import resolve, slot_resolve
 
+    # A rung follows its job's model (a slot stays a slot), but the lane's list holds literal
+    # ids, so each rung is checked with the slot's current id (Prism 07e86974b011).
+    check = slot_resolve(model)[0] or model
     chain = []
     for lane in _A_LANE_DEFAULT_FALLBACK_PROVIDERS:
         try:
-            ok = resolve(lane, model, resolve_aliases=False).ok
+            ok = resolve(lane, check, resolve_aliases=False).ok
         except Exception:
             ok = True
         if ok:
@@ -4259,6 +4287,8 @@ def create_job(
         f["model"], allow_flagship_reason=allow_flagship_reason
     )
     _require_known_job_route(f["model"], f["provider"], force_model_reason=force_model_reason)
+    if not str(force_model_reason or "").strip():  # --force-model keeps the literal
+        f["model"] = _slot_for_current_id(f["model"], f["provider"])
     _revalidate_resolved_provider(provider, f["provider"], f["base_url"])
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
@@ -4404,6 +4434,20 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
+def _slot_for_current_id(model: Any, provider: Any) -> Any:
+    """Slot aliases P6 (t_efde9d1a): a job model that is exactly a slot's CURRENT id on a lane
+    that serves it is stored as the slot (``gpt-6.2-sol`` -> ``sol``), so a rollout moves the job
+    with no sweep. The tool and CLI confirmation say so (``model_canonicalised``)."""
+    if not isinstance(model, str) or not model:
+        return model
+    from hermes_cli.model_registry import slot_canonicalise
+
+    stored, note = slot_canonicalise(model, provider if isinstance(provider, str) else None)
+    if note:
+        logger.info("cron: model %s", note)
+    return stored
+
+
 def _require_known_job_route(
     model: Any, provider: Any, fallback: Any = None, *, force_model_reason: Optional[str] = None,
 ) -> None:
@@ -4490,6 +4534,16 @@ def _normalize_job_updates(job: Dict[str, Any], updates: Dict[str, Any]) -> None
     for key, norm in _UPDATE_FIELD_NORMALIZERS.items():
         if key in updates:
             updates[key] = norm(updates[key])
+    if updates.get("env") is not None:
+        # Only a script child receives `env` (cron/job_env.py); an agent turn never does.
+        from cron.job_env import job_env_error
+        env_err = job_env_error(updates["env"])
+        if env_err:
+            raise ValueError(env_err)
+        merged = {**job, **updates}
+        if updates["env"] and not (merged.get("script") or merged.get("monitor_script")):
+            raise ValueError("cron job env reaches only the job's script or monitor_script; "
+                             "this job has neither, so env would do nothing")
     if "repeat" in updates:
         _rp = updates["repeat"]
         completed = (job.get("repeat") or {}).get("completed", 0)
@@ -4666,6 +4720,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 force_model_reason=_force,
             )
             updated.pop("force_model_reason", None)
+            if "model" in updates and not str(_force or "").strip():  # --force-model keeps the literal
+                updated["model"] = _slot_for_current_id(updated.get("model"), updated.get("provider"))
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
@@ -4832,6 +4888,22 @@ RESTART_REQUEUE_MAX_AGE_SECONDS = DEFAULT_ONESHOT_CATCHUP_SECONDS
 # fleet-upstream-leak-lint re-fired 71 ms apart -> Studio load1=67). The n-th
 # re-fire in one scan is deferred n * this many seconds; the first fires now.
 RESTART_REQUEUE_STAGGER_S = 300
+# t_fa0b5cff: a row may ask the script runner's code-skew drain to let its in-flight run finish
+# instead of terminating it at ``RUNNER_SKEW_DRAIN_MAX_S``, for at most this many seconds of run
+# time (measured from the run's start). Past it the run is cut like any other (one re-fire).
+DRAIN_FINISH_KEY = "drain_finish_s"
+
+
+def drain_finish_seconds(job: Optional[Dict[str, Any]]) -> Optional[int]:
+    """The row's positive ``drain_finish_s`` as int seconds, else None (today's bounded drain)."""
+    raw = (job or {}).get(DRAIN_FINISH_KEY)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if value > 0 else None
 
 
 def restart_refire_refusal(job: Optional[Dict[str, Any]], *, run_counted: bool = True) -> Optional[str]:
@@ -5096,6 +5168,11 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
+# hermes-home's house DEFERRED rc (scripts/lib/cron_exit_contract.py DEFERRED_RC), as the script
+# runner renders it (cron/scheduler_script.py "Script exited with code N").
+_DEFERRED_EXIT_RE = re.compile(r"^Script exited with code 76\b")
+
+
 def _record_run_outcome(
     job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
     status: Optional[str], now: str,
@@ -5106,17 +5183,21 @@ def _record_run_outcome(
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
+    # rc 76 is the house DEFERRED exit (hermes-home scripts/lib/cron_exit_contract.py DEFERRED_RC:
+    # host in its other OS / outside its window). The job did not run, so it is neither a failure nor a
+    # success: last_status "deferred", failure_streak left where it was (t_5c58441f).
+    deferred = not success and status is None and bool(_DEFERRED_EXIT_RE.match(error or ""))
     # Consecutive failures carrying the IDENTICAL error string — read (before this write) by
     # the scheduler's repeated-error page gate, which pages a stuck no_agent job once instead
     # of per tick (t_04822736). Any success or changed error resets.
-    if success or not error:
+    if success or not error or deferred:
         job["error_repeat_streak"] = 0
     elif job.get("last_status") == "error" and job.get("last_error") == error:
         job["error_repeat_streak"] = int(job.get("error_repeat_streak") or 0) + 1
     else:
         job["error_repeat_streak"] = 1
-    job["last_status"] = status or (
-        "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
+    job["last_status"] = status or ("deferred" if deferred else (
+        "error" if not success else ("delivery_failed" if delivery_failed else "ok")))
     job["last_error"] = None if success else error
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
@@ -5126,7 +5207,7 @@ def _record_run_outcome(
         # A clean run closes the restart re-queue streak (fork, #1301/#1548).
         job.pop(RESTART_REQUEUE_COUNT_KEY, None)
         job["failure_streak"] = 0
-    else:
+    elif not deferred:
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge).
         job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
@@ -5167,9 +5248,10 @@ def _advance_after_run(job: Dict[str, Any], now: str) -> None:
 
     # An interval fire re-arms off the instant it started, not off this finish time (t_b2f58c48).
     fire_at = job.pop(INTERVAL_FIRE_AT_KEY, None)
+    tick = bool(job.pop(INTERVAL_FIRE_TICK_KEY, False))
     next_slot = None
     if kind == "interval":
-        next_slot = _next_interval_slot(job["schedule"], fire_at, datetime.fromisoformat(now))
+        next_slot = _next_interval_slot(job["schedule"], fire_at, datetime.fromisoformat(now), tick)
     job["next_run_at"] = next_slot or compute_next_run(job["schedule"], now)
     if job["next_run_at"] is not None:
         if job.get("state") != "paused":
@@ -5582,7 +5664,7 @@ def advance_next_runs(job_ids) -> int:
                 continue
             new_next = compute_next_run(job["schedule"], now)
             if new_next and new_next != job.get("next_run_at"):
-                _record_interval_fire(job, now_dt)
+                _record_interval_fire(job, now_dt, tick=True)
                 job["next_run_at"] = new_next
                 advanced += 1
         if advanced:
@@ -6366,6 +6448,13 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         scan.persist(
             job["id"], last_dispatch=dispatch_stamp,
             pending_slot=pending_slot_stamp(next_run, now))
+        # A new scheduled occurrence gets its own one restart re-fire (t_2b319a64): the count bounds
+        # re-fires of ONE killed run, it is not a lifetime budget. Kept across nights it let one
+        # drain-killed re-fire spend every later night's re-fire until a run happened to succeed.
+        raw = scan.find(job["id"])
+        if job.pop(RESTART_REQUEUE_COUNT_KEY, None) is not None and raw is not None:
+            raw.pop(RESTART_REQUEUE_COUNT_KEY, None)
+            scan.needs_save = True
     return True
 
 

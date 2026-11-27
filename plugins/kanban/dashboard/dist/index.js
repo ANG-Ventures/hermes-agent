@@ -852,6 +852,16 @@
     //   summary — completion summary string, or null/undefined to skip
     const performMoveTask = useCallback(function (taskId, newStatus, count, summary) {
       const patch = { status: newStatus };
+      if (newStatus === "scheduled") {
+        const deadline = window.prompt("Schedule at (ISO date/time with timezone):", new Date(Date.now() + 3600000).toISOString());
+        if (deadline === null) return;
+        const wakeAt = Date.parse(deadline);
+        if (!Number.isFinite(wakeAt)) {
+          setError("Enter a valid schedule date/time with timezone");
+          return;
+        }
+        patch.wake_at = Math.floor(wakeAt / 1000);
+      }
       const finalPatch = summary
         ? Object.assign({}, patch, { result: summary, summary: summary })
         : patch;

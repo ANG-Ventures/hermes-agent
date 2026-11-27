@@ -145,7 +145,8 @@ def _blocked(conn, reason, kind="transient", age=600):
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     assert kb.claim_task(conn, tid, claimer="worker") is not None
-    assert kb.block_task(conn, tid, reason=reason, kind=kind)
+    predicate = "\nunblock_when: ruling:host-recovery" if kind is None else ""
+    assert kb.block_task(conn, tid, reason=reason + predicate, kind=kind)
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE task_events SET created_at = created_at - ? "

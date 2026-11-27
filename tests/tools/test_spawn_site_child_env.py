@@ -54,13 +54,17 @@ def _openviking_server_seen(child_env, monkeypatch, names):
     real_popen, children = subprocess.Popen, []
 
     def _record(*args, **kwargs):
-        children.append(real_popen(*args, **kwargs))
+        # Invoke the Python stand-in explicitly rather than relying on platform
+        # shebang parsing of the managed CI interpreter path.
+        argv, *rest = args
+        assert argv[0] == str(probe)
+        children.append(real_popen([sys.executable, *argv], *rest, **kwargs))
         return children[-1]
 
     monkeypatch.setattr(ov.subprocess, "Popen", _record)
     state, _ = ov._start_local_openviking_server("http://127.0.0.1:1933")
     assert state == ov._LOCAL_SERVER_STARTED
-    children[0].wait(timeout=30)
+    assert children[0].wait(timeout=30) == 0
     return json.loads(out.read_text(encoding="utf-8-sig"))
 
 

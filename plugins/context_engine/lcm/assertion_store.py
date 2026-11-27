@@ -20,6 +20,7 @@ import time
 from typing import Any, Iterable, Sequence
 from urllib.parse import quote
 
+from .sqlite_util import connect_read, guard_connection
 from .db_bootstrap import (
     ASSERTION_MIGRATION_STEP,
     configure_connection,
@@ -230,7 +231,7 @@ class AssertionStore:
     def _open_connection(self) -> sqlite3.Connection:
         if self.read_only:
             uri = f"file:{quote(str(self.db_path), safe='/')}?mode=ro"
-            conn = sqlite3.connect(
+            conn = connect_read(
                 uri,
                 uri=True,
                 timeout=5.0,
@@ -250,7 +251,7 @@ class AssertionStore:
             refuse_schema_version_too_new(conn)
             configure_connection(conn)
         conn.row_factory = sqlite3.Row
-        return conn
+        return guard_connection(conn)
 
     def _init_db(self) -> None:
         if self.read_only:

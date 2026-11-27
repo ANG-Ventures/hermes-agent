@@ -111,10 +111,12 @@ def test_head_label_names_the_quota():
 
 def test_seatless_zero_eligible_quota_seat_is_all_subs():
     text = fp.format_cause_rider(_row(), tz=UTC)
-    assert text == "model budget capped at the relay on all subs, 22:49:56", text
+    assert text == ("model budget capped for claude-fable-5-1 via claude-alr "
+                    "(model-specific, not account-wide) at the relay on all subs, 22:49:56"), text
     # The quota_model twin already said all subs; the redundant pool rider goes.
     qm = fp.format_cause_rider(_row(trigger_class="quota_model"), tz=UTC)
-    assert qm == "model budget capped at the relay on all subs, 22:49:56", qm
+    assert qm == ("model budget capped for claude-fable-5-1 via claude-alr "
+                    "(model-specific, not account-wide) at the relay on all subs, 22:49:56"), qm
 
 
 def test_sub_unknown_stays_for_missing_evidence():

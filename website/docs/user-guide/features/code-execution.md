@@ -219,6 +219,33 @@ When your script calls a function like `web_search("query")`:
 
 This means tool calls inside scripts behave identically to normal tool calls — same rate limits, same error handling, same capabilities. The only restriction is that `terminal()` is foreground-only (no `background` or `pty` parameters).
 
+### Parallel tool calls
+
+In the local session kernel, tool calls made from different threads run at the same time, up to `code_execution.max_parallel_tool_calls` at once (default 4). Each request carries an id that its reply echoes, so every thread gets its own result. Use plain threads, `concurrent.futures`, or the `parallel` helper:
+
+```python
+from agent_tools import parallel, terminal, read_file
+build, log = parallel(lambda: terminal("make test"), lambda: read_file("build.log"))
+```
+
+Every call still passes the same checks one at a time on arrival: the token, the allow-list, the per-cell budget (a slot is reserved before the call runs, so the 50-call limit is exact), and the approval path. A call that is still waiting for a slot when its cell ends or is interrupted is refused; it never runs under the next cell.
+
+No tool is serialized. Each `terminal()` call starts its own shell, and `write_file`/`patch` already lock per path. Concurrent `terminal()` calls do share the session's working directory and exported variables, and the last one to finish wins: a `cd` or `export` in one of several concurrent calls may not carry over to the next call, so pass `workdir=` instead.
+
+Set `max_parallel_tool_calls: 1` to restore one-at-a-time calls. The value is read when a kernel starts, so it applies to the next kernel (`reset: true` or a new session). Remote backends always run tool calls one at a time.
+
+```yaml
+# ~/.hermes/config.yaml
+code_execution:
+  max_parallel_tool_calls: 4   # in-flight tool calls per kernel; 1 = serial
+```
+
+### Web results inside a script
+
+When a cell's script calls a tool whose direct results are wrapped as untrusted content (`web_search`, `web_extract`, and the other untrusted tools), the whole `execute_code` result for that cell is wrapped the same way, and the result JSON opens with `"untrusted_tools": [...]` naming those tools. Kernel state outlives the cell, so every later cell in the same kernel is wrapped too, until `reset=true` or a lost kernel starts a fresh one. The host decides this from its own record of the tool calls the kernel dispatched (including a call that finishes after its cell returned), so nothing the script prints can set or clear it. A cell whose kernel never called such a tool returns exactly what it did before.
+
+The host only sees calls made through the tool stubs. A script that fetches a page itself (`urllib`, `requests`, `curl` through `terminal()`) is not marked.
+
 ## Error Handling
 
 When a script fails, the agent receives structured error information:

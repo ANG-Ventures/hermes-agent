@@ -465,6 +465,33 @@ def _recover_provider_from_model(model: str, provider: str) -> tuple[str, str]:
     return provider, model
 
 
+def _resolve_turn_slot(model: str, provider: str, asked: Any) -> tuple[str, str]:
+    """``(model, model_slot)`` for the turn row (t_5c87d313).
+
+    ``asked`` is the slot the agent was configured with (``agent._model_slot``), and ``model`` is
+    normally already its resolved id. A slot name that reaches the recorder as ``model`` is resolved
+    here, at turn time, so the row holds the id the turn ran on and a later reprice cannot price it
+    at whatever the slot points to by then. A slot the view cannot resolve stays in ``model`` (the
+    turn books unpriced under the slot name). ``model_slot`` is ``''`` for a literal id.
+    """
+    slot = asked.strip() if isinstance(asked, str) else ""
+    if str(provider or "").strip().lower() == "moa":
+        return model, slot
+    try:
+        from hermes_cli.model_registry import slot_resolve
+
+        resolved, named = slot_resolve(model)
+    except Exception:
+        return model, slot
+    if not named or not resolved:
+        return model, slot
+    resolved = str(resolved)
+    lane = str(provider or "").strip().lower()
+    if lane and resolved.lower().startswith(lane + "/"):
+        resolved = resolved.split("/", 1)[1]  # ``cpa/sol`` on provider cpa: the lane is the provider
+    return resolved, slot or named
+
+
 
 def _profile_name() -> str:
     try:
@@ -473,6 +500,42 @@ def _profile_name() -> str:
         return get_active_profile_name() or "default"
     except Exception:
         return "default"
+
+
+def _placement_host() -> str | None:
+    """The box running THIS process's kanban-worker tools (t_c9fc6c9f).
+
+    A spilled worker carries ``KANBAN_WORKER_PLACEMENT`` (its pool host); the
+    boot record wins over the env, which the config bridge may have touched. A
+    dispatcher-owned worker with no placement is ``studio-local`` only when
+    its resolved terminal backend is local. Anything else (gateway, interactive CLI, a child process
+    that merely inherited a worker's env) is None.
+    """
+    import os
+
+    try:
+        if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+            return None
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if not is_dispatcher_owned_worker_context():
+            return None
+        from hermes_cli import kanban_worker_hosts as kwh
+
+        # A failed bridge reapply can run tools locally despite a remote boot
+        # placement. Mixed-host runs cannot truthfully carry a single host.
+        if kwh.reapply_failures():
+            return None
+        if kwh.BOOT_PLACED_HOST:
+            return kwh.BOOT_PLACED_HOST
+        # Unplaced workers can inherit a remote profile backend. Resolve through
+        # the same config bridge as terminal rather than assuming Studio-local.
+        from tools.terminal_tool import _get_env_config
+
+        return kwh.LOCAL_HOST_NAME if _get_env_config()["env_type"] == "local" else None
+    except Exception:
+        logger.debug("blackbox placement_host resolve failed", exc_info=True)
+        return None
 
 
 def _config() -> dict[str, Any] | None:
@@ -629,6 +692,7 @@ def _build_record(
     if is_subagent and not bool(cfg.get("record_subagents", True)):
         return None
 
+    model, model_slot = _resolve_turn_slot(model, provider, kwargs.get("model_slot"))
     # Repair a leaked composite ``<provider>/<model>`` model id that arrived with
     # an empty provider column (Ace's 2026-07-05 phantom "Spend by model" row).
     # Done here at the recording boundary so it's telemetry-only and can never
@@ -749,6 +813,13 @@ def _build_record(
         final_text=str(final_response or "") if store_text else "",
         tool_calls=tool_calls if store_text else [],
         cli_invocation_id=kwargs.get("cli_invocation_id"),
+        model_slot=model_slot,
+        # A caller writing on another process's behalf (orphan repair) passes
+        # the key explicitly so this process's placement is never stamped.
+        placement_host=(
+            None if is_subagent else
+            kwargs["placement_host"] if "placement_host" in kwargs else _placement_host()
+        ),
         # An explicit marker names how a turn that never finished was closed
         # (``signal_15``: the kanban dispatcher killed the worker;
         # ``orphan_repair``: synthesized by ``orphans --repair``). Otherwise a
@@ -796,6 +867,7 @@ def _abandoned_record(args: dict[str, Any], cfg: dict[str, Any]) -> TurnRecord |
             "chat_name": args.get("chat_name"),
             "turn_exit_reason": args.get("reason"),
             "reasoning_effort": args.get("reasoning_effort"),
+            "model_slot": args.get("model_slot"),
             "provisional": True,
         },
     )

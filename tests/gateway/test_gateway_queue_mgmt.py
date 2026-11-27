@@ -5,6 +5,7 @@ Store-level tests drive ``gateway/queue_mgmt.py`` against a real ``GatewayRunner
 entry-point tests drive ``_busy_queue_command`` / ``_hm_cmd_queue`` themselves.
 """
 
+import asyncio
 import importlib
 from types import SimpleNamespace
 
@@ -194,14 +195,6 @@ def test_mutate_held_keeps_rest_held_and_never_arms_the_slot(rig):
     assert _active(runner, adapter) == []
 
 
-def test_new_queue_item_joins_held(rig):
-    runner, adapter = rig
-    _seed(runner, adapter, "a")
-    qm.hold_user_items(runner, KEY, adapter)
-    reply = qm.append_if_held(runner, KEY, _ev("z"))
-    assert "2 held" in reply and _held(runner) == ["a", "z"]
-
-
 def test_restage_moves_held_into_slot_then_overflow(rig):
     runner, adapter = rig
     _seed(runner, adapter, "a", "b", "c")
@@ -367,13 +360,72 @@ async def test_rm_all_with_extra_words_is_still_a_prompt(rig):
     assert _active(runner, adapter) == ["a", "rm all of them"]
 
 
+_STILL_HELD = "1 older prompt(s) still held: /queue run releases them, /queue clear drops them."
+
+
 @pytest.mark.asyncio
-async def test_busy_queue_prompt_joins_held_when_held(rig):
+async def test_busy_queue_prompt_goes_active_while_held(rig):
+    """D14 (Ace 2026-11-26, Discord 1575705667786776607): a new /queue item never joins held."""
     runner, adapter = rig
     _seed(runner, adapter, "a")
     qm.hold_user_items(runner, KEY, adapter)
-    reply = await runner._busy_queue_command(_cmd("/queue next thing"), KEY, _source())
-    assert "2 held" in reply and _held(runner) == ["a", "next thing"]
+    reply = await runner._busy_queue_command(_cmd("/queue y"), KEY, _source())
+    assert reply == "Queued for the next turn.\n" + _STILL_HELD
+    reply = await runner._busy_queue_command(_cmd("/queue add z"), KEY, _source())
+    assert reply == "Queued for the next turn. (2 queued)\n" + _STILL_HELD
+    assert adapter._pending_messages[KEY].text == "y"                  # armed: runs when the turn ends
+    assert _active(runner, adapter) == ["y", "z"] and _held(runner) == ["a"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text, prompt", [("/queue z", "z"), ("/queue add z", "z")])
+async def test_idle_queue_prompt_runs_now_while_held(rig, text, prompt):
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    qm.hold_user_items(runner, KEY, adapter)
+    calls = []
+    async def _ack(source, ack, label):
+        calls.append(("ack", ack))
+    runner._send_command_ack = _ack
+    ev = _cmd(text)
+    handled, reply = await runner._hm_cmd_queue(ev, _source(), KEY)
+    calls.append(("turn", ev.text) if handled is False else ("reply", reply))
+    await asyncio.sleep(0)                                   # the note is sent in the background
+    assert calls == [("turn", prompt), ("ack", _STILL_HELD)]
+    assert _held(runner) == ["a"] and KEY not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_idle_queue_while_held_never_awaits_the_note_before_the_claim(rig):
+    """Prism 03e7f19cf6dc: a pending note send must not hold the idle path open for a second /queue."""
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    qm.hold_user_items(runner, KEY, adapter)
+    never = asyncio.Event()
+    async def _stuck_ack(source, ack, label):
+        await never.wait()
+    runner._send_command_ack = _stuck_ack
+    ev = _cmd("/queue z")
+    assert await asyncio.wait_for(runner._hm_cmd_queue(ev, _source(), KEY), 1) == (False, None)
+    never.set()
+    await asyncio.sleep(0)
+
+
+def test_verbs_while_held_and_a_later_active_item(rig):
+    """Report-only (t_0990175d): verbs index the held store; a later active item is shown, not indexed."""
+    runner, adapter = rig
+    _seed(runner, adapter, "a", "b")
+    qm.hold_user_items(runner, KEY, adapter)
+    _seed(runner, adapter, "z")
+    out = qm.apply_management(runner, qm.QueueOp("list"), KEY, adapter)
+    assert "1. a" in out and "2. b" in out and "Also waiting (1)" in out and "· z" in out
+    assert qm.apply_management(runner, qm.QueueOp("edit", index=1, text="A"), KEY, adapter).startswith("Updated")
+    assert qm.apply_management(runner, qm.QueueOp("move", index=2, to=1), KEY, adapter) == "Moved queue item 2 to 1."
+    assert _held(runner) == ["b", "A"] and _active(runner, adapter) == ["z"]
+    assert qm.apply_management(runner, qm.QueueOp("rm", index=3), KEY, adapter) == "Queue item 3 not found. Current size: 2"
+    assert qm.apply_management(runner, qm.QueueOp("rm", index=1), KEY, adapter) == "Removed queue item 1: b"
+    assert qm.apply_management(runner, qm.QueueOp("clear"), KEY, adapter) == "Cleared 1 queued prompt."
+    assert _held(runner) == [] and _active(runner, adapter) == ["z"] and adapter._pending_messages[KEY].text == "z"
 
 
 @pytest.mark.asyncio
@@ -578,3 +630,47 @@ def test_per_item_release_marks_every_released_event(rig):
     qm.hold_user_items(runner, KEY, adapter)
     qm.restage_held(runner, KEY, adapter)
     assert [e._queue_released for e in qm.active_items(runner, KEY, adapter)] == [True, True]
+
+
+def test_held_note_counts_user_items_only(rig):
+    """Prism 9ebebc545090 (PR 572): parked [system] wakes are not "older prompts"."""
+    runner, adapter = rig
+    held = runner._session_state(KEY).conversation.held_queue
+    held.append(_ev("wake", internal=True))
+    assert qm.held_note(runner, KEY) == ""
+    held.extend([_ev("a"), _ev("b")])
+    assert qm.held_note(runner, KEY) == "\n2 older prompt(s) still held: /queue run releases them, /queue clear drops them."
+
+
+def test_every_transition_logs_one_line_per_item(rig, caplog):
+    """Ace 2026-11-26 (Discord 1575715843738705972): gateway.log alone says what moved where."""
+    runner, adapter = rig
+    runner._queue_release_mode = "merged"
+    _seed(runner, adapter, "a", "line one\nline two " + "x" * 80)
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):
+        qm.hold_user_items(runner, KEY, adapter)
+        qm.restage_held(runner, KEY, adapter)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("queue_mgmt item ")]
+    assert [ln.split()[2] for ln in lines] == ["op=hold", "op=hold", "op=release", "op=release"]
+    assert "pos=2 msg_id=None kind=user preview=line one line two " in lines[1] and "\n" not in lines[1]
+    assert "trigger=queue_run" in caplog.text
+    caplog.clear()
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):   # restart sweeps: no prompt text (bf25489bb43e)
+        qm.log_items(runner, "restart_spool", KEY, [_ev("secret\x1b[2Jprompt")], with_preview=False)
+        qm.log_items(runner, "hold", KEY, [_ev("esc\x1b[2Jcode")])
+    assert "preview=-" in caplog.text and "secret" not in caplog.text
+    assert "preview=esc?[2Jcode" in caplog.text and "\x1b" not in caplog.text   # control chars (222226ef4636)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):   # redact before the 60-char cut (8e6f86bd338c)
+        qm.log_items(runner, "add", KEY, [_ev("postgresql://user:" + "x" * 42 + "@db.example/app")])
+    assert "x" * 20 not in caplog.text, caplog.text
+
+
+def test_user_reset_counts_a_popped_unclaimed_follow_up(rig):
+    """Prism 50373862d991: a /new in the pop-to-claim window drops the popped item WITH a count."""
+    runner, adapter = rig
+    ev = _ev("a")
+    qm.mark_inflight(runner, KEY, ev)
+    qm.before_scope_clear(runner, KEY, "session_reset")
+    assert qm.take_reset_drop_suffix(runner, KEY).strip().startswith("Dropped 1 ")
+    assert qm.claim_inflight(runner, KEY, ev) is False   # the old chain must not run it

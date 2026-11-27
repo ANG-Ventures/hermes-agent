@@ -39,8 +39,11 @@ def kanban_home(tmp_path, monkeypatch):
 @pytest.fixture
 def head_at(monkeypatch):
     """PR head commit time served to the guard; None = unknown (no network)."""
-    box = {"at": None}
+    box = {"at": None, "pr": None}
     monkeypatch.setattr(kpo, "pr_head_committed_at", lambda repo, n, **kw: box["at"])
+    # PR REST payload served to the open/closed check; None = unreadable (no network).
+    monkeypatch.setattr(kpo, "_gh_json", lambda path: box["pr"])
+    monkeypatch.setattr(kpo, "_STATE_CACHE", {}, raising=False)
     return box
 
 
@@ -238,6 +241,74 @@ def test_bare_title_ref_inherits_the_parents_pr(kanban_home, head_at):
         detail: dict = {}
         assert kb.check_respawn_guard(conn, child, detail=detail) == kpo.GUARD_REASON
         assert detail["owner"] == owner
+
+
+def _bare_ref_child_under_running_parent(conn) -> tuple:
+    """t_032a0e6f shape: running parent whose handoff names the PR; ready child titled with a bare ``#N``."""
+    parent = _run_owner(conn, title="W7-1: upstream parity sync", metadata={"pr_url": URL})
+    child = kb.create_task(conn, title="#1624 follow-up: residual", assignee="alice",
+                           parents=[parent])
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+    assert kpo.card_pr_targets(conn, child) == {("ang-ventures/hermes-agent", 1624)}
+    return parent, child
+
+
+def test_merged_pr_does_not_hold_a_bare_ref_child(kanban_home, head_at):
+    """Live 11-11: t_dcf6920a held pr_owner_busy 15 min on hermes-home#10552, merged hours earlier."""
+    head_at["pr"] = {"state": "closed", "merged": True, "head": {"sha": "e3a448dc"}}
+    with kb.connect() as conn:
+        _, child = _bare_ref_child_under_running_parent(conn)
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, child, detail=detail) != kpo.GUARD_REASON
+        assert "owner" not in detail
+
+
+def test_open_pr_still_holds_a_bare_ref_child(kanban_home, head_at):
+    head_at["pr"] = {"state": "open", "merged": False, "head": {"sha": "e3a448dc"}}
+    with kb.connect() as conn:
+        parent, child = _bare_ref_child_under_running_parent(conn)
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, child, detail=detail) == kpo.GUARD_REASON
+        assert detail["owner"] == parent
+
+
+def _counting_gh(monkeypatch, box: dict) -> list:
+    calls: list = []
+    monkeypatch.setattr(kpo, "_gh_json", lambda path: calls.append(path) or box["pr"])
+    return calls
+
+
+def test_closed_unmerged_pr_still_holds(kanban_home, head_at, monkeypatch):
+    """A closed-unmerged PR can be reopened while its writer runs: keep the hold (prism P1 reopen race)."""
+    _counting_gh(monkeypatch, head_at)
+    head_at["pr"] = {"state": "closed", "merged": False}
+    with kb.connect() as conn:
+        parent, child = _bare_ref_child_under_running_parent(conn)
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, child, detail=detail) == kpo.GUARD_REASON
+        assert detail["owner"] == parent
+
+
+def test_merged_pr_state_is_cached(kanban_home, head_at, monkeypatch):
+    """GitHub cannot reopen a merged PR, so merged is final and read once per 5 min."""
+    calls = _counting_gh(monkeypatch, head_at)
+    head_at["pr"] = {"state": "closed", "merged": True}
+    with kb.connect() as conn:
+        _, child = _bare_ref_child_under_running_parent(conn)
+        assert kb.check_respawn_guard(conn, child) != kpo.GUARD_REASON
+        assert kb.check_respawn_guard(conn, child) != kpo.GUARD_REASON
+    assert len([p for p in calls if p.endswith("/pulls/1624")]) == 1
+
+
+def test_unreadable_pr_state_still_holds(kanban_home, head_at):
+    """Fail open to the old behaviour only when the PR state cannot be read."""
+    head_at["pr"] = None
+    with kb.connect() as conn:
+        parent, child = _bare_ref_child_under_running_parent(conn)
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, child, detail=detail) == kpo.GUARD_REASON
+        assert detail["owner"] == parent
 
 
 def test_birth_refusal_override_is_ledgered(kanban_home, head_at):

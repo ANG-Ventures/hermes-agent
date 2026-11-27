@@ -142,6 +142,7 @@ from .message_content import (
 from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
+    connect_read,
 )
 from .store import MessageStore
 from .storage_security import plaintext_path_policy, retention_status
@@ -604,6 +605,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # next ingest.
         self._ingest_cursor: int = 0
         self._ingest_cursor_needs_reconcile = False
+        # (len(input), len(compressed), digest of every input row's identity) of the
+        # last compaction, until the next ingest; see _ingest_messages_unlogged.
+        self._compaction_source: Optional[tuple] = None
         self._last_ingest_reconciliation: Dict[str, Any] = {
             "action": "none",
             "reason": "not run",
@@ -729,6 +733,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_fail_open_over_context_limit = False
         self._last_fail_open_fallback_attempted = False
         self._last_fail_open_fallback_status = ""
+        # True while the last compress() failed open on a damaged/unreadable
+        # store (sqlite3.DatabaseError other than locked/busy). The host reads
+        # it to classify the attempt as ``store_unavailable``, not no_progress.
+        self.last_compress_store_unavailable = False
         self._fail_open_total_count = 0
         self._fail_open_consecutive_count = 0
         self._fail_open_timestamps: list[float] = []
@@ -1644,7 +1652,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return False
         try:
             uri = path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+            conn = connect_read(uri, uri=True)
             try:
                 row = conn.execute(
                     """
@@ -2520,6 +2528,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # only messages appended *after* this point get ingested next time.
         self._ingest_cursor = len(compressed)
         self._ingest_cursor_needs_reconcile = False
+        self._compaction_source = (
+            len(messages),
+            len(compressed),
+            self._replay_identity_digest(messages),
+        )
 
         # Per-event node accounting: nodes THIS compress built = current total minus
         # the pre-event snapshot. The lifetime total is kept in parens because it was
@@ -2563,6 +2576,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._degraded = False
         self._last_degraded_reason = ""
         self._fail_open_consecutive_count = 0
+        self.last_compress_store_unavailable = False
 
     def _fail_open_rate_snapshot(self) -> tuple[int, float]:
         now = time.time()
@@ -2585,6 +2599,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         context_limit: Optional[int],
     ) -> bool:
         return bool(context_limit and context_limit > 0 and raw_tokens >= context_limit)
+
+    @staticmethod
+    def _is_store_damage_error(exc: BaseException) -> bool:
+        """True only for a store error that a retry cannot fix: SQLITE_CORRUPT /
+        SQLITE_NOTADB (``database disk image is malformed``, ``file is not a
+        database``). Every other sqlite error (locked, busy, I/O, cantopen,
+        readonly, full, ...) may be transient and keeps the old degrade path."""
+        if not isinstance(exc, sqlite3.DatabaseError):
+            return False
+        code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(code, int):
+            return (code & 0xFF) in (11, 26)  # SQLITE_CORRUPT, SQLITE_NOTADB
+        text = str(exc).lower()
+        return "malformed" in text or "not a database" in text
 
     def _record_fail_open_degraded(
         self,
@@ -2715,8 +2743,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         request_overhead_tokens = max(0, raw_tokens - count_messages_tokens(messages))
         context_limit = self.context_length if self.context_length > 0 else None
+        over_context_limit = self._raw_messages_exceed_context_limit(raw_tokens, context_limit)
+        store_damaged = self._is_store_damage_error(exc)
+        self.last_compress_store_unavailable = store_damaged
+        # A damaged store fails every LCM pass identically, so waiting for the
+        # model limit means no compaction at all until the session hits the
+        # wall. Over the compaction threshold, run the store-free fallback now.
+        over_threshold = bool(self.threshold_tokens > 0 and raw_tokens >= self.threshold_tokens)
 
-        if not self._raw_messages_exceed_context_limit(raw_tokens, context_limit):
+        if not over_context_limit and not (store_damaged and over_threshold):
             self._record_fail_open_degraded(
                 exc,
                 raw_tokens=raw_tokens,
@@ -2750,6 +2785,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 fallback_status="failed",
                 fallback_exc=fallback_exc,
             )
+            if not over_context_limit:
+                # Still under the model limit: degrade as before, don't escalate.
+                return messages
             raise self._recoverable_fail_open_error(
                 exc,
                 fallback_exc,
@@ -3240,6 +3278,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_fail_open_over_context_limit = False
         self._last_fail_open_fallback_attempted = False
         self._last_fail_open_fallback_status = ""
+        self.last_compress_store_unavailable = False
         self._fail_open_total_count = 0
         self._fail_open_consecutive_count = 0
         self._fail_open_timestamps = []
@@ -4978,6 +5017,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "threshold_full_sweep": dict(self._last_threshold_full_sweep),
             "ingest_failure_count": self._ingest_failure_count,
             "consecutive_ingest_failures": self._consecutive_ingest_failures,
+            "store_tail_health": getattr(getattr(self, "_store", None), "tail_health", None),
             "last_ingest_error": self._last_ingest_error,
             "last_ingest_error_time": self._last_ingest_error_time,
             "model": self.model,
@@ -5852,6 +5892,37 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return redacted_replay_messages
 
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Persist new messages; log the first ingest after a rebind, whatever the caller.
+
+        The reconcile flag is consumed inside ``_ingest_messages_unlogged``; the
+        INFO line fires exactly when this call consumed it (t_f4a72542).
+        """
+        if not self._ingest_cursor_needs_reconcile:
+            return self._ingest_messages_unlogged(messages)
+        rows_before = self._store.get_session_count(self._session_id)
+        rec_before = self._last_ingest_reconciliation
+        result = self._ingest_messages_unlogged(messages)
+        if not self._ingest_cursor_needs_reconcile:
+            # One line per session per agent rebuild: how a restart is judged.
+            rec = self._last_ingest_reconciliation
+            rec = {} if rec is rec_before or not rec else rec
+            logger.info(
+                "LCM first ingest after rebind: session=%s incoming=%d reason=%s cursor=%s appended=%d",
+                self._session_id,
+                len(messages),
+                rec.get("reason", "none"),
+                rec.get("cursor"),
+                self._store.get_session_count(self._session_id) - rows_before,
+            )
+        return result
+
+    def _replay_identity_digest(self, messages: List[Dict[str, Any]]) -> str:
+        h = hashlib.sha256()
+        for msg in messages:
+            h.update(json.dumps(self._message_replay_identity(msg)).encode())
+        return h.hexdigest()
+
+    def _ingest_messages_unlogged(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list
@@ -5875,6 +5946,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._session_id,
             )
             return self._redact_active_replay_messages(messages)
+
+        # The cursor indexes the list the last compaction returned. A caller that
+        # still holds the list it was given (the commit's session-end flush,
+        # t_5ce457b8) would re-store rows [len(compressed):] of rows compress()
+        # already stored, so only rows past that input are new. The cursor stays
+        # on the compacted list for the next ingest.
+        source, self._compaction_source = self._compaction_source, None
+        if (
+            source is not None
+            and not self._ingest_cursor_needs_reconcile
+            and self._ingest_cursor == source[1]
+            and len(messages) >= source[0]
+            and self._replay_identity_digest(messages[: source[0]]) == source[2]
+        ):
+            self._ingest_cursor = source[0]
+            try:
+                return self._ingest_messages_unlogged(messages)
+            finally:
+                self._ingest_cursor = source[1]
 
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)

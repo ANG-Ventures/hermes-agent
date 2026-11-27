@@ -86,22 +86,65 @@ def _default_query() -> Optional[QueryFn]:
     return prg.query_pr
 
 
-def _state(ref, query_fn: QueryFn, now: float, budget: list) -> Optional[str]:
-    key = (id(query_fn), ref.repo.lower(), ref.number)
-    hit = _CACHE.get(key)
+def _cached(ref, query_fn: QueryFn, now: float) -> Optional[tuple]:
+    # Keyed on the repo bytes as recorded (the identifier-key lint): a case variant of one repo is one extra read,
+    # never a wrong verdict.
+    hit = _CACHE.get((id(query_fn), ref.repo, ref.number))
     if hit is not None and hit[0] is query_fn and (hit[1] == "MERGED" or now - hit[2] < CACHE_TTL_SECONDS):
+        return hit
+    return None
+
+
+def _state(ref, query_fn: QueryFn, now: float, budget: list,
+           prefetched: Optional[dict] = None) -> Optional[str]:
+    key = (id(query_fn), ref.repo, ref.number)
+    hit = _cached(ref, query_fn, now)
+    if hit is not None:
         return hit[1]
     if budget[0] <= 0:
         return None
     budget[0] -= 1
+    pkey = (ref.repo, ref.number)
     try:
-        payload = query_fn(ref.repo, ref.number)
+        payload = prefetched[pkey] if prefetched is not None and pkey in prefetched else query_fn(ref.repo, ref.number)
     except Exception:
         return None
     state = str((payload or {}).get("state") or "").upper() or None
     if state:
         _CACHE[key] = (query_fn, state, now)
     return state
+
+
+def _batch_reads(conn: sqlite3.Connection, parents: list, query_fn: QueryFn, now: float,
+                 budget: int) -> Optional[dict]:
+    """The real oracle only (t_97a78e19): the first ``budget`` uncached refs the loop below will read, fetched
+    with one ``gh api graphql`` per repo (:func:`kanban_pr_gate.query_prs`) instead of one ``gh`` per PR. The loop
+    still spends one lookup per ref, so the per-tick budget and every verdict are what per-PR reads give. A test
+    oracle keeps the per-PR path (None)."""
+    from hermes_cli import kanban_pr_gate as prg
+
+    if query_fn is not prg._REAL_QUERY_PR or budget <= 0:
+        return None
+    plan: dict = {}
+    for parent_id in parents:
+        for ref in _fleet_refs(conn, parent_id):
+            key = (ref.repo, ref.number)
+            if len(plan) < budget and key not in plan and _cached(ref, query_fn, now) is None:
+                plan[key] = ref
+        if len(plan) >= budget:
+            break
+    by_repo: dict = {}
+    for key, ref in plan.items():
+        by_repo.setdefault(key[0], (ref.repo, []))[1].append(ref.number)
+    out: dict = {}
+    for slug, (repo, numbers) in by_repo.items():
+        try:
+            answers = prg.query_prs(repo, numbers)
+        except Exception:
+            answers = {}
+        for n in numbers:
+            out[(slug, n)] = answers.get(n)
+    return out
 
 
 def _fleet_refs(conn: sqlite3.Connection, parent_id: str) -> list:
@@ -121,7 +164,7 @@ def release_merged_edges(
 ) -> list[tuple[str, str]]:
     """Rewrite every ``after-merge`` edge whose parent's recorded fleet PRs all
     read MERGED to ``derived-from``; return the released ``(parent, child)``
-    pairs. An OPEN (draft or not), CLOSED or unreadable PR keeps the gate, open
+    pairs. An OPEN (draft or not) or unreadable PR keeps the gate, open
     parent or done one alike. A parent with no recorded PR is left to
     :func:`release_prless_closed_parents`. Lookups happen before the short
     write txn, which re-reads the parent's PR set and skips any parent whose
@@ -147,8 +190,10 @@ def release_merged_edges(
     now = time.time() if now is None else now
     budget = [max(0, int(max_lookups))]
     merged_prs: dict[str, list[str]] = {}
+    closed_prs: dict[str, tuple[list[str], list[str]]] = {}
     parents = sorted(dict.fromkeys(e["parent_id"] for e in edges),
                      key=lambda pid: (_LAST_CHECKED.get(pid, 0.0), pid))
+    prefetched = _batch_reads(conn, parents, query_fn, now, budget[0])
     for parent_id in parents:
         if budget[0] <= 0:
             break
@@ -157,15 +202,34 @@ def release_merged_edges(
             continue
         _LAST_CHECKED[parent_id] = now
         # No short-circuit: every ref is read, so the cache fills evenly.
-        states = [_state(r, query_fn, now, budget) for r in refs]
+        states = [_state(r, query_fn, now, budget, prefetched) for r in refs]
+        closed = [str(r) for r, state in zip(refs, states) if state == "CLOSED"]
+        if closed:
+            closed_prs[parent_id] = ([str(r) for r in refs], closed)
         if all(st == "MERGED" for st in states):
             merged_prs[parent_id] = [str(r) for r in refs]
     released: list[tuple[str, str]] = []
-    if not merged_prs:
+    if not merged_prs and not closed_prs:
         return released
     with kb.write_txn(conn):
         for edge in edges:
             parent_id, child_id = edge["parent_id"], edge["child_id"]
+            if parent_id in closed_prs:
+                recorded, closed = closed_prs[parent_id]
+                if [str(r) for r in _fleet_refs(conn, parent_id)] != recorded:
+                    continue
+                reason = (f"prerequisite {', '.join(closed)} closed unmerged: "
+                          "name a replacement PR or waive")
+                cur = conn.execute(
+                    "UPDATE tasks SET status='triage', result=? WHERE id=? "
+                    "AND status IN ('todo', 'ready') AND EXISTS ("
+                    "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=? AND kind=?)",
+                    (reason, child_id, parent_id, child_id, kb.LINK_KIND_AFTER_MERGE),
+                )
+                if cur.rowcount:
+                    kb._append_event(conn, child_id, "after_merge_prerequisite_closed",
+                                     {"parent": parent_id, "prs": closed, "reason": reason})
+                continue
             if parent_id not in merged_prs:
                 continue
             # The lookups ran outside the txn: a parent that recorded a new PR,

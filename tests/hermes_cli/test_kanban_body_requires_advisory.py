@@ -33,10 +33,12 @@ def _no_real_spawn(monkeypatch):
     monkeypatch.setattr(kbd, "_default_spawn", boom)
 
 
-def _mode(monkeypatch, body_mode=None):
+def _mode(monkeypatch, body_mode=None, prose=None):
     pl = {"capabilities": "enforce"}
     if body_mode:
         pl["body_requires_mode"] = body_mode
+    if prose is not None:
+        pl["prose_pins_advisory"] = prose
     monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": pl})
 
 
@@ -65,7 +67,8 @@ def test_body_docker_run_is_placed_with_an_ignored_event(home, monkeypatch):  # 
 
 
 def test_kill_switch_enforce_restores_the_hold(home, monkeypatch):  # noqa: F811
-    _mode(monkeypatch, "enforce")
+    # body_requires_mode: enforce holds a body sniff only while t_c82eded0's outer switch is off too.
+    _mode(monkeypatch, "enforce", prose=False)
     with kb.connect_closing() as conn:
         tid = _card(conn, BODY)
         res, spawned = _tick(conn)

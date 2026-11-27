@@ -46,8 +46,8 @@ def _handled_canonicals() -> set[str]:
         )
         names.add(name)
     for name in GatewayRunner._HM_CANONICAL_COMMANDS:
-        assert callable(getattr(GatewayRunner, f"_hm_cmd_{name.replace('-', '_')}", None)), (
-            f"/{name} is in _HM_CANONICAL_COMMANDS but GatewayRunner._hm_cmd_{name.replace('-', '_')} does not exist"
+        assert callable(getattr(GatewayRunner, f"_hm_cmd_{name}", None)), (
+            f"/{name} is in _HM_CANONICAL_COMMANDS but GatewayRunner._hm_cmd_{name} does not exist"
         )
         names.add(name)
     for key, attr in GatewayRunner._BUSY_SPECIAL_HANDLERS.items():

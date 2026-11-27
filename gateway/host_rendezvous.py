@@ -576,6 +576,30 @@ def cleanup_on_exit(role: str) -> None:
             _prev_signal_handlers[signum] = prev
 
 
+def forget_owner_state_in_forked_child() -> None:
+    """Run in a child forked without exec: it owns no role, so drop the parent's cleanup (t_89c3a411).
+
+    Left alone, a SIGTERM to the child ran ``_cleanup_role`` and ``release_host_lock``'s
+    ``flock(LOCK_UN)`` on the inherited fd, which shares the parent's open file description and so
+    released the LIVE parent's host lock; the wrapper then chained to asyncio's no-op and the child
+    survived. Here the wrapper is unwound to the handler it wrapped (``gateway.fork_signal_reset``
+    then turns an asyncio no-op into the default), the roles are forgotten, and the child's copies
+    of the lock fds are closed (closing a copy never unlocks: the parent's fd still holds it).
+    """
+    import signal as _signal
+
+    _cleanup_roles.clear()
+    for handle in tuple(_lock_handles.values()):
+        with contextlib.suppress(Exception):
+            handle.close()
+    _lock_handles.clear()
+    for signum, prev in tuple(_prev_signal_handlers.items()):
+        with contextlib.suppress(Exception):
+            if _signal.getsignal(signum) is _handle_terminating_signal:
+                _signal.signal(signum, _signal.SIG_DFL if prev is None else prev)
+    _prev_signal_handlers.clear()
+
+
 def _multiplex_profiles_enabled() -> bool:
     """Will THIS process multiplex? An explicit ``true`` and an unset key both say yes, and an
     explicit ``false`` is RETIRED (``hermes_cli.gateway_multiplex_mode``) — it is warned about and

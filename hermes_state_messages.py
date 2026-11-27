@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -66,6 +67,9 @@ _DISPLAY_META_ROW_SQL = "SELECT display_metadata FROM messages WHERE id = ? AND 
 _DISPLAY_INDEX_MISSING_SQL = ("SELECT 1 FROM messages WHERE session_id = ?" + _DISPLAY_ACTIVE_CLAUSE
                               + " AND (display_order IS NULL OR display_identity IS NULL) LIMIT 1")
 _ACTIVE_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND active = 1 ORDER BY id"
+# The columns _display_dedupe_key reads: the same set messages_display_identity_update watches.
+_RECONCILE_KEY_COLUMNS = ("id, role, content, timestamp, tool_call_id, tool_calls, tool_name, display_kind, "
+                          "display_metadata")
 _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, message_uid FROM messages "
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
@@ -1085,7 +1089,7 @@ class SessionMessagesMixin:
     def _archive_named_rows(
         self, conn, session_id: str, compacted_messages: List[Dict[str, Any]], covered: List[int], *,
         tail_count: int, carried_messages: Optional[List[Dict[str, Any]]], patched_model_config: Any,
-        patch: bool,
+        patch: bool, display_prescan: Optional[Dict[int, Tuple[Optional[bytes], bytes]]] = None,
     ) -> int:
         """Archive *covered* as summarized and clone every other active row after the new set.
 
@@ -1125,7 +1129,7 @@ class SessionMessagesMixin:
             tool_calls_total += unseen_tool_calls
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
-        self._reconcile_display_orders(conn, session_id)
+        self._reconcile_display_orders(conn, session_id, display_prescan)
         conn.execute(
             f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
             (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
@@ -1163,6 +1167,9 @@ class SessionMessagesMixin:
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
         """
         from hermes_state import SessionCompressionInProgressError
+        # Read/hash work happens here, before BEGIN IMMEDIATE; the transaction re-checks each row (t_d63a8ca8).
+        display_prescan = self._prescan_display_identities(session_id)
+
         def _do(conn):
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
@@ -1180,7 +1187,8 @@ class SessionMessagesMixin:
             if proved is not None:
                 inserted = self._archive_named_rows(
                     conn, session_id, compacted_messages, proved, tail_count=tail_count,
-                    carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch)
+                    carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
+                    display_prescan=display_prescan)
                 self._raise_if_compaction_introduced_duplicate_results(
                     conn, session_id, preexisting_dup_tool_results)
                 self._recompute_effective_last_active_for_session(conn, session_id)
@@ -1219,7 +1227,7 @@ class SessionMessagesMixin:
                 tool_calls_total += tail_tool_calls
             # A carried copy whose stored identity was computed differently lands in its own
             # display_order group and would project twice; re-fold before publishing (#122167).
-            self._reconcile_display_orders(conn, session_id)
+            self._reconcile_display_orders(conn, session_id, display_prescan)
             self._raise_if_compaction_introduced_duplicate_results(
                 conn, session_id, preexisting_dup_tool_results)
             conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
@@ -1413,7 +1421,34 @@ class SessionMessagesMixin:
         # copy in a newer generation has a higher id than messages emitted after the original.
         return [seen[key] for key in sorted(seen, key=first_id.__getitem__)]
 
-    def _reconcile_display_orders(self, conn, session_id: str) -> None:
+    def _prescan_display_identities(self, session_id: str) -> Dict[int, Tuple[Optional[bytes], bytes]]:
+        """``{row id: (stored display_identity, recomputed identity)}`` for the session's visible rows, read
+        OUTSIDE the write lock. Recomputing every identity (decode + handoff split + sha256 over the whole
+        history) was most of an ``archive_and_compact`` hold: 30 of 37 s on a 112k-row session (t_d63a8ca8).
+        The stored value is the watermark :meth:`_reconcile_display_orders` checks in the transaction: the
+        ``messages_display_identity_update`` trigger NULLs it whenever an identity column changes, so a row
+        whose stored value still equals the prescanned one has the bytes this hash was computed from.
+        Best-effort: a failed read returns what it has and the transaction recomputes the rest."""
+        found: Dict[int, Tuple[Optional[bytes], bytes]] = {}
+        last_id = 0
+        try:
+            while True:
+                rows = self._read_all(
+                    f"SELECT {_RECONCILE_KEY_COLUMNS}, display_identity FROM messages "
+                    "INDEXED BY idx_messages_session_id "
+                    "WHERE session_id = ? AND id > ? AND (active = 1 OR compacted = 1) ORDER BY id LIMIT 1000",
+                    (session_id, last_id))
+                if not rows:
+                    return found
+                for row in rows:
+                    found[row["id"]] = (row["display_identity"], self._display_identity(self._display_dedupe_key(row)))
+                last_id = rows[-1]["id"]
+        except sqlite3.Error as exc:
+            logger.debug("display-identity prescan for %s stopped early: %s", session_id, exc)
+            return found
+
+    def _reconcile_display_orders(self, conn, session_id: str,
+                                  prescan: Optional[Dict[int, Tuple[Optional[bytes], bytes]]] = None) -> None:
         """Re-fold split display generations by the recomputed display key.
 
         A compaction generation that computed the display identity differently (or cloned
@@ -1421,28 +1456,49 @@ class SessionMessagesMixin:
         and ``GROUP BY display_order`` then projects it twice (#122167). Folding by the same
         recomputed key :meth:`_dedupe_display_generations` uses keeps every display projection
         on one definition of a logical message; the live copy wins its group via the read
-        path's ``ORDER BY candidate.active DESC, candidate.id DESC``. Writes only on drift."""
-        first_id: Dict[bytes, int] = {}
+        path's ``ORDER BY candidate.active DESC, candidate.id DESC``. Writes only on drift.
+
+        *prescan* (:meth:`_prescan_display_identities`) supplies identities hashed before the
+        transaction; one is used only when the stored value read with it already equaled the hash AND
+        the row still stores that value, so drifted rows and every row a concurrent writer inserted or
+        edited are recomputed here."""
+        prescan = prescan or {}
+        listing: List[Tuple[int, Any, Any]] = []
         last_id = 0
         while True:
-            rows = conn.execute(
-                "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
-                "display_kind, display_metadata, display_order, display_identity "
-                "FROM messages INDEXED BY idx_messages_session_id "
-                "WHERE session_id = ? AND id > ? AND (active = 1 OR compacted = 1) "
-                "ORDER BY id LIMIT 1000",
-                (session_id, last_id))
-            batch_start = last_id
-            updates = []
-            for row in rows:
-                last_id = row["id"]
-                identity = self._display_identity(self._display_dedupe_key(row))
-                order = first_id.setdefault(identity, last_id)
-                if order != row["display_order"] or identity != row["display_identity"]:
-                    updates.append((order, identity, last_id))
-            rows.close()
-            if last_id == batch_start:
+            batch = conn.execute(
+                "SELECT id, display_order, display_identity FROM messages INDEXED BY idx_messages_session_id "
+                "WHERE session_id = ? AND id > ? AND (active = 1 OR compacted = 1) ORDER BY id LIMIT 1000",
+                (session_id, last_id)).fetchall()
+            if not batch:
                 break
+            listing.extend((row[0], row[1], row[2]) for row in batch)
+            last_id = batch[-1][0]
+        identities: Dict[int, bytes] = {}
+        misses = []
+        for row_id, _order, stored in listing:
+            cached = prescan.get(row_id)
+            # A drifted stored value (cached[0] != cached[1]) is no watermark: a concurrent edit plus
+            # reconcile can restore exactly that value over different bytes (ABA), so recompute it here.
+            if cached is not None and stored is not None and cached[0] == stored == cached[1]:
+                identities[row_id] = cached[1]
+            else:
+                misses.append(row_id)
+        for start in range(0, len(misses), 500):
+            chunk = misses[start:start + 500]
+            for row in conn.execute(
+                    f"SELECT {_RECONCILE_KEY_COLUMNS} FROM messages WHERE id IN ({_placeholders(chunk)})", chunk):
+                identities[row["id"]] = self._display_identity(self._display_dedupe_key(row))
+        # display_* updates fire no trigger and change no row a later step reads, so one pass at the end
+        # writes what the old per-batch passes wrote.
+        first_id: Dict[bytes, int] = {}
+        updates = []
+        for row_id, order, stored in listing:
+            identity = identities[row_id]
+            folded = first_id.setdefault(identity, row_id)
+            if folded != order or identity != stored:
+                updates.append((folded, identity, row_id))
+        if updates:
             conn.executemany(
                 "UPDATE messages SET display_order = ?, display_identity = ? WHERE id = ?", updates)
 

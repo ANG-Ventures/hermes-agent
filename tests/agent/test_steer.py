@@ -480,7 +480,7 @@ class TestSteerInjection:
         from agent.agent_runtime_helpers import _merge_consecutive_users
         from agent.prompt_builder import steer_user_row
 
-        steer = steer_user_row("focus on error handling")
+        steer = steer_user_row("focus on error handling", agent=None)
         before = dict(steer)
         merged, repairs = _merge_consecutive_users([steer, {"role": "user", "content": "next question"}])
         assert steer == before
@@ -734,7 +734,7 @@ class TestSteerRowIsHumanInput:
         from agent.prompt_builder import steer_user_row
         from hermes_state import SessionDB
 
-        row = steer_user_row("focus on the error handling")
+        row = steer_user_row("focus on the error handling", agent=None)
         assert _is_real_user_message(row)
         assert is_user_originated_turn(row)
         assert ContextCompressor._is_actionable_user_turn(row)

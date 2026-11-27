@@ -660,35 +660,45 @@ class GuardedSet(collections.abc.Set):
 # Refresh callbacks
 # ---------------------------------------------------------------------------
 
-_refresh_callbacks: list[Callable[[str, Optional[str]], None]] = []
+_refresh_callbacks: list[Callable[[str, Optional[str]], Optional[str]]] = []
 _refresh_state = threading.local()
 
 
-def register_refresh(cb: Callable[[str, Optional[str]], None]) -> None:
+def register_refresh(cb: Callable[[str, Optional[str]], Optional[str]]) -> None:
     """Register a refresh callback ``cb(reason, name)``; idempotent per callable."""
     with _lock:
         if cb not in _refresh_callbacks:
             _refresh_callbacks.append(cb)
 
 
-def refresh(reason: str, name: Optional[str] = None) -> None:
+def refresh(reason: str, name: Optional[str] = None) -> Optional[str]:
     """Give registered callbacks a chance to publish names before a lookup.
 
     ``reason`` is ``picker`` (full scan), ``typed`` or ``request`` (``name``
     is the requested provider, or None). Same-thread re-entry — a callback
     whose own work reaches a refresh trigger — is a no-op. A callback failure
     is logged and never propagates into the caller's lookup.
+
+    Returns the first non-empty string a callback returned, else None. A callback returns one
+    when it recognises ``name`` as a provider name of its own grammar that it will NOT publish
+    (t_f1cd7951: ``/model claude-alx-0`` with no registry row declaring that face); the string
+    says why. A caller may then refuse ``name`` instead of reading it as a model id.
     """
     if reason not in REFRESH_REASONS:
         raise ValueError(f"unknown refresh reason: {reason!r}")
     if not _refresh_callbacks or getattr(_refresh_state, "depth", 0):
-        return
+        return None
     _refresh_state.depth = 1
+    refusal: Optional[str] = None
     try:
         for cb in tuple(_refresh_callbacks):
             try:
-                cb(reason, name)
+                out = cb(reason, name)
             except Exception:
                 logger.warning("provider refresh callback failed (reason=%s)", reason, exc_info=True)
+                continue
+            if refusal is None and isinstance(out, str) and out.strip():
+                refusal = out.strip()
     finally:
         _refresh_state.depth = 0
+    return refusal

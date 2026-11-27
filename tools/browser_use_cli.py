@@ -14,6 +14,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -497,21 +498,89 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     return err or None
 
 
-def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
+def _attach_vault_supervisor(env: dict, task_id: Optional[str]):
     """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault_fill`` has
     a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
-    endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``."""
+    endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``.
+    Returns the supervisor, or None."""
     cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
     if not cdp:
-        return
+        return None
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
         policy, timeout_s = _get_dialog_policy_config()
-        SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=_resolve_cdp_override(cdp),
-                                         dialog_policy=policy, dialog_timeout_s=timeout_s)
+        return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=_resolve_cdp_override(cdp),
+                                                dialog_policy=policy, dialog_timeout_s=timeout_s)
     except Exception as exc:
         logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
+        return None
+
+
+# Navigation's route per task: the harness daemon (BU_NAME), CDP endpoint and vault supervisor the
+# LAST browser_exec drove. Vault operations bind to this route and refuse when it changes.
+_LAST_ROUTE: Dict[str, Dict[str, Any]] = {}
+_ROUTE_LOCK = threading.Lock()
+
+
+def _record_route(task_id: Optional[str], session: str, env: dict, supervisor: Any) -> None:
+    route = {"session": session or "", "cdp": env.get("BU_CDP_WS") or env.get("BU_CDP_URL") or "",
+             "supervisor": supervisor}
+    with _ROUTE_LOCK:
+        _LAST_ROUTE[task_id or "default"] = route
+
+
+def last_route(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The route navigation drove last for ``task_id`` (a copy), or None."""
+    with _ROUTE_LOCK:
+        route = _LAST_ROUTE.get(task_id or "default")
+        return dict(route) if route else None
+
+
+_DRIVER_MARK = "__hermes_vault_driver__"
+# Reads the daemon's CURRENT target and evaluates in exactly that attachment, so the target id and the
+# evaluated document cannot disagree. Never carries secrets: inspection and the witness only.
+_DRIVER_CODE = """\
+import json as _cj
+from browser_harness.helpers import _send as _cs, cdp as _cc
+_st = _cs({"meta": "connection_status"})
+_pid = _cs({"meta": "ping"}).get("pid")
+_r = _cc("Runtime.evaluate", session_id=_st["session_id"], expression=%s, returnByValue=True)
+print(%s + _cj.dumps({"target_id": _st["target_id"], "session_id": _st["session_id"], "pid": _pid,
+                      "value": (_r.get("result") or {}).get("value"), "exception": bool(_r.get("exceptionDetails"))}))
+"""
+
+
+def _driver_query(route: Dict[str, Any], expression: str) -> Optional[Dict[str, Any]]:
+    """Evaluate a NON-SECRET expression in the harness daemon's current page for ``route``.
+    Returns ``{target_id, session_id, pid, value}`` or None. The expression travels on stdin."""
+    cmd = _find_cli()
+    if not cmd or not route.get("cdp"):
+        return None
+    env = _base_subprocess_env()
+    if route.get("session"):
+        env["BU_NAME"] = route["session"]
+    _set_cdp_env(env, route["cdp"])
+    code = _DRIVER_CODE % (json.dumps(expression), json.dumps(_DRIVER_MARK))
+    try:
+        proc = _run_cli_killing_process_group(cmd, code, env, 30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("vault driver query failed: %s", exc)
+        return None
+    for line in reversed((proc.stdout or "").splitlines()):
+        if line.startswith(_DRIVER_MARK):
+            out = _quiet(lambda: json.loads(line[len(_DRIVER_MARK):]), None)
+            if isinstance(out, dict) and out.get("target_id") and not out.get("exception"):
+                return out
+            return None
+    return None
+
+
+def driver_eval(task_id: Optional[str], route: Dict[str, Any], expression: str) -> Optional[Dict[str, Any]]:
+    """``_driver_query`` on ``route``; None unless ``route`` is still navigation's route for the task."""
+    if last_route(task_id) != route:
+        return None
+    return _driver_query(route, expression)
 
 
 def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool) -> Optional[str]:
@@ -616,12 +685,21 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     route_err = _route_backend(env, session, task_id, bool(local))
     if route_err:
         return tool_error(route_err)
+    # Match the provider browser's lifetime: explicit names persist across tasks,
+    # unnamed browsers remain task-scoped. Vault transaction authorization stays per-task.
+    import hashlib
+    from hermes_constants import hermes_home_key
+    from tools.browser_tool_cdp import _resolve_cdp_override
+    endpoint = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
+    daemon_scope = json.dumps([hermes_home_key(), _backend_cache_key(task_id, session), env.get("BU_NAME", "default"),
+                              _resolve_cdp_override(endpoint) if endpoint else ""])
+    env["BU_NAME"] = "hermes-" + hashlib.sha256(daemon_scope.encode()).hexdigest()[:40]
     bot_desktop_browser = bool(env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None))
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
-    if session and not private_browser:
+    if not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
@@ -637,17 +715,36 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     started = time.time()
 
     def dispatch() -> Dict[str, Any]:
-        _attach_vault_supervisor(env, task_id)
-        try:
-            return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
-        except subprocess.TimeoutExpired:
-            return {"error_result": tool_error(
-                f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
-                f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
-                "append to workspace files — anything already written to the workspace is preserved."
-            )}
-        except OSError as e:
-            return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
+        from tools.browser_use_target import selection_execution
+        admitted = None
+        if bot_desktop_browser:
+            from tools.bot_desktop import lease as _bd_lease
+            admitted = _bd_lease.get().epoch  # run_fenced admitted this epoch just before calling us
+        with selection_execution(task_id, env, local=bot_desktop_browser) as complete:
+            if admitted is not None:
+                # The selection wait can span another execution; a human may have taken the
+                # screen meanwhile. Re-admit before anything reaches the page.
+                try:
+                    if _bd_lease.assert_agent_may_act().epoch != admitted:
+                        raise _bd_lease.HumanHasControl("A human took over the bot's screen while this "
+                                                        "browser command waited; it did not run.")
+                except _bd_lease.HumanHasControl as e:
+                    return {"success": False, "code": "human_has_control", "error": str(e)}
+            # Record the daemon name this exec actually drives (BU_NAME is scoped above), so vault
+            # driver queries reach the same daemon.
+            _record_route(task_id, env.get("BU_NAME", ""), env, _attach_vault_supervisor(env, task_id))
+            try:
+                proc = _run_cli_killing_process_group(cmd, code, env, timeout)
+                complete(proc.returncode == 0)
+                return {"proc": proc}
+            except subprocess.TimeoutExpired:
+                return {"error_result": tool_error(
+                    f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
+                    f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
+                    "append to workspace files — anything already written to the workspace is preserved."
+                )}
+            except OSError as e:
+                return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
 
     if bot_desktop_browser:
         from tools.browser_tool_session import run_fenced

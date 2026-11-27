@@ -383,6 +383,28 @@ KANBAN_ATTACHMENTS_SCHEMA = _schema(
     [],
 )
 
+KANBAN_ATTACHMENT_READ_SCHEMA = _schema(
+    "kanban_attachment_read",
+    (
+        "Read one attachment's bytes by id (from kanban_attachments). Works from any "
+        "host, including a pool host where the attachment's stored_path does not exist. "
+        "Returns filename, size_bytes and sha256 of the whole file, and the content: "
+        "`text` when it is UTF-8 and fits the result budget, else `content_base64`. A "
+        "worker may read its own card's and its parents' attachments. One read returns at "
+        "most 64 KiB; read a larger file in ranges with offset/length until `eof` is true."
+    ),
+    {
+        "attachment_id": _prop("integer", "Attachment id from kanban_attachments (required)."),
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "encoding": {"type": "string", "enum": ["auto", "base64"],
+                     "description": "auto (default): UTF-8 text when it decodes, else base64. "
+                                    "base64: always content_base64."},
+        "offset": _prop("integer", "Byte offset to start reading at (default 0)."),
+        "length": _prop("integer", "Bytes to read from offset (1..65536, default 65536)."),
+    },
+    ["attachment_id"],
+)
+
 KANBAN_CREATE_SCHEMA = _schema(
     "kanban_create",
     (
@@ -618,9 +640,18 @@ _FORK_PROPERTIES: dict[str, dict[str, Any]] = {'KANBAN_LIST_SCHEMA': {'all': {'t
                                                         'INTENTIONALLY left open, e.g. a CI '
                                                         'vehicle for an upstream PR: the reason. '
                                                         'Recorded as an audited '
-                                                        'completion_draft_override event; the '
-                                                        'draft is not routed to review. Empty is '
-                                                        'refused.'},
+                                                        'completion_draft_override event. See '
+                                                        'draft_kind for what happens to the PR. '
+                                                        'Empty is refused.'},
+                            'draft_kind': {'type': 'string', 'enum': ['merge_hold', 'keep_draft'],
+                                           'description': 'With draft_ok: which override. '
+                                                          'merge_hold (default): you want a merge '
+                                                          'hold; the kernel sets a ledger hold on '
+                                                          'your own draft PR(s), marks them ready so '
+                                                          'CI and Prism run, and routes the card to '
+                                                          'review (not done). keep_draft: the PR must '
+                                                          'stay a draft (stacked or pinned); the card '
+                                                          'closes done as before.'},
                             'survivor_pr': {'type': ['string', 'array'],
                                             'items': {'type': 'string'},
                                             'description': 'Only when completion already REFUSED '

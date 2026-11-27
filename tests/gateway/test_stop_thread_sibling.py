@@ -131,7 +131,9 @@ async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stop_cancels_detached_delegation_without_resident_agent(monkeypatch):
+async def test_idle_stop_leaves_detached_delegation_running(monkeypatch):
+    """/stop ends turns, never registry-owned background delegations (t_8c4608e6): with no resident
+    agent, the session's detached units keep running and deliver through the outbox."""
     runner = object.__new__(GatewayRunner)
     key = _per_user_key("userA")
     runner._running_agents = {}
@@ -145,16 +147,9 @@ async def test_stop_cancels_detached_delegation_without_resident_agent(monkeypat
     event = MessageEvent(
         text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
     )
-    result = await runner._handle_stop_command(event)
+    await runner._handle_stop_command(event)
 
-    assert cancelled == [
-        {
-            "session_key": key,
-            "parent_session_id": "",
-            "reason": "stop_command",
-        }
-    ]
-    assert "no active" not in str(getattr(result, "text", result)).lower()
+    assert cancelled == []
 
 
 # ---------------------------------------------------------------------------

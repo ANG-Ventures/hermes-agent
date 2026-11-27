@@ -280,6 +280,26 @@ def test_turn_lease_refresh_and_release_are_owner_fenced(tmp_path):
     )
 
 
+def test_turn_lease_holder_read_answers_while_writer_locked(tmp_path):
+    """The refresher's ownership check must work exactly when renewal cannot: another
+    connection holds the write lock, a successor's claim is visible, expired rows still answer."""
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.create_session("s", source="test")
+    assert db.get_session_turn_lease_holder("s") is None
+    assert db.try_acquire_session_turn_lease("s", "pid=1:turn=a", ttl_seconds=0.1)
+    time.sleep(0.2)  # expired, still the row's holder until reclaimed
+    blocker = sqlite3.connect(str(path), timeout=0)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        assert db.get_session_turn_lease_holder("s") == "pid=1:turn=a"
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert SessionDB(path).try_acquire_session_turn_lease("s", "pid=1:turn=b", ttl_seconds=5)
+    assert db.get_session_turn_lease_holder("s") == "pid=1:turn=b"
+
+
 def test_expired_turn_lease_is_reclaimed(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     db.create_session("shared", source="test")

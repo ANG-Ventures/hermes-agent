@@ -4,8 +4,9 @@ The fleet retention job (hermes-home ``scripts/kanban-events-retention.py`` rule
 moves the comments and runs of done/archived cards completed more than 14 days ago from
 ``kanban.db`` into ``kanban-archive.db`` beside it. It keeps the ``tasks`` row. The archive
 tables use the live table names and columns, plus ``moved_at``. ``kanban show`` (CLI and the
-``kanban_show`` tool) is the one reader that lists them, labelled archived. Every other reader
-works on live cards and is unchanged.
+``kanban_show`` tool) lists them labelled archived; the worker context (prior attempts, parent
+handoffs, comment thread) and the PR -> card lookup (``kanban_pr_owner.pr_cards``) merge them in,
+live first (t_589fb988).
 """
 from __future__ import annotations
 
@@ -55,7 +56,7 @@ def archived_rows(conn: sqlite3.Connection, task_id: str, *, state_type: str | N
     if state_type is not None and state_type not in ("status", "outcome"):
         raise ValueError("state_type must be 'status' or 'outcome'")
     path = _archive_path(conn)
-    if path is None or not path.is_file():
+    if path is None or not path.exists():   # only MISSING is absent; a dir/non-file must fail (t_78dbef10)
         return {"comments": [], "runs": []}
     run_where, run_params = ("", ()) if state_type is None else (" AND %s = ?" % state_type, (state_name,))
     arch = None
@@ -71,6 +72,95 @@ def archived_rows(conn: sqlite3.Connection, task_id: str, *, state_type: str | N
     finally:
         if arch is not None:
             arch.close()
+
+
+class ArchiveUnreadable(RuntimeError):
+    """``kanban-archive.db`` exists but could not be read; the caller must not render less history."""
+
+
+def _connect_ro(conn: sqlite3.Connection) -> sqlite3.Connection | None:
+    path = _archive_path(conn)
+    if path is None or not path.exists():   # only MISSING is absent; a dir/non-file must fail (t_78dbef10)
+        return None
+    try:
+        return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=_TIMEOUT_S)
+    except sqlite3.Error as exc:
+        raise ArchiveUnreadable("%s: %s: %s" % (ARCHIVE_NAME, type(exc).__name__, exc)) from exc
+
+
+def full_rows(conn: sqlite3.Connection, table: str, task_id: str, *, live_ids=()) -> list[dict[str, Any]]:
+    """Archived ``table`` rows of ``task_id`` with the LIVE table's columns (NULL where the archive lacks one).
+
+    For readers that build ``Run``/``Comment`` objects from archived rows (worker context, t_589fb988). Read
+    live first and pass the live ids: an archived row whose id is still live is dropped, so the live copy
+    always wins. No archive file / no such table = ``[]``; an unreadable archive raises ``ArchiveUnreadable``."""
+    arch = _connect_ro(conn)
+    if arch is None:
+        return []
+    try:
+        have = {r[1] for r in arch.execute("PRAGMA table_info(%s)" % table)}
+        if not have:
+            return []
+        cols = [r[1] for r in conn.execute("PRAGMA main.table_info(%s)" % table)]
+        sel = ", ".join(c if c in have else "NULL AS %s" % c for c in cols)
+        live = set(live_ids)
+        return [row for row in (dict(zip(cols, r)) for r in arch.execute(
+            "SELECT %s FROM %s WHERE task_id = ? ORDER BY id" % (sel, table), (task_id,)))
+            if row.get("id") not in live]
+    except sqlite3.Error as exc:
+        raise ArchiveUnreadable("%s: %s: %s" % (ARCHIVE_NAME, type(exc).__name__, exc)) from exc
+    finally:
+        arch.close()
+
+
+def runs_with_archive(conn: sqlite3.Connection, task_id: str) -> list:
+    """``kanban_db.list_runs(conn, task_id)`` plus the card's archived runs, in start order, deduped by id."""
+    from hermes_cli import kanban_db as kb
+
+    live = kb.list_runs(conn, task_id)
+    runs = live + [kb.Run.from_row(r) for r in full_rows(conn, "task_runs", task_id,
+                                                          live_ids=[r.id for r in live])]
+    return sorted(runs, key=lambda r: (r.started_at, r.id))
+
+
+def comments_with_archive(conn: sqlite3.Connection, task_id: str) -> list:
+    """``kanban_db.list_comments(conn, task_id)`` plus the card's archived comments, oldest first, deduped by id."""
+    from hermes_cli import kanban_db as kb
+
+    live = kb.list_comments(conn, task_id)
+    comments = live + [kb.Comment.from_row(r) for r in full_rows(conn, "task_comments", task_id,
+                                                                  live_ids=[c.id for c in live])]
+    return sorted(comments, key=lambda c: (c.created_at, c.id))
+
+
+def run_metadatas(conn: sqlite3.Connection, task_id: str) -> list:
+    """Every non-NULL ``task_runs.metadata`` of the card, live rows first, then archived rows not live."""
+    live = conn.execute("SELECT id, metadata FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
+    out = [r[1] for r in live if r[1] is not None]
+    out += [r["metadata"] for r in full_rows(conn, "task_runs", task_id, live_ids=[r[0] for r in live])
+            if r.get("metadata") is not None]
+    return out
+
+
+def task_ids_with_run_metadata_like(conn: sqlite3.Connection, patterns) -> set:
+    """Task ids whose ARCHIVED runs' metadata matches any ``LIKE`` pattern (PR -> card lookup, t_589fb988)."""
+    patterns = list(patterns)
+    arch = _connect_ro(conn)
+    if arch is None or not patterns:
+        if arch is not None:
+            arch.close()
+        return set()
+    try:
+        have = {r[1] for r in arch.execute("PRAGMA table_info(task_runs)")}
+        if not {"task_id", "metadata"} <= have:
+            return set()
+        return {r[0] for r in arch.execute(
+            "SELECT DISTINCT task_id FROM task_runs WHERE " + " OR ".join(["metadata LIKE ?"] * len(patterns)),
+            patterns)}
+    except sqlite3.Error as exc:
+        raise ArchiveUnreadable("%s: %s: %s" % (ARCHIVE_NAME, type(exc).__name__, exc)) from exc
+    finally:
+        arch.close()
 
 
 def present(archived: dict) -> bool:

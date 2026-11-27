@@ -43,7 +43,7 @@ def kanban_home(tmp_path, monkeypatch):
 def _card(conn, *, session_id=HOME, assignee="worker-a", blocked=True):
     tid = kb.create_task(conn, title="card", assignee=assignee, session_id=session_id)
     if blocked:
-        assert kb.block_task(conn, tid, reason="needs input")
+        assert kb.block_task(conn, tid, reason="needs input", kind="needs_input")
     return tid
 
 
@@ -170,7 +170,7 @@ def test_explicit_session_stamps_origin_line_once(kanban_home):
 def test_unhomed_card_refused_for_chat_session_and_takeover_records_event(kanban_home):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="cron card", assignee="worker-a")
-        assert kb.block_task(conn, tid, reason="x")
+        assert kb.block_task(conn, tid, reason="x", kind="needs_input")
         with kb.mutation_actor(session_ids=(OTHER,), profile="apollo"):
             with pytest.raises(kb.ForeignSessionMutationError, match="UNHOMED"):
                 kb.unblock_task(conn, tid)
@@ -308,7 +308,7 @@ def test_cli_refused_status_verb_leaves_no_status_comment(kanban_home, monkeypat
     with kb.connect_closing() as conn:
         tid = _card(conn, session_id=HOME, blocked=blocked)
         before = _comments(conn, tid)
-    out = kc.run_slash(f"{verb} {tid} 'why not'")
+    out = kc.run_slash(_status_cmd(verb, tid))
     assert f"refused {verb}" in out, out
     with kb.connect_closing() as conn:
         assert _comments(conn, tid) == before
@@ -318,6 +318,10 @@ def _status_cmd(verb, tid):
     # unblock takes its reason as --reason; block/schedule take it positionally.
     if verb == "unblock":
         return f"unblock --reason 'why not' {tid}"
+    if verb == "schedule":
+        return f"schedule {tid} --at 2000000000 'why not'"
+    if verb == "block":
+        return f"block {tid} --kind needs_input 'Need: x. Why: y. How to reply: z. why not'"
     return f"{verb} {tid} 'why not'"
 
 
@@ -351,7 +355,8 @@ def test_cli_successful_status_verb_writes_status_comment(kanban_home, monkeypat
         tid = _card(conn, session_id=HOME, blocked=blocked)
     kc.run_slash(_status_cmd(verb, tid))
     with kb.connect_closing() as conn:
-        assert _comments(conn, tid)[-1] == f"{prefix} why not"
+        shape = "Need: x. Why: y. How to reply: z. " if verb == "block" else ""
+        assert _comments(conn, tid)[-1] == f"{prefix} {shape}why not"
 
 
 def test_unblock_comment_commits_with_the_transition(kanban_home):
@@ -385,7 +390,7 @@ def test_cli_schedule_wake_reset_on_scheduled_card_writes_comment(kanban_home, m
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     with kb.connect_closing() as conn:
         tid = _card(conn, session_id=HOME, blocked=False)
-        assert kb.schedule_task(conn, tid)
+        assert kb.schedule_task(conn, tid, wake_at=2_000_000_000)
     kc.run_slash(f"schedule {tid} --at 4102444800 'later'")
     with kb.connect_closing() as conn:
         assert _comments(conn, tid)[-1] == "SCHEDULED: later"
@@ -533,7 +538,7 @@ def _unlink(conn, tid):
 # (setup, mutation) for every newly guarded status writer. Each mutation is
 # first proven to CHANGE the card with no actor bound, so a refusal is real.
 _ROUND2 = {
-    "schedule": (_ready, lambda c, t: kb.schedule_task(c, t, reason="later")),
+    "schedule": (_ready, lambda c, t: kb.schedule_task(c, t, reason="later", wake_at=2_000_000_000)),
     "reopen": (_done, lambda c, t: kb.reopen_task(c, t, actor="apollo", reason="r")),
     "request-review": (_ready, lambda c, t: kb.request_review(
         c, t, summary="s", reviewer="argus", force=True)),
@@ -653,7 +658,7 @@ async def test_gateway_slash_binds_invoking_session(kanban_home, monkeypatch):
         assert kb.get_task(conn, tid).status != "blocked"
 
     out = await GatewayRunner._handle_kanban_command(
-        home_runner, _slash_event(f"/kanban block {tid} 'mine to block'"))
+        home_runner, _slash_event(f"/kanban block {tid} --kind needs_input 'Need: x. Why: y. How to reply: z. mine to block'"))
     assert "refused" not in out, out
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "blocked"
@@ -938,19 +943,49 @@ def _is_guarded(node):
     )
 
 
+# Generic column writers (``UPDATE tasks SET {column}``) whose column is checked
+# against an allowlist INSIDE the function. Not an exemption: each is routed only
+# while test_column_allowlisted_writers_refuse_guarded_columns proves the
+# allowlist excludes every guarded column and the function refuses one at runtime.
+_GUARDED_COLUMNS = frozenset({"status", "assignee", "priority", "session_id"})
+COLUMN_ALLOWLISTED = {
+    "_set_task_column": ("hermes_cli.kanban_db_workspace", "_SET_TASK_COLUMN_ALLOWED"),
+}
+
+
+def test_column_allowlisted_writers_refuse_guarded_columns():
+    import importlib
+    import sqlite3
+
+    for fn_name, (mod_name, allow_name) in COLUMN_ALLOWLISTED.items():
+        mod = importlib.import_module(mod_name)
+        allowed = getattr(mod, allow_name)
+        assert allowed and not (allowed & _GUARDED_COLUMNS), (fn_name, sorted(allowed))
+        fn = getattr(mod, fn_name)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, assignee TEXT, "
+                     "priority INTEGER, session_id TEXT)")
+        conn.execute("INSERT INTO tasks VALUES ('t_1', 'ready', 'a', 1, 's')")
+        for col in sorted(_GUARDED_COLUMNS):
+            with pytest.raises(ValueError):
+                fn(conn, "t_1", col, "x")
+        assert conn.execute("SELECT status, assignee, priority, session_id FROM tasks").fetchone() == (
+            "ready", "a", 1, "s")
+
+
 def test_every_status_writer_goes_through_the_guard():
     writers = _writers()
     assert len(writers) > 10, "writer scan found nothing: the scanner is broken"
     unrouted = sorted(
         n for n, node in writers.items()
-        if not _is_guarded(node) and n not in EXECUTION_LANE
+        if not _is_guarded(node) and n not in EXECUTION_LANE and n not in COLUMN_ALLOWLISTED
     )
     assert not unrouted, (
         f"status/assignee/priority/session_id or dispatch-intent writers without "
         f"@_home_session_guarded: {unrouted}. Guard them, or add them to "
         f"EXECUTION_LANE with the reason no chat surface can reach them."
     )
-    stale = sorted(set(EXECUTION_LANE) - set(writers))
+    stale = sorted((set(EXECUTION_LANE) | set(COLUMN_ALLOWLISTED)) - set(writers))
     assert not stale, f"EXECUTION_LANE lists non-writers: {stale}"
     both = sorted(n for n in EXECUTION_LANE if _is_guarded(writers[n]))
     assert not both, f"guarded AND listed as execution lane: {both}"
@@ -969,7 +1004,8 @@ def test_every_cli_verb_reaching_a_guarded_writer_binds_the_actor():
     funcs = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
     # Upstream moved verb bodies into kanban_ops / kanban_boards (re-imported by kanban.py).
     from hermes_cli import kanban_admit as _kad, kanban_boards as _kbo, kanban_ops as _kop
-    for _m in (_kop, _kbo, _kad):
+    from hermes_cli import kanban_studio_allowlist as _ksa
+    for _m in (_kop, _kbo, _kad, _ksa):
         for _n in _ast.parse(_module_src(_m)).body:
             if isinstance(_n, _ast.FunctionDef):
                 funcs.setdefault(_n.name, _n)

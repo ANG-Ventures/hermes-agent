@@ -138,6 +138,8 @@ def test_browser_fill_resolves_scoped_password_on_bound_origin_only(op_backend):
     vault-scoped, and a wrong origin is refused before any item read."""
     backend, _, calls = op_backend
     from tools.browser_vault_tool import browser_vault_fill
+    # Backend fixture mocks page IO; real document targeting has its own CLI suite.
+    browser_vault_fill = browser_vault_fill.__wrapped__
 
     controls = json.dumps([{"tag": "input", "type": "password", "name": "password", "id": "pw",
                             "autocomplete": "current-password", "visible": True}])

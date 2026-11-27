@@ -1,0 +1,20 @@
+{
+ "expect": {
+  "ci": true,
+  "ci-failover": true,
+  "cron": true,
+  "deploy": true,
+  "kanban": true,
+  "prism": true,
+  "reboot": true
+ },
+ "holds": [
+  {
+   "age_s": 600,
+   "file": "20261107T120000Z-ace-media-a0000009.json",
+   "raw": "{\"schema\": 1, \"id\": \"20261107T120000Z-ace-media-a0000009\", \"host\": \"ace-media\", \"kind\": \"pause\", \"lanes\": [\"kanban\", \"prism\", \"ci\", \"main\", \"test-gate\", \"batch\", \"gpu\", \"media\", \"nas-ci\", \"cron\", \"deploy\", \"ci-failover\"], \"owner\": \"card:t_fixture\", \"drive\": true, \"by\": \"fixture\", \"card\": \"t_fixture\", \"reason\": \"fixture a0000009\", \"since\": 1794069400}"
+  }
+ ],
+ "host": "ace-media",
+ "now": 1794070000
+}

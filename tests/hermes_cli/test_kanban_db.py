@@ -330,7 +330,7 @@ def test_explicit_block_cannot_spoof_legacy_creation_reason(kanban_home):
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="delayed recheck", assignee="ops")
-        assert kb.schedule_task(conn, t, reason="run next week") is True
+        assert kb.schedule_task(conn, t, reason="run next week", wake_at=2_000_000_000) is True
         task = kb.get_task(conn, t)
         assert task.status == "scheduled"
         assert kb.claim_task(conn, t) is None
@@ -340,7 +340,7 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         # a plain park of a ready card resumes as an implementation run.
         assert any(
             e.kind == "scheduled"
-            and e.payload == {"reason": "run next week", "source_status": "ready"}
+            and e.payload == {"reason": "run next week", "source_status": "ready", "until": 2_000_000_000}
             for e in events
         )
 
@@ -3243,7 +3243,7 @@ def test_create_task_with_open_parent_emits_dependency_wait(kanban_home):
     unfinished parent must carry the same dependency_wait as a link-time gate."""
     with kbc.connect() as conn:
         parent = kb.create_task(conn, title="blocked parent")
-        kb.block_task(conn, parent, reason="waiting on files")
+        kb.block_task(conn, parent, reason="waiting on files", kind="needs_input")
 
         child = kb.create_task(conn, title="support card", parents=(parent,))
 
@@ -3620,17 +3620,29 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     assert backup.exists()
     assert backup.read_bytes() == original
 
-    # Mutate the corrupt bytes — fingerprint changes, separate backup preserved.
+    # A broken live board keeps taking writes on open connections, so its bytes
+    # change between refused opens. Same file, same corruption episode: still
+    # ONE copy (t_54b8e6cc: 10 x 512 MB copies in 7 minutes on 11-17).
     with db_path.open("r+b") as f:
         f.seek(4096)
         f.write(b"\xAB" * 64)
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     with pytest.raises(kbc.KanbanDbCorruptError) as excinfo2:
         kbc.connect(db_path=db_path)
-    second_backup = excinfo2.value.backup_path
-    assert second_backup is not None
-    assert second_backup != backup
-    assert second_backup.exists()
+    assert excinfo2.value.backup_path == backup
+    assert sorted(tmp_path.glob("kanban.db.corrupt.*.bak")) == [backup]
+
+    # A replaced file (new inode) is a new episode and gets its own copy.
+    replacement = tmp_path / "replacement.db"
+    replacement.write_bytes(db_path.read_bytes()[:-64] + b"\xCD" * 64)
+    os.replace(replacement, db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with pytest.raises(kbc.KanbanDbCorruptError) as excinfo3:
+        kbc.connect(db_path=db_path)
+    third_backup = excinfo3.value.backup_path
+    assert third_backup is not None
+    assert third_backup != backup
+    assert third_backup.exists()
 
 
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):

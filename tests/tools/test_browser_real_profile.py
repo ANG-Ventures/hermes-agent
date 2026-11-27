@@ -199,10 +199,23 @@ class TestRealProfileCdpLaunch:
         self._reset()
         with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
-             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(None, "boom")):
+             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(None, "boom")), \
+             patch.object(bt_real_profile, "_agent_browser_get_cdp", return_value=None):
             cdp, err = bt_real_profile._real_profile_cdp()
         assert cdp is None
         assert err and "boom" in err
+
+    def test_cold_probe_closes_the_session_it_started(self):
+        """``get cdp-url`` on a cold session starts the daemon (no idle timeout on this session), so a
+        probe that finds no browser must still close it, or the daemon outlives Hermes at ppid 1."""
+        self._reset()
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(None, "boom")), \
+             patch.object(bt_real_profile, "_agent_browser_get_cdp", return_value=None), \
+             patch.object(bt_real_profile, "_agent_browser_close_session") as close:
+            bt_real_profile._real_profile_cdp()
+        close.assert_called_once()
 
 
     def test_launch_is_headless_and_agent_browser_attaches(self, tmp_path):

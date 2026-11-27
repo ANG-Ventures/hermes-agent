@@ -904,8 +904,11 @@ DEFAULT_CONFIG = {
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "5m" | "1h" | "auto"
     # (auto = 1h for human-paced sessions — cli/tui/desktop/messaging — and 5m for subagent, cron,
     # oneshot, webhook, kanban, api, tool, batch); other non-falsy values are ignored; falsy (false, null, "off",
-    # "disabled", "no", "none") disables caching.
-    "prompt_caching": {"cache_ttl": "5m"},
+    # "disabled", "no", "none") disables caching. preserve_thinking_window: the thinking replay window
+    # of every preserve_thinking lane (a-family Claude): "contiguous" sends every turn's thinking back
+    # until compaction (each request reads the last one from cache); "latest" is the kill switch back
+    # to the newest-turn-only window. A providers.<name>.preserve_thinking_window key still wins.
+    "prompt_caching": {"cache_ttl": "5m", "preserve_thinking_window": "contiguous"},
     # OpenRouter settings. response_cache: X-OpenRouter-Cache header — identical requests return
     # cached responses at zero billing; independent of Anthropic prompt caching. response_cache_ttl:
     # seconds (1-86400), only used when response_cache is on. min_coding_score (0.0-1.0):
@@ -1003,7 +1006,7 @@ DEFAULT_CONFIG = {
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
-        "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
+        "goal_judge": _aux(60, fallback_chain=[], total_timeout=120),  # verdict chain; drafting uses ordinary aux routing
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
         "curator": _aux(600),
@@ -1656,6 +1659,12 @@ DEFAULT_CONFIG = {
         # restart, docs/dev/delegate-background-on-kanban-runtime.md). "in_process" is the kill switch.
         # Default "kanban" since option C P3 (t_3646c28e: drills + daedalus canary).
         "background_runtime": "kanban",
+        # A kanban-eligible unit whose card cannot spawn: "detached" runs it as a detached child process
+        # (survives a restart; never a gateway thread). "in_process" is the kill switch (t_49e02567).
+        "background_kanban_fallback": "detached",
+        # delegate_task placement="pool" (t_30537365): "opt_in" lets a task run its terminal/file commands on a
+        # fleet pool host leased from the allocator; "off" ignores the field (kill switch).
+        "pool_placement": "off",
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
@@ -1672,6 +1681,9 @@ DEFAULT_CONFIG = {
         # chat) and that the user did not author queues no continuation; the idle check-in is the
         # next nudge. True restores a continuation after every judged-continue turn.
         "nudge_on_read_only_turns": False,
+        # Gateway: once an hour, an ACTIVE goal/loop whose session no routed key holds and that
+        # was idle this many days is retired as ``orphaned`` (/goal resume restores). 0 = off.
+        "orphan_gc_days": 7,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
@@ -2223,6 +2235,24 @@ DEFAULT_CONFIG = {
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
     },
+    # Copy-on-write checkouts from a per-host template (hermes_cli/worktree_cache.py; spec
+    # hermes-content plans/fleet-worktree-cache). OFF: every creator runs plain git. ``scopes``
+    # turns it on per creator: dispatcher_worktree, kanban_clone, port_clone, manual,
+    # deploy_selftest, script:<name>. Read per create, so no restart is needed.
+    "worktree_cache": {
+        "enabled": False,
+        "scopes": [],
+        "repos": [
+            "ANG-Ventures/hermes-home", "ANG-Ventures/hermes-agent", "ANG-Ventures/hermes-skills",
+            "ANG-Ventures/hermes-content", "ANG-Ventures/pipecat-house-voice", "ANG-Ventures/prism-router",
+        ],
+        "max_lag_s": 900,
+        "max_diff_files": 2000,
+        # Extra templates roots, one per volume checkouts land on (absolute dirs; host root
+        # config). A create uses the root on its destination's volume, else
+        # <kanban.workspaces_root>/.templates; refresh keeps a template in every root.
+        "templates_roots": [],
+    },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
@@ -2232,6 +2262,7 @@ DEFAULT_CONFIG = {
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "workspaces_root": None,
         "workspaces_root_require_mount": False,
+        "studio_pin_requires_reason": "notice",
         # Let the dispatcher itself clear a scratch card stranded by mount
         # loss (persisted path gone, root mounted + writable again) when the
         # lost tree provably held nothing: no worker ever spawned into it, or
@@ -2245,6 +2276,12 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
+        # The dispatcher leader holds one idle read-only connection on every live board so other
+        # openers do not rebuild the board's -shm on disk (t_1460fa32). Env off switch:
+        # HERMES_KANBAN_BOARD_ANCHOR=0. Read when the dispatcher takes its lock. Live switches, read
+        # every pass with no restart: ~/.hermes/kanban/board-anchor.off (drop every held
+        # connection) and ~/.hermes/kanban/board-anchor-checkpoint.off (no -wal checkpoints).
+        "board_anchor": True,
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,
@@ -2434,11 +2471,33 @@ DEFAULT_CONFIG = {
                       # and <root>/var/alloc/shadow/kanban.jsonl gets one line per decision
                       # (promotion gate: n >= 50 answered, 0 disagreements). on = alloc_client.admit
                       # picks and books; release/renew go through alloc_client.
-                      "allocd": "off"},
+                      "allocd": "off",
+                      # studio_capability_only (t_9965b8d5; read per tick from the ROOT config): the Studio runs a
+                      # card only for a named Studio-only capability; files / a worktree are carried or ported,
+                      # else the card waits (studio_capability_only:<rule>); a pool refusal waits, never a
+                      # Studio last resort. Active only while allocation-policy makes the Studio last resort
+                      # and the capability map reads. false = the behaviour before t_9965b8d5 (kill switch).
+                      "studio_capability_only": True,
+                      # prose_pins_advisory (t_c82eded0; read per tick from the ROOT config): a Studio need read
+                      # from card PROSE (CARD_NEEDS / studio_needs, the legacy body list, a capability sniffed from
+                      # the body or inferred from a skill NAMED in the body) never holds a card on the Studio; it
+                      # is recorded as the placement event's `advisory` plus one card comment, and the card starts
+                      # on a pool host. A `requires:` line, an attached skill or a structural fact still holds it.
+                      # false = the hold before t_c82eded0 (kill switch).
+                      "prose_pins_advisory": True,
+                      # studio_default_deny (t_062a5948; ROOT config, read per tick): on top of the rule above, a
+                      # Studio-only capability also needs to be in `allow` or carry a live operator override
+                      # (`hermes kanban studio-override`), else the card waits studio_default_deny:<cap>.
+                      # Operator-assignee and no_worker cards are exempt. Default off; the operator arms it.
+                      "studio_default_deny": {"enabled": False, "allow": []}},
         # Admission predicate of the shared placement scorer and unified_filter (t_da6f84f7): legacy = the
         # static scorer; utilization = hermes_cli/fleet_placement/admission.py over the host's measured sample.
         # The spawn gate (dispatch_load_gate) is utilization-only whatever this says (t_b20850d2).
         "admission": "legacy",
+        # A tick hands the board's dispatch lock back while it resolves workspaces and spawns, so
+        # `kanban admit` / a second dispatcher are not locked out for minutes (t_f60f502f). false =
+        # the tick holds the lock for its whole run, as before.
+        "dispatch": {"narrow_lock": True},
         "dispatch_load_gate": {
             "enabled": True,
             # A spawn younger than ramp_seconds is a lease candidate (admission settles it after
@@ -2478,11 +2537,14 @@ DEFAULT_CONFIG = {
         # the notifier posts done / ready-for-review / blocked lines there
         # instead of the subscriber's chat; the wake still goes to the
         # subscriber. A needs_input block on a priority >= 100 card stays put.
+        # "file:<path>" (t_89bfcd1f) appends them to a local file instead, one
+        # JSON line per post/digest; a relative path is under HERMES_HOME.
         # Empty = post in the subscriber's chat.
         "lifecycle_channel": "",
         # Seconds to batch lifecycle_channel lines into one digest post
-        # (0 = one post per line). The wake is never delayed.
-        "lifecycle_digest_seconds": 0,
+        # (0 = one post per line). The wake is never delayed. 1800 since r143
+        # (2026-11-11): at 0 #logs carried 1,728 single lifecycle lines in 48 h.
+        "lifecycle_digest_seconds": 1800,
         # With lifecycle_channel set: "channel" (default, t_eb8c6fd7, Ace
         # 2026-10-17: receipts go to #logs) sends every done / ready-for-review
         # / blocked line to lifecycle_channel. "home" (opt-in, t_808bc8e6)
@@ -2551,6 +2613,10 @@ DEFAULT_CONFIG = {
         # default: a review request with no reviewer is refused rather than
         # leaving the implementer as its own reviewer.
         "review_assignee": None,
+        # Machine holder for a handback whose PR is still open (t_54f4fde6): the card waits there, not on
+        # review_assignee, until hermes-home's land evaluator hands it on once CI/Prism settle (or after 120 min).
+        # None/blank/human:* = off: today's routing (the kill switch).
+        "review_hold_assignee": None,
         # Minutes an unclaimed review card may sit before it is reported
         # stale. Non-positive/invalid values fall back to 30.
         "review_stale_minutes": 30,
@@ -2583,6 +2649,10 @@ DEFAULT_CONFIG = {
         # free turn slots (max_inflight - active_turns); an unreadable
         # /health admits none (fail closed). false = off.
         "pool_relay_capacity": True,
+        # t_c754f664: `kanban create` / `edit --body` refuse a requires: line naming words the
+        # capability map does not define, and a ready card holding one wakes its home session
+        # once after 30 min (hermes_cli/kanban_requires_words.py). false = both off.
+        "requires_unknown_guard": True,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create
@@ -2632,7 +2702,7 @@ DEFAULT_CONFIG = {
         # session: notify+wake (Ace 2026-10-03, t_74bf5296). One waker per
         # card is enforced in the store; false = notify-only.
         "auto_subscribe_wake": True,
-        "auto_subscribe_boomerang": True,  # operator auto-subscriptions use a child by default
+        "auto_subscribe_boomerang": True,  # every new card's boomerang_wake level unless set explicitly
         # Wake -> notify downgrade per EVENT under contention (t_74bf5296).
         # host_axis cpu (default): downgrade at cpu_pause (0.90) busy. host_axis
         # load1 (kill switch): the pause_above / resume_below band set HERE.
@@ -2683,6 +2753,9 @@ DEFAULT_CONFIG = {
         # rebound per cell — that runtime boundary is the cross-cell enforcement.
         "kernel_idle_timeout": 1800,
         "max_session_kernels": 4,
+        # In-flight tool calls per local session kernel when a script calls stubs from threads.
+        # 1 = the serial one-call-at-a-time wire (kill switch). Read at kernel spawn.
+        "max_parallel_tool_calls": 4,
     },
     # Tool Search replaces deferred tools in the model-facing array with the
     # tool_search / tool_describe / tool_call bridges and surfaces them on demand.

@@ -21,6 +21,7 @@ from hermes_cli import kanban_survivor as ks
 
 
 _RUN = subprocess.run  # the remote fixture patches subprocess.run module-wide
+_SHIPPED = ks._REMOTE_PROOF  # the db fixture widens G for its bare remotes; this is the real one
 
 
 def git(repo, *args):
@@ -161,6 +162,11 @@ def db(tmp_path, monkeypatch):
               "VALUES('t_11111111','t','alpha','done',1,'/missing','ace-media','requires: none')")
     # Execute the exact remote payload locally, not a synthesized result.
     monkeypatch.setattr(ks.subprocess, "run", lambda argv, **kw: _RUN(shlex.split(argv[-1]), **kw))
+    # The proof certifies only GitHub remotes (t_f47e4e3f); these remotes are bare repos under tmp_path, so this
+    # text copy of the proof also accepts that prefix. The shipped proof has no hook that widens G.
+    g = "G=('https://github.com/',"
+    assert ks._REMOTE_PROOF.count(g) == 1
+    monkeypatch.setattr(ks, "_REMOTE_PROOF", ks._REMOTE_PROOF.replace(g, g + repr(str(tmp_path) + "/") + ","))
     yield c
     c.close()
 
@@ -367,6 +373,16 @@ def _literal(script, name):
     return ast.literal_eval(m.group(1))
 
 
+def test_remote_proof_holds_a_local_path_remote(db, tmp_path, monkeypatch):
+    """t_f47e4e3f: the SHIPPED proof (no widened G) holds a clean tree whose only remote is a local path, even with
+    HEAD at that remote's exact tip: the path may share this clone's objects."""
+    monkeypatch.setattr(ks, "_REMOTE_PROOF", _SHIPPED)
+    ws = remote_ws(tmp_path)
+    assert git(ws, "rev-parse", "HEAD") in git(ws, "ls-remote", "origin")
+    assert not ks.remove_workspace_dir(db, "t_11111111", ws, remote_host=HOST)
+    assert (ws / "code.py").exists()
+
+
 def test_remote_residue_list_matches_local():
     assert _literal(ks._REMOTE_PROOF, "R") == ks._RESIDUE_DIRS
     assert _literal(ks._REMOTE_PROOF, "F") == ks._RESIDUE_FILES
@@ -376,5 +392,6 @@ def test_remote_residue_list_matches_local():
 
 
 def test_remote_proof_stays_small():
-    # Shipped as one argv over ssh; the fleet-nas seccomp note caps it.
-    assert len(ks._REMOTE_PROOF.encode()) < 4096
+    # Shipped as one argv over ssh. The kernel cap is MAX_ARG_STRLEN (128 KiB per argv string); a 64 KB argv ran
+    # on ace-media, ci-box and fleet-nas (t_f47e4e3f). 8 KB keeps the proof one screen a reviewer can read.
+    assert len(ks._REMOTE_PROOF.encode()) < 8192

@@ -35,7 +35,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from hermes_cli import kanban_worker_hosts as _kwh
+from hermes_cli.kanban_lazy import Module
+_kbd = Module("hermes_cli.kanban_db_dispatch")
+_kwh = Module("hermes_cli.kanban_worker_hosts")
 from toolsets import get_toolset_names
 from utils import env_var_enabled
 import unicodedata  # noqa: E402
@@ -694,8 +696,8 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
             parsed = -1
         if parsed >= 0:
             return parsed
-        return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
+        return _kbd.DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", _kbd.DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
@@ -1232,7 +1234,11 @@ def kanban_home() -> Path:
         if kanban_sandbox_enabled():
             root = _sandbox_kanban_home(root)
         else:
-            _refuse_nested_non_profile_home(root)
+            # Once per dispatcher tick per (root, HERMES_HOME) (t_97a78e19): a realpath + live-root walk on every
+            # kanban_home() call was the largest leaf of the measured tick. A refusal is never cached.
+            from hermes_cli.kanban_tick_steps import tick_memo
+            tick_memo(("refuse_nested_home", str(root), os.environ.get("HERMES_HOME", "")),
+                      lambda: _refuse_nested_non_profile_home(root) or True)
     _refuse_live_kanban_root_in_isolation(root, "kanban_home()")
     return root
 
@@ -1293,8 +1299,10 @@ def _account_home_board_root() -> Optional[Path]:
     Inert on fleet hosts: no ``~/kanban.db`` exists there (checked Studio and
     ace-ai 2026-10-10).
     """
-    from hermes_state import _os_account_home
-    account = _os_account_home()
+    from hermes_state_roots import account_home as _os_account_home
+    state = sys.modules.get("hermes_state")
+    anchor = getattr(state, "_os_account_home", _os_account_home)
+    account = anchor()
     if account is None:
         return None
     try:
@@ -1314,8 +1322,10 @@ def _live_kanban_roots() -> tuple:
     is not where the board lives (``hermes_state._deployed_hermes_home_root``,
     plus :func:`_account_home_board_root` for a process that redirected its home).
     """
-    from hermes_state import _deployed_hermes_home_root
-    roots = [r for r in (_live_kanban_root(), _deployed_hermes_home_root(), _account_home_board_root())
+    from hermes_state_roots import account_home, deployed_root
+    state = sys.modules.get("hermes_state")
+    deployed = getattr(state, "_deployed_hermes_home_root", lambda: deployed_root(account_home()))
+    roots = [r for r in (_live_kanban_root(), deployed(), _account_home_board_root())
              if r is not None]
     return tuple(dict.fromkeys(roots))
 
@@ -2213,21 +2223,24 @@ def _board_db_is_empty(db_path: Path) -> bool:
     returns 3. ``mode=ro`` still refuses to create a missing file, so this
     probe cannot itself become a phantom-creator.
     """
-    try:
-        uri = f"file:{db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
-    except sqlite3.Error:
-        return False
-    try:
-        row = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
-    except sqlite3.Error:
-        return False
-    finally:
+    def _read() -> bool:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
         try:
-            conn.close()
-        except sqlite3.Error:
-            pass
-    return bool(row) and row[0] == 0
+            row = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+        finally:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        return bool(row) and row[0] == 0
+
+    # list_boards() runs this on every watcher tick in every gateway; an unchanged DB answers
+    # from memory instead of a reopen that rewrites its -shm on disk (t_2cfa2782).
+    from hermes_cli import sqlite_quiet_memo
+    try:
+        return sqlite_quiet_memo.read(db_path, "board_db_is_empty", _read)
+    except sqlite3.Error:
+        return False
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -2581,6 +2594,8 @@ class Task:
     # / is not ``boomerang wake``; None = never set (not boomerang). The only setting.
     boomerang_wake: Optional[bool] = None
     asap: bool = False  # Explicit operator edit only; never inherited at creation.
+    # Raw ``tasks.artifact_pointer`` JSON (t_328f78fc); parse with kanban_artifact_pointer.read.
+    artifact_pointer: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2621,7 +2636,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract", "origin_host",
-    "workspace_of",
+    "workspace_of", "artifact_pointer",
 )
 
 # Text columns where "" is stored/read as "not set".
@@ -2878,7 +2893,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_of         TEXT,
     -- Boomerang wake level: 1 = mechanical wakes on this card are handled by a
     -- background boomerang child; 0/NULL = they surface. The card is the only setting.
-    boomerang_wake       INTEGER
+    boomerang_wake       INTEGER,
+    -- JSON list of the closed card's artifact pointers (PR/ref, attachments, URLs, doc
+    -- paths), stamped on close; retention never prunes the tasks row (t_328f78fc).
+    -- NULL = never stamped, '[]' = nothing found. hermes_cli/kanban_artifact_pointer.py.
+    artifact_pointer     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2967,7 +2986,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     resources           TEXT NOT NULL DEFAULT '[]',
     -- Where this run executed (t_8bfdcc07): a pool host id, or 'studio' for a
     -- local run. NULL = legacy row or a run that never spawned.
-    host                TEXT
+    host                TEXT,
+    -- Why this run started no worker (t_4b313c15): operator | synthetic | refused.
+    -- NULL = a worker ran (its `placement` event says where), the run is open, or a legacy row.
+    no_worker_class     TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -3060,6 +3082,7 @@ CREATE TABLE IF NOT EXISTS sign_grants (
     created_at         INTEGER NOT NULL,
     expires_at         INTEGER NOT NULL,
     revoked_at         INTEGER,
+    closed_at          INTEGER,            -- background batch ended normally: no new write, rows stand to expiry
     PRIMARY KEY (grant_id, task_id)
 );
 
@@ -3934,6 +3957,18 @@ def _require_known_model(
     from hermes_cli.model_registry import require
 
     return require(provider, model, force_reason=force_model_reason, flag="--force-model")
+
+
+def _store_slot(model: Optional[str], provider: Optional[str], force_model_reason: Optional[str]) -> Optional[str]:
+    """Slot aliases P6 (t_efde9d1a): a card pin that is exactly a slot's CURRENT id on a lane
+    that serves it is stored as the slot (``gpt-6.2-sol`` -> ``sol``), so a rollout moves the pin
+    with no sweep. ``--force-model`` keeps the literal. Callers print
+    :func:`hermes_cli.model_registry.slot_store_note` as the confirmation line."""
+    if not model or (force_model_reason or "").strip():
+        return model
+    from hermes_cli.model_registry import slot_canonicalise
+
+    return slot_canonicalise(model, provider)[0]
 
 
 def _model_registry_valid_ids(provider: Optional[str]) -> tuple[str, ...]:
@@ -5168,19 +5203,20 @@ def _takeover_comment_body(
 
 
 def _validate_foreign_action_comments(
-    actor: MutationActor, action: str, prev_home: Optional[str],
+    conn: sqlite3.Connection, actor: MutationActor, action: str, prev_home: Optional[str],
+    task_id: Optional[str] = None,
 ) -> None:
     """:func:`add_comment`'s refusals (:func:`_validate_comment_args`) for every
-    comment :func:`record_foreign_action` will write, with no database access.
+    comment :func:`record_foreign_action` will write, before any mutation.
     Run where the override is ACCEPTED, so a reason those comments cannot carry
     is refused before any guarded write journals (t_705b1458, Prism 34b90ddab22b)."""
     author = actor.profile or "user"
     if not actor.operator:
         _validate_comment_args(author, _takeover_comment_body(
             actor, action, prev_home, _takeover_new_home(action, actor),
-        ))
+        ), conn=conn, task_id=task_id)
     if action in FOREIGN_CHANGE_ACTIONS:
-        _validate_comment_args(author, _foreign_change_comment_body(actor, action))
+        _validate_comment_args(author, _foreign_change_comment_body(actor, action), conn=conn, task_id=task_id)
 
 
 def check_home_session(
@@ -5258,11 +5294,11 @@ def check_home_session(
                 f"\"<who: why>\" (e.g. \"Ace via Aegis: ruled (a)\")."
             )
         _check_ruling_precedence(conn, task_id, action, home, actor.operator)
-        _validate_foreign_action_comments(actor, action, row["session_id"])
+        _validate_foreign_action_comments(conn, actor, action, row["session_id"], task_id)
         return actor
     if actor.foreign_ok:
         _check_ruling_precedence(conn, task_id, action, home, actor.foreign_ok)
-        _validate_foreign_action_comments(actor, action, row["session_id"])
+        _validate_foreign_action_comments(conn, actor, action, row["session_id"], task_id)
         return actor
     if home_guard_mode() == "warn":
         print(
@@ -5404,7 +5440,7 @@ def record_foreign_action(
     )
     # Every comment this writes, judged before its first event: a refusal
     # here leaves no takeover/operator_override line in the journal.
-    _validate_foreign_action_comments(actor, action, prev_home)
+    _validate_foreign_action_comments(conn, actor, action, prev_home, task_id)
     if actor.operator:
         last = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? "
@@ -5847,24 +5883,20 @@ class NearDuplicateError(ValueError):
         self.duplicates = duplicates
 
 
-# Per-creator mint cap (Ace 2026-11-05 12:59 PT, "do this immediately"): measured 2026-11-05, 710 cards
-# minted in 24 h on the default board, 477 of them by automation (main-tip-red 177, pager-owner-card 120,
-# landing-queue 93, ci-red-owner 38, live-edit-card 32, prism-page-card 17) feeding ~1,640 worker runs and
-# ~2,500 CI runs on hermes-home alone; CI runners then starved the Prism review pool to 0 placeable hosts.
-# Every minter passes through ``create_task``, so the cap lives here, not per script. A creator that is
-# not a human (``created_by`` empty / ``user`` / ``human:*``) may mint at most ``MINT_CAP_PER_DAY`` cards
-# per rolling 24 h; the (N+1)th raises :class:`MintCapError`. ``force_reason`` (CLI ``--force``) overrides
-# it and is ledgered as a ``mint_cap_forced`` event on the new card. Kill switch:
-# ``HERMES_KANBAN_MINT_CAP=0`` (env; ``HERMES_KANBAN_MINT_CAP=<n>`` resizes). Idempotent re-mints that
-# return an existing card never count: the check runs after the idempotency lookup.
-MINT_CAP_PER_DAY = 24
-MINT_CAP_WINDOW_S = 24 * 3600
-MINT_CAP_HUMAN_PREFIXES = ("human:",)
-MINT_CAP_HUMAN_NAMES = frozenset({"", "user", "operator", "apollo", "aegis"})
+# Automated-creator classification. The per-creator rolling-24 h mint cap that used to live here (PR #65/#85,
+# ``MINT_CAP_PER_DAY`` = 24, ``HERMES_KANBAN_MINT_CAP``) was REMOVED on Ace's ruling 2026-11-09 (Discord
+# msg 1569346219715592214, "kill it, get rid of it"): no creator is refused for minting volume. Volume is held by
+# the signature resolver / flap breaker (one card per failure signature), idempotency keys, near-duplicate
+# refusal, and the explicit mint moratorium below. :func:`mint_cap_applies` survives as the "is this an
+# automated creator" predicate those controls share (humans, the operator CLI default, apollo/aegis are exempt).
+AUTOMATED_CREATOR_HUMAN_PREFIXES = ("human:",)
+AUTOMATED_CREATOR_HUMAN_NAMES = frozenset({"", "user", "operator", "apollo", "aegis"})
 
 
 class MintCapError(ValueError):
-    """``create_task`` refused: ``created_by`` is over its rolling-24 h mint cap."""
+    """Retired: the per-creator mint cap was removed (2026-11-09) and nothing raises this any more.
+
+    Kept so callers that still ``except MintCapError`` keep importing; it is never raised."""
 
     def __init__(self, message: str, created_by: str, count: int, cap: int):
         super().__init__(message)
@@ -5873,42 +5905,88 @@ class MintCapError(ValueError):
         self.cap = cap
 
 
-def mint_cap() -> int:
-    """The live cap (``HERMES_KANBAN_MINT_CAP`` env, else :data:`MINT_CAP_PER_DAY`); 0 = off."""
-    return _env_int("HERMES_KANBAN_MINT_CAP", MINT_CAP_PER_DAY, minimum=0)
-
-
 def mint_cap_applies(created_by: Optional[str]) -> bool:
-    """True for an automated creator; humans and the operator CLI default are never capped."""
+    """True for an automated creator; humans and the operator CLI default are exempt from the shared mint
+    controls (signature dedup, mint moratorium). Historical name; there is no volume cap."""
     by = (created_by or "").strip()
-    if by.lower() in MINT_CAP_HUMAN_NAMES:
+    if by.lower() in AUTOMATED_CREATOR_HUMAN_NAMES:
         return False
-    return not any(by.lower().startswith(p) for p in MINT_CAP_HUMAN_PREFIXES)
-
-
-def mint_count_24h(conn: sqlite3.Connection, created_by: str, now: Optional[int] = None) -> int:
-    """Cards this creator minted in the trailing window, archived ones included (a reaped card still cost a run)."""
-    now = int(time.time()) if now is None else int(now)
-    row = conn.execute(
-        "SELECT COUNT(*) FROM tasks WHERE created_by = ? AND created_at > ?",
-        (created_by, now - MINT_CAP_WINDOW_S),
-    ).fetchone()
-    return int(row[0] if row else 0)
+    return not any(by.lower().startswith(p) for p in AUTOMATED_CREATOR_HUMAN_PREFIXES)
 
 
 def check_mint_cap(conn: sqlite3.Connection, created_by: Optional[str], *, now: Optional[int] = None) -> None:
-    """Raise :class:`MintCapError` when ``created_by`` is an automated creator at or over the cap."""
-    cap = mint_cap()
-    if cap <= 0 or not mint_cap_applies(created_by):
+    """Retired no-op (the per-creator mint cap was removed 2026-11-09). Kept for API compatibility only."""
+    return None
+
+
+# Mint moratorium (Ace 2026-11-08 22:5x, t_fb98bedc): while ``<kanban root>/state/kanban-mint-moratorium`` exists,
+# no automated creator (:func:`mint_cap_applies`) mints a NEW card. Humans, the operator CLI default, apollo/aegis
+# and worker-created cards (``creator_task_id`` set) are exempt; re-mints that return an existing card
+# (idempotency_key / signature reuse) create nothing and are never refused. ``force_reason`` overrides. Refusals
+# and forces go to ``<db>.mint-cap.jsonl`` as ``moratorium_refused`` / ``moratorium_forced``. Read per call, so
+# touching or removing the flag takes effect on the next ``hermes kanban create`` with no restart.
+MINT_MORATORIUM_FLAG = ("state", "kanban-mint-moratorium")
+
+
+class MintMoratoriumError(ValueError):
+    """``create_task`` refused: the mint moratorium flag is set and ``created_by`` is an automated creator."""
+
+    def __init__(self, message: str, created_by: str, flag: Path):
+        super().__init__(message)
+        self.created_by = created_by
+        self.flag = flag
+
+
+def mint_moratorium_flag() -> Path:
+    return kanban_home().joinpath(*MINT_MORATORIUM_FLAG)
+
+
+def check_mint_moratorium(created_by: Optional[str], creator_task_id: Optional[str] = None) -> None:
+    """Raise :class:`MintMoratoriumError` when the flag file exists and the creator is automated, not a worker."""
+    if creator_task_id or not mint_cap_applies(created_by):
+        return
+    flag = mint_moratorium_flag()
+    if not flag.exists():
         return
     by = (created_by or "").strip()
-    n = mint_count_24h(conn, by, now)
-    if n >= cap:
-        raise MintCapError(
-            "mint cap: created_by=%r has minted %d cards in the last 24 h (cap %d). One card per distinct "
-            "failing signature, not one per occurrence: reuse the open card (idempotency_key) or wait for "
-            "the window. Override: --force \"<why this card must exist now>\"; kill switch "
-            "HERMES_KANBAN_MINT_CAP=0." % (by, n, cap), by, n, cap)
+    raise MintMoratoriumError(
+        "mint moratorium: no automated producer creates a new card while %s exists (created_by=%r). Send the "
+        "finding back to the existing card instead (comment / reopen / request-changes). Override: --force "
+        "\"<why this card must exist now>\"." % (flag, by), by, flag)
+
+
+def mint_cap_ledger_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """``<board db>.mint-cap.jsonl`` beside the connection's own db file; None for an in-memory/unnamed db.
+
+    t_f956f87f: one append-only row per mint-control outcome a ``task_events`` row cannot carry (a refusal has no
+    card): today ``moratorium_refused`` / ``moratorium_forced``. The file name predates the cap's removal and is
+    kept so existing readers keep working; historical ``refused``/``forced``/``bypassed`` rows came from the
+    removed per-creator cap."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return None
+    file = row[2] if row else ""
+    return Path(file + ".mint-cap.jsonl") if file else None
+
+
+def _ledger_mint_cap(conn: sqlite3.Connection, outcome: str, **fields: Any) -> None:
+    """Append one ledger row. Best effort: a write failure never changes the create outcome."""
+    try:
+        p = mint_cap_ledger_path(conn)
+        if p is None:
+            return
+        rec = dict(fields, outcome=outcome, at=int(time.time()))
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:  # noqa: BLE001 - the ledger is evidence, never a gate
+        _log.debug("mint-cap ledger write failed", exc_info=True)
+
+
+def _ledger_on_commit(conn: sqlite3.Connection, outcome: str, **fields: Any) -> None:
+    """Queue a ledger row for the outer COMMIT of the enclosing write_txn (kanban_db_connect.on_commit)."""
+    from hermes_cli.kanban_db_connect import on_commit
+    on_commit(conn, lambda: _ledger_mint_cap(conn, outcome, **fields))
 
 
 # Signature resolver + flap breaker (PRD plans/2026-11-05_machine-minted-cards-signature-dedup-prd.md, Ace
@@ -6219,6 +6297,29 @@ def _workspace_of_copy(conn: sqlite3.Connection, of: str, kind: Optional[str],
     return of_kind, of_path
 
 
+def _insert_task_row(conn, fields):
+    """SQL-only insertion shared by legacy create and prevalidated authority create.
+
+    Caller owns the transaction and validation. No network here. The one hook read is the
+    studio-requires-reason check on the body being stored (t_1aea9763, t_41763e36): every task
+    INSERT goes through this function (tests/hermes_cli/test_kanban_requires_inherit.py pins
+    that), so no create path stores a body the rule refuses. Raises StoredBodyRefused (a
+    ValueError); same kill switch and fail-open as the caller-side check.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError('task insert requires write transaction')
+    columns = tuple(fields)
+    allowed = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
+    if not columns or not set(columns) <= allowed:
+        raise ValueError('unknown task column')
+    from hermes_cli import kanban_requires_inherit as _kri
+    _stored_why = _kri.stored_refusal(fields.get('body'))
+    if _stored_why:
+        raise _kri.StoredBodyRefused(f"kanban create: stored body: {_stored_why}")
+    conn.execute('INSERT INTO tasks (' + ','.join(columns) + ') VALUES (' +
+                 ','.join('?' for _ in columns) + ')', tuple(fields.values()))
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -6247,6 +6348,7 @@ def create_task(
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
     force_model_reason: Optional[str] = None,
+    keep_literal_model: bool = False,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -6400,6 +6502,17 @@ def create_task(
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
+    if not keep_literal_model:
+        model_override = _store_slot(model_override, provider_override, force_model_reason)
+    # A delegations-board card contains an already-admitted delegate_task call, not a new work item.
+    # Its goal-derived title may quote a ruling without minting a ruling-bearing task.
+    container_card = _kdb.conn_is_delegations(conn)
+    if not container_card:
+        from hermes_cli.kanban_ruling_citation import validate_fields
+        validate_fields(conn, [("title", title), ("body", body)])
+    from hermes_cli.kanban_studio_pin import prepare_body, report_notices
+    pin_notices = []
+    body = prepare_body(body, pin_notices)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -6411,7 +6524,11 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    from hermes_cli import kanban_boomerang_default as _kbd
     from hermes_cli import kanban_mint_lint as _mint_lint
+
+    # Every producer gets the boomerang default here; an explicit value is kept as given.
+    boomerang_wake, boomerang_source = _kbd.resolve(boomerang_wake)
 
     if until is not None:
         until = validate_wake_at(until)
@@ -6442,6 +6559,15 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
+    if workspace_of is None and not continues and not project_id:
+        # A worktree on a checkout whose origin is an upstream we do not own can never rerun off the Studio:
+        # mint scratch + `Repo:` + `Branch:` lines instead (t_efd1497a).
+        from hermes_cli import kanban_mint_scratch as _kms
+        _scratch = _kms.rewrite(workspace_kind, workspace_path, branch_name, body)
+        if _scratch is not None:
+            body, _notice = _scratch
+            workspace_kind, workspace_path, branch_name = "scratch", None, None
+            print(_notice, file=sys.stderr)
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
@@ -6491,20 +6617,12 @@ def create_task(
         body,
         inherited_origin or format_origin_line(session_id, created_by=created_by),
     )
-    # Only hard parent declarations inherit; body sniffs never do.
-    from hermes_cli.kanban_host_capabilities import declared_words
-    _inherited_requires = set()
-    for _parent in parents:
-        _prow = conn.execute('SELECT body,skills FROM tasks WHERE id=?', (_parent,)).fetchone()
-        if _prow:
-            _inherited_requires.update(w for w in declared_words(_prow[0]) if w != 'none')
-            from hermes_cli import kanban_host_capabilities as _khc_inherit
-            _cmap = _khc_inherit.load_map(kanban_home() / 'fleet')
-            if _cmap is not None:
-                _reqs, _none = _khc_inherit.derive(_prow[0], _json_or(_prow[1]) or [], _cmap)
-                _inherited_requires.update(r.cap.removeprefix('unknown:') for r in _reqs if r.strength == 'hard')
-    if _inherited_requires:
-        body = (body or '') + '\nrequires: ' + ', '.join(sorted(_inherited_requires))
+    # Only hard parent declarations inherit; body sniffs and Studio-only words never do (t_1aea9763).
+    from hermes_cli import kanban_requires_inherit as _kri
+    _inherited_line, _not_inherited = _kri.inherited_line(
+        conn, parents, kanban_home() / 'fleet', continues=continues)
+    if _inherited_line:
+        body = (body or '') + '\n' + _inherited_line
 
 
     # Inherit the board's scoped project when the caller didn't name one, so a
@@ -6566,9 +6684,6 @@ def create_task(
             pr_owner_forced = {"owner": exc.owner["task_id"], "pr": exc.owner["pr"],
                                "reason": force_reason}
 
-    # Per-creator mint cap (see MINT_CAP_PER_DAY): after the idempotency lookup, so a re-mint that returns the
-    # existing card never counts; before the write txn, so a refusal holds no lock.
-    mint_cap_forced: Optional[dict] = None
     mint_breaker_forced: Optional[dict] = None
     # Signature resolver (see SIGNATURE_QUIET_S): an open or recently closed card for the same failure signature
     # is returned instead of minting; a flapping signature raises unless forced.
@@ -6583,13 +6698,17 @@ def create_task(
         else:
             if owner:
                 return owner
+    # Mint moratorium (see MINT_MORATORIUM_FLAG): after both reuse paths, so a re-mint that returns an existing
+    # card is never refused; before the write txn, so a refusal holds no lock and inserts nothing.
+    moratorium_forced: Optional[dict] = None
     try:
-        check_mint_cap(conn, created_by)
-    except MintCapError as exc:
+        check_mint_moratorium(created_by, creator_task_id)
+    except MintMoratoriumError as exc:
         if not force_reason:
+            _ledger_mint_cap(conn, "moratorium_refused", created_by=exc.created_by, title=(title or "")[:120],
+                             idempotency_key=idempotency_key)
             raise
-        mint_cap_forced = {"created_by": exc.created_by, "count": exc.count, "cap": exc.cap,
-                           "reason": force_reason}
+        moratorium_forced = {"created_by": exc.created_by, "reason": force_reason}
 
     now = int(time.time())
 
@@ -6640,6 +6759,9 @@ def create_task(
                         inherited_origin
                         or format_origin_line(session_id, created_by=created_by),
                     )
+                    # The rebuild starts from the caller's body; keep the inherited line (t_41763e36).
+                    if _inherited_line:
+                        body = (body or '') + '\n' + _inherited_line
                 ruled_mint = None
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
@@ -6754,7 +6876,18 @@ def create_task(
                     )
                 # The override comment is written after the card's first
                 # journaled event; judge it before the INSERT (Prism 8b7984d6e364 r14).
-                flagship_override_comment(flagship_override_author, flagship_override_reason)
+                flagship_override_comment(flagship_override_author, flagship_override_reason, conn=conn,
+                                          task_id=task_id)
+                audit_author = flagship_override_author or created_by or "operator"
+                if pin_sub_reason:
+                    from hermes_cli.model_policy import sub_pin_comment
+                    _validate_comment_args(audit_author, sub_pin_comment(
+                        provider_override, pin_sub_reason, fallback=bool(pin_sub_fallback)), conn=conn,
+                        task_id=task_id)
+                if _model_verdict.reason == "forced":
+                    _validate_comment_args(audit_author, _model_force_comment(
+                        provider_override, model_override, _model_verdict.force_reason or ""), conn=conn,
+                        task_id=task_id)
 
                 if tenant is None and parents:
                     # Parent order breaks ties in this soft namespace; an
@@ -6819,60 +6952,48 @@ def create_task(
                         "(tool: i_mean_blocks) if the parent closing really is the gate.",
                         time_gate_hit or "",
                     )
-                conn.execute(
-                    """
-                    INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
-                        reasoning_effort, pin_sub_reason, pin_sub_fallback,
-                        goal_mode, goal_max_turns, session_id, completion_contract, brain,
-                        workspace_of, boomerang_wake, signature
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_id,
-                        title.strip(),
-                        body,
-                        assignee,
-                        task_status,
-                        priority,
-                        created_by,
-                        now,
-                        workspace_kind,
-                        workspace_path,
-                        branch_name,
-                        project_id,
-                        tenant,
-                        idempotency_key,
-                        int(max_runtime_seconds) if max_runtime_seconds is not None else None,
-                        json.dumps(skills_list) if skills_list is not None else None,
-                        int(max_retries) if max_retries is not None else None,
-                        model_override,
-                        provider_override,
-                        reasoning_effort,
-                        pin_sub_reason,
-                        1 if (pin_sub_reason and pin_sub_fallback) else 0,
-                        1 if goal_mode else 0,
-                        int(goal_max_turns) if goal_max_turns is not None else None,
-                        session_id,
-                        completion_contract,
-                        brain,
-                        workspace_of,
-                        None if boomerang_wake is None else (1 if boomerang_wake else 0),
-                        signature,
-                    ),
-                )
+                # _insert_task_row checks the body every create path stores (t_1aea9763).
+                _insert_task_row(conn, {
+                    'id': task_id,
+                    'title': title.strip(),
+                    'body': body,
+                    'assignee': assignee,
+                    'status': task_status,
+                    'priority': priority,
+                    'created_by': created_by,
+                    'created_at': now,
+                    'workspace_kind': workspace_kind,
+                    'workspace_path': workspace_path,
+                    'branch_name': branch_name,
+                    'project_id': project_id,
+                    'tenant': tenant,
+                    'idempotency_key': idempotency_key,
+                    'max_runtime_seconds': int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                    'skills': json.dumps(skills_list) if skills_list is not None else None,
+                    'max_retries': int(max_retries) if max_retries is not None else None,
+                    'model_override': model_override,
+                    'provider_override': provider_override,
+                    'reasoning_effort': reasoning_effort,
+                    'pin_sub_reason': pin_sub_reason,
+                    'pin_sub_fallback': 1 if (pin_sub_reason and pin_sub_fallback) else 0,
+                    'goal_mode': 1 if goal_mode else 0,
+                    'goal_max_turns': int(goal_max_turns) if goal_max_turns is not None else None,
+                    'session_id': session_id,
+                    'completion_contract': completion_contract,
+                    'brain': brain,
+                    'workspace_of': workspace_of,
+                    'boomerang_wake': 1 if boomerang_wake else 0,
+                    'signature': signature,
+                    'next_eligible_at': int(until) if until is not None else None,
+                })
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links "
                         "(parent_id, child_id, kind) VALUES (?, ?, ?)",
                         (pid, task_id, parents_kind),
                     )
-                if boomerang_wake is not None:   # mirror into the legacy column (Prism 921e843952a6)
-                    write_card_boomerang_wake(conn, task_id, 1 if boomerang_wake else 0)
+                # mirror into the legacy column (Prism 921e843952a6)
+                write_card_boomerang_wake(conn, task_id, 1 if boomerang_wake else 0)
                 from hermes_cli import kanban_continuation as _kcont_create
                 if continues:
                     _kcont_create.transfer_workspace(conn, continues, task_id)
@@ -6905,7 +7026,8 @@ def create_task(
                         "provider_override": provider_override,
                         "minted_by": _minted_by(create_origin),
                         **({"brain": brain} if brain else {}),
-                        **({"boomerang_wake": bool(boomerang_wake)} if boomerang_wake is not None else {}),
+                        "boomerang_wake": bool(boomerang_wake),
+                        "boomerang_wake_source": boomerang_source,
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
                            if pin_sub_reason else {}),
@@ -6960,8 +7082,13 @@ def create_task(
                     })
                 if pr_owner_forced:
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
-                if mint_cap_forced:
-                    _append_event(conn, task_id, "mint_cap_forced", mint_cap_forced)
+                # Prism 31f2934ed515: a create nested in a caller's write_txn only releases a savepoint here, so the
+                # ledger row of a card is queued for the OUTER commit (dropped on any rollback); never a row for a
+                # card that does not exist. A refusal (no card) stays an immediate append.
+                if moratorium_forced:
+                    _append_event(conn, task_id, "moratorium_forced", moratorium_forced)
+                    _ledger_on_commit(conn, "moratorium_forced", task_id=task_id, title=(title or "")[:120],
+                                      **moratorium_forced)
                 if mint_breaker_forced:
                     _append_event(conn, task_id, "mint_breaker_forced", mint_breaker_forced)
                 overlap_hits: list[dict] = []
@@ -7038,6 +7165,8 @@ def create_task(
                         )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
+            report_notices(conn, task_id, pin_notices)
+            _kri.report_not_inherited(conn, task_id, _not_inherited)
             if overlap_hits:
                 # After commit, fire-and-forget: a create never waits on Discord.
                 _kov.notify_logs(board, task_id, overlap_hits)
@@ -7193,7 +7322,7 @@ def list_tasks(
 ) -> list[Task]:
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
-    query = "SELECT * FROM tasks WHERE 1=1"
+    query = " WHERE 1=1"
     params: list[Any] = []
     for col, val in (
         ("assignee", _canonical_assignee(assignee)), ("status", status), ("tenant", tenant),
@@ -7216,12 +7345,39 @@ def list_tasks(
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
             raise ValueError(f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}")
-        query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
+        order_sql = VALID_SORT_ORDERS[order_by]
     else:
-        query += " ORDER BY priority DESC, created_at ASC"
+        order_sql = "priority DESC, created_at ASC"
+    if order_by == "title":
+        # Titles are long (Studio board: 3.4 MB of them): even (title, id) alone, or a
+        # 48-char prefix, outgrew the 2 MB cache and spilled etilqs files (4.1 MB per
+        # call, t_ba5a93d0). No SQL sort here; Python orders (title, id), which for
+        # UTF-8 text is SQLite's BINARY order, so results are identical.
+        # Keys first (t_188b19e8, Prism P2 e880279c7cf3): sort (title, id) only, cut to
+        # ``limit``, then read just those full rows, never every body and result.
+        keys = sorted(conn.execute(f"SELECT title, id FROM tasks{query}", params).fetchall(),
+                      key=lambda r: (r[0], r[1]))
+        ids = [r[1] for r in (keys[:int(limit)] if limit else keys)]
+        by_id: dict[str, Any] = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for r in conn.execute(
+                f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk,
+            ):
+                by_id[r["id"]] = r
+        # A card deleted between the two reads is dropped, never returned half-read.
+        return [Task.from_row(by_id[i]) for i in ids if i in by_id]
+    # Sort only (keys, id), then join the full rows by primary key and order in Python.
+    # ``SELECT * ... ORDER BY`` sorted whole rows (bodies, results): 198 MB of etilqs
+    # temp files per ``kanban list`` on the Studio board (t_d24713d3). One statement,
+    # so still one read snapshot.
+    keyed = f"SELECT id, row_number() OVER (ORDER BY {order_sql}) AS rn FROM tasks{query}"
     if limit:
-        query += f" LIMIT {int(limit)}"
-    rows = conn.execute(query, params).fetchall()
+        keyed += f" ORDER BY rn LIMIT {int(limit)}"
+    rows = conn.execute(
+        f"SELECT k.rn AS _list_rn, t.* FROM ({keyed}) k JOIN tasks t ON t.id = k.id", params,
+    ).fetchall()
+    rows.sort(key=lambda r: r[0])
     return [Task.from_row(r) for r in rows]
 
 
@@ -7335,16 +7491,16 @@ def authorize_flagship(
     reads back. A caller that mutates before this call checks
     ``require_flagship_authority`` first.
     """
-    comment = flagship_override_comment(actor, reason)
+    comment = flagship_override_comment(actor, reason, conn=conn, task_id=task_id)
     if comment:
         add_comment(conn, task_id, *comment)
 
 
 def flagship_override_comment(
-    actor: Optional[str], reason: Optional[str],
+    actor: Optional[str], reason: Optional[str], *, conn=None, task_id: Optional[str] = None,
 ) -> Optional[tuple[str, str]]:
     """The ``(author, body)`` :func:`authorize_flagship` would write, judged
-    with no database access: the authority (:func:`model_policy.require_flagship_authority`)
+    before any write: the authority (:func:`model_policy.require_flagship_authority`)
     and every refusal :func:`add_comment` applies to that author and body
     (:func:`_validate_comment_args`). ``None`` when no reason was given. Each
     caller that writes before ``authorize_flagship`` calls this first, so the
@@ -7356,7 +7512,7 @@ def flagship_override_comment(
     if not reason:
         return None
     body = override_comment(reason)
-    _validate_comment_args(actor, body)
+    _validate_comment_args(actor, body, conn=conn, task_id=task_id)
     return actor, body
 
 
@@ -7448,7 +7604,7 @@ def _route_flagship_reason(
         return None
     # The override comment this reason will be written as, judged with every
     # add_comment refusal before the caller's first write (Prism 8b7984d6e364 r14).
-    flagship_override_comment(actor, allowed)
+    flagship_override_comment(actor, allowed, conn=conn, task_id=task_id)
     return allowed
 
 
@@ -7649,7 +7805,11 @@ def assign_task(
         conn, task_id, profile, flagship_override_reason, operator,
         releases_dispatch=clear_no_worker, sends_back=sends_back,
     )
-    if not sends_back:
+    # t_54f4fde6: the review-hold lane hands a parked card to the operator lane; that keeps it in review with a
+    # reviewer, so the open-PR refusal below (a review card left with no worker) does not apply.
+    hold_handoff = (not sends_back and is_human_reviewer(profile)
+                    and _review_hold_handoff_source(conn, task_id) is not None)
+    if not sends_back and not hold_handoff:
         held = review_hold_open_prs(conn, task_id, query_fn=pr_query)
         if held:
             raise ReviewHoldRequired(
@@ -7709,6 +7869,20 @@ def assign_task(
             _append_event(
                 conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
             )
+        if hold_handoff and row["status"] == "review" and is_review_hold_assignee(row["assignee"]):
+            # The operator's review starts now: a fresh review entry (deadman clock, owner wake),
+            # same implementer, so a later send-back still restores the worker. It keeps the replaced entry's
+            # run id (t_1e4649b7), so the owner wake still finds a PR named only in that run's metadata.
+            replaced = conn.execute(
+                "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            _append_event(conn, task_id, "review_requested", {
+                # t_9000e509: no read of the head's checks here, so the words claim nothing about CI.
+                "summary": f"review hold: handed to {profile} for an operator record",
+                "implementer": _review_handoff_implementer(conn, task_id),
+                "reviewer": profile, "handed_from": row["assignee"],
+            }, run_id=replaced["run_id"] if replaced else None)
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee", "status") if sends_back else ("assignee",))
     return True
@@ -7783,7 +7957,7 @@ def set_model_override(
         pin_sub_author=pin_sub_author,
         force_model_reason=force_model_reason,
     ):
-        _validate_comment_args(author, body)
+        _validate_comment_args(author, body, conn=conn, task_id=task_id)
     # Only a flagship override may stand in for the clear-route check; any
     # other audit comment does not (Prism r9 aed001cfb920).
     validated_override = (audit_comment_body or "").lstrip().casefold().startswith(
@@ -7901,7 +8075,7 @@ def _validate_model_override_args(
         if not body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
             raise ValueError(flagship_model_error(str(model)))
     _require_known_model(model, provider, force_model_reason=force_model_reason)
-    return model, provider
+    return _store_slot(model, provider, force_model_reason), provider
 
 
 def _flagship_reason_to_audit(
@@ -8312,7 +8486,7 @@ def apply_batch_route_writes(
                     pin_sub_author=write.pin_sub_author or write.audit_comment_author,
                     force_model_reason=write.force_model_reason,
                 ):
-                    _validate_comment_args(author, body)
+                    _validate_comment_args(author, body, conn=conn, task_id=write.task_id)
             if write.touch_model and not (write.audit_comment_body or "").lstrip().casefold().startswith(
                 FLAGSHIP_OVERRIDE_COMMENT_PREFIX
             ):
@@ -8648,10 +8822,14 @@ def _validate_comment_provenance(
     return run_id, session_ref
 
 
-def _validate_comment_args(author: str, body: str, *, kernel_approve: bool = False) -> None:
-    """:func:`add_comment`'s author/body refusals, with no database access, so a
+def _validate_comment_args(
+    author: str, body: str, *, kernel_approve: bool = False, conn=None, task_id: Optional[str] = None,
+) -> None:
+    """:func:`add_comment`'s author/body refusals (read-only with ``conn``), so a
     batch can judge every comment it will insert before its first write
-    (Prism d0b2bf482d38)."""
+    (Prism d0b2bf482d38). With ``task_id`` the deadman-hold check
+    (:func:`check_comment_hold`) runs too: a pre-checking writer passes it so a
+    hold refusal never comes after its change journals (t_5b3065cf)."""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -8663,6 +8841,22 @@ def _validate_comment_args(author: str, body: str, *, kernel_approve: bool = Fal
     if not kernel_approve:
         check_approve_stamp(author, body)
     _check_flagship_override_body(author, body)
+    if conn is not None:
+        from hermes_cli.kanban_ruling_citation import validate_fields
+        validate_fields(conn, [("comment", body)])
+    if task_id is not None:
+        check_comment_hold(task_id, author, body)
+
+
+def check_comment_hold(task_id: str, author: str, body: str) -> None:
+    """Refuse a ``deadman: hold`` line the deadman would not honour, judged on the author as
+    :func:`add_comment` STORES it (subagent marker included). A caller that writes its comment after
+    a lifecycle transition calls this first, so a refusal never strands the transition (Prism e233b2a07b96)."""
+    from hermes_cli.kanban_close_on_guard import check_hold_author
+
+    if _is_delegated_child() and not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
+        author = author.strip() + SUBAGENT_AUTHOR_MARKER
+    check_hold_author(task_id, author, body)
 
 
 # Bound on an unhonoured ``--author`` label kept for forensics (see add_comment).
@@ -8712,7 +8906,7 @@ def add_comment(
     card, author, verb and session inside the insert's transaction; else
     :class:`~hermes_cli.kanban_sign_grants.GrantRefused` and nothing is written.
     """
-    _validate_comment_args(author, body, kernel_approve=_kernel_approve)
+    _validate_comment_args(author, body, kernel_approve=_kernel_approve, conn=conn)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
             raise ValueError("claimed_author must be a non-empty string")
@@ -8720,6 +8914,9 @@ def add_comment(
             raise ValueError(f"claimed_author longer than {_CLAIMED_AUTHOR_MAX} chars")
         claimed_author = claimed_author.strip()
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
+    # A granted write is judged in _add_comment_txn after the grant validated, so the grant's own refusal wins.
+    if grant_id is None:
+        check_comment_hold(task_id, author, body)
     now = int(time.time())
     if grant_id is not None:
         return _add_granted_comment(
@@ -8840,6 +9037,9 @@ def _add_comment_txn(
         if grant_id is not None:
             ksg.validate_comment(conn, grant_id, task_id, signer, body,
                                  caller_session_ref=session_ref, now=now)
+            from hermes_cli.kanban_close_on_guard import check_hold_author
+
+            check_hold_author(task_id, author, body)  # grant-marked author, as stored
             cur = conn.execute(
                 "INSERT INTO task_comments "
                 "(task_id, author, body, run_id, session_ref, created_at, grant_id) "
@@ -9147,6 +9347,35 @@ def _append_event(
         ).fetchone()[0]
     actor_profile, actor_session_id = _event_actor()
     boot = _boot_evidence() if kind in _BOOT_EVIDENCE_KINDS else None
+    if kind == "review_requested":
+        review_exit_id = conn.execute(
+            "SELECT COALESCE(max(id), 0) FROM task_status_audit "
+            "WHERE task_id=? AND old_status='review' AND new_status!='review'", (task_id,),
+        ).fetchone()[0]
+        payload = {**(payload or {}), "review_exit_id": review_exit_id}
+        # A raw-entry trigger supplies provisional provenance before the normal
+        # handoff writer has finished. Finalize that row rather than publish two
+        # handoffs (and two notifications) for the same entry. Bind adoption
+        # to the most recent review EXIT, not event recency: unrelated events
+        # may follow a raw entry before its canonical handoff is written.
+        provisional = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='review_requested' "
+            "AND json_valid(payload) AND json_extract(payload,'$.source')='lifecycle_entry_repair' "
+            "AND id=(SELECT max(id) FROM task_events WHERE task_id=? AND kind='review_requested') "
+            "AND COALESCE(json_extract(payload,'$.review_exit_id'), 0)="
+            "(SELECT COALESCE(max(id), 0) FROM task_status_audit "
+            "WHERE task_id=? AND old_status='review' AND new_status!='review')",
+            (task_id, task_id, task_id),
+        ).fetchone()
+        if provisional is not None:
+            payload = {**json.loads(provisional[1]), **(payload or {})}
+            payload.pop("source", None)
+            conn.execute(
+                "UPDATE task_events SET run_id=?,payload=?,actor_profile=?,actor_session_id=? WHERE id=?",
+                (run_id, _json_or_null(payload), actor_profile, actor_session_id, provisional[0]),
+            )
+            _journal_append(conn, task_id, kind, payload, run_id=run_id)
+            return
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
         "actor_profile, actor_session_id, boottime, boot_id) "
@@ -9201,7 +9430,7 @@ def _end_run(
     if run_id is None:
         return None
     metadata = _carry_run_counters(conn, run_id, metadata)
-    conn.execute(
+    closed = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -9216,6 +9445,8 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
+    if closed.rowcount == 1:
+        _stamp_no_worker_class(conn, run_id)
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     # A pool run's headroom reservation ends with the run (t_d6ce856e), once
     # the run row is COMMITTED: a rolled-back end keeps its promise (Prism 441fe743030f).
@@ -9223,8 +9454,44 @@ def _end_run(
     _rid, _via = _kh.run_reservation(conn, task_id, run_id)
     if _rid is not None:
         from hermes_cli.kanban_db_connect import on_commit
-        on_commit(conn, lambda: _kh.release_run_reservation(_rid, _via))
+        # t_26acfaa2: the release carries the run's use measured on its pool host (read after commit, never here)
+        _fp = _kh.run_footprint_target(conn, task_id, run_id) if _via == _kh.VIA_ALLOC_CLIENT else None
+        on_commit(conn, lambda: _kh.release_run_reservation(_rid, _via, _fp))
     return run_id
+
+
+NO_WORKER_OPERATOR = "operator"    # a human / human:* lane row (review verdict, operator transition): no process
+NO_WORKER_SYNTHETIC = "synthetic"  # zero-duration run written for a card nobody claimed (_synthesize_ended_run)
+NO_WORKER_REFUSED = "refused"      # claimed, closed before any worker started (workspace_refused, spawn_failed, ...)
+
+
+def _is_operator_profile(profile: Optional[str]) -> bool:
+    p = str(profile or "")
+    return p == HUMAN_REVIEWER_SENTINEL or p.startswith(HUMAN_REVIEWER_SENTINEL + ":")
+
+
+def _stamp_no_worker_class(conn: sqlite3.Connection, run_id: int, *, synthetic: bool = False,
+                           worker_pid: Optional[int] = None) -> None:
+    """At a run's close, record why it started no worker (t_4b313c15). A run with a worker pid or a ``spawned``
+    event is left NULL: its ``placement`` event is the record. A spawn landing after the close clears the class
+    again (``_set_worker_pid``'s claim-lost branch), so a class never stands beside a worker. ``worker_pid`` is
+    the pid a closer read BEFORE its own UPDATE cleared the column (Prism 31803cfc0dc0): a pid-only legacy run
+    is a worker run, not a refused one."""
+    if worker_pid:
+        return
+    row = conn.execute("SELECT profile, worker_pid FROM task_runs WHERE id = ?", (int(run_id),)).fetchone()
+    if row is None or row["worker_pid"]:
+        return
+    if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind IN ('spawned', 'worker_registered', "
+                    "'placement', 'allocation') LIMIT 1", (int(run_id),)).fetchone() is not None:
+        return
+    if _is_operator_profile(row["profile"]):
+        cls = NO_WORKER_OPERATOR
+    elif synthetic:
+        cls = NO_WORKER_SYNTHETIC
+    else:
+        cls = NO_WORKER_REFUSED
+    conn.execute("UPDATE task_runs SET no_worker_class = ? WHERE id = ?", (cls, int(run_id)))
 
 
 def _carry_run_counters(conn: sqlite3.Connection, run_id: int, metadata: Optional[dict]) -> Optional[dict]:
@@ -9333,7 +9600,9 @@ def _synthesize_ended_run(
             now, now,
         ),
     )
-    return int(cur.lastrowid or 0)
+    run_id = int(cur.lastrowid or 0)
+    _stamp_no_worker_class(conn, run_id, synthetic=True)
+    return run_id
 
 
 # ---------------------------------------------------------------------------
@@ -9553,13 +9822,13 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
       3. ``DEFAULT_FAILURE_LIMIT``
     """
     if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
+        failure_limit = _kbd.DEFAULT_FAILURE_LIMIT
     from hermes_cli import kanban_after_merge as _am
     _am.release_prless_closed_parents(conn)
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, assignee, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -9587,6 +9856,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             if all(p["status"] in ("done", "archived") and p["kind"] != LINK_KIND_AFTER_MERGE
                    for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
+                if resume_status == "ready" and is_human_reviewer(row["assignee"]):
+                    continue
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
                     # recover -> respawn -> exhaust -> block forever). The
@@ -9657,6 +9928,9 @@ def _claim_and_open_run(
     a card whose origin host is paused (fleet pause layer 2, t_133d6efd)."""
     from hermes_cli.kanban_pause_hold import refuse_if_held
     refuse_if_held(conn, task_id)
+    from hermes_cli.kanban_failure_ownership import recheck_for_claim
+    if recheck_for_claim(conn, task_id).action != 'claim':
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -10178,7 +10452,7 @@ def _recorded_worker_alive(
     started_at = row["worker_started_at"] if row is not None else None
     if (
         started_at is not None
-        and started_at != UNVERIFIED_WORKER_FINGERPRINT
+        and started_at != _kbd.UNVERIFIED_WORKER_FINGERPRINT
         and _pid_recycled(pid, started_at)
     ):
         return False
@@ -10304,6 +10578,9 @@ def _open_review_run(
     if spawns and not operator_claim:
         from hermes_cli.kanban_pause_hold import refuse_if_held
         refuse_if_held(conn, task_id)
+        from hermes_cli.kanban_failure_ownership import recheck_for_claim
+        if recheck_for_claim(conn, task_id).action != 'claim':
+            return None
     cur = conn.execute(
         """
         UPDATE tasks
@@ -10716,6 +10993,8 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            if _dead_claim_release_voided(conn, row["id"], termination):
+                continue    # late worker evidence: the next sweep re-judges it (t_bf2c4ade)
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -10940,10 +11219,9 @@ def reclaim_task(
     held_status = row["status"]
     preserve_status = held_status in ("blocked", "triage", "scheduled")
     with write_txn(conn):
-        if termination.get("operator_override") and (
-            _dead_claimer_release_at(conn, task_id)[1] != "launch_bound"
-        ):
-            # The override was granted on "no worker evidence". Worker evidence
+        if _dead_claim_release_voided(conn, task_id, termination):
+            # The override (and every dead-claimer release at the bound,
+            # t_bf2c4ade) was granted on "no worker evidence". Worker evidence
             # (a ``spawned``/``heartbeat`` event) that landed after that check
             # voids it: re-read it under the write lock (FleetReview
             # 8a8140b0725a on #1404).
@@ -11437,7 +11715,7 @@ class NotLandableError(ValueError):
         self.task_id = task_id
         self.prs = [pr for pr, _ in refusals]
         super().__init__(
-            "handoff refused by the pre-PR verifier (fleet-merge would refuse it at land):\n"
+            "handoff refused by the pre-PR verifier (scripts/lib/landable.py check; fix the PR, then hand back):\n"
             + "\n".join(text for _, text in refusals)
             + f"\n{task_id} is still in-flight (no state change)."
         )
@@ -11675,8 +11953,14 @@ def complete_task(
     external: Optional[str] = None,
     watcher: Optional[str] = None,
     abandon_routed_pr: Optional[str] = None,
+    scheduled_ok: bool = False,
+    draft_kind: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``scheduled_ok`` (t_63ebf58b) lets an explicit operator close (no ``expected_run_id``)
+    take a ``scheduled`` card in one step. Only the complete verbs pass it; internal callers
+    such as the review-policy fallback in :func:`request_review` never end a park.
 
     ``abandon_routed_pr`` (t_829fce95) is the audited override for
     :func:`_enforce_routed_pr_survivor`: a survivor claim naming a different PR
@@ -11695,7 +11979,9 @@ def complete_task(
     draft PR. The draft is dropped from the open-PR route, and a
     ``completion_draft_override`` event records the PRs and the reason. A blank
     reason is refused (:class:`EmptyDraftOverrideError`); without it the
-    default :class:`DraftPrError` refusal is unchanged.
+    default :class:`DraftPrError` refusal is unchanged. ``draft_kind`` (t_12401145) says which override:
+    ``merge_hold`` (default) turns the card's OWN drafts into a ledger hold + ready PR that routes to review
+    (:mod:`kanban_draft_merge_hold`); ``keep_draft`` is the override above. Invalid values raise ValueError.
 
     ``superseded_by`` closes a card whose premise is ALREADY SATISFIED on
     current main — the sibling card, PR or sha that did the work. The closing
@@ -11796,6 +12082,9 @@ def complete_task(
                     {"reason": "overlong_draft_ok" if too_long else "empty_draft_ok"},
                 )
             raise EmptyDraftOverrideError(task_id, too_long)
+    if draft_kind is not None:
+        from hermes_cli import kanban_draft_merge_hold as _mh
+        draft_kind = _mh.normalize_kind(draft_kind)   # ValueError before any mutation
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -11829,10 +12118,17 @@ def complete_task(
     # An external close also takes a ``triage`` card: the external-wait card
     # parked there by a block loop is exactly what the verb exists to end.
     closable = ('running', 'ready', 'blocked', 'review') + (('triage',) if external else ())
-    if candidate is None or candidate.status not in closable:
+    # An operator closes a ``scheduled`` card in one step (t_63ebf58b): no unblock first, so no
+    # lifecycle-repair review_requested and no park-return wake for a card that is done seconds later.
+    if scheduled_ok and expected_run_id is None:
+        closable += ('scheduled',)
+    if candidate is None or (candidate.status not in closable and not _operator_todo(candidate)):
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
+    # A card parked from review closes as the review approval the unblock+complete pair recorded.
+    parked_review = (candidate.status == "scheduled"
+                     and _resume_status_from_events(conn, task_id) == "review")
     # A reviewer approval (the active run was claimed from ``review``) that
     # names the reviewed PR head writes the APPROVE review_coverage record
     # card-sourced land requests read as the review of record (t_7fee0f83).
@@ -11917,7 +12213,8 @@ def complete_task(
         negative_trigger = _neg.match(_neg.handoff_texts(summary, result), metadata)
     from hermes_cli import kanban_open_pr as _open_pr
     _pr_query = None
-    if candidate.status != 'review' and not approve_head_sha:
+    merge_held: dict = {}   # t_12401145: {"o/r#n": hold/ready result} for merge-hold drafts
+    if candidate.status != 'review' and not parked_review and not approve_head_sha:
         # Foreign-owner PRs (upstream / third-party repos) are mentions, not a
         # gate: the fleet cannot merge them (t_06dccfe3). Record, never route.
         foreign = _open_pr.foreign_pr_refs(
@@ -12021,11 +12318,17 @@ def complete_task(
                     with write_txn(conn):
                         _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
 
+            # The card's Intent block into its own PR bodies before the ready flip (t_deee5435);
+            # None when KANBAN_PR_INTENT/KANBAN_HANDOFF_PR_INTENT=0. Never raises.
+            from hermes_cli import kanban_pr_intent as _intent
+            intent_fn = _intent.applier_for_task(conn, task_id, summary, metadata)
+
             def _freshness_gate(refs, allow_arm):
                 try:
                     out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
                         draft_ok=draft_ok is not None, flipped=dict(flip_records),
+                        intent=intent_fn,
                     )
                 except _fresh.DraftPrError as draft_err:
                     _record_flips(draft_err.flipped)
@@ -12047,11 +12350,25 @@ def complete_task(
                 override = {"prs": list(overridden), "reason": draft_ok}
                 if freshness.get("draft_held"):
                     override["held"] = freshness["draft_held"]  # t_62389c4f: the hold stays visible
+                # t_12401145: a merge-hold override on the card's OWN draft becomes a ledger hold + ready
+                # PR that stays on the open-PR route (review, not done); keep_draft is the override above.
+                from hermes_cli import kanban_draft_merge_hold as _mh
+                hold_keys = _mh.plan(
+                    overridden, kind=_mh.normalize_kind(draft_kind),
+                    own_keys=armable | {f"{r.repo}#{r.number}" for r in branch_owned_prs},
+                    held=(freshness.get("draft_held") or {}).keys())
+                if draft_kind is not None or hold_keys:
+                    override["kind"] = _mh.normalize_kind(draft_kind)
+                if hold_keys:
+                    merge_held = _mh.apply(hold_keys, why=draft_ok, by=_mh.by_of(
+                        candidate.assignee, candidate.current_run_id, task_id))
+                    override["merge_hold"] = merge_held
                 with write_txn(conn):
                     _append_event(conn, task_id, "completion_draft_override", override)
                 metadata = dict(metadata or {}, draft_override=override)
                 still_open = [
-                    r for r in still_open if f"{r.repo}#{r.number}" not in overridden
+                    r for r in still_open
+                    if f"{r.repo}#{r.number}" not in overridden or f"{r.repo}#{r.number}" in merge_held
                 ]
         if no_new is not None:
             # The freshness gate can update-branch after the verdict; a moved head is
@@ -12121,6 +12438,22 @@ def complete_task(
                 note = "\n".join([_neg.route_note(negative_trigger), note])
                 routed_meta["negative_handoff"] = negative_trigger
                 open_pr_reviewer = _neg.REVIEWER
+            else:
+                # t_54f4fde6 D1: the machine holder waits for CI/Prism; the land evaluator hands the card to
+                # the operator when they settle. Unset knob: None, today's reviewer resolution.
+                open_pr_reviewer = configured_review_hold_assignee()
+                if open_pr_reviewer:
+                    routed_meta["review_hold"] = open_pr_reviewer
+                if any(not e.get("ok") for e in merge_held.values()):
+                    # t_12401145: a merge-hold PR still DRAFT runs no checks to settle; the human takes it now.
+                    _human = configured_review_assignee()
+                    open_pr_reviewer = (_human.casefold() if is_human_reviewer(_human)
+                                        else HUMAN_REVIEWER_SENTINEL)
+                    routed_meta.pop("review_hold", None)
+            if merge_held:
+                from hermes_cli import kanban_draft_merge_hold as _mh
+                note = "\n".join([note, *_mh.note(merge_held)])
+                routed_meta["draft_merge_hold"] = merge_held
             routed_summary = _neg.routed_summary(note, summary, result)
             routed_meta, staged = _stage_routed_scratch_artifacts(
                 conn, task_id, routed_meta, summary=summary, result=result,
@@ -12311,7 +12644,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    if candidate.status == "review" or review_claimed:
+    if candidate.status == "review" or parked_review or review_claimed:
         metadata = _carry_routed_artifacts(conn, task_id, metadata)
     if superseded_by:
         metadata = dict(metadata or {}, superseded_by=superseded_by)
@@ -12322,9 +12655,9 @@ def complete_task(
         metadata = dict(metadata or {}, external={"url": external, "watcher": watcher})
         if not (summary or "").strip() and not (result or "").strip():
             summary = f"External: {external} (watcher {watcher} reopens on upstream close)."
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    _gate_empty_completion(conn, task_id, result=result, summary=summary, review_approval=parked_review)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata, superseded=content_survivors)
     if acceptance is False:
         return False
     with write_txn(conn):
@@ -12340,6 +12673,8 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
+        if parked_review and prior_status == "scheduled":
+            prior_status = "review"
         if expected_run_id is None and not force and trow and _claim_is_live(trow):
             raise LiveClaimError(task_id)
         if expected_run_id is None:
@@ -12353,12 +12688,16 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       next_eligible_at = CASE WHEN status = 'scheduled'
+                                          THEN NULL ELSE next_eligible_at END
                  WHERE id = ?
                    AND (status IN ('running', 'ready', 'blocked', 'review')
-                        OR (? AND status = 'triage'))
+                        OR (? AND status = 'scheduled')
+                        OR (? AND status = 'triage')
+                        OR (status = 'todo' AND (assignee = 'human' OR substr(assignee, 1, 6) = 'human:')))
                 """,
-                (result, now, task_id, bool(external)),
+                (result, now, task_id, bool(scheduled_ok), bool(external)),
             )
         else:
             cur = conn.execute(
@@ -12468,6 +12807,9 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+        # Permanent pointer on the tasks row; the run/comment rows it reads are pruned later.
+        from hermes_cli import kanban_artifact_pointer as _kap
+        _kap.stamp(conn, task_id)
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -12552,11 +12894,13 @@ def _gate_empty_completion(
     *,
     result: Optional[str],
     summary: Optional[str],
+    review_approval: bool = False,
 ) -> None:
     """Refuse a completion that would leave the card with no evidence.
 
     Review approvals are exempt: a human vouches for the card and
-    ``_REVIEW_APPROVED_NOTE`` is the documented record.
+    ``_REVIEW_APPROVED_NOTE`` is the documented record. ``review_approval``
+    marks a scheduled card parked from review as one (t_63ebf58b).
     """
     row = conn.execute(
         "SELECT status, result FROM tasks WHERE id = ?",
@@ -12564,7 +12908,7 @@ def _gate_empty_completion(
     ).fetchone()
     if row is None:
         return
-    if row["status"] == "review":
+    if row["status"] == "review" or review_approval:
         return
     stored = row["result"]
     if _substantive_text(result) or _substantive_text(summary) or _substantive_text(stored):
@@ -12938,6 +13282,11 @@ def edit_task(
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("title", title), ("body", body)])
+    from hermes_cli.kanban_studio_pin import prepare_body, report_notices
+    pin_notices = []
+    body = prepare_body(body, pin_notices)
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -13004,6 +13353,7 @@ def edit_task(
                 },
                 run_id=run_id,
             )
+    report_notices(conn, task_id, pin_notices)
     notify_task_updated(conn, task_id, changed_fields, board=board)
     return True
 
@@ -13955,6 +14305,7 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+
     if until is not None and kind != "deferred":
         raise BlockRefused("until only applies to kind 'deferred'")
     if kind == "deferred" and until is None:
@@ -13967,11 +14318,16 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences, claim_lock FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, claim_lock, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        if expected_run_id is not None and cur_row["current_run_id"] != expected_run_id:
+            return False
+        if (kind is None and cur_row["status"] in ('running', 'ready', 'review')
+                and not re.search(r"(?m)^unblock_when:\s*\S+:\S+", reason or "")):
+            raise BlockRefused("block needs a kind or an explicit unblock_when predicate")
         if require_unclaimed_ready and (cur_row["status"] != "ready" or cur_row["claim_lock"] is not None):
             return False
         # Refuse only where a block could have landed; a done/archived/
@@ -14445,6 +14801,50 @@ def configured_review_assignee() -> Optional[str]:
     if not isinstance(value, str) or not value.strip():
         return None
     return value.strip()
+
+
+def configured_review_hold_assignee() -> Optional[str]:
+    """``kanban.review_hold_assignee`` (t_54f4fde6): the machine holder a handback with a still-open PR is
+    assigned to instead of the operator, while CI and Prism settle. hermes-home's land evaluator hands the
+    card to the operator (``assign``) when its checks have settled. Unset/blank/human = today's routing.
+    The holder is never spawned (not a profile) and is not a ``human:*`` lane, so the operator review deadman
+    does not watch it."""
+    try:
+        value, _source = _kanban_review_setting("review_hold_assignee", None)
+    except Exception:
+        return None
+    if not isinstance(value, str) or not value.strip() or is_human_reviewer(value):
+        return None
+    name = value.strip().lower()
+    try:
+        from hermes_cli.profiles import profile_exists
+        installed = profile_exists(name)
+    except Exception:
+        installed = False
+    if installed:
+        # t_1e4649b7: a holder that is (or later becomes) an installed profile would be spawned as a reviewer.
+        if name not in _REVIEW_HOLD_PROFILE_LOGGED:
+            _REVIEW_HOLD_PROFILE_LOGGED.add(name)
+            _log.warning("kanban.review_hold_assignee=%r is an installed profile; treating the knob as unset", name)
+        return None
+    return name
+
+
+_REVIEW_HOLD_PROFILE_LOGGED: set = set()
+
+
+def is_review_hold_assignee(assignee: Optional[str]) -> bool:
+    # Byte-exact: every writer of the holder (resolve_reviewer, the open-PR route) stores the configured value.
+    hold = configured_review_hold_assignee()
+    return bool(hold and assignee == hold)
+
+
+def _review_hold_handoff_source(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The holder's name when ``task_id`` sits in ``review`` on the review-hold lane, else None."""
+    row = conn.execute("SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] != "review" or not is_review_hold_assignee(row["assignee"]):
+        return None
+    return row["assignee"]
 DEFAULT_MAX_REVIEW_ROUNDS = 3
 MILESTONE_MARKER = "[milestone]"
 QA_REQUIRED_MARKER = "qa:required"
@@ -14637,6 +15037,8 @@ def resolve_reviewer(
     raw = str(reviewer).strip()
     if is_human_reviewer(raw):
         return raw.casefold(), None
+    if is_review_hold_assignee(raw):
+        return raw, None   # t_54f4fde6: the configured machine holder, a deliberate non-spawnable lane
 
     try:
         canonical = _canonical_assignee(raw)
@@ -14712,6 +15114,8 @@ def review_awaiting_human(
         "FROM tasks WHERE status = 'review' AND claim_lock IS NULL"
     ):
         assignee = row["assignee"]
+        if is_review_hold_assignee(assignee):
+            continue   # t_54f4fde6: the machine hold lane, not awaiting a human (the land evaluator times it out)
         since = int(row["since"] or now)
         age_minutes = max(0, (now - since) // 60)
         spawnable = bool(
@@ -15459,6 +15863,17 @@ class _SendBackRefused(Exception):
         self.detail = detail
 
 
+def _send_back_routed_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Head sha of the card's routed PR, or None (no PR, unreadable head, any fault)."""
+    try:
+        from hermes_cli.kanban_verb_input import _routed_pr_head
+
+        head, _pr = _routed_pr_head(conn, task_id)
+    except Exception:  # fail-open: the reader side holds a headless send-back
+        return None
+    return head or None
+
+
 @_home_session_guarded("request-changes")
 def request_changes(
     conn: sqlite3.Connection,
@@ -15553,9 +15968,16 @@ def request_changes(
         # Inline INSERT below bypasses add_comment's release-line guard: check before any write (t_80c7e5b9).
         from hermes_cli.kanban_close_on_guard import refusal as _close_on_refusal
 
+        from hermes_cli.kanban_ruling_citation import validate_fields
+        validate_fields(conn, [("comment", coverage_body)])
         close_on_error = _close_on_refusal(comment_author, coverage_body)
         if close_on_error:
             return False, close_on_error
+    # The routed PR's head goes on the event whatever the coverage holds (t_a54ae900;
+    # read by hermes-home changes_hold._request_head). Read before the txn (gh REST);
+    # an unreadable head writes nothing and refuses nothing. A nested send-back is
+    # inside the caller's write txn, so it skips the network read.
+    routed_head = None if nested else _send_back_routed_head(conn, task_id)
 
     opened: list[int] = []
     posted: list[tuple[int, int, int]] = []  # (comment_id, run_id, created_at)
@@ -15681,6 +16103,10 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
+        # A composed reassignment owns its final route and worker_ok release;
+        # its intermediate implementer must not clear a non-worker hold.
+        if not nested and is_worker_assignee(implementer):
+            _set_no_worker_locked(conn, task_id, False, source="request-changes")
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
@@ -15695,6 +16121,7 @@ def request_changes(
                 "status": new_status,
                 **({"operator": operator_reason,
                     "operator_kind": kind or OPERATOR_KIND_HUMAN} if operator_reason else {}),
+                **({"head_sha": routed_head} if routed_head else {}),
             },
             run_id=run_id,
         )
@@ -15761,6 +16188,8 @@ SENDBACK_SOURCES: tuple[str, ...] = (
 )
 _SENDBACK_MAX_PAYLOAD_BYTES = 16 * 1024
 _CTX_MAX_SENDBACKS = 5
+# kanban_show cuts the worker context around this section, never inside it (t_5949eafd).
+CTX_SENDBACKS_HEADER = "## Send-backs on your PR (newest last)"
 
 
 def _sendback_payload_error(payload: Any) -> Optional[str]:
@@ -15888,6 +16317,10 @@ def request_sendback(
                     )
                     if cur.rowcount != 1:
                         return False, "task changed during sendback"
+                    # Only a sendback that hands the card back to its worker
+                    # releases an operator hold; an untouched assignee keeps it.
+                    if is_worker_assignee(implementer):
+                        _set_no_worker_locked(conn, task_id, False, source="sendback")
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": status,
@@ -15906,6 +16339,8 @@ def request_sendback(
             )
             if cur.rowcount != 1:
                 return False, "task changed during sendback"
+            if is_worker_assignee(implementer):
+                _set_no_worker_locked(conn, task_id, False, source="sendback")
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": new_status,
@@ -15915,19 +16350,37 @@ def request_sendback(
         return False, f"task is {status!r}; a sendback needs running/ready/todo/review"
 
 
-def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+def _ctx_current_sendback(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
+    """The ONE send-back the worker must act on now, shown whole (t_5949eafd): the newest
+    ``changes_requested`` or ``sendback`` event, by event id (not wall time), that no later
+    ``review_requested`` handback answered. ``("run", run_id)`` or ``("event", event_id)``."""
+    row = conn.execute(
+        "SELECT id, kind, run_id FROM task_events WHERE task_id = ? AND kind IN ('changes_requested', ?) "
+        "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested'), 0) ORDER BY id DESC LIMIT 1",
+        (task_id, SENDBACK_EVENT_KIND, task_id),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["kind"] == SENDBACK_EVENT_KIND:
+        return ("event", int(row["id"]))
+    return ("run", int(row["run_id"])) if row["run_id"] is not None else None
+
+
+def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int,
+                   current: Optional[tuple[str, int]] = None, marks: Optional[dict] = None) -> None:
     """Render the newest ``sendback`` events into the worker prompt (§2.4).
     A sendback older than the latest ``review_requested`` was already answered
     by that handback and is not replayed."""
     rows = conn.execute(
-        "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "SELECT id, payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
         "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
         "AND kind = 'review_requested'), 0) ORDER BY id DESC LIMIT ?",
         (task_id, SENDBACK_EVENT_KIND, task_id, _CTX_MAX_SENDBACKS),
     ).fetchall()
     if not rows:
         return
-    lines.append("## Send-backs on your PR (newest last)")
+    lines.append(CTX_SENDBACKS_HEADER)
     lines.append(
         "A producer sent a defect on your PR straight back to you. Fix it and "
         "push (a new head clears it), or reply `prism-verdict: <id> not-a-bug "
@@ -15939,11 +16392,18 @@ def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now
         where = f"{p.get('repo')}#{p.get('pr')}" if p.get("repo") else "(no PR)"
         head = str(p.get("head") or "")[:12]
         rnd = f" r{p['round']}" if p.get("round") is not None else ""
+        start = len(lines)
         lines.append(
             f"### {p.get('source')}: {p.get('reason')}{rnd} on {where}"
             + (f" @ {head}" if head else "") + f" ({_ctx_stamp(r['created_at'], now)})"
         )
-        lines.append(_ctx_cap(p.get("summary")))
+        if current == ("event", int(r["id"])):  # the one current send-back is whole (t_5949eafd)
+            lines.append(str(p.get("summary") or "").strip())
+            if marks is not None:
+                marks["sendback"] = (start, len(lines))
+        else:
+            lines.append(_ctx_cap_lines(p.get("summary"), render_operator_command(
+                get_current_board(), "show", task_id, "--json")))
         if p.get("evidence"):
             lines.append("```json")
             lines.append(_ctx_cap(json.dumps(p["evidence"], ensure_ascii=False, indent=1)))
@@ -16070,6 +16530,20 @@ def reopen_task(
     # where the review-card closer completes it on REST merged=true.
     review_assignee = configured_review_assignee() if to_status == "review" else None
     with write_txn(conn):
+        if _task_status(conn, task_id) != "done":
+            return False, f"task {task_id} changed state concurrently; retry"
+        candidate_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
+            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if to_status == "review":
+            from hermes_cli.kanban_review_handoff import record_reopened_candidate
+            try:
+                record_reopened_candidate(conn, task_id, actor=actor, reviewer=review_assignee,
+                                          reason=reason, run_id=int(candidate_run["id"]) if candidate_run else None)
+            except ValueError as exc:
+                return False, str(exc)
         upd = conn.execute(
             "UPDATE tasks "
             "   SET status = ?, result = NULL, completed_at = NULL, "
@@ -16091,12 +16565,7 @@ def reopen_task(
                 "previous_path": dead_scratch,
                 "survivor_baseline": _reset_survivor_baseline(conn, task_id),
             })
-        run_id = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
-            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        voided_run = int(run_id["id"]) if run_id else None
+        voided_run = int(candidate_run["id"]) if candidate_run else None
         if voided_run is not None:
             conn.execute(
                 "UPDATE task_runs SET outcome = 'voided' WHERE id = ?",
@@ -16164,6 +16633,17 @@ def reopen_task(
     return True, None
 
 
+def _operator_todo(task_or_status, assignee: Optional[str] = None) -> bool:
+    """A human-assigned card the lifecycle guard keeps in ``todo`` (tasks_human_ready_* triggers: a
+    ``human``/``human:*`` card is never ``ready``, because no worker may claim it). That is the operator's
+    working state, so ``complete`` accepts it like ``ready``; before this, every operator card was
+    uncloseable (``promote`` wrote ready, the trigger reverted it in the same statement, ``complete``
+    refused ``todo``: t_554b6dc1, 2026-11-10)."""
+    status = getattr(task_or_status, "status", task_or_status)
+    who = getattr(task_or_status, "assignee", assignee) or ""
+    return status == "todo" and (who == "human" or who.startswith("human:"))
+
+
 @_home_session_guarded("promote")
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
@@ -16179,6 +16659,14 @@ def promote_task(
         # Same wording as complete: a stale replayed script must read as a no-op.
         return False, f"{explain_complete_refusal(conn, task_id)}; nothing to promote"
 
+    _who = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if _who is not None and _operator_todo("todo", _who[0]) and cur_status == "todo":
+        return False, (
+            f"task {task_id} is assigned to {_who[0]}: an operator card stays 'todo' by design (no worker "
+            f"may claim it, the lifecycle guard reverts ready), so there is nothing to promote; close it "
+            f"with 'hermes kanban complete {task_id} ...' or hand it to a worker with "
+            f"'hermes kanban assign {task_id} <profile>'"
+        )
     if cur_status not in ("todo", "blocked"):
         hint = (
             f" (a scheduled card wakes with 'hermes kanban unblock {task_id}'"
@@ -16235,6 +16723,8 @@ def _reclaim_dangling_run(
         (task_id, *statuses),
     ).fetchone()
     if stale and stale["current_run_id"]:
+        prior = conn.execute("SELECT worker_pid FROM task_runs WHERE id = ?",
+                             (int(stale["current_run_id"]),)).fetchone()
         conn.execute(
             """
             UPDATE task_runs
@@ -16246,6 +16736,7 @@ def _reclaim_dangling_run(
             """,
             (note, now, int(stale["current_run_id"])),
         )
+        _stamp_no_worker_class(conn, int(stale["current_run_id"]), worker_pid=prior[0] if prior else None)
 
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
@@ -16296,6 +16787,12 @@ def _unblock_expectation_holds(
     return True
 
 
+def card_text_digest(title: Optional[str], body: Optional[str]) -> str:
+    """Stable digest of a card's ``(title, body)``: what ``unblock_task(expect_card_digest=)`` compares."""
+    raw = json.dumps([title, body]).encode("ascii")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 @_home_session_guarded("unblock")
 def unblock_task(
     conn: sqlite3.Connection,
@@ -16304,6 +16801,8 @@ def unblock_task(
     comment: Optional[tuple] = None,
     expect_block_event: Optional[int] = None,
     expect_last_comment: Optional[int] = None,
+    expect_card_text: Optional[tuple] = None,
+    expect_card_digest: Optional[str] = None,
 ) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -16320,6 +16819,10 @@ def unblock_task(
     that latest ``scheduled``/``schedule_wake_set`` event id, t_7f670c57) and that latest comment
     id (0 = none), checked inside the same IMMEDIATE txn as the flip. A card
     re-blocked or re-pointed in between returns False and is left alone.
+    ``expect_card_text`` pins ``(title, body)`` under that same lock, for callers
+    whose authorization decision depends on tags embedded in those fields.
+    ``expect_card_digest`` is the same pin as :func:`card_text_digest` of ``(title, body)``,
+    for a caller that persists the decision and should not store the text (t_2f7fd11c).
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -16330,6 +16833,14 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
+        if expect_card_text is not None:
+            row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None or tuple(row) != expect_card_text:
+                return False
+        if expect_card_digest is not None:
+            row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None or card_text_digest(row[0], row[1]) != expect_card_digest:
+                return False
         if (expect_block_event is not None or expect_last_comment is not None) and not (
             _unblock_expectation_holds(conn, task_id, expect_block_event, expect_last_comment)
         ):
@@ -16578,6 +17089,8 @@ def specify_triage_task(
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("title", title), ("body", body)])
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
@@ -16685,6 +17198,8 @@ def triage_resolve_task(
         if close_on_error:
             return False, close_on_error
 
+    from hermes_cli.kanban_ruling_citation import validate_fields
+    validate_fields(conn, [("reason", reason)])
     now = int(time.time())
     with write_txn(conn):
         row = conn.execute(
@@ -16873,6 +17388,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
+        from hermes_cli import kanban_artifact_pointer as _kap
+        _kap.stamp(conn, task_id)   # t_328f78fc: survives retention of the rows it reads
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # Stop the worker before its workspace is reaped below. Same identity-checked
     # host-local termination the reclaim paths use. Reap ONLY on proven death:
@@ -17270,6 +17787,19 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
                 return _workspace_admission_refused(
                     conn, task_id, result, board=board, dry_run=dry_run,
                 )
+        # t_7eb1cbbb: the missing dir is the hand-over's own target that never
+        # came to exist (mount fine, no run since): not a lost mount. Restore
+        # the declared worktree (or create the scratch path) and re-admit.
+        if (
+            not dry_run
+            and reason.startswith("stranded_by_mount_loss:")
+            and task.status in ("ready", "review")
+        ):
+            from hermes_cli import kanban_worktree_port as _kwt
+            if _kwt.recover_handover(conn, task):
+                return _workspace_admission_refused(
+                    conn, task_id, result, board=board, dry_run=dry_run,
+                )
         # ``stranded_by_mount_loss`` is only reached after ``validate_mount``
         # passed: the mount is present, the card's dir is not. When no worker
         # has spawned since the card's last completion, kanban itself reaped
@@ -17289,6 +17819,29 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
                 _log.warning(
                     "kanban dispatch: workspace re-minted task=%s (dir reaped at "
                     "completion, mount present: %s)", task_id, reason,
+                )
+                return _workspace_admission_refused(
+                    conn, task_id, result, board=board, dry_run=dry_run,
+                )
+        # t_8721e331: the card's origin_host is a pool host (the field
+        # placement routes on) and it never ran here at this path, so its tree
+        # lives there and the dir here was only a placeholder. Re-create it at
+        # the same path (origin state stays bound) and re-admit; never a page.
+        if (
+            not dry_run
+            and reason.startswith("stranded_by_mount_loss:")
+            and task.status in ("ready", "review")
+        ):
+            from hermes_cli import kanban_continuation as _kcont
+            remote = _kcont.restore_remote_placeholder(conn, task)
+            if remote is not None:
+                with write_txn(conn):
+                    _append_event(conn, task_id, "workspace_placeholder_restored", {
+                        "host": remote, "path": task.workspace_path,
+                    })
+                _log.warning(
+                    "kanban dispatch: workspace placeholder restored task=%s "
+                    "(origin %s; local dir absent)", task_id, remote,
                 )
                 return _workspace_admission_refused(
                     conn, task_id, result, board=board, dry_run=dry_run,
@@ -17673,22 +18226,29 @@ def release_workspace_refusal_pages(conn, event_ids) -> None:
         )
 
 
-def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
-    """Undo a claim when the mount changes during the claim/resolve window."""
+def _release_claim_for_workspace_refusal(conn, task_id, result, reason, *, expected_run_id=None):
+    """Undo a claim when the mount changes during the claim/resolve window.
+
+    ``expected_run_id``: only that run's claim is undone, checked in the write transaction; a successor run that
+    claimed the card while the tick had the board lock handed back is left alone and False is returned
+    (t_f60f502f, Prism d4e9bf031486)."""
     task = get_task(conn, task_id)
     if task is None:
-        return
-    if not any(item[0] == task_id for item in result.workspace_refused):
-        result.workspace_refused.append((task_id, reason))
+        return False
     stranded = bool(task.workspace_path) and reason.startswith((
         "stranded_by_mount_loss:", "workspaces_root_unmounted:",
     ))
-    if stranded and task_id not in result.stranded_by_mount_loss:
-        result.stranded_by_mount_loss.append(task_id)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id=?", (task_id,),
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,),
         ).fetchone()
+        if expected_run_id is not None and (row is None or row["status"] != "running"
+                                            or row["current_run_id"] != int(expected_run_id)):
+            return False
+        if not any(item[0] == task_id for item in result.workspace_refused):
+            result.workspace_refused.append((task_id, reason))
+        if stranded and task_id not in result.stranded_by_mount_loss:
+            result.stranded_by_mount_loss.append(task_id)
         run_id = row["current_run_id"] if row else None
         retry_status = _retry_status_for_run(conn, task_id, run_id)
         conn.execute(
@@ -17706,6 +18266,7 @@ def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
             "stranded_by_mount_loss" if stranded else "workspace_refused",
             _stranded_event_payload(reason), run_id=closed_run_id,
         )
+    return True
 
 
 @_home_session_guarded("set-model")
@@ -17743,6 +18304,7 @@ def set_task_model(
     _verdict = _require_known_model(
         resolved_model, resolved_provider, force_model_reason=force_model_reason,
     )
+    resolved_model = _store_slot(resolved_model, resolved_provider, force_model_reason)
     if not resolved_model:
         resolved_provider = None
     with write_txn(conn):
@@ -17846,22 +18408,25 @@ def set_task_priority(
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    wake_at: Optional[int] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park until a validated wake time, atomically with ending the run."""
+    if wake_at is not None:
+        wake_at = validate_wake_at(wake_at)
     with write_txn(conn):
-        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute("SELECT status, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        from hermes_cli.kanban_lifecycle_guards import has_event_gate
+        if wake_at is None and not (row and has_event_gate(row["body"])):
+            raise ValueError("scheduled needs a wake time (--at or --now) or unblock_when: event:<name>")
         parked_from = _resume_phase_for_park(conn, task_id, row["status"]) if row else "ready"
-        params: list[Any] = [task_id]
+        params: list[Any] = [wake_at, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL,
-                   -- A leftover rate-limit cooldown would read as a timed wake
-                   -- to wake_due_scheduled; set_schedule_wake stamps a real one.
-                   next_eligible_at = NULL
+                   next_eligible_at = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked', 'review')
         """
@@ -17874,7 +18439,7 @@ def schedule_task(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, "scheduled",
-                      {"reason": reason, "source_status": parked_from}, run_id=run_id)
+                      {"reason": reason, "source_status": parked_from, "until": wake_at}, run_id=run_id)
         return True
 
 # Scheduled cards with no timed wake (``next_eligible_at IS NULL``) wait on a
@@ -18620,7 +19185,7 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
     """
     key = (repo.lower(), int(number))
     base_fields = "state,mergedAt,headRefName"
-    for fields in (f"{base_fields},mergeStateStatus,statusCheckRollup", base_fields):
+    for fields in (f"{base_fields},mergeStateStatus,statusCheckRollup,labels", base_fields):
         try:
             proc = subprocess.run(
                 ["gh", "pr", "view", str(number), "-R", repo, "--json", fields],
@@ -18655,6 +19220,7 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
         _PR_MERGE_HEALTH_CACHE[key] = {
             "merge_state": str(payload.get("mergeStateStatus") or "").upper() or None,
             "ci_red": _pr_rollup_is_red(payload.get("statusCheckRollup")),
+            "hold_label": _pr_has_hold_label(payload.get("labels")),
         }
     while len(_PR_MERGE_HEALTH_CACHE) > _PR_HEAD_REF_CACHE_LIMIT:
         _PR_MERGE_HEALTH_CACHE.pop(next(iter(_PR_MERGE_HEALTH_CACHE)))
@@ -18679,6 +19245,14 @@ _PR_RED_CHECK_VALUES = frozenset({
 
 # States in which the PR can land without its worker.
 _PR_MERGEABLE_STATES = frozenset({"CLEAN", "HAS_HOOKS", "BLOCKED"})
+
+
+def _pr_has_hold_label(labels) -> bool:
+    """True when the PR carries the ``hold`` label: no closer lands it, the operator decides (t_4cface27)."""
+    if not isinstance(labels, list):
+        return False
+    return any(isinstance(item, dict) and str(item.get("name") or "").strip().lower() == "hold"
+               for item in labels)
 
 
 def _pr_rollup_is_red(rollup) -> bool:
@@ -18794,6 +19368,7 @@ def _record_worker_returncode(pid: int, code: int) -> None:
     """Remember Popen's native return code, including on Windows."""
     if not pid or pid <= 0:
         return
+    __getattr__("_recent_worker_exits")
     now = time.time()
     # (code, wall, boot evidence): the reap's upper bound on both clocks.
     _recent_worker_exits[int(pid)] = (int(code), now, _boot_evidence())
@@ -19735,6 +20310,7 @@ def reap_exited_worker_leftovers(
             continue
         task_id, run_id, spawned_at = ident[:3]
         boot = {"after_boot": ident[3] if len(ident) > 3 else None}
+        __getattr__("_recent_worker_exits")
         exit_entry = _recent_worker_exits.get(int(pid))
         if exit_entry:
             now = exit_entry[1]
@@ -20035,6 +20611,47 @@ def _dead_claimer_hold_only(worker_pid: Optional[int], termination: dict) -> boo
     )
 
 
+def _reclaim_hold_expires(now: int, termination: dict) -> int:
+    """``claim_expires`` for a claim a reclaim path just HELD instead of releasing.
+
+    A dead-claimer hold has a known end (``dead_claimer_hold_until``, the launch
+    bound): the lease runs to exactly that point, so the TTL sweep re-judges the
+    claim the moment the bound passes and releases it there. A flat
+    ``now + RECLAIM_DEFER_GRACE_SECONDS`` both SHORTENED the lease inside the
+    bound (a refused manual ``reclaim`` made the sweep fire early and defer
+    ``ttl_expired_worker_alive``) and pushed it past the bound (t_bf2c4ade).
+    Every other hold keeps the flat grace."""
+    hold_until = termination.get("dead_claimer_hold_until")
+    if isinstance(hold_until, int) and hold_until > now:
+        return hold_until
+    return now + RECLAIM_DEFER_GRACE_SECONDS
+
+
+def _dead_claim_release_voided(
+    conn: sqlite3.Connection, task_id: str, termination: dict,
+) -> bool:
+    """Call UNDER the write lock that releases the claim. True when a release
+    granted on "no worker evidence" for a pid-less, dead-claimer claim is void
+    because evidence landed after the verdict: a stamped worker pid, a
+    ``spawned``/``heartbeat`` row that moved (or replaced) the bound, or a
+    changed basis. Every path that releases a claim at the dead-claimer bound
+    calls this one helper (t_bf2c4ade, Apollo P1 8ffc317b3093). Verdicts not
+    made on the dead-claimer path return False."""
+    basis = termination.get("dead_claimer_release_basis")
+    if not termination.get("host_local") or termination.get("prev_pid") or basis is None:
+        return False
+    cur = conn.execute("SELECT worker_pid FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if cur is not None and cur["worker_pid"]:
+        return True
+    release_at, basis_now, _ = _dead_claimer_release_at(conn, task_id)
+    if basis == "operator_claim_no_worker":
+        return basis_now != basis
+    if termination.get("operator_override"):
+        # Granted inside the bound on "no evidence at all" (FleetReview 8a8140b0725a).
+        return basis_now != "launch_bound"
+    return basis_now != basis or release_at is None or int(time.time()) < release_at
+
+
 def _host_process_mentions_task(task_id: str) -> bool:
     """True if any other process on this host carries ``task_id`` in argv.
 
@@ -20154,7 +20771,7 @@ def _refuse_reclaim_unproven_death(
     this call just refused to release.
     """
     now = int(time.time())
-    grace = now + RECLAIM_DEFER_GRACE_SECONDS
+    grace = _reclaim_hold_expires(now, termination)
     with write_txn(conn):
         run_id = _current_run_id(conn, task_id)
         cur = conn.execute(
@@ -20283,7 +20900,7 @@ def detect_progress_stalls(
             continue
         start = int(row["started_at"])
         hb = row["last_heartbeat_at"]
-        if hb is None or now - int(hb) >= _STALE_HEARTBEAT_GAP_SECONDS:
+        if hb is None or now - int(hb) >= _kbd._STALE_HEARTBEAT_GAP_SECONDS:
             continue
         pid = int(row["worker_pid"])
         lock = row["claim_lock"]
@@ -20334,6 +20951,8 @@ def detect_progress_stalls(
         escalate = attempts >= 2
         reason = f"worker progress stalled for {age}s; {evidence['signals']}; heartbeat age {evidence['heartbeat_age_seconds']}s"
         with write_txn(conn):
+            if _dead_claim_release_voided(conn, row["id"], termination):
+                continue    # late worker evidence: the next pass re-judges it (t_bf2c4ade)
             status = "blocked" if escalate else _kdb.requeue_status(
                 conn, _retry_status_for_run(conn, row["id"]))
             cur = conn.execute(
@@ -20442,6 +21061,7 @@ def end_orphaned_terminal_runs(
             )
             if cur.rowcount != 1:
                 continue
+            _stamp_no_worker_class(conn, run_id, worker_pid=pid)
             conn.execute(
                 "UPDATE tasks SET current_run_id = NULL "
                 "WHERE id = ? AND current_run_id = ?",
@@ -20511,7 +21131,7 @@ def _protocol_violation_history(
         "SELECT outcome, error, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY id DESC LIMIT ?",
-        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+        (task_id, _kbd._PROTOCOL_VIOLATION_SCAN_LIMIT),
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
@@ -20574,7 +21194,121 @@ def _cohort_death_ids(dead: list, *, now: float) -> set:
     return members if len(members) >= _COHORT_DEATH_MIN else set()
 
 
-def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive: Optional[list] = None) -> None:
+# Who sent the signal (t_c6d2e782). The Studio runs an exec flight recorder
+# (hermes-home fleet/exec-flight-recorder.py: one JSON line per exec(), hourly
+# ``YYYY-mm-dd-HH.jsonl`` files, ``ts`` in local time). A kill/pkill/killall exec
+# in the minutes before detection is the sender; its parents name the session.
+# On 2026-11-17 11:06:16 it was a worker's ``sudo -n pkill -f PAT -P N``.
+_EXEC_FLIGHT_DIRS_ENV = "HERMES_EXEC_FLIGHT_DIRS"
+_COHORT_SENDER_WINDOW_SECONDS = 240
+_COHORT_SENDER_TAIL_BYTES = 96 * 1024 * 1024
+_KILL_EXES = (b'/kill"', b'/pkill"', b'/killall"')
+
+
+def _exec_flight_dirs() -> list:
+    raw = os.environ.get(_EXEC_FLIGHT_DIRS_ENV)
+    if raw is not None:
+        return [Path(p) for p in raw.split(os.pathsep) if p]
+    return [Path("/Volumes/fleet-scratch/var/exec-flight"), Path.home() / ".hermes" / "var" / "exec-flight"]
+
+
+def _exec_flight_tail(path: Path, max_bytes: int) -> list:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read(max_bytes)
+    except OSError:
+        return []
+    lines = data.split(b"\n")
+    return lines[1:] if size > max_bytes else lines  # first line may be cut
+
+
+def _cohort_death_sender(*, pids: Iterable[int] = (), now: Optional[float] = None,
+                         window: float = _COHORT_SENDER_WINDOW_SECONDS) -> Optional[str]:
+    """Name the kill/pkill/killall exec(s) seen in the window before ``now``, else None.
+
+    ``pkill``/``killall`` (pattern kills) always count. A plain ``kill`` counts only when it
+    names a member pid or pgid from ``pids`` (or ``-1``): a targeted kill of some other pid
+    in the same minutes is another session's business, not the sender.
+
+    Reads only the tail of the current (and, across an hour boundary, previous)
+    hourly file. None also when no recorder ring exists or the killer did not exec
+    (``os.kill`` from inside a process, or the recorder itself was killed first).
+    Never raises.
+    """
+    try:
+        now = time.time() if now is None else now
+        lo = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - window))
+        hi = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now + 5))
+        hours = sorted({time.strftime("%Y-%m-%d-%H", time.localtime(t)) for t in (now - window, now)})
+        ring = next((d for d in _exec_flight_dirs() if d.is_dir()), None)
+        if ring is None:
+            return None
+        members = {abs(int(p)) for p in pids if p}
+        lines: list = []
+        for h in hours:
+            lines.extend(_exec_flight_tail(ring / f"{h}.jsonl", _COHORT_SENDER_TAIL_BYTES))
+        rows = []
+        for line in lines:
+            if not any(k in line for k in _KILL_EXES):
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            exe = os.path.basename(str(r.get("exe") or ""))
+            args = str(r.get("args") or "")
+            if exe not in ("kill", "pkill", "killall") or not (lo <= str(r.get("ts") or "") <= hi):
+                continue
+            if re.search(r"(?:^|\s)-0(?:\s|$)", args):
+                continue  # liveness probe, sends nothing
+            if exe == "kill":
+                targets = {abs(int(a)) for a in re.findall(r"(?:^|\s)(-?\d+)(?=\s|$)", args)}
+                if not (targets & members or "-1" in args.split()):
+                    continue
+            rows.append(r)
+        if not rows:
+            return None
+
+        def _parent(ppid, before: str) -> Optional[dict]:
+            needle = ('"pid":%d,' % int(ppid)).encode()
+            hit = None
+            for line in lines:
+                if needle in line:
+                    try:
+                        cand = json.loads(line)
+                    except ValueError:
+                        continue
+                    if cand.get("pid") == ppid and str(cand.get("ts") or "") <= before:
+                        hit = cand  # latest exec of that pid up to the kill
+            return hit
+
+        def _cmd(row: dict, n: int) -> str:
+            return " ".join(str(row.get("args") or "").split())[:n]
+
+        out = []
+        for r in reversed(rows[-3:]):  # newest first: the kill closest to the deaths
+            chain = [f"`{_cmd(r, 200)}` (pid {r.get('pid')}, uid {r.get('uid')}, {str(r.get('ts'))[11:]})"]
+            cur = r
+            for _ in range(3):
+                ppid = cur.get("ppid")
+                if not isinstance(ppid, int) or ppid <= 1:
+                    break
+                cur = _parent(ppid, str(cur.get("ts") or hi))
+                if cur is None:
+                    break
+                chain.append(f"`{_cmd(cur, 160)}` (pid {cur.get('pid')})")
+            out.append(" <- ".join(chain))
+        return "; ".join(out)
+    except Exception as exc:  # pragma: no cover - attribution must never break a tick
+        _log.debug("cohort-death sender lookup failed: %s", exc)
+        return None
+
+
+def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive: Optional[list] = None,
+                       sender: Optional[str] = None) -> None:
     """Page #alerts ONCE for a cohort death. Best-effort, never raises.
 
     Once per cohort by construction: the members are released in the same
@@ -20602,9 +21336,13 @@ def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive:
                 "`log show --predicate 'process == \"timed\"'`), so live workers may now "
                 "be running beside their own requeued card."
             )
+        elif sender:
+            cause = f"Signal sender (exec flight recorder): {sender}"
         else:
             cause = (
-                "Something outside the dispatcher killed them (reaper / OOM / signal sweep): "
+                "SENDER UNKNOWN: the exec flight recorder holds no kill/pkill/killall exec in the "
+                "4 min before detection (a kill from inside a process, or the recorder was killed "
+                "too). Something outside the dispatcher killed them (reaper / OOM / signal sweep): "
                 "the cohort_death events carry each member's spawn pgid and who else was in it; "
                 "find the sender with `log show --predicate 'eventMessage CONTAINS \"sent by\"'` "
                 "around the tick."
@@ -20659,6 +21397,8 @@ def _unusable_workspace_reason(exc: BaseException) -> Optional[str]:
     characters that ended mid-path and told the reader nothing.
     """
     text = str(exc)
+    if getattr(exc, "permanent_spawn_wall", False):
+        return text  # carries its own operator fix (kanban_worktree_port.ForeignOriginPush, t_eac2768a)
     if not any(marker in text for marker in _UNUSABLE_WORKSPACE_MARKERS):
         return None
     return (
@@ -20724,6 +21464,10 @@ def _pool_in_flight(conn: sqlite3.Connection) -> dict[str, int]:
         if isinstance(pool, str) and pool:
             counts[pool] = counts.get(pool, 0) + 1
     return counts
+
+
+class ClaimLost(RuntimeError):
+    """A run-fenced write found the card owned by another run (t_f60f502f): the launch that issued it stops."""
 
 
 def _claim_still_held(conn: sqlite3.Connection, task: "Task") -> bool:
@@ -20813,10 +21557,10 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
     comments = conn.execute(
         "SELECT id, author, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY id DESC",
-        (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+        (task_id, int(time.time()) - _kbd._RESPAWN_GUARD_PR_WINDOW),
     ).fetchall()
     pr_comment = next(
-        (c for c in comments if _RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None,
+        (c for c in comments if _kbd._RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None,
     )
     if pr_comment is None:
         return False
@@ -20901,6 +21645,9 @@ def _reassign_stale_pr_owners(
 # ``hold`` of an active_pr decline whose OPEN own-PR is mergeable. The gateway
 # watcher enqueues that PR on the land queue instead of paging (t_5a9deed5).
 RESPAWN_GUARD_HOLD_MERGEABLE = "PR mergeable, closer will land it"
+# ``hold`` of an active_pr decline whose own PR carries the ``hold`` label: no closer lands it, so the card waits
+# on the operator. kanban_held_pr_wake wakes the card's home session once (t_4cface27).
+RESPAWN_GUARD_HOLD_LABELLED = "PR carries the hold label, the operator decides"
 
 # A READY+assigned card continuously deferred as ``respawn_guarded:active_pr``
 # for this long is STUCK, not cooling down: nothing automatic will clear it.
@@ -22420,7 +23167,8 @@ def _shim_model_rank(model: Optional[str]) -> Optional[int]:
     rank the same as the bare model. Unknown families never rank, so a cap
     never fires on a model the dispatcher cannot place (fail-open to today).
     """
-    name = str(model or "").rsplit("/", 1)[-1].lower()
+    from hermes_cli.model_registry import slot_resolve  # a slot card (``opus``) ranks as its id
+    name = str(slot_resolve(str(model or ""))[0] or "").rsplit("/", 1)[-1].lower()
     # Only recognized Claude model-id shapes rank (``claude-<family>-<digit>``
     # e.g. claude-opus-5, claude-sonnet-4-5, claude-haiku-4-5-20251001).
     # A custom alias (``acme/opus-v1``, ``claude-custom-opus-v1``) never ranks,
@@ -22505,7 +23253,8 @@ def _apply_shim_model_cap(
 # ---------------------------------------------------------------------------
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(conn: sqlite3.Connection, task_id: str,
+                         spans: Optional[dict] = None) -> str:
     """Everything a worker should read about its task: header, body,
     attachments, prior attempts, done-parent handoffs, the assignee's recent
     work, comments. Lists are tail-capped and fields char-capped
@@ -22522,13 +23271,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                            (int(task.current_run_id),)).fetchone()
         run_started_at = int(row["started_at"]) if row and row["started_at"] is not None else None
     _ctx_header(lines, task, run_started_at)
+    marks: dict = {"head": (0, len(lines))}  # line ranges kanban_show never cuts (t_5949eafd)
+    current = _ctx_current_sendback(conn, task_id)
     _ctx_attachments(lines, list_attachments(conn, task_id))
-    _ctx_prior_attempts(lines, conn, task_id, now)
-    _ctx_sendbacks(lines, conn, task_id, now)
+    _ctx_prior_attempts(lines, conn, task_id, now, current, marks)
+    _ctx_sendbacks(lines, conn, task_id, now, current, marks)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
-    _ctx_comments(lines, list_comments(conn, task_id), now)
-    return "\n".join(lines).rstrip() + "\n"
+    from hermes_cli import kanban_archive_read as _kar
+    _ctx_comments(lines, _kar.comments_with_archive(conn, task_id), now)
+    text = "\n".join(lines).rstrip() + "\n"
+    if spans is not None:  # char spans of the header+body and the current send-back
+        for key, (a, b) in marks.items():
+            start = len("\n".join(lines[:a])) + (1 if a else 0)
+            spans[key] = (start, min(len(text), len("\n".join(lines[:b]))))
+    return text
 
 
 def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
@@ -22539,6 +23296,21 @@ def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
+def _ctx_cap_lines(s: Optional[str], more: str) -> str:
+    """``_ctx_cap`` for a send-back: cut at a line end within the field cap and
+    name ``more``, the command that prints the rest (t_5949eafd)."""
+    s = (s or "").strip()
+    limit = _CTX_MAX_FIELD_BYTES
+    if len(s) <= limit:
+        return s
+    head = s[:limit]
+    if s[limit] != "\n":  # the cap already ends a line otherwise
+        cut = head.rfind("\n")
+        head = head[:cut] if cut > 0 else head[:max(head.rfind(" "), 1)]
+    head = head.rstrip()
+    return head + f"\n… [truncated, {len(s) - len(head)} chars omitted; whole text: `{more}`]"
 
 
 def _ctx_stamp(ts: int, now: int) -> str:
@@ -22597,27 +23369,29 @@ def _ctx_header(lines: list[str], task: Task, run_started_at: Optional[int] = No
 
 
 def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
-    """Absolute on-disk paths so the worker's file tools read them directly
-    (remote terminal backends need the attachments dir mounted)."""
+    """Attachment ids for ``kanban_attachment_read``, which serves the bytes through the
+    board connection from any host; the board-host path is kept for local readers."""
     if not attachments:
         return
     lines.append("## Attachments")
     lines.append(
-        "Files attached to this task. Read them with the file/terminal "
-        "tools at the absolute paths below:"
+        "Files attached to this task. Read one with `kanban_attachment_read(attachment_id=<id>)` "
+        "(works on any host). The path after the arrow exists only on the board host:"
     )
     for att in attachments:
         size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
         size_str = f", {size_kb} KB" if size_kb else ""
         ctype = f", {att.content_type}" if att.content_type else ""
-        lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+        lines.append(f"- id {att.id} `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
     lines.append("")
 
 
-def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int,
+                        current: Optional[tuple[str, int]] = None, marks: Optional[dict] = None) -> None:
     """Closed runs on this task (the active run is this worker), newest
     ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    from hermes_cli import kanban_archive_read as _kar  # R8 moves old cards' runs out (t_589fb988)
+    all_prior = [r for r in _kar.runs_with_archive(conn, task_id) if r.ended_at is not None]
     shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
     if not shown:
         return
@@ -22628,11 +23402,21 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
     for offset, run in enumerate(shown):
         profile = run.profile or "(unknown)"
         outcome = run.outcome or run.status
+        start = len(lines)
         lines.append(
             f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
         )
         if run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
+            if current == ("run", run.id):  # the one current send-back is whole (t_5949eafd)
+                lines.append(run.summary.strip())
+                if marks is not None:
+                    marks["sendback"] = (start, len(lines))
+            elif run.outcome == "changes_requested":
+                lines.append(_ctx_cap_lines(run.summary, render_operator_command(
+                    get_current_board(), "show", task_id, "--json",
+                    "--state-type", "outcome", "--state-name", "changes_requested")))
+            else:
+                lines.append(_ctx_cap(run.summary))
         if run.error and run.error.strip():
             lines.append(f"_error_: {_ctx_cap(run.error)}")
         meta_line = _ctx_metadata_line(run.metadata)
@@ -22645,6 +23429,7 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
     """Done-parent handoffs: newest ``completed`` run's summary+metadata,
     falling back to ``task.result`` for pre-runs-table data. Stamped with a
     relative age so the worker re-verifies stale upstream results."""
+    from hermes_cli import kanban_archive_read as _kar  # a parent done > 14 d has its runs archived (R8)
     parent_rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
     ).fetchall()
@@ -22653,7 +23438,7 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         pt = get_task(conn, pid)
         if not pt or pt.status != "done":
             continue
-        runs = [r for r in list_runs(conn, pid) if r.outcome in SUCCESS_RUN_OUTCOMES]
+        runs = [r for r in _kar.runs_with_archive(conn, pid) if r.outcome in SUCCESS_RUN_OUTCOMES]
         runs.sort(key=lambda r: r.started_at, reverse=True)
         run = runs[0] if runs else None
         if not wrote_header:
@@ -23283,8 +24068,10 @@ def explain_complete_refusal(
         )
         state = "already done" if task.status == "done" else "archived (was done)" if task.completed_at else "archived"
         return f"{state} by {who} at {when}{outcome}"
-    if task.status not in ("running", "ready", "blocked", "review"):
-        return f"status is {task.status!r}; complete needs running/ready/blocked/review"
+    closable = ("running", "ready", "blocked", "review") + (("scheduled",) if expected_run_id is None else ())
+    if task.status not in closable and not _operator_todo(task):
+        return (f"status is {task.status!r}; complete needs running/ready/blocked/review "
+                f"(scheduled from an operator, or todo on a human-assigned operator card)")
     if expected_run_id is not None and task.current_run_id != expected_run_id:
         return (
             f"run {expected_run_id} is no longer the current run "
@@ -23383,37 +24170,40 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _managed_scratch_path_info,
     _scratch_workspace,
 )
-from hermes_cli.kanban_db_dispatch import (  # noqa: E402
-    DEFAULT_FAILURE_LIMIT,
-    DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
-    DispatchResult,
-    _PROTOCOL_VIOLATION_SCAN_LIMIT,
-    _RECENT_WORKER_EXITS_MAX,
-    _RECENT_WORKER_EXIT_TTL_SECONDS,
-    _RESPAWN_GUARD_PR_URL_RE,
-    _RESPAWN_GUARD_PR_WINDOW,
-    _STALE_HEARTBEAT_GAP_SECONDS,
-    UNVERIFIED_WORKER_FINGERPRINT,
-    _classify_worker_exit,
-    _clear_failure_counter,
-    _defer_reclaim_for_live_worker,
-    _pid_alive,
-    _pid_recycled,
-    _recent_worker_exits,
-    _record_task_failure,
-    _terminate_reclaimed_worker,
-    _worker_alive,
-    _worker_survived_termination,
-    _worker_terminal_timeout_env,
-    # Fork facade re-exports: the dispatcher entry points lived here before
-    # upstream's kanban_db_dispatch split; fork tests and callers still reach
-    # them as ``kanban_db.dispatch_once`` etc.
-    check_respawn_guard,
-    detect_crashed_workers,
-    dispatch_once,
-    enforce_max_runtime,
-    has_spawnable_ready,
-)
+# Keep the facade's dispatcher API without loading it for board reads.
+_DISPATCH_EXPORTS = frozenset({
+    "DEFAULT_FAILURE_LIMIT", "DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS", "DispatchResult",
+    "_PROTOCOL_VIOLATION_SCAN_LIMIT", "_RECENT_WORKER_EXITS_MAX",
+    "_RECENT_WORKER_EXIT_TTL_SECONDS", "_RESPAWN_GUARD_PR_URL_RE", "_RESPAWN_GUARD_PR_WINDOW",
+    "_STALE_HEARTBEAT_GAP_SECONDS", "UNVERIFIED_WORKER_FINGERPRINT", "_recent_worker_exits",
+})
+def _dispatch_handler(name):
+    def call(*args, **kwargs):
+        __getattr__("DispatchResult")
+        from hermes_cli import kanban_db_dispatch
+        return getattr(kanban_db_dispatch, name)(*args, **kwargs)
+    return call
+
+
+for _name in (
+    "_classify_worker_exit", "_clear_failure_counter", "_defer_reclaim_for_live_worker",
+    "_pid_alive", "_pid_recycled", "_record_task_failure", "_terminate_reclaimed_worker",
+    "_worker_alive", "_worker_survived_termination", "_worker_terminal_timeout_env",
+    "check_respawn_guard", "detect_crashed_workers", "dispatch_once", "enforce_max_runtime",
+    "has_spawnable_ready",
+):
+    globals()[_name] = _dispatch_handler(_name)
+
+
+def __getattr__(name):
+    if name not in _DISPATCH_EXPORTS:
+        raise AttributeError(name)
+    from hermes_cli import kanban_db_dispatch
+    # Internal function globals must see the same constants and mutable registry.
+    for exported in _DISPATCH_EXPORTS:
+        globals().setdefault(exported, getattr(kanban_db_dispatch, exported))
+    return globals()[name]
+
 from hermes_cli.kanban_db_board_registry import (  # noqa: E402
     PINNED_SLUG,
     KanbanBoardDerivationError,

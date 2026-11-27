@@ -82,6 +82,7 @@ def _completed_subscription(**sub_kwargs):
     try:
         tid = kb.create_task(
             conn,
+            boomerang_wake=False,
             title="wake scope",
             assignee="worker",
             session_id="origin-session",

@@ -51,6 +51,24 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+# Each wrapper with the one separator the gateway puts after it ("\n\n" after
+# the note, gateway/run.py; " " after the timestamp, message_timestamps.py).
+_USER_ROW_SYSTEM_NOTE_PREFIX = re.compile(r"^\[System note: [^\]]*\](?:\n\n)?")
+_USER_ROW_TIMESTAMP_PREFIX = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [A-Z]{2,5}\] ?")
+# gateway/run_inbound.py discord_triggering_note + the "\n\n" it is joined with.
+_USER_ROW_DISCORD_NOTE_PREFIX = re.compile(
+    r"^\[Triggering message id: `[^`\n]*` — use as `message_id` for reply/react/pin via the discord tools\.\](?:\n\n)?"
+)
+# Lines ingest_protection adds before </persisted-output> on the write path.
+_INLINE_PERSISTED_OUTPUT_METADATA_LINES = re.compile(
+    r"\r?\n\[LCM persisted-output (?:marker identity: preview_sha256=[0-9a-f]{64}"
+    r"|file generation: size=\d+; mtime_ns=\d+; ctime_ns=\d+)\](?=\r?\n(?:\[LCM persisted-output [^\r\n]*\]\r?\n)*</persisted-output>\s*$)"
+)
+_USER_ROW_WRAPPER_PREFIXES = (
+    _USER_ROW_SYSTEM_NOTE_PREFIX,
+    _USER_ROW_TIMESTAMP_PREFIX,
+    _USER_ROW_DISCORD_NOTE_PREFIX,
+)
 
 
 class ReconcileMixin:
@@ -933,6 +951,16 @@ class ReconcileMixin:
                 if not self._effective_replay_identities(messages[:cursor])
                 else "replayed durable tail"
             )
+            if reason == "skipped scaffold-only prefix":
+                # A restarted gateway resumes a compacted session as
+                # [preserved-objective scaffold] + the stored tail it kept
+                # (t_17732be2: 13 of 18 sessions at the 10:39 boot). The
+                # scaffold proves nothing about the rows after it, so prove
+                # those the same way as a scaffold-free resume.
+                anchored = self._tool_call_anchored_replay_cursor(messages[cursor:], stored_rows)
+                if anchored > 0:
+                    cursor += anchored
+                    reason = "replayed history anchored on stored tool calls"
             self._record_ingest_reconciliation(
                 action="advanced cursor",
                 reason=reason,
@@ -998,6 +1026,19 @@ class ReconcileMixin:
             )
             return len(messages)
 
+        cursor = self._tool_call_anchored_replay_cursor(messages, stored_rows)
+        if cursor > 0:
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="replayed history anchored on stored tool calls",
+                cursor=cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            return cursor
+
         self._record_ingest_reconciliation(
             action="persisted batch",
             reason="persisted ambiguous delta",
@@ -1008,6 +1049,344 @@ class ReconcileMixin:
             effective_incoming=len(incoming_identities),
         )
         return 0
+
+    def _tool_call_anchored_replay_cursor(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_rows: List[Dict[str, Any]],
+    ) -> int:
+        """Cursor past the leading host rows proven to be stored, row by row.
+
+        A rebuilt agent's first ingest hands LCM the host's in-memory history:
+        a trailing slice of the session that starts mid-turn, has no system row
+        or compaction scaffold, and may carry host rewrites of earlier user rows
+        (a timestamp prefix, emptied content). No exact-suffix rule accepts it,
+        so each agent rebuild re-appended the whole slice under fresh
+        timestamps (t_73572f17: one session 552,644 rows / 10,848 contents).
+
+        The first host tool result whose full identity is stored fixes the
+        alignment between host rows and stored rows. From host row 0 the rows
+        are then compared position by position: assistant/tool/system rows must
+        be identical, user rows must be equal under ``_user_row_rerender_key``
+        (the host re-renders them) and must not carry a different gateway
+        timestamp. A user row matched only through that key (or emptied) is
+        provisional: the cursor passes it only when a later row
+        in the run matches by full identity, so a run that ends right after it
+        leaves it to be appended. Where the store holds rows the host does not
+        (an interrupted turn's residue, turns left between moved dedup copies),
+        the walk re-aligns forward on the next once-stored tool call and
+        re-checks the host row there; a host tool row whose call the store
+        holds here with other content counts as stored when the store holds
+        it verbatim elsewhere. Otherwise the run ends at the first row that
+        does not match, so the cursor never passes a row that is not shown to
+        be stored:
+        a gap in the store (rows the host holds that were never written, e.g.
+        the store-free compaction fallback marks its raw tail ingested) ends
+        the run at its first row, whether the gap shows on an assistant row, a
+        tool row or a user row (turns whose assistant reply repeats), and a
+        reused call id with new arguments fails on its assistant row. A call id
+        that occurs more than once among the stored rows neither anchors nor
+        counts: it cannot tell a new polling turn from an old one. Two distinct
+        once-stored tool-call ids must be matched inside the run, so a short
+        delta keeps dup-over-loss.
+
+        Accepted limit: a gap row is still skipped when its user row equals its
+        stored neighbour's apart from the re-render variance AND the rows after
+        it are identical to the neighbour's (same prompt, same reply, e.g. a
+        repeated "[<timestamp>] proceed" answered identically). Nothing in the
+        rows tells such a turn from a re-render of the stored one.
+        """
+        stored_ids = [
+            self._strip_inline_persisted_output_metadata(self._message_replay_identity(row, stored_row=True))
+            for row in stored_rows
+        ]
+        id_uses: dict[str, int] = {}
+        for row in stored_rows:
+            if str(row.get("role") or "") == "tool" and row.get("tool_call_id"):
+                call_id = str(row.get("tool_call_id"))
+                id_uses[call_id] = id_uses.get(call_id, 0) + 1
+        # A call id stored more than once (providers that number calls per
+        # turn) cannot say which occurrence a host row is: never anchor on it.
+        unique_ids = {call_id for call_id, uses in id_uses.items() if uses == 1}
+        stored_tool_pos: dict[tuple[Any, ...], int] = {}
+        for pos, (row, identity) in enumerate(zip(stored_rows, stored_ids)):
+            if str(row.get("role") or "") == "tool" and str(row.get("tool_call_id") or "") in unique_ids:
+                stored_tool_pos[identity] = pos
+        host_ids = [
+            self._strip_inline_persisted_output_metadata(self._message_replay_identity(msg)) for msg in messages
+        ]
+        # Stored position of each host tool row whose once-stored call id is
+        # stored with this full identity; None for every other host row.
+        anchor_pos = [
+            stored_tool_pos.get(identity)
+            if str(msg.get("role") or "") == "tool" and str(msg.get("tool_call_id") or "") in unique_ids
+            else None
+            for msg, identity in zip(messages, host_ids)
+        ]
+        offset = next((pos - idx for idx, pos in enumerate(anchor_pos) if pos is not None), None)
+        if offset is None or offset < 0:
+            return 0
+        # A host tool row's identity counts as stored elsewhere only while the
+        # store holds a copy that no host row has passed yet (Prism cb28d89fa826).
+        unused_stored: dict[tuple[Any, ...], int] = {}
+        for identity in stored_ids:
+            unused_stored[identity] = unused_stored.get(identity, 0) + 1
+        cursor = 0
+        matched_ids: set[str] = set()
+        idx = 0
+        while idx < len(messages):
+            msg = messages[idx]
+            pos = idx + offset
+            identity = host_ids[idx]
+            role = str(msg.get("role") or "")
+            # The store can hold one user turn twice in a row, once per
+            # rendering, where the host holds it once (t_ca2c9470, session
+            # 20261023_031240_9df89e67: "[ts] <text>" then "<text>"). Step over
+            # the stored copy unless the host row is that user row itself;
+            # every host row still has to match.
+            while (
+                0 < pos < len(stored_rows)
+                and identity != stored_ids[pos]
+                and role != "user"
+                and str(stored_rows[pos].get("role") or "") == "user"
+                and str(stored_rows[pos - 1].get("role") or "") == "user"
+                and self._user_row_rerenders_stored(stored_ids[pos][1], stored_ids[pos - 1][1])
+            ):
+                offset += 1
+                pos += 1
+            if pos >= len(stored_rows):
+                break
+            stored_role = str(stored_rows[pos].get("role") or "")
+            if role != stored_role or identity != stored_ids[pos]:
+                if role == stored_role == "user" and (
+                    self._user_row_rerender_key(identity[1]) == ""
+                    or (
+                        self._user_row_rerenders_stored(identity[1], stored_ids[pos][1])
+                        and not self._user_row_stamps_differ(identity[1], stored_ids[pos][1])
+                    )
+                ):
+                    # Provisional: the cursor passes it only when a later row
+                    # in the run matches by full identity.
+                    idx += 1
+                    continue
+                merged = (
+                    self._stored_user_run_merged_by_host(identity[1], stored_ids, pos)
+                    if role == stored_role == "user"
+                    else 0
+                )
+                if merged:
+                    # The host merged consecutive stored user rows into this one
+                    # (t_eebb04bf: a reboot's "[System note: ...interrupted...]"
+                    # resume row after the prompt it interrupted). Provisional
+                    # as above, over all the stored rows it absorbed.
+                    offset += merged - 1
+                    idx += 1
+                    continue
+                if (
+                    role == stored_role == "tool"
+                    and str(msg.get("tool_call_id") or "") == str(stored_rows[pos].get("tool_call_id") or "")
+                    and unused_stored.get(identity, 0) >= host_ids[idx:].count(identity)
+                ):
+                    # The store holds this tool row verbatim elsewhere, and here
+                    # the same call with other content: a restart rewrote the
+                    # result (t_99e38df0, session 20261109_011227_2e109b: host
+                    # "[Command interrupted]", stored "[Orphan recovery: ...]").
+                    # Every host copy of it from here on needs its own unused
+                    # stored copy, so none of them is passed unstored.
+                    unused_stored[identity] -= 1
+                    cursor = idx + 1
+                    idx += 1
+                    continue
+                # The store holds rows here the host does not (an interrupted
+                # turn's residue, or turns stored between two moved dedup
+                # copies; t_99e38df0). Re-align on the next host row that is a
+                # once-stored tool call, only forward: stored rows are skipped,
+                # host rows never, and each one still has to match. A user row
+                # passed provisionally under the old offset keeps that match:
+                # under the new one it lands on the residue (Prism cb28d89fa826,
+                # head 6f864616). A re-sent prompt is never provisional, since
+                # its gateway timestamp differs from the stored one.
+                anchor = next(
+                    (at - j for j, at in enumerate(anchor_pos[idx:], start=idx) if at is not None),
+                    None,
+                )
+                if anchor is not None and anchor > offset:
+                    offset = anchor
+                    continue
+                break
+            if role == "tool" and str(msg.get("tool_call_id") or "") in unique_ids:
+                matched_ids.add(str(msg.get("tool_call_id")))
+            unused_stored[identity] -= 1
+            cursor = idx + 1
+            idx += 1
+        if len(matched_ids) < 2:
+            return 0
+        return cursor
+
+    @staticmethod
+    def _strip_inline_persisted_output_metadata(
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str]:
+        """A tool row's identity without the lines the store's write path adds.
+
+        With large-output externalization off, the write path appends
+        ``[LCM persisted-output marker identity: preview_sha256=...]`` (a digest
+        of the marker's own preview) and may append a file-generation line to a
+        persisted-output marker (ingest_protection.py). The history a restarted
+        gateway resumes from carries the marker without them (t_17732be2,
+        session ..63465a4e at the 10:39 boot), so the anchored walk compares
+        both sides with those lines removed. The marker text itself, preview
+        included, must still be identical.
+        """
+        role, content, tool_call_id, tool_calls = identity
+        if role != "tool" or not isinstance(content, str) or "</persisted-output>" not in content:
+            return identity
+        stripped = _INLINE_PERSISTED_OUTPUT_METADATA_LINES.sub("", content)
+        return (role, stripped, tool_call_id, tool_calls)
+
+    @staticmethod
+    def _user_row_rerender_key(content: Any) -> str:
+        """A user row's content with the host's re-render variance removed.
+
+        Measured on the live store (session 20261108_093540_fa4b70b9, store_ids
+        13007493, 12999747, 12993102, 12990342 and their later copies), the host
+        re-renders a stored user row in three ways only: trailing whitespace
+        dropped, a leading ``[System note: ...]`` block added or dropped, and a
+        leading ``[Wed 2026-11-11 23:57:30 PST]`` timestamp added or dropped.
+        A gateway restart adds a fourth (t_17732be2, session
+        20261112_092254_4cd44442): the stored row carries the Discord
+        ``[Triggering message id: ...]`` note after the timestamp, and the
+        history the restarted gateway resumes from has it stripped. The
+        wrappers stack in either order: after a restart the host row reads
+        ``[ts] [System note: ...interrupted by a gateway shutdown...]\\n\\n[ts]
+        <text>`` against a stored ``[ts] <text>`` (session
+        20261108_093540_fa4b70b9 at the 10:39 boot), so leading wrappers are
+        removed in whatever order they appear, each at most once, except that
+        a system note opens room for one more timestamp (the gateway stamps the
+        note and the text after it). A second timestamp with no note between
+        is the user's own text and stays in the key.
+        Each wrapper goes with the one separator the gateway writes after it;
+        leading whitespace of the text itself is kept (indentation is content).
+        Anything else is a different row. An empty key means the host emptied
+        the row: skipping it drops no content, so the caller accepts it.
+
+        """
+        return ReconcileMixin._strip_user_row_wrappers(str(content or "").rstrip())
+
+    @staticmethod
+    def _user_row_rerenders_stored(host: Any, stored: Any) -> bool:
+        """Whether a host user row is a re-render of a stored user row.
+
+        Equal under ``_user_row_rerender_key``, or a merged turn re-rendered
+        part by part (t_ca2c9470, session 20261113_202135_169c983f at the 21:22
+        boot): the host joins consecutive user rows with "\\n\\n"
+        (agent_runtime_helpers._merge_consecutive_users), the live row was
+        stored as ``[ts] <a>\\n\\n[ts] [Triggering ...]\\n\\n<b>``, and the
+        restarted gateway rebuilds it from the clean parts as ``<a>\\n\\n<b>``.
+        Parts are compared in order. A later stored part equal to the host part
+        matches as is; otherwise it matches only after losing one gateway
+        timestamp opening it and the triggering note after that. So a stamp
+        both rows carry (a pasted log line) matches, a stamp only the host row
+        carries or a changed one does not, and any other added or changed
+        paragraph, a ``[System note: ...]`` one included, ends the match.
+        """
+        host_part, host_sep, host_rest = ReconcileMixin._user_row_rerender_key(host).partition("\n\n")
+        part, sep, rest = ReconcileMixin._user_row_rerender_key(stored).partition("\n\n")
+        if part != host_part:
+            return False
+        while sep:
+            if not host_sep:
+                return False
+            host_part, host_sep, host_rest = host_rest.partition("\n\n")
+            part, next_sep, next_rest = rest.partition("\n\n")
+            if part != host_part:
+                stamped = _USER_ROW_TIMESTAMP_PREFIX.sub("", rest, count=1)
+                if stamped == rest:
+                    return False
+                part, next_sep, next_rest = _USER_ROW_DISCORD_NOTE_PREFIX.sub("", stamped, count=1).partition("\n\n")
+                if part != host_part:
+                    return False
+            sep, rest = next_sep, next_rest
+        return not host_sep
+
+    @staticmethod
+    def _user_row_stamps_differ(host: Any, stored: Any) -> bool:
+        """Whether both user rows carry a gateway timestamp on their text and they differ.
+
+        The host re-renders a stored row by adding or dropping its timestamp,
+        never by changing it, so two different stamps are two sends: a re-sent
+        prompt after an interrupted turn, not a re-render of the old one (Prism
+        cb28d89fa826). The stamp compared is the one right before the text; a
+        restart's ``[ts] [System note: ...]`` opening carries its own.
+        """
+
+        def text_stamp(content: Any) -> str:
+            text, stamp = str(content or ""), ""
+            left = {wrapper: 1 for wrapper in _USER_ROW_WRAPPER_PREFIXES}
+            while True:
+                for wrapper in _USER_ROW_WRAPPER_PREFIXES:
+                    found = wrapper.match(text) if left[wrapper] else None
+                    if found and found.end():
+                        text = text[found.end():]
+                        left[wrapper] -= 1
+                        if wrapper is _USER_ROW_SYSTEM_NOTE_PREFIX:
+                            left[_USER_ROW_TIMESTAMP_PREFIX] = 1
+                        elif wrapper is _USER_ROW_TIMESTAMP_PREFIX:
+                            stamp = found.group(0).strip()
+                        break
+                else:
+                    return stamp
+
+        host_stamp, stored_stamp = text_stamp(host), text_stamp(stored)
+        return bool(host_stamp and stored_stamp and host_stamp != stored_stamp)
+
+    @staticmethod
+    def _stored_user_run_merged_by_host(
+        host: Any,
+        stored_ids: List[tuple[Any, ...]],
+        pos: int,
+    ) -> int:
+        """How many consecutive stored user rows from ``pos`` the host row merges, or 0.
+
+        The host joins consecutive user rows with "\\n\\n" when it rebuilds its
+        history (agent_runtime_helpers._merge_consecutive_users), while the
+        store keeps each row it was given. Session 20261017_083333_13cf5395 at
+        the 00:52:04 boot (t_eebb04bf): store_ids 13918005 (the prompt) and
+        13918006 (the reboot's "[System note: ...interrupted...]" resume row)
+        came back as one host row, the walk stopped there and 225 stored rows
+        were appended again. Only runs of two or more stored user rows count,
+        compared under the single-row re-render rules.
+        """
+        parts: list[str] = []
+        end = pos
+        while end < len(stored_ids) and stored_ids[end][0] == "user":
+            parts.append(str(stored_ids[end][1] or ""))
+            end += 1
+            if len(parts) < 2:
+                continue
+            joined = "\n\n".join(parts)
+            if ReconcileMixin._user_row_rerenders_stored(host, joined) and not ReconcileMixin._user_row_stamps_differ(
+                host, joined
+            ):
+                return len(parts)
+        return 0
+
+    @staticmethod
+    def _strip_user_row_wrappers(text: str) -> str:
+        left = {wrapper: 1 for wrapper in _USER_ROW_WRAPPER_PREFIXES}
+        while True:
+            for wrapper in _USER_ROW_WRAPPER_PREFIXES:
+                if not left[wrapper]:
+                    continue
+                rest = wrapper.sub("", text, count=1)
+                if rest != text:
+                    text = rest
+                    left[wrapper] -= 1
+                    if wrapper is _USER_ROW_SYSTEM_NOTE_PREFIX:
+                        left[_USER_ROW_TIMESTAMP_PREFIX] = 1
+                    break
+            else:
+                return text
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (

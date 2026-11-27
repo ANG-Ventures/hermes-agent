@@ -121,14 +121,24 @@ def load_published(conn) -> set:
         return set()
 
 
-def save_published(conn, units) -> None:
+def load_pending_withdrawals(conn) -> list:
+    try:
+        return json.loads(_published_path(conn).read_text(encoding="utf-8-sig")).get("pending_withdrawals", [])
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+
+
+def save_published(conn, units, *, pending_withdrawals=None) -> None:
     import os
     import tempfile
+    if pending_withdrawals is None:
+        pending_withdrawals = load_pending_withdrawals(conn)
     path = _published_path(conn)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".published.")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"units": sorted([h, u] for h, u in units)}, fh)
+        json.dump({"units": sorted([h, u] for h, u in units),
+                   "pending_withdrawals": pending_withdrawals}, fh)
     os.replace(tmp, path)
 
 
@@ -166,7 +176,9 @@ def enqueue_here(client, conn, hid, uid):
             raise
         receipt = client.enqueue("kanban", hid, uid, *need())
     units.add((hid, uid))
-    save_published(conn, units)
+    # This pair is wanted again; an old auth-refused withdrawal must not remove the renewed unit next tick.
+    pending = [p for p in load_pending_withdrawals(conn) if (p["host"], p["unit_id"]) != (hid, uid)]
+    save_published(conn, units, pending_withdrawals=pending)
     return receipt
 
 
@@ -195,6 +207,23 @@ def _receipt(conn, task, doc):
         kb._append_event(conn, task.id, EVENT, doc, run_id=task.current_run_id)
 
 
+def _cancel_unreceipted(client, rid, hid, why):
+    """Release a lease this run holds no receipt for, as its door owner ``kanban@<host>``.
+
+    A refusal here is about THIS reservation (its owner record, a row already gone), never door config: the start is
+    cancelled and the lease ends at its TTL. It must not latch the fleet door, because the latch fingerprint (token,
+    table, registry stats) cannot move when one lease expires (t_b18b346e: a lost upgrade reply left alloc_client's
+    process-local owner at 'kanban' and the release was refused client-side, latching every host twice in 10 min).
+    An unreadable credential is still a config fault and propagates to the latch."""
+    try:
+        client.release(rid, consumer=f"kanban@{hid}")
+    except client.TokenUnreadable:
+        raise
+    except client.Refused as exc:
+        raise DoorCancelled(f"{why}: release of {rid} refused ({exc}); lease ends at its TTL, "
+                            "retry with new ID") from None
+
+
 def _authorize(client, hid, uid, reservation_id, ttl_s):
     try:
         ans = client.authorize_start("kanban", hid, uid, ttl_s=ttl_s, existing_reservation_id=reservation_id,
@@ -209,7 +238,7 @@ def _authorize(client, hid, uid, reservation_id, ttl_s):
         state = seen.get("state")
         if state == "authorized":
             # No receipt exists for a start this run never made: cancel the lease, a fresh id next run.
-            client.release(seen["reservation_id"], consumer=f"kanban@{hid}")
+            _cancel_unreceipted(client, seen["reservation_id"], hid, "lost authorization reply")
             raise DoorCancelled("lost authorization reply; cancelled, retry with new ID") from None
         if state == "spent_expired":
             raise DoorCancelled(f"unit {uid} spent_expired after a lost reply; retry with new ID") from None
@@ -277,12 +306,16 @@ def start(conn, task, host=None, *, reservation_id=None, client=None):
         raise
     if ans.get("reused"):
         # spent_live with no receipt on this run: the earlier reply was lost. Cancel, never a second spawn.
-        client.release(ans["reservation_id"], consumer=f"kanban@{hid}")
+        _cancel_unreceipted(client, ans["reservation_id"], hid, "reused authorization")
         raise DoorCancelled("reconciled uncertain authorization; retry with new ID")
+    import time
     doc = {"reservation_id": ans["reservation_id"], "consumer": f"kanban@{hid}",
-           "host": hid, "unit_id": uid, "until": ans["until"]}
+           "host": hid, "unit_id": uid, "until": ans["until"],
+           "at": time.time(), "at_source": "authorization_receipt_received"}
     try:
         _receipt(conn, task, doc)
+        if time.time() >= doc["until"]:
+            raise DoorCancelled("authorization expired before launch; retry with new ID")
         yield
     except BaseException:
         # Caller must stop an already-created worker before propagating an error.
@@ -333,6 +366,30 @@ def _mark_released(conn, tid, run_id, doc):
         kb._append_event(conn, tid, RELEASED, doc, run_id=run_id)
 
 
+def _release_finished(client, conn, task_id, run_id, doc):
+    """Release a finished run's door lease with the run's use measured on its pool host as ``actual`` (t_dd7a1b7d:
+    a door run's lease is released HERE, never by ``_end_run``, so this is where #354's measurement has to ride).
+    A failed measurement still releases, unmeasured; an actual allocd refuses still ended the lease (a warning)."""
+    from hermes_cli import kanban_headroom as kh
+    rid, consumer = doc["reservation_id"], doc["consumer"]
+    actual = None
+    fp = kh.run_footprint_target(conn, task_id, run_id)
+    if fp is not None:
+        try:
+            actual = kh.measure_run_footprint(fp)
+        except Exception as exc:  # never blocks the release: the lease ends unmeasured
+            _log.info("kanban door: release of %s carries no actual (%s run %s): %s", rid, fp.get("host"), run_id, exc)
+    if actual is None:
+        return client.release(rid, consumer=consumer)
+    try:
+        return client.release(rid, consumer=consumer, actual=actual, actual_source=kh.FOOTPRINT_SOURCE)
+    except client.Refused as exc:
+        if not str(exc).startswith("actual refused after lease release"):
+            raise
+        _log.warning("kanban door: release of %s: actual not recorded: %s", rid, exc)
+        return True
+
+
 def maintain(conn, *, client=None):
     """Renew running authorizations and release finished runs, including old modes."""
     if client is None:
@@ -349,7 +406,7 @@ def maintain(conn, *, client=None):
             if row["status"] == "running" and row["current_run_id"] == row["run_id"]:
                 if not client.renew(doc["reservation_id"], consumer=doc["consumer"], ttl_s=RESERVE_TTL_S):
                     _log.warning("door lease expired: %s run %s", row["task_id"], row["run_id"])
-            elif client.release(doc["reservation_id"], consumer=doc["consumer"]):
+            elif _release_finished(client, conn, row["task_id"], row["run_id"], doc):
                 _mark_released(conn, row["task_id"], row["run_id"], doc)
         except (client.Refused, client.Unreachable):
             _log.exception("door lifecycle failed for %s; retry next tick", row["task_id"])

@@ -1387,9 +1387,14 @@ class _LifecycleScanBudget:
     cloud placeholder) so the caller can tell the model the real reason (#113944)."""
 
     __slots__ = ("bytes_remaining", "lines_remaining", "paths_remaining", "remote_reads_remaining",
-                 "refusal", "hit")
+                 "refusal", "hit", "local_reads", "over", "over_walk")
 
-    def __init__(self) -> None:
+    def __init__(self, *, local_reads: bool = False) -> None:
+        # t_7eff4af6: on the local backend the "remote" callback is an in-process open() of a path
+        # the walk already found missing, not a backend roundtrip, so the roundtrip cap does not
+        # apply; the unique-path cap (charged first) still bounds those reads. scripts/test-gate
+        # names ~71 such paths and was refused at 64 on every direct call.
+        self.local_reads = local_reads
         # Read the module constants at construction so tests/operators can lower them at runtime.
         self.bytes_remaining = _MAX_LIFECYCLE_SCAN_BYTES
         self.lines_remaining = _MAX_LIFECYCLE_SCAN_LINES
@@ -1400,22 +1405,34 @@ class _LifecycleScanBudget:
         # refusal can be diagnosed in one read (card t_4fded0bd: three false positives in one night
         # were only traceable by bisecting the command text).
         self.hit: Optional[str] = None
+        # Which text cap the last refused charge_text hit, for the refusal message (t_bb509376).
+        self.over: Optional[str] = None
+        # True when what ran out is the walk's SHARED byte/line budget, not the per-line cap.
+        self.over_walk = False
 
     def charge_text(self, text: str) -> bool:
         """Charge *text* before tokenization; False when it does not fit."""
         # UTF-8 is >= one byte per code point, so the char count is a free lower bound.
+        self.over_walk = True
         if len(text) > self.bytes_remaining:
+            self.over = f"{len(text)} chars, over the {self.bytes_remaining} bytes left of the 1 MiB walk cap"
             return False
         encoded = len(text.encode("utf-8", errors="replace"))
         if encoded > self.bytes_remaining:
+            self.over = f"{encoded} bytes, over the {self.bytes_remaining} bytes left of the 1 MiB walk cap"
             return False
         lines = text.count("\n") + 1
         if lines > self.lines_remaining:
+            self.over = (f"{lines} lines, over the {self.lines_remaining} lines left of the "
+                         f"{_MAX_LIFECYCLE_SCAN_LINES}-line walk cap")
             return False
         # One huge token is the quadratic shlex case; bound the longest physical line (chars, a
         # lower bound on bytes — tight enough for a DoS bound without a per-line encode).
         longest = max((len(line) for line in text.split("\n")), default=0)
         if longest > _MAX_LIFECYCLE_SCAN_LINE_BYTES:
+            self.over = (f"a {longest}-char line, over the {_MAX_LIFECYCLE_SCAN_LINE_BYTES}-char "
+                         "longest-line cap")
+            self.over_walk = False
             return False
         self.bytes_remaining -= encoded
         self.lines_remaining -= lines
@@ -1430,6 +1447,8 @@ class _LifecycleScanBudget:
 
     def charge_remote_read(self) -> bool:
         """Charge one remote-backend read (a network roundtrip each)."""
+        if self.local_reads:
+            return True
         if self.remote_reads_remaining <= 0:
             return False
         self.remote_reads_remaining -= 1
@@ -1458,13 +1477,55 @@ def lifecycle_scan_root_within_budget(text: str) -> bool:
         return False
 
 
-def _budget_exhausted(budget: _LifecycleScanBudget, what: str, depth: int) -> bool:
+# t_bb509376: a file a command names is scanned as a script when the guard cannot prove the
+# command only READS it; these are the shapes that pass for a read (each one tested).
+_TEXT_CAP_WAY_THROUGH = (
+    "the guard scans a file the command names as a script unless it can prove the file is only "
+    "read. To read it as data: in a python heredoc use only json/re/open/str operations "
+    "(`json.load(open(p))`, no sys/os/lambda/other imports), or pass the path as an argument "  # windows-footgun: ok
+    "(`python3 - \"$F\" <<'EOF'` and `sys.argv[1]`), or put the script in a .py file and run "
+    "`python3 that.py`"
+)
+# A file the shell itself names (`bash big.sh`, `python3 big.py`) is run, not read: the read-as-data
+# shapes above do not apply to it (Prism 8e4887a66a56).
+_TEXT_CAP_EXECUTED = (
+    "a file the command runs is scanned whole and no line may exceed the longest-line cap: "
+    "break that line into shorter ones"
+)
+# The 1 MiB / 16384-line budget is shared by the command and every file the walk reads, so a
+# file can fail it because earlier text used it up: splitting that file does not help.
+_TEXT_CAP_EXECUTED_WALK = (
+    "the command and every file it runs share one 1 MiB / 16384-line scan budget, and what was "
+    "left did not fit this file: run it in a command of its own, or make it smaller"
+)
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _printable_path(path: Path) -> str:
+    """*path* with control characters replaced, safe for a refusal or a log line."""
+    return _CONTROL_CHARS_RE.sub("?", str(path))
+
+
+def _budget_exhausted(
+    budget: _LifecycleScanBudget, what: str, depth: int, source: Optional[Path] = None,
+    read_as_data: bool = False,
+) -> bool:
+    detail = ""
+    if what == "text" and budget.over:
+        named = f"`{_printable_path(source)}`" if source is not None else "the text"
+        detail = f": {named} is {budget.over}"
     logger.warning(
-        "lifecycle guard scan budget exhausted (%s at depth %d); "
+        "lifecycle guard scan budget exhausted (%s at depth %d%s); "
         "failing closed — see _MAX_LIFECYCLE_SCAN_* in cron/lifecycle_guard.py",
-        what, depth,
+        what, depth, detail,
     )
-    budget.refusal = f"the scan budget was exhausted ({what} at depth {depth})"
+    budget.refusal = f"the scan budget was exhausted ({what} at depth {depth}{detail})"
+    if what == "text" and source is not None:
+        if read_as_data:
+            hint = _TEXT_CAP_WAY_THROUGH
+        else:
+            hint = _TEXT_CAP_EXECUTED_WALK if budget.over_walk else _TEXT_CAP_EXECUTED
+        budget.refusal += f"; {hint}"
     return True
 
 
@@ -2966,9 +3027,10 @@ def _is_unscannable_non_executable_file(path: Path) -> bool:
 
 
 def _references_at(
-    segment: list[str], index: int, cwd: Optional[str]
+    segment: list[str], index: int, cwd: Optional[str], keep_oversized: bool = False
 ) -> Iterator[Path]:
-    """Yield the scripts the token at *index* executes, if any."""
+    """Yield the scripts the token at *index* executes, if any. ``keep_oversized``: the text is a
+    python body, not shell, so the x-bit test below says nothing (t_94a8d819)."""
     if index >= len(segment):
         return
     executable = segment[index]
@@ -3019,16 +3081,47 @@ def _references_at(
             # is scanned while x.sh is still 0644), and this branch is the
             # ONLY one affected — `bash file` and `source file` execute
             # without the x bit and must keep being scanned.
-            if resolved is not None and not _is_unscannable_non_executable_file(
-                resolved
+            if resolved is not None and (
+                keep_oversized or not _is_unscannable_non_executable_file(resolved)
             ):
                 yield resolved
+
+
+def _cwd_after_cd(segment: list[str], index: int, effective_cwd: Optional[str]) -> Optional[str]:
+    """The directory after the ``cd`` at *index*. ``cd`` with no argument goes $HOME; ``cd -`` is
+    untrackable (previous dir unknown) so conservatively stop trusting the cwd from here on.
+    Options (``-L``, ``-P``, ``-e``, ``-@``) and the ``--`` end marker are skipped: the directory is
+    the first operand (Prism 40a3a2a5fa2f)."""
+    position = index + 1
+    while position < len(segment) and segment[position].startswith("-") and segment[position] != "-":
+        position += 1
+        if segment[position - 1] == "--":
+            break
+    if position >= len(segment):
+        return str(Path.home())
+    target = segment[position]
+    if target == "-" and segment[position - 1] != "--":
+        return None
+    resolved_target = _resolve_terminal_script_path(target, effective_cwd)
+    return str(resolved_target) if resolved_target is not None else None
+
+
+def _shell_cwds(command: str, cwd: Optional[str]) -> list[Optional[str]]:
+    """Every directory *command*'s ``cd`` segments move through, *cwd* first, in order. A python
+    heredoc body runs in one of them (Prism ecbd1c8f1080, t_94a8d819)."""
+    seen = [cwd]
+    for segment in _iter_command_segments(command):
+        index = _command_token_index(segment)
+        if index is not None and _executable_name(segment[index]) == "cd":
+            seen.append(_cwd_after_cd(segment, index, seen[-1]))
+    return list(dict.fromkeys(seen))
 
 
 def _iter_referenced_shell_scripts(
     command: str,
     *,
     cwd: Optional[str] = None,
+    keep_oversized: bool = False,
 ) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell.
 
@@ -3053,29 +3146,12 @@ def _iter_referenced_shell_scripts(
             continue
         executable_name = _executable_name(segment[index])
         if executable_name == "cd":
-            # Model the directory change for subsequent segments. `cd` with
-            # no argument goes $HOME; `cd -` is untrackable (previous dir
-            # unknown) so conservatively stop trusting the cwd from here on.
-            if len(segment) <= index + 1:
-                effective_cwd = str(Path.home())
-            else:
-                target = segment[index + 1]
-                if target == "-":
-                    effective_cwd = None
-                else:
-                    resolved_target = _resolve_terminal_script_path(
-                        target, effective_cwd
-                    )
-                    effective_cwd = (
-                        str(resolved_target)
-                        if resolved_target is not None
-                        else None
-                    )
+            effective_cwd = _cwd_after_cd(segment, index, effective_cwd)
             continue
-        yield from _references_at(segment, index, effective_cwd)
+        yield from _references_at(segment, index, effective_cwd, keep_oversized)
         peeled = _peel_transparent_prefixes(segment, index)
         if peeled != index:
-            yield from _references_at(segment, peeled, effective_cwd)
+            yield from _references_at(segment, peeled, effective_cwd, keep_oversized)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -3322,8 +3398,22 @@ _MASK_SAFE_NODE_TYPES = (
     ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.comprehension,
     ast.boolop, ast.operator, ast.unaryop, ast.cmpop,
 )
-_MASK_SAFE_MODULES = frozenset({"json", "subprocess"})
-_MASK_SAFE_MODULE_CALLS = frozenset({("json", "loads"), ("json", "dumps"), ("json", "dump"), ("subprocess", "run")})
+_MASK_SAFE_MODULES = frozenset({"json", "re", "subprocess"})
+# t_bb509376: `json.load(fp)` only calls `fp.read()` (its hooks are callback keywords, held to
+# constants below), and the `re` searches return str/Match data. 18 of the 22 "text at depth 1"
+# refusals in 24 h to 11-22 12:20 PT were `d = json.load(open(<spillover>.txt))` bodies, 13 of
+# them with `import json,re`; the 100-314 KB single-line spillover JSON then hit the 64 KiB
+# longest-line cap as a "script". Not `re.sub`/`re.subn` (the repl may be a callable) and not
+# `re.compile` (its Pattern methods are not data methods here).
+_MASK_SAFE_MODULE_CALLS = frozenset({
+    ("json", "loads"), ("json", "load"), ("json", "dumps"), ("json", "dump"), ("subprocess", "run"),
+    ("re", "search"), ("re", "match"), ("re", "fullmatch"), ("re", "finditer"), ("re", "findall"),
+    ("re", "split"), ("re", "escape"),
+})
+# `re.M` etc.: an int flag, the one non-call load of an imported module the mask allows.
+_MASK_SAFE_MODULE_CONSTANTS = frozenset(
+    ("re", flag) for flag in ("I", "M", "S", "X", "A", "IGNORECASE", "MULTILINE", "DOTALL", "VERBOSE", "ASCII")
+)
 # `open(<literal>, <mode>)`: reading is data; WRITING is data too (a review's JSON built in a
 # python heredoc and written to a file, Apollo r1 on t_4fded0bd) UNLESS the written path is
 # named again in the surrounding shell text, where a later segment could execute it -- the
@@ -3344,6 +3434,8 @@ _MASK_SAFE_METHODS = frozenset({
     "strip", "lstrip", "rstrip", "lower", "upper", "startswith", "endswith",
     "replace", "join", "get", "items", "keys", "values", "add", "append",
     "extend", "count", "find", "encode", "decode", "isdigit", "write",
+    # re.Match accessors (t_bb509376): return str/int/tuple data.
+    "group", "groups", "start", "end", "span",
 })
 _MASK_SUBPROCESS_KEYWORDS = frozenset({"capture_output", "text", "check", "timeout", "encoding", "errors"})
 # Keywords whose value is CALLED by the callee (sorted/min/max key, json hooks,
@@ -3427,6 +3519,10 @@ def _python_body_is_mask_safe(tree: ast.AST) -> bool:
     # (``sorted(out, key=subprocess.os.system)``, ``s = subprocess``).
     callee_uses: set[int] = set()
     for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and (node.value.id, node.attr) in _MASK_SAFE_MODULE_CONSTANTS):
+            callee_uses.add(id(node.value))
         if not isinstance(node, ast.Call):
             continue
         func = node.func
@@ -3649,6 +3745,112 @@ def _mask_read_only_python_paths(body: str) -> str:
     return body
 
 
+def _dotted_name(node: ast.AST) -> Optional[str]:
+    """``os.path.getsize`` for that Attribute chain, ``None`` for anything else."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+# t_94a8d819: calls that open a file without handing its bytes to the interpreter. A literal used
+# only here names a file no python body runs, so an oversized one is not refused: the database of
+# sqlite3.connect (#36a78f6a) and the stat family (`Path(p).stat().st_size`, #110422).
+_PY_PATH_WRAPPERS = frozenset({"str", "Path", "os.path.expanduser"})
+_PY_UNREAD_PATH_CALLS = frozenset({
+    "sqlite3.connect", "os.stat", "os.lstat", "os.path.getsize", "os.path.getmtime",
+    "os.path.exists", "os.path.isfile", "os.path.isdir", "os.path.islink",
+})
+_PY_UNREAD_PATH_METHODS = frozenset({"stat", "lstat", "exists", "is_file", "is_dir", "is_symlink"})
+
+
+def _python_literal_uses(body: str) -> tuple[set[str], set[str]]:
+    """``(unread, other)``: string literals *body* uses as the path of a call in
+    ``_PY_UNREAD_PATH_CALLS`` or the receiver of a ``_PY_UNREAD_PATH_METHODS`` call (each optionally
+    under ``_PY_PATH_WRAPPERS``), and literals it uses any other way. A literal can be in both.
+    The caller compares them by the FILE they name, not the spelling (Prism ecbd1c8f1080).
+    Unparseable body: no unread literals (fail closed)."""
+    try:
+        tree = ast.parse(body)
+    except (SyntaxError, ValueError):
+        return set(), set()
+    parent = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    unread: set[str] = set()
+    other: set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        use = node
+        up = parent.get(id(use))
+        while (isinstance(up, ast.Call) and up.args and up.args[0] is use and len(up.args) == 1
+               and not up.keywords and _dotted_name(up.func) in _PY_PATH_WRAPPERS):
+            use, up = up, parent.get(id(up))
+        is_unread = (
+            isinstance(up, ast.Call) and up.args and up.args[0] is use
+            and _dotted_name(up.func) in _PY_UNREAD_PATH_CALLS
+        ) or (
+            isinstance(up, ast.Attribute) and up.value is use and up.attr in _PY_UNREAD_PATH_METHODS
+            and isinstance(parent.get(id(up)), ast.Call) and parent[id(up)].func is up
+        )
+        (unread if is_unread else other).add(node.value)
+    return unread, other
+
+
+# t_94a8d819 (operator round): what lets a python body RUN a file or hand it to something that
+# does. A body with none of these only reads what it opens, so a file too large to scan is not
+# refused: reading a big log as data is not the hazard this guard exists for.
+_PY_RUNNER_MODULES = frozenset({"subprocess", "runpy", "importlib", "pty", "pickle", "code", "builtins"})
+_PY_RUNNER_BUILTINS = frozenset({"exec", "eval", "compile", "__import__", "getattr", "__builtins__"})
+_PY_RUNNER_ATTRS = frozenset({"create_subprocess_exec", "create_subprocess_shell"})
+
+
+def _is_os_runner(name: str) -> bool:
+    return name in {"system", "popen", "startfile"} or name.startswith(("exec", "spawn", "posix_spawn"))
+
+
+def _python_body_can_run(body: str) -> bool:
+    """True when *body* can execute a file or pass it to a process: exec/eval/compile/getattr,
+    runpy, importlib, subprocess, pty, pickle, os.system/popen/exec*/spawn*, asyncio subprocesses.
+    An aliased ``os`` or an unparseable body: True (fail closed)."""
+    try:
+        tree = ast.parse(body)
+    except (SyntaxError, ValueError):
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] in _PY_RUNNER_MODULES
+                   or (alias.name == "os" and alias.asname is not None) for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.split(".")[0] in _PY_RUNNER_MODULES or any(
+                (module == "os" and _is_os_runner(alias.name)) or alias.name in _PY_RUNNER_ATTRS
+                for alias in node.names
+            ):
+                return True
+        elif isinstance(node, ast.Name):
+            if node.id in _PY_RUNNER_BUILTINS:
+                return True
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _PY_RUNNER_ATTRS or (
+                isinstance(node.value, ast.Name) and node.value.id == "os" and _is_os_runner(node.attr)
+            ):
+                return True
+    return False
+
+
+def _same_file_key(path: Path) -> str:
+    """One key per file however it is spelled: ``./x``, ``a/../x`` and a symlink to x agree."""
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return str(path)
+
+
 def _contains_unsafe_gateway_action(
     command: str,
     *,
@@ -3658,13 +3860,17 @@ def _contains_unsafe_gateway_action(
     budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
     executed: bool = True,
+    source: Optional[Path] = None,
+    read_as_data: bool = False,
 ) -> bool:
-    """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
+    """``source`` is the referenced file *command* was read from (None for command text);
+    ``read_as_data`` says only a python heredoc body named it (the refusal's way through).
+    ``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
     depth, size, device, live SQLite, cloud) is "nothing to scan" there, never a block (#113944)."""
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
-        return _budget_exhausted(budget, "text", depth) if executed else False
+        return _budget_exhausted(budget, "text", depth, source, read_as_data) if executed else False
     hit = _describe_direct_lifecycle_scan(command)
     if hit is not None:
         budget.hit = budget.hit or hit + ("" if depth == 0 else f" (in a referenced script, depth {depth})")
@@ -3677,7 +3883,10 @@ def _contains_unsafe_gateway_action(
         strip_inert_heredoc_bodies,
     )
 
-    def recurse(text: str, cwd: Optional[str], executed: bool) -> bool:
+    def recurse(
+        text: str, cwd: Optional[str], executed: bool, source: Optional[Path] = None,
+        read_as_data: bool = False,
+    ) -> bool:
         return _contains_unsafe_gateway_action(
             text,
             cwd=cwd,
@@ -3686,6 +3895,8 @@ def _contains_unsafe_gateway_action(
             budget=budget,
             read_remote_script=read_remote_script,
             executed=executed,
+            source=source,
+            read_as_data=read_as_data,
         )
 
     # Python stdin is executable Python source, but not a sequence of shell
@@ -3714,6 +3925,13 @@ def _contains_unsafe_gateway_action(
         if recurse(payload, cwd, executed):
             return True
 
+    # Files the shell itself names; feeds only the refusal wording (read-as-data vs executed), so
+    # it is computed after the payload walk and can never change a verdict (Apollo, #529).
+    try:
+        shell_named = set(_iter_referenced_shell_scripts(shell_command, cwd=cwd))
+    except Exception:
+        shell_named = set()
+
     # Paths named only inside a masked body are still READ: an interpreter body that hands
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
@@ -3721,6 +3939,37 @@ def _contains_unsafe_gateway_action(
     candidates = [
         (path, executed) for path in _iter_referenced_shell_scripts(referenced_command, cwd=cwd)
     ]
+    # t_94a8d819: `_references_at` drops an OVERSIZED file without the x bit, because the shell
+    # cannot run it at command position. A python body is not shell: `exec(open(p).read())` runs
+    # it whatever its mode, and the same body naming a 147 KB file is scanned (and refused on the
+    # line cap). So a path a body still names after the
+    # read-only mask is kept whatever its size, and one too large to scan fails closed below with
+    # the refusal `bash <file>` gets. Not a literal the body only stats or hands to sqlite3.connect.
+    kept = {path for path, _ in candidates}
+    # The body runs in whichever directory the shell's `cd`s left it in; check under every one
+    # of them, so neither the exemption nor the candidate is read in the wrong place (Prism
+    # ecbd1c8f1080, round 2).
+    body_cwds = _shell_cwds(shell_command, cwd)
+    for body, masked in zip(python_bodies, masked_bodies):
+        if not _python_body_can_run(body):
+            continue  # it only reads what it opens: a big log read as data is not the hazard
+        unread_literals, other_literals = _python_literal_uses(body)
+
+        def _keys(literals: set[str]) -> set[str]:
+            return {
+                _same_file_key(resolved) for resolved in (
+                    _resolve_terminal_script_path(literal, body_cwd)
+                    for literal in literals for body_cwd in body_cwds
+                ) if resolved is not None
+            }
+
+        # By file, not spelling: `os.stat('/w/big')` must not exempt `open('./big')`.
+        unread = _keys(unread_literals) - _keys(other_literals)
+        for body_cwd in body_cwds:
+            for path in _iter_referenced_shell_scripts(masked, cwd=body_cwd, keep_oversized=True):
+                if path not in kept and _same_file_key(path) not in unread:
+                    kept.add(path)
+                    candidates.append((path, executed))
     if shell_command != command:
         # Fork: a path `_mask_read_only_python_paths` removed is a file the body provably only
         # READS as data (#1017/#1348) — its contents are never executed, so it is not even a
@@ -3765,7 +4014,10 @@ def _contains_unsafe_gateway_action(
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
             if candidate_executed:
-                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+                reason = _unreadable_reason(script_path)
+                if script_path not in shell_named and "scan cap" in reason:
+                    reason += f"; {_TEXT_CAP_WAY_THROUGH}"
+                return _refuse_unreadable(budget, script_path, reason)
             continue
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
@@ -3792,7 +4044,8 @@ def _contains_unsafe_gateway_action(
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
         script_dir = _resolve_script_directory(str(resolved)) or cwd
-        if recurse(script_text, script_dir, candidate_executed):
+        if recurse(script_text, script_dir, candidate_executed, script_path,
+                   script_path not in shell_named):
             return True
     return False
 
@@ -3832,11 +4085,14 @@ def scan_gateway_lifecycle_detail(
     *,
     cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    read_remote_script_is_local: bool = False,
 ) -> tuple[bool, Optional[str], Optional[str]]:
     """``(unsafe, refusal, hit)``: :func:`scan_gateway_lifecycle` plus *hit*, a one-line
     description of the token and position that tripped the guard (``None`` when allowed or when
-    the verdict is a non-lifecycle refusal)."""
-    budget = _LifecycleScanBudget()
+    the verdict is a non-lifecycle refusal). ``read_remote_script_is_local``: the callback reads
+    the host filesystem in-process (local backend), so its reads are not charged to the
+    roundtrip cap ``_MAX_LIFECYCLE_SCAN_REMOTE_READS``; every other cap still applies."""
+    budget = _LifecycleScanBudget(local_reads=read_remote_script_is_local)
     try:
         # Includes the direct regex/submit scans at depth 0.
         unsafe = _contains_unsafe_gateway_action(
@@ -4000,7 +4256,8 @@ def check_gateway_lifecycle(
         raise GatewayLifecycleBlocked(
             f"Blocked: the lifecycle guard could not scan this cron job or referenced script: {refusal}. "
             "Nothing in the job is known to contain a gateway lifecycle command, but a script "
-            "the job executes must be scannable (a regular text file under 1 MiB) before it can run."
+            "the job executes must be scannable (a regular text file under 1 MiB, at most 16384 "
+            "lines, no line over 65,536 characters) before it can run."
         )
     if unsafe:
         raise GatewayLifecycleBlocked(

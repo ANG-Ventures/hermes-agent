@@ -427,12 +427,13 @@ _BEDROCK_PROBE_FAILURE_TTL_SECONDS = 300.0
 _BEDROCK_PROBE_FAILURE_CACHE: Dict[tuple, float] = {}
 # Anthropic — bare ids only (prefixed ids resolve via OpenRouter/models.dev
 # and would collide: "anthropic/claude-sonnet-4" ⊂ "anthropic/claude-sonnet-4.6").
-# Generation-5 ids are listed explicitly (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
+# Generation-5 ids are listed explicitly (fable-5-2, fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
 # longest-key-first lookup resolves the exact id and never falls to the 200K catch-all.
 # An IMMUTABLE ((id, window), ...) tuple, not dict rows: it is the FALLBACK hermes-home's
 # scripts/anthropic-limits-render.py --check certifies against config/anthropic-limits.json, and a tuple
 # cannot be changed after this line (hermes-home#7860, Prism f-ce7cb29c7df69f55 / f-bbf4d7c761341baa).
 ANTHROPIC_CONTEXT_FALLBACK: Tuple[Tuple[str, int], ...] = (
+    ("claude-fable-5-2", 1000000),
     ("claude-fable-5-1", 1000000),
     ("claude-fable-5", 1000000),
     ("claude-fable", 1000000),
@@ -462,6 +463,8 @@ DEFAULT_CONTEXT_LENGTHS = {
     # Codex-OAuth-only and listed so "gpt-5" (400k) doesn't win.
     "gpt-6-astra": 1050000,  # also matches -pro (verified live on OpenRouter)
     "gpt-6.1-sol": 1050000,  # -pro too (OpenAI model page + OpenRouter live 2026-09-29)
+    # models.dev limit.context 1,050,000 (input 922,000 / output 128,000), read 2026-11-17.
+    "gpt-6.2-sol": 1050000, "gpt-6.2-astra": 1050000,
     "gpt-6.1-terra": 1050000,  # -pro too (models.dev limit.context 1,050,000; OpenRouter lists -pro, 2026-11-06)
     "gpt-6-sol": 1050000, "gpt-6-luna": 1050000,  # -pro too (OpenRouter live 2026-09-22)
     "gpt-5.6-luna": 1050000, "gpt-5.6-terra": 1050000, "gpt-5.6-sol": 1050000, "gpt-5.5": 1050000,
@@ -2033,6 +2036,8 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-6-astra": 272_000, "gpt-6.1-sol": 272_000, "gpt-6-sol": 272_000, "gpt-6-luna": 272_000,
     # gpt-6.1-terra: the codex-sub catalog advertises context_window=500,000 (2026-11-06, client 0.162.1).
     "gpt-6.1-terra": 500_000,
+    # GPT-6.2 (2026-11-17, client_version 0.169.0): sol advertises 500,000, astra 272,000.
+    "gpt-6.2-sol": 500_000, "gpt-6.2-astra": 272_000,
     "gpt-5.1-codex-max": 272_000, "gpt-5.1-codex-mini": 272_000, "gpt-5.3-codex": 272_000,
     "gpt-5.3-codex-spark": 128_000, "gpt-5.2-codex": 272_000, "gpt-5.4-mini": 272_000,
     "gpt-5.6-sol": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000, "gpt-daybreak-blue-latest": 272_000,
@@ -2069,12 +2074,21 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
     # client_version 0.162.1, all 3 accounts). Live request on chatgpt.com/backend-api/codex/responses:
     # 832,408 input tokens accepted, needle recalled. EXACT, like the other gpt-6 tiers.
     "gpt-6.1-terra": 872_000,
+    # GPT-6.2 Sol / Astra: catalog context_window 500,000 / 272,000, max_context_window 872,000 for both
+    # (2026-11-17, client_version 0.169.0). Request bisection on chatgpt.com/backend-api/codex/responses,
+    # identical for both ids: 918,028 input tokens accepted, 925,028 rejected (context_length_exceeded),
+    # the same ~922,000 ceiling as gpt-6.1-sol. 900K keeps the >=11K margin. EXACT entries. A live catalog
+    # that still publishes max_context_window 872,000 caps the bump there (#105443).
+    "gpt-6.2-sol": 900_000, "gpt-6.2-astra": 900_000,
 }
 _CODEX_OAUTH_STALE_ADVERTISED_CTX = 272_000  # the only advertised value the bump may override
 # Slugs whose catalog advertises a NON-272K value that is still below the verified cap. Measured
 # 2026-11-06 (client_version 0.162.1): gpt-6.1-terra and gpt-6.1-sol both advertise 500K with
 # max_context_window 872K (terra accepted an 832,408-token request). The bump may override exactly that value.
-_CODEX_OAUTH_STALE_ADVERTISED_EXACT: Dict[str, int] = {"gpt-6.1-terra": 500_000, "gpt-6.1-sol": 500_000}
+# gpt-6.2-sol also advertises 500K (2026-11-17, client_version 0.169.0); gpt-6.2-astra advertises 272K.
+_CODEX_OAUTH_STALE_ADVERTISED_EXACT: Dict[str, int] = {
+    "gpt-6.1-terra": 500_000, "gpt-6.1-sol": 500_000, "gpt-6.2-sol": 500_000,
+}
 CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"  # picker-only opt-in suffix; never sent on the wire
 # The ONLY bases eligible for ``-900k``: routable, live-verified. No family prefixing (it would synthesize
 # dead ``-pro`` variants); dated snapshots of the routable 5.6 bases are allowed. gpt-daybreak-blue-latest is a verified Sol alias.
@@ -2085,6 +2099,7 @@ _CODEX_900K_ELIGIBLE_BASES = frozenset({
     "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",  # measured max_context_window 872,000
     "gpt-6.1-sol",  # measured ceiling 922,000 (2026-09-30 bisection)
     "gpt-6.1-terra",  # catalog max_context_window 872,000; 832,408-token request OK (2026-11-06)
+    "gpt-6.2-sol", "gpt-6.2-astra",  # 918,028-token request OK, 925,028 rejected (2026-11-17)
 })
 _CODEX_900K_SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -2723,6 +2738,12 @@ def _resolve_provider_aware_context_length(model: str, base_url: str, api_key: s
     return None
 
 
+# Providers whose step-5 lookup returns the window the lane enforces, which can be smaller than the
+# id's API window (Codex OAuth 922K vs 1.05M; Copilot account caps). A per-id registry row must not
+# override it.
+_LANE_WINDOW_PROVIDERS = frozenset({"openai-codex", "copilot", "copilot-acp", "github-copilot"})
+
+
 def get_model_context_length(
     model: str, base_url: str = "", api_key: str = "", config_context_length: int | None = None,
     provider: str = "", custom_providers: list | None = None,
@@ -2740,6 +2761,9 @@ def get_model_context_length(
         ctx = _resolve_moa_context_length(model, custom_providers)
         if ctx is not None:
             return ctx
+    # A slot name (``sol``) has the window of the id it resolves to, not the unknown-model fallback.
+    from hermes_cli.model_registry import slot_resolve
+    model = slot_resolve(model)[0]
     ctx = _config_override_context_length(model, base_url, provider, custom_providers)
     if ctx is not None:
         return ctx
@@ -2793,6 +2817,16 @@ def get_model_context_length(
     # (HERMES_CODEX_BASE_URL, model.base_url, custom api_mode: codex_responses) the URL looks
     # generic while the window is still the Codex OAuth one (#116191).
     codex_route = _is_codex_route(provider, base_url, custom_providers)
+    # Slot aliases P7 (t_efde9d1a): the registry row's window (config/model-meta.json) wins over the
+    # caches, probes and built-in tables below. It is one row per id (the API window), so it runs
+    # AFTER the lane windows above (Codex-subscription proxy, endpoint-scoped, profile bound), and a
+    # lane that enforces its own window in step 5 (Codex OAuth, Copilot) reads it only when that
+    # lane lookup misses, just before the hardcoded table (Prism dbbdd3313f7f).
+    from hermes_cli.model_registry import registry_context_length
+    lane_window = codex_route or (provider or "").strip().lower() in _LANE_WINDOW_PROVIDERS
+    ctx = None if lane_window else registry_context_length(model)
+    if ctx is not None:
+        return ctx
     # 1. Persistent cache (LM Studio / Codex routes excluded — see _skip_persistent_context_cache).
     cached = get_cached_context_length(model, base_url) if base_url and not is_bedrock_context and not codex_route and not _skip_persistent_context_cache(base_url, provider) else None
     validated = _validate_cached_context_length(model, base_url, cached, api_key=api_key, provider=provider) if cached is not None else None
@@ -2873,6 +2907,9 @@ def get_model_context_length(
             if base_url and not _skip_persistent_context_cache(base_url, provider):
                 save_context_length(model, base_url, agg_ctx)
             return agg_ctx
+    ctx = registry_context_length(model) if lane_window else None
+    if ctx is not None:
+        return ctx
     # 8. Hardcoded defaults: `key in model` only — the reverse would let "claude-sonnet-4" match "claude-sonnet-4-6" and return 1M.
     hit = _longest_key_match(DEFAULT_CONTEXT_LENGTHS, model.lower())
     if hit:

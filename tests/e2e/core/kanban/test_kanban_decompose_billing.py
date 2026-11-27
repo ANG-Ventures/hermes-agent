@@ -30,6 +30,7 @@ from typing import Callable, Iterator
 
 import pytest
 
+from tests import rig_parent_watch
 from tests.e2e.core._pending_fixes import known_gate
 from tests.e2e.core.kanban._helpers import PY, Board, wait_until
 from tests.fakes.fake_llm_provider import Error, FakeLLMServer, Response, Text
@@ -142,6 +143,7 @@ def gateway(b: Board) -> Iterator[subprocess.Popen]:
         proc = subprocess.Popen([PY, "-m", "hermes_cli.main", "gateway", "run"], cwd=str(b.root),
                                 env=env, stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
+    rig_parent_watch.track(proc.pid)  # own session: only this watch ends it if pytest dies first
     try:
         yield proc
     finally:
@@ -156,6 +158,7 @@ def gateway(b: Board) -> Iterator[subprocess.Popen]:
                 proc.wait(grace)
             except subprocess.TimeoutExpired:
                 continue
+        rig_parent_watch.untrack(proc.pid)
 
 
 def gateway_tail(b: Board) -> str:

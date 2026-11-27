@@ -56,6 +56,7 @@ class ReplayResult:
         self.orphan_task_ids: set = set()
         self.grant_ids_dropped = 0
         self.grants_revoked = 0
+        self.grants_closed = 0
         self.snapshot_ts: float = 0.0
 
     def as_dict(self) -> dict:
@@ -68,6 +69,7 @@ class ReplayResult:
             "orphan_task_ids": sorted(self.orphan_task_ids),
             "grant_ids_dropped": self.grant_ids_dropped,
             "grants_revoked": self.grants_revoked,
+            "grants_closed": self.grants_closed,
             "snapshot_ts": self.snapshot_ts,
         }
 
@@ -141,6 +143,9 @@ def replay_into(
         has_grants_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sign_grants'"
         ).fetchone() is not None
+        has_grant_closed_col = has_grants_table and any(
+            r[1] == "closed_at" for r in conn.execute("PRAGMA table_info(sign_grants)").fetchall()
+        )
 
         known = {
             str(r[0]) for r in conn.execute("SELECT id FROM tasks").fetchall()
@@ -253,6 +258,19 @@ def replay_into(
                     ).rowcount
                 continue
 
+            if kind == "sign_grant_closed":
+                # A grant closed after the snapshot comes back closed (t_4548202f): no new write, its rows stand
+                # until expiry. A revoked grant stays revoked; a pre-column snapshot skips it (the grant then
+                # lapses at its expiry, still bounded).
+                if task_id and payload.get("grant_id") and has_grant_closed_col:
+                    closed_at = payload.get("closed_at")
+                    result.grants_closed += conn.execute(
+                        "UPDATE sign_grants SET closed_at = ? WHERE grant_id = ? AND task_id = ? "
+                        "AND closed_at IS NULL AND revoked_at IS NULL",
+                        (int(ts if closed_at is None else closed_at), payload["grant_id"], task_id),
+                    ).rowcount
+                continue
+
             # Every other kind is a lifecycle event: replay it so the audit
             # trail is continuous across the restore seam.
             if not kind or not task_id:
@@ -260,6 +278,29 @@ def replay_into(
             import json as _json
 
             pl = _json.dumps(payload, ensure_ascii=False) if payload else None
+            run_id = record.get("run_id")
+            if kind in ("placement", "allocation") and run_id is not None:
+                # One placement row per run, as ``_write_placement`` keeps it (t_4b313c15, Prism 12234d70b060):
+                # a full record replaces an ``unrecorded`` placeholder in place, any other prior record stands,
+                # and a run with no row gets one. A (task, kind, second) dedup would keep the placeholder or
+                # append a second row.
+                prior = conn.execute(
+                    "SELECT id, json_extract(payload, '$.reason') FROM task_events WHERE run_id = ? AND task_id = ? "
+                    "AND kind IN ('placement', 'allocation') ORDER BY id DESC LIMIT 1",
+                    (int(run_id), task_id),
+                ).fetchone()
+                if prior is not None:
+                    if prior[1] == "unrecorded" and payload.get("reason") != "unrecorded":
+                        conn.execute("UPDATE task_events SET payload = ? WHERE id = ?", (pl, prior[0]))
+                        result.events_restored += 1
+                    continue
+                conn.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (task_id, run_id, kind, pl, int(ts)),
+                )
+                result.events_restored += 1
+                continue
             dupe = conn.execute(
                 "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
                 "AND created_at = ?",

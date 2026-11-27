@@ -37,7 +37,10 @@ def _db_path(conn) -> Path:
 def _move_out(tid: str, delete: bool = True) -> Path:
     """What R8 does to one card: copy its rows (all columns + moved_at) to the archive, then delete them.
     ``delete=False`` stops after the archive commit (the window before R8 deletes the live rows)."""
-    conn = kbc.connect()
+    # Retention is a separate writer, even when injected synchronously while
+    # the CLI's read-only context is active.
+    with kbc.read_scope(False):
+        conn = kbc.connect()
     try:
         arch = _db_path(conn).parent / "kanban-archive.db"
         conn.execute("ATTACH DATABASE ? AS march", (str(arch),))

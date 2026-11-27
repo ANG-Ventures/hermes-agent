@@ -117,9 +117,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("boomerang", "Run a task in a subagent inheriting this session (fork; --summary folds); "
                "summary returns here", "Session",
                args_hint="<task>"),
-    # Description <= 100 chars; full flag usage prints on bare /fork-fan.
-    CommandDef("fork-fan", "Fork this session once per item (cards, PRs, paths, text); verdicts fold back here",
-               "Session", args_hint="<items>"),
     CommandDef("worktree", "Show, list, create, or prune isolated git worktrees", "Session",
                cli_only=True, args_hint="[new [name]|list|prune [--dry-run]]",
                subcommands=("new", "list", "prune")),

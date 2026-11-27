@@ -163,6 +163,13 @@ def spawn_background_process(
         _redact_terminal_error_text, _resolve_command_cwd, _resolve_notification_flag_conflict,
     )
 
+    from agent.delegation_context import is_delegated_child_context
+
+    completion_requested = bool(notify_on_complete)
+    child_notifications = is_delegated_child_context() and bool(notify_on_complete or watch_patterns)
+    if child_notifications:
+        notify_on_complete, watch_patterns = False, None
+
     effective_cwd = _resolve_command_cwd(
         workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
         mounted_host=mounted_host if mounted_host is not None else getattr(env, "host_cwd", None),
@@ -173,10 +180,14 @@ def spawn_background_process(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
-            durable_output=bool(notify_on_complete),
+            durable_output=completion_requested,
         )
+        proc_session.completion_requested = completion_requested
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
+        if child_notifications:
+            result_data["notify_on_complete"] = False
+            result_data["subagent_note"] = _SUBAGENT_NOTIFY_NOTE
         if persist_on_release:
             result_data["persist_on_release"] = True
         if approval_note:
@@ -205,11 +216,7 @@ def spawn_background_process(
                 proc_session.completion_output_chars = int(completion_output_chars)
             if proc_session.watcher_platform:
                 _register_completion_watcher(process_registry, proc_session, session_key)
-            from agent.delegation_context import is_delegated_child_context
-            if is_delegated_child_context():
-                result_data["notify_on_complete"] = False
-                result_data["subagent_note"] = _SUBAGENT_NOTIFY_NOTE
-            elif heartbeat_seconds:
+            if heartbeat_seconds:
                 # Heartbeats ride the same delivery path as the completion notice, so they are
                 # only armed where that notice can actually reach the agent.
                 result_data["heartbeat_seconds"] = process_registry.arm_heartbeat(proc_session, heartbeat_seconds)
@@ -255,10 +262,12 @@ def yield_to_background_handler(
 
     def _handler(proc, output_so_far: str) -> dict:
         from tools.process_registry import process_registry
+        from agent.delegation_context import is_delegated_child_context
         session = process_registry.adopt_local(
             proc, command=command, cwd=cwd, task_id=effective_task_id,
             owner_task_id=task_id or effective_task_id, session_key=session_key,
-            output_so_far=output_so_far)
+            output_so_far=output_so_far,
+            notify_on_complete=not is_delegated_child_context())
         _stamp_routing_if_gateway(process_registry, session, session_key)
         logger.info("foreground command yielded to background as %s (pid %s)", session.id, session.pid)
         return {
@@ -270,7 +279,8 @@ def yield_to_background_handler(
 def _stamp_routing_if_gateway(process_registry, session, session_key) -> None:
     """Route the adopted session's completion like a normal notify_on_complete spawn."""
     from gateway.session_context import async_delivery_supported, get_session_env
-    if not async_delivery_supported():
+    from agent.delegation_context import is_delegated_child_context
+    if is_delegated_child_context() or not async_delivery_supported():
         session.notify_on_complete = False
         return
     _stamp_gateway_routing(session, get_session_env)

@@ -260,6 +260,55 @@ def test_warn_context_overflow_blocked_stamps_cooldown_for_ineffective(monkeypat
     agent._emit_warning.assert_called_once()
 
 
+def test_warn_context_overflow_blocked_names_damaged_store(monkeypatch):
+    """t_5be6185c: when the last attempt failed on a damaged store, /compress cannot help; say so."""
+    agent = _agent_with_db()
+    agent._last_ctx_overflow_warn = None
+    agent._emit_warning = MagicMock()
+    agent.context_compressor = SimpleNamespace(last_compress_store_unavailable=True)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    run_agent.AIAgent._warn_context_overflow_blocked(agent, "attempts_exhausted:3", 730_000, 650_000)
+
+    agent._emit_warning.assert_called_once()
+    text = agent._emit_warning.call_args.args[0]
+    assert "compaction store is damaged" in text
+    assert "/compress uses the same store and will not help" in text
+    assert "/new" in text
+    assert "attempts_exhausted" not in text
+    assert "730,000" in text and "650,000" in text
+
+
+def test_warn_context_overflow_blocked_keeps_text_for_other_causes(monkeypatch):
+    agent = _agent_with_db()
+    agent._last_ctx_overflow_warn = None
+    agent._emit_warning = MagicMock()
+    agent.context_compressor = SimpleNamespace(last_compress_store_unavailable=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    run_agent.AIAgent._warn_context_overflow_blocked(agent, "attempts_exhausted:3", 730_000, 650_000)
+
+    text = agent._emit_warning.call_args.args[0]
+    assert "compression is currently blocked (attempts_exhausted:3)" in text
+    assert "damaged" not in text
+
+
+def test_warn_context_overflow_blocked_store_down_keeps_cooldown_activity(monkeypatch):
+    """Prism 4c48c2a9c268: the store warning must not drop the cooldown activity touch."""
+    agent = _agent_with_db()
+    agent._last_ctx_overflow_warn = None
+    agent._emit_warning = MagicMock()
+    agent._touch_activity = MagicMock()
+    agent.context_compressor = SimpleNamespace(last_compress_store_unavailable=True)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    run_agent.AIAgent._warn_context_overflow_blocked(agent, "cooldown:30s", 730_000, 650_000)
+
+    agent._touch_activity.assert_called_once()
+    assert "compression blocked (cooldown:30s)" in agent._touch_activity.call_args.args[0]
+    assert "compaction store is damaged" in agent._emit_warning.call_args.args[0]
+
+
 def test_compression_transition_provenances_surface_in_activity_summary(monkeypatch):
     """Compaction / timeout / cooldown publish through get_activity_summary."""
     agent = _agent_with_db()

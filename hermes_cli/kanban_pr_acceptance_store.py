@@ -10,7 +10,10 @@ def _snapshot(conn, task_id):
     return tuple(row) if row else None
 
 
-def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+def prepare_acceptance(conn, task_id, expected_run_id, metadata, superseded=()):
+    """``superseded``: survivor refs ``complete_task``'s content gate verified this run (never caller metadata).
+    A contract PR among them was closed unmerged and superseded on main, so its own head has no checks to read
+    (t_1b2322fe): the receipt records the verified superseder instead."""
     snapshot = _snapshot(conn, task_id)
     if snapshot is None:
         return False
@@ -31,6 +34,14 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
         contract = published_pr
     # The assignee profile's gh login owns the repo: acceptance must not run as
     # the ambient login of whichever process completes the card (#122689).
+    declared = _PR.fullmatch(contract)
+    if declared:
+        key = f"{declared[1]}#{declared[2]}".lower()
+        cover = next((s for s in superseded or () if str(s.get("pr") or "").lower() == key and s.get("sha")), None)
+        if cover is not None:
+            return snapshot, {"ok": True, "classification": "superseded", "head_sha": None, "pr_url": contract,
+                              "checks": [], "recovery": "", "superseded_by": cover["sha"],
+                              "detail": f"closed unmerged; content gate verified superseder {cover['sha']}"}
     assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
     return snapshot, collect_acceptance(contract, published_pr, assignee=assignee)
 

@@ -32,7 +32,7 @@ _ALL_TOOLSETS = {"all", "*"}
 _USAGE_KEYS = (
     "estimated_cost_usd", "cost_status", "cost_source", "input_tokens", "output_tokens",
     "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "total_tokens", "api_calls",
-    "model", "provider", "session_id", "completed", "partial", "interrupted", "turn_exit_reason",
+    "model", "provider", "served_model", "session_id", "completed", "partial", "interrupted", "turn_exit_reason",
 )
 
 # Counters summed per auxiliary task (vision, compression, title_generation, ...) into the

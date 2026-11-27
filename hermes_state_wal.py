@@ -645,3 +645,26 @@ def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.d
     # Last: sizing pragmas cannot change durability (see _apply_synchronous_pragma).
     if (raw_synchronous := cfg_get(cfg, "database", "synchronous", default=None)) is not None:
         _apply_synchronous_pragma(conn, raw_synchronous, db_label=db_label)
+
+
+_writer_autocheckpoint_cached: Optional[bool] = None
+
+
+def writer_autocheckpoint_enabled() -> bool:
+    """``database.writer_autocheckpoint`` (default False), read once per process.
+
+    False: state.db writer connections run with ``wal_autocheckpoint=0``. SQLite's inline autocheckpoint
+    runs inside COMMIT after the WAL write lock is released but while ``SessionDB._lock`` is still held, so
+    every other writer in the process (the /stop marker included) waited out the checkpoint I/O: 9.8 s,
+    18.2 s and 283.9 s "commit" holds at ~0 CPU on 2026-11-10 (t_b6742fb1). The side-thread PASSIVE
+    checkpointer does the backfill instead. Durability is unchanged: a checkpoint copies frames the
+    commit already synced. True restores SQLite's inline autocheckpoint (kill switch)."""
+    global _writer_autocheckpoint_cached
+    if _writer_autocheckpoint_cached is None:
+        try:
+            from hermes_cli.config import cfg_get, load_config_readonly  # local: avoids a circular import
+            raw = cfg_get(load_config_readonly(), "database", "writer_autocheckpoint", default=False)
+        except Exception:
+            raw = False
+        _writer_autocheckpoint_cached = raw is True or str(raw).strip().lower() in ("1", "true", "yes", "on")
+    return _writer_autocheckpoint_cached

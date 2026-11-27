@@ -21,7 +21,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    for v in ("HERMES_KANBAN_MINT_CAP", "HERMES_KANBAN_SIGNATURE_DEDUP", "HERMES_KANBAN_MINT_BREAKER",
+    for v in ("HERMES_KANBAN_SIGNATURE_DEDUP", "HERMES_KANBAN_MINT_BREAKER",
               "HERMES_KANBAN_SIGNATURE_QUIET_S", "HERMES_KANBAN_SIGNATURE_FLAP_N"):
         monkeypatch.delenv(v, raising=False)
     kb.init_db()

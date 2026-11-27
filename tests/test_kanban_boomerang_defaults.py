@@ -1,6 +1,7 @@
 """Default subscriptions and quiet, single-line boomerang handbacks."""
 import asyncio
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,16 @@ import pytest
 from gateway import kanban_boomerang_wake as bw
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_notify as kbn
+
+
+@pytest.fixture(autouse=True)
+def owner_scope(monkeypatch):
+    from gateway import kanban_owner_wake as ow
+    home = SimpleNamespace(origin=SimpleNamespace(chat_id="42", platform="discord"))
+    monkeypatch.setattr(ow, "resolve_owner", lambda *a: home)
+    # t_827d5940: these tests retry on the very next tick; pacing is covered in
+    # tests/gateway/test_kanban_boomerang_wake_backoff.py.
+    monkeypatch.setattr(bw, "BACKOFF_BASE_S", 0.0, raising=False)
 
 
 @pytest.mark.parametrize("configured,explicit,worker,expected", [
@@ -55,7 +66,8 @@ def _runner(outcomes, sent):
         if o:
             sent.append(text)
         return SendResult(success=bool(o), error=None if o else "injected")
-    return SimpleNamespace(_kanban_route_adapter=lambda *a: SimpleNamespace(send=send))
+    return SimpleNamespace(_kanban_route_adapter=lambda *a: SimpleNamespace(send=send),
+                           _async_profile_scope_for_source=lambda source: nullcontext())
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -150,8 +162,9 @@ def test_surface_with_failed_resurface_is_retried_by_the_tick(tmp_path, monkeypa
 
 @pytest.mark.parametrize("cli_auto_subscribe", [False, True])
 def test_cli_create_boomerang_follows_cli_auto_subscribe(tmp_path, monkeypatch, cli_auto_subscribe):
-    """Shape test (5), Prism 1aec29b63c57: scripts/cron drive the CLI, so the boomerang default
-    applies to a CLI create only when kanban.cli_auto_subscribe is on, identity or not."""
+    """Shape test (5), Prism 1aec29b63c57: scripts/cron drive the CLI, so a CLI create
+    SUBSCRIBES its chat only when kanban.cli_auto_subscribe is on. The card level is the
+    creation default either way (t_c24b1cc7)."""
     import re
     from pathlib import Path
     from hermes_cli import kanban as kc
@@ -176,7 +189,7 @@ def test_cli_create_boomerang_follows_cli_auto_subscribe(tmp_path, monkeypatch, 
     out = kc.run_slash('--board default create "cli scratch" --assignee worker1')
     tid = re.search(r"Created\s+(t_[0-9a-f]+)\b", out).group(1)
     with kb.connect_closing() as conn:
-        assert bool(kb.get_task(conn, tid).boomerang_wake) is cli_auto_subscribe
+        assert kb.get_task(conn, tid).boomerang_wake is True
         assert bool(kbn.list_notify_subs(conn, tid)) is cli_auto_subscribe
 
 
@@ -201,18 +214,30 @@ def test_gateway_create_persists_level(tmp_path, monkeypatch, opt_out):
         assert kbn.list_notify_subs(conn, created["task_id"])[0]["delivery_mode"] == "notify+wake"
 
 
-@pytest.mark.parametrize("owner", [False, True])
-def test_deadman_owner_comment_since_review(tmp_path, monkeypatch, owner):
+@pytest.mark.parametrize("owner,after_event,switch_off,acted", [
+    (False, True, False, False),
+    (True, True, False, True),
+    (True, False, False, False),   # t_a6da8394: a comment before the deadman event is what it already weighed
+    (True, False, True, True),     # BOOMERANG_DEADMAN_TRIGGER_CURSOR=0: any owner comment since the review
+])
+def test_deadman_owner_comment_since_review(tmp_path, monkeypatch, owner, after_event, switch_off, acted):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    if switch_off:
+        monkeypatch.setenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", "0")
+    else:
+        monkeypatch.delenv("BOOMERANG_DEADMAN_TRIGGER_CURSOR", raising=False)
     kb.init_db()
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="deadman", assignee="human:apollo")
         kb._append_event(conn, tid, "review_requested", {})
-        kb.add_comment(conn, tid, "human:apollo" if owner else "worker", "CI pending")
+        if not after_event:
+            kb.add_comment(conn, tid, "human:apollo" if owner else "worker", "CI pending")
         kb._append_event(conn, tid, "review_deadman", {})
         event_id = kb.max_event_id(conn)
-    assert bw.deadman_owner_acted(dict(task_id=tid, row="review_deadman", event_id=event_id)) is owner
+        if after_event:
+            kb.add_comment(conn, tid, "human:apollo" if owner else "worker", "CI pending")
+    assert bw.deadman_owner_acted(dict(task_id=tid, row="review_deadman", event_id=event_id)) is acted
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -223,10 +248,10 @@ def test_run_entry_deadman_passive_delivery(tmp_path, monkeypatch, stale):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="scratch live deadman", assignee="human:apollo")
         kb._append_event(conn, tid, "review_requested", {})
-        if stale:
-            kb.add_comment(conn, tid, "human:apollo", "already landed")
         kb._append_event(conn, tid, "review_deadman", {})
         event_id = kb.max_event_id(conn)
+        if stale:   # t_a6da8394: the owner acts after the deadman fired
+            kb.add_comment(conn, tid, "human:apollo", "already landed")
     state = bw.BoomerangWakeState(tmp_path / "claims.json")
     entry = dict(key="claim", task_id=tid, board=None, row="review_deadman", kind="review_deadman",
                  event_id=event_id, delegation_id="d2", verdict_nonce="abcd", route={}, mode="fork")
@@ -246,7 +271,7 @@ def test_run_entry_deadman_passive_delivery(tmp_path, monkeypatch, stale):
     monkeypatch.setattr(bw, "resurface", resurface)
     sent = []
     asyncio.run(bw.run_entry(_runner([], sent), entry, state))
-    assert sent == ([] if stale else [f"boomerang handled {tid} (review_deadman): operator decision needed"])
+    assert sent == []  # t_8ab5557d: no chat line beside a delivered turn
     assert len(turns) == (0 if stale else 1)
     with kb.connect_closing() as conn:
         assert any(c.body.startswith("boomerang: review_deadman ") for c in kb.list_comments(conn, tid))

@@ -77,7 +77,7 @@ def test_kanban_block_reason_scrubbed_jwt(worker_env):
         ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
         ".dozjgNryP4J3jVmNHl0w5N_5NjP1-iXkpHgcth826Iw"
     )
-    kt._handle_block({"reason": f"Bearer {jwt}"})
+    kt._handle_block({"reason": f"Need: x. Why: y. How to reply: z. Bearer {jwt}", "kind": "needs_input"})
     conn = kbc.connect()
     try:
         run = kb.latest_run(conn, worker_env)

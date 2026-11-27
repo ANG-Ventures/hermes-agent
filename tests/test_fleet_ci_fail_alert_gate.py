@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.ci.public_workflow_allowlist import assert_dispatch_only, self_start_allowed
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "fleet-ci-fail-alert.yml"
 
@@ -1704,7 +1706,11 @@ def _sweep(tmp_path, reds, *, sweeps=(), sweep_jobs=None, listener=None, event="
 
 def test_no_workflow_run_trigger_left():
     on = _workflow()["on"]
-    assert "workflow_run" not in on and "schedule" in on and "workflow_dispatch" in on
+    assert "workflow_run" not in on and "workflow_dispatch" in on
+    if self_start_allowed(WORKFLOW.name):
+        assert "schedule" in on
+    else:
+        assert_dispatch_only(on, WORKFLOW.name)
 
 
 def test_matrix_leg_feeds_the_route_step():

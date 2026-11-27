@@ -515,9 +515,13 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
 
 
 def _worktree_is_dirty(worktree_path: str, timeout: int = 10) -> bool:
-    """Whether a worktree has staged/unstaged/untracked changes. Fails SAFE toward True."""
+    """Whether a worktree has staged/unstaged/untracked changes. Fails SAFE toward True.
+
+    ``--no-optional-locks`` (t_fbeea95b): a plain ``status`` takes ``index.lock`` to write back its
+    refreshed index, and a timeout kill mid-refresh leaves that lock behind; ~50 per pruner pass on
+    the Studio's aged trees."""
     try:
-        status = _git_out(["status", "--porcelain"], worktree_path, timeout=timeout)
+        status = _git_out(["--no-optional-locks", "status", "--porcelain"], worktree_path, timeout=timeout)
         return status is None or bool(status)
     except Exception:
         return True
@@ -780,6 +784,8 @@ def _prune_candidates(worktrees_dir: Path, max_age_hours: int, now: float) -> li
     for entry in sorted(worktrees_dir.iterdir()):
         if not entry.is_dir() or kanban_re.match(entry.name):
             continue
+        if not (entry / ".git").exists():
+            continue  # not a worktree: every git probe in it would act on the ENCLOSING repo (t_fbeea95b)
         tier_hours = max_age_hours if entry.name.startswith("hermes-") else max_age_hours * 3
         try:
             mtime = entry.stat().st_mtime

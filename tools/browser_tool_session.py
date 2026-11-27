@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -296,7 +297,8 @@ def _local_backend_process_dead(session_info: Dict[str, Any]) -> bool:
 
 def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     """Session connecting to a user-supplied CDP endpoint."""
-    info = _session_record("cdp", cdp_url, {"cdp_override": True})
+    # t_f68d74f9: remember a lease URL; once that lease ends the session must never run again (see _lease_ended).
+    info = _session_record("cdp", cdp_url, {"cdp_override": True, "lease": _is_lease_cdp(cdp_url)})
     _bt.logger.info("Created CDP browser session %s → %s for task %s",
                 info["session_name"], _bt._sanitize_url_for_logs(cdp_url), task_id)
     return info
@@ -543,8 +545,31 @@ def _sandbox_close_daemon(session_name: str) -> None:
         _bt.logger.debug("sandbox browser close for %s failed: %s", session_name, exc)
 
 
-def _sandbox_socket_dir(env) -> str:
-    return f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/agent-browser"
+def _sandbox_socket_dir(env, lease_session: str = "") -> str:
+    """The daemon socket dir in the terminal backend. One per login is safe for ``--session <unique>`` commands,
+    but a lease command passes ``--cdp`` and no ``--session`` (agent-browser then uses session "default"), so every
+    lease session gets its own dir: two workers on one login must not share a daemon (t_db945925)."""
+    from tools.bot_desktop import sandbox_host
+    base = f"{sandbox_host.remote_root(env)}/agent-browser"
+    return f"{base}-{lease_session}" if lease_session else base
+
+
+_lease_socket_dirs: Dict[str, Any] = {}  # remote lease socket dir -> its sandbox env; emptied on lease end
+
+
+def _sandbox_drop_lease_dirs() -> None:
+    """On lease end: stop each lease session's daemon and remove its private socket dir (t_db945925)."""
+    from tools.bot_desktop import sandbox_host
+    from tools.environments import streams
+    while _lease_socket_dirs:
+        sock, env = _lease_socket_dirs.popitem()
+        d = shlex.quote(sock)
+        try:
+            streams.run_in(env, ["bash", "-c", f"p=$(cat {d}/default.pid 2>/dev/null) && ps -p \"$p\" -o command="
+                                 f" | grep -q agent-browser && kill \"$p\"; rm -rf -- {d}"],
+                           user=sandbox_host._user_for(env), timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _bt.logger.debug("lease socket dir cleanup for %s failed: %s", sock, exc)
 
 
 def sandbox_screenshot_path(host_path: "Path") -> Optional[str]:
@@ -555,7 +580,8 @@ def sandbox_screenshot_path(host_path: "Path") -> Optional[str]:
     env = _bd_runtime._sandbox_env(create=False)
     if env is None:
         return None
-    return f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/shots/{host_path.name}"
+    from tools.bot_desktop import sandbox_host
+    return f"{sandbox_host.remote_root(env)}/shots/{host_path.name}"
 
 
 def fetch_sandbox_file(remote_path: str, local_dest: "Path", *, max_bytes: int = 16 * 1024 * 1024) -> bool:
@@ -640,10 +666,31 @@ def _browser_in_sandbox() -> bool:
     return placement.resolve().where == placement.TERMINAL
 
 
-def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket_dir: str) -> "tuple[List[str], Dict[str, str]]":
+_SCREEN_ENV_KEYS = ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def _is_lease_cdp(cdp_url: str) -> bool:
+    """t_ba46cfe3: ``cdp_url`` is the loopback port of THIS process's live identity lease. The page renders in the
+    Studio's identity browser; agent-browser only has to reach the lease forwarder's port on the terminal host,
+    so no screen is needed there (a pool host with no worker desktop: mbp-2026, nas-fleet)."""
+    from tools.browser_lease import is_lease_url
+    return is_lease_url(cdp_url or "")
+
+
+def _lease_ended(session_info: Optional[Dict[str, Any]]) -> bool:
+    """t_f68d74f9: the session was opened on an identity lease that has since ended. Its ``cdp_url`` is a dead,
+    ephemeral forwarder port: a command on it would take the non-lease path (shared socket dir, session "default")
+    and could attach to another worker's new lease on the same port, so no agent-browser may start for it."""
+    info = session_info or {}
+    return bool((info.get("features") or {}).get("lease")) and not _is_lease_cdp(str(info.get("cdp_url") or ""))
+
+
+def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket_dir: str,
+                  *, screenless: bool = False, session_name: str = "") -> "tuple[List[str], Dict[str, str]]":
     """Rewrite one agent-browser invocation to run inside the sandbox: exec prefix + the CLI by name, with the
     browser-relevant variables exported there (the daemon's socket dir mirrors the host path so the host-side
-    liveness probes keep their shape) and a screen-published DISPLAY. Identity on a gateway-hosted screen."""
+    liveness probes keep their shape) and a screen-published DISPLAY. Identity on a gateway-hosted screen.
+    ``screenless`` (a lease CDP session, t_ba46cfe3): no screen is required or exported, but the CLI must exist."""
     if not _browser_in_sandbox():
         return cmd_parts, browser_env
     from tools.bot_desktop import runtime as _bd_runtime, sandbox_host
@@ -651,21 +698,43 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
     env = _bd_runtime._sandbox_env(create=True)
     if env is None:
         raise RuntimeError("the terminal backend's sandbox is not running, so there is nowhere to run the browser")
-    published = _bd_runtime.published_env()
-    if not published.get("DISPLAY"):
+    published = {} if screenless else _bd_runtime.published_env()
+    if not screenless and not published.get("DISPLAY"):
         # The sandbox died under a live screen (container removed, ssh host rebooted). Fail here rather than
         # let a DISPLAY-less agent-browser run headless inside a dead sandbox or, worse, fall back to the host.
         raise RuntimeError("the screen inside the terminal backend's sandbox is gone; start it again")
-    remote_env = {k: v for k, v in browser_env.items() if k in _SANDBOX_ENV_KEYS}
+    if screenless and not getattr(env, "_bd_lease_cli_ready", False):
+        probe = streams.run_in(env, ["bash", "-c", f"command -v {_SANDBOX_AGENT_BROWSER}"],
+                               user=sandbox_host._user_for(env), timeout=15)
+        if probe.returncode != 0:
+            where = f"{getattr(env, 'user', None) or '?'}@{getattr(env, 'host', None) or type(env).__name__}"
+            raise RuntimeError(
+                f"BROWSER_LEASE_CLI_ABSENT: {_SANDBOX_AGENT_BROWSER} is not on PATH for {where}. The lease's CDP port "
+                f"listens on that machine's loopback, so the browser tools run the {_SANDBOX_AGENT_BROWSER} CLI there; "
+                f"install it for that login (no screen or Chromium is needed for a lease)")
+        env._bd_lease_cli_ready = True
+    remote_env = {k: v for k, v in browser_env.items()
+                  if k in _SANDBOX_ENV_KEYS and not (screenless and k in _SCREEN_ENV_KEYS)}
     remote_env.update(published)
-    remote_env["AGENT_BROWSER_SOCKET_DIR"] = _sandbox_socket_dir(env)
+    sock = _sandbox_socket_dir(env, session_name if screenless else "")
+    remote_env["AGENT_BROWSER_SOCKET_DIR"] = sock
     remote_env.pop("AGENT_BROWSER_EXECUTABLE_PATH", None)  # the sandbox image's Playwright Chromium, not a host path
     remote_env["AGENT_BROWSER_PROFILE"] = sandbox_host.browser_profile_dir(env)  # persists with the container, not its tmpfs
     remote_env["TMPDIR"] = env.get_temp_dir()
-    if not getattr(env, "_bd_browser_dirs_ready", False):
-        streams.run_in(env, ["mkdir", "-p", _sandbox_socket_dir(env), f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/shots",
-                             remote_env["AGENT_BROWSER_PROFILE"]], user=sandbox_host._user_for(env), timeout=15)
+    if not getattr(env, "_bd_browser_dirs_ready", False) or (screenless and sock not in _lease_socket_dirs):
+        dirs = dict.fromkeys((_sandbox_socket_dir(env), sock, f"{sandbox_host.remote_root(env)}/shots"))
+        priv = " ".join(shlex.quote(d) for d in dirs)
+        made = streams.run_in(env, ["bash", "-c", f"set -e; {sandbox_host.private_root_sh(env)}; mkdir -p -m 0700 {priv};"
+                                    f" for d in {priv}; do [ ! -L \"$d\" ] || {{ echo \"$d is a symlink\" >&2; exit 1; }}; done;"
+                                    f" chmod 0700 {priv}; mkdir -p {shlex.quote(remote_env['AGENT_BROWSER_PROFILE'])}"],
+                              user=sandbox_host._user_for(env), timeout=15)
+        if made.returncode != 0:
+            raise RuntimeError(f"could not make the sandbox browser dirs: {made.stderr.decode('utf-8', 'replace')[-500:]}")
         env._bd_browser_dirs_ready = True
+        if screenless:
+            from tools import browser_lease
+            browser_lease.on_lease_end(_sandbox_drop_lease_dirs)
+            _lease_socket_dirs[sock] = env
     remote_env["AGENT_BROWSER_ARGS"] = ",".join(CHROMIUM_SANDBOX_BYPASS_ARGS)  # container: no userns for Chromium's own sandbox
     # cmd_parts = <agent-browser argv0 (+npx spec)> + backend args + command; keep everything after argv0.
     tail = cmd_parts[len(_agent_browser_argv(cmd_parts[0])):]
@@ -681,13 +750,20 @@ def _browser_command_preflight() -> Dict[str, Any]:
     """Fail fast before spawning (missing CLI, Termux gap, interrupt, no Chromium in local
     mode — else every call hangs for command_timeout). Error result, or ``{"browser_cmd": path}``."""
     from tools.bot_desktop import placement, runtime as _bd_runtime
+    if _is_lease_cdp(_cdp._get_cdp_override_raw()) and placement.resolve().where == placement.TERMINAL:
+        # t_ba46cfe3: a live identity lease renders in the Studio's browser; agent-browser runs in the terminal
+        # backend next to the lease forwarder and needs no screen there, so never start or require one.
+        from tools.interrupt import is_interrupted
+        if is_interrupted():
+            return {"success": False, "error": "Interrupted"}
+        return {"browser_cmd": _SANDBOX_AGENT_BROWSER}
     try:
         where = _bd_runtime.tool_placement()  # starts the sandbox screen on demand; raises for refused / down
     except RuntimeError as e:
         # t_db491366: on a placed kanban worker the pool host's sandbox was the only place left
         # for the agent's own browser; the operator's lives on the Studio, so name that fix.
         from tools.rail_preflight import placed_browser_rail_error
-        if rail := placed_browser_rail_error():
+        if rail := placed_browser_rail_error(str(e)):
             return {"success": False, "error": rail}
         return {"success": False, "error": f"The browser cannot run here: {e}"}
     if where == placement.TERMINAL:
@@ -726,7 +802,8 @@ def _spawn_and_collect(
     task_socket_dir = _prepare_session_socket_dir(session_info["session_name"])
     _bt.logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
                  command, task_id, task_socket_dir, len(task_socket_dir))
-    if engine != "lightpanda":
+    screenless = _is_lease_cdp(str(session_info.get("cdp_url") or ""))
+    if engine != "lightpanda" and not screenless:
         _ensure_screen_for_headed_chromium()  # first command forks the daemon; a headed window needs the screen up
     browser_env = _agent_browser_command_env(task_socket_dir)
 
@@ -743,7 +820,8 @@ def _spawn_and_collect(
 
     stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
     stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
-    cmd_parts, browser_env = _sandbox_wrap(cmd_parts, browser_env, task_socket_dir)
+    cmd_parts, browser_env = _sandbox_wrap(cmd_parts, browser_env, task_socket_dir, screenless=screenless,
+                                           session_name=session_info["session_name"])
     proc = _popen_agent_browser(cmd_parts, browser_env, task_socket_dir, command, stdin_payload)
 
     try:
@@ -879,6 +957,14 @@ def _run_browser_command(
     if timeout is None:
         timeout = _bt._safe_command_timeout()
     args = args or []
+
+    with _bt._cleanup_lock:
+        current = _bt._active_sessions.get(task_id)
+    if _lease_ended(current):   # before preflight: it can bring up a screen for the non-lease path
+        if command == "close":  # lease end already stopped the lease daemon and removed its socket dir
+            return {"success": True, "data": {"skipped": "lease ended"}}
+        return {"success": False, "error": "BROWSER_LEASE_ENDED: this browser session was on an identity lease that "
+                "has ended; call browser_navigate with lease_identity=<id> to lease it again"}
 
     preflight = _browser_command_preflight()
     if "browser_cmd" not in preflight:

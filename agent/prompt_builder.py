@@ -317,9 +317,8 @@ KANBAN_GUIDANCE = (
     "`kanban_request_changes`, post a current-run comment with a `review_coverage: {...}` JSON line "
     f"({_review_schema.coverage_fields_text()}). If a lens cannot run, use `kanban_block(kind=capability)` instead "
     "of a partial changes request.\n"
-    "6. **If follow-up work appears, create it; don't do it.** Use `kanban_create(title=..., assignee=<right-profile>, "
-    "parents=[your-task-id])` to spawn a child task for the appropriate specialist profile instead of scope-creeping "
-    "into the next thing.\n"
+    "6. **List follow-ups; do not create cards.** Put follow-up work under a `follow-ups:` heading in the handback, "
+    "one line each with file and evidence. The operator cards what is worth doing.\n"
     "7. **Flag collision hotspots; don't pile on.** If your change keeps colliding with sibling branches in one file, "
     "or a file your diff touches shows up in other cards' recent comments, do not silently add more to it: leave a "
     "`kanban_comment` starting with `hotspot: <path> — <one-line reason>` on your card and repeat the flag in your "
@@ -336,6 +335,9 @@ KANBAN_GUIDANCE = (
     "if two tasks would each pick one, decide it yourself and write the decision into BOTH card bodies. Every child "
     "card body must carry the decisions it depends on, because workers cannot see sibling context.\n"
     "\n"
+    "**Created cards.** List ids in `kanban_complete(created_cards=[...])` ONLY when captured from a successful "
+    "`kanban_create` return — never invent or paste ids; the kernel rejects the completion on any phantom id.\n"
+    "\n"
     "## Reference details that change outcomes\n\n"
     "- **Workspace.** `cd $HERMES_KANBAN_WORKSPACE` first. For a `worktree` kind with no `.git`, `git worktree add "
     "<path> ${HERMES_KANBAN_BRANCH:-wt/$HERMES_KANBAN_TASK}` from the main repo, then cd there. For a project-linked "
@@ -346,11 +348,9 @@ KANBAN_GUIDANCE = (
     "objects with a fleet mirror instead of copying the whole history.\n"
     "- **Deliverables.** Files a human wants go in `kanban_complete(artifacts=[<absolute paths>])` (top-level param; "
     "paths in `metadata` are NOT uploaded). Files must exist at completion.\n"
-    "- **Attachments.** Attach real downloadable artifacts instead of pasting links in comments: `kanban_attach` "
-    "(base64) or `kanban_attach_url` (server-side public http(s) fetch); 25 MB cap, `kanban_attachments` lists them. "
-    "Workers may only attach to their own task.\n"
-    "- **Created cards.** List ids in `kanban_complete(created_cards=[...])` ONLY when captured from a successful "
-    "`kanban_create` return — never invent or paste ids; the kernel rejects the completion on any phantom id.\n"
+    "- **Attachments.** Attach real files, not links: `kanban_attach` (base64) or `kanban_attach_url` (server-side "
+    "http(s) fetch); 25 MB cap, own task only. `kanban_attachments` lists them; `kanban_attachment_read` returns "
+    "one's bytes from any host (own card + parents, 64 KiB).\n"
     "- **Paging #alerts.** Only via `scripts/lib/episode_pager.py` or a whole-line `# alerts-pager-ok: <reason>`; else "
     "quarantined.\n"
     "- **Orchestrating: discover profiles first.** The dispatcher SILENTLY drops a card with an unknown assignee (it "
@@ -365,7 +365,6 @@ KANBAN_GUIDANCE = (
     "will time out and the task will sit silently in `running` with no signal to the operator. Instead: "
     "`kanban_comment` the context, then `kanban_block(reason=...)` so the task surfaces on the board as needing "
     "input.\n"
-    "- Do not assign follow-up work to yourself. Assign it to the right specialist profile.\n"
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is for short reasoning subtasks inside your "
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
@@ -593,16 +592,35 @@ def format_steer_marker(steer_text: str) -> str:
 STEER_DISPLAY_KIND = "steer"
 
 
-def steer_user_row(steer_text: str) -> Dict[str, Any]:
+# Instance attribute the gateway installs on an agent it steers (gateway.run_busy): called with the drained
+# steer text, it returns that row's ``display_metadata`` (the platform message's inbound record, t_b8fbfc54).
+STEER_ROW_DISPLAY_METADATA_ATTR = "_steer_row_display_metadata"
+
+
+def steer_user_row(steer_text: str, *, agent: Any) -> Dict[str, Any]:
     """The standalone ``role:user`` row a mid-turn /steer is delivered as (after the newest tool
     result). Its own row — never smeared onto the already-persisted tool row, which append-only
     persistence would leave divergent from the live request — and typed so the alternation repair
-    never merges the next real prompt into it and history renderers can label it."""
+    never merges the next real prompt into it and history renderers can label it.
+
+    *agent* is the agent whose buffer *steer_text* was drained from (``None`` only where there is
+    none): a gateway-steered agent supplies the row's ``display_metadata``, so a Telegram "place it"
+    sent mid-turn keeps the record the chat-buy gate reads (t_b8fbfc54)."""
     from agent.route_note_ingest import relabel_route_note_text  # late: route_note_ingest imports this module
 
     # E11: the steer is received text; relabel before the genuine steering wrapper is added.
-    return {"role": "user", "content": format_steer_marker(relabel_route_note_text(steer_text)).lstrip(),
-            "display_kind": STEER_DISPLAY_KIND}
+    row = {"role": "user", "content": format_steer_marker(relabel_route_note_text(steer_text)).lstrip(),
+           "display_kind": STEER_DISPLAY_KIND}
+    hook = getattr(agent, "__dict__", {}).get(STEER_ROW_DISPLAY_METADATA_ATTR) if agent is not None else None
+    if callable(hook):
+        try:
+            meta = hook(steer_text)
+        except Exception:  # noqa: BLE001 -- a lookup failure leaves the row unrecorded (fails closed)
+            logger.debug("steer row display_metadata lookup failed", exc_info=True)
+            meta = None
+        if isinstance(meta, dict) and meta:
+            row["display_metadata"] = dict(meta)
+    return row
 
 
 STEER_CHANNEL_NOTE = (
@@ -1144,6 +1162,33 @@ def _embedder_environment_hint() -> str:
         (_config_readonly("agent.environment_hint").get("agent", {}) or {}).get("environment_hint", "")).strip()
 
 
+def kanban_placement_hint(environ: "Optional[Dict[str, str]]" = None) -> str:
+    """The line a kanban worker placed on a pool host reads (t_8c580b20): its
+    terminal runs ON that host, which has no ssh route to itself, so a card step
+    ``ssh <host> '<cmd>'`` is run directly. Read from the dispatcher's placement
+    env (``KANBAN_WORKER_PLACEMENT``, kanban_worker_hosts.apply_placement); ``""``
+    for an unplaced or malformed placement."""
+    env = os.environ if environ is None else environ
+    try:
+        data = json.loads(env.get("KANBAN_WORKER_PLACEMENT") or "")
+        host, values = str(data.get("host") or ""), data.get("env") or {}
+        user = str(values.get("TERMINAL_SSH_USER") or "")
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    if not host or values.get("TERMINAL_ENV") != "ssh":
+        return ""
+    who = f" as `{user}`" if user else ""
+    return (f"Kanban placement: you are on pool host `{host}`. Your terminal runs ON {host}{who}, so run "
+            f"{host}'s commands directly in it. Do not `ssh {host}` (or any other name of it) from there: a "
+            f"host has no ssh route to itself (rc 255). A card step written as `ssh {host} '<cmd>'` means: "
+            f"run `<cmd>` here, but as {user or 'the worker account'}, NOT as the account that alias logs into "
+            f"from a peer (an ssh config `User`, often fleetw or ace): `~`, `$HOME` and that account's files "
+            f"differ, so use absolute paths. A step that needs another "
+            f"account's home, files or permissions (`ssh <user>@{host}`, `-l <user>`, `-o User=<user>`, or a "
+            f"`~` path of the alias's account) cannot run here; block it with kind=capability naming that "
+            f"login.")
+
+
 def build_environment_hints() -> str:
     """Execution-environment block: local backends get host OS/home/cwd; remote/sandbox
     backends get ONLY the backend's own state (the agent's tools cannot touch the host).
@@ -1151,6 +1196,7 @@ def build_environment_hints() -> str:
     backend = (_tenv_read("TERMINAL_ENV") or "local").strip().lower()
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
     hints = [_remote_backend_hint(backend)] if is_remote_backend else _local_host_hints()
+    hints.append(kanban_placement_hint())
     # A host-placed Bot Screen is only reachable from a local backend (a sandboxed terminal cannot
     # open windows on the gateway host), and a sandbox-placed one is the sandbox probe's business.
     if not is_remote_backend:

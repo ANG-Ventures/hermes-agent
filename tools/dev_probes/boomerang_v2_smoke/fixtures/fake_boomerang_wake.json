@@ -1,0 +1,27 @@
+{
+  "claims": {
+    "bv2-smoke|t_5m0ce002|12": {
+      "task_id": "t_5m0ce002",
+      "board": "bv2-smoke",
+      "row": "blocked_assess",
+      "state": "terminal",
+      "outcome": "surfaced",
+      "delegation_id": "deleg_s1b0001"
+    },
+    "bv2-smoke|t_5m0ce007|71": {
+      "task_id": "t_5m0ce007",
+      "board": "bv2-smoke",
+      "state": "terminal",
+      "outcome": "redispatched_after_restart",
+      "delegation_id": "deleg_s4a0001",
+      "redispatched_as": "bv2-smoke|t_5m0ce007|71#restart1"
+    },
+    "bv2-smoke|t_5m0ce007|71#restart1": {
+      "task_id": "t_5m0ce007",
+      "board": "bv2-smoke",
+      "state": "terminal",
+      "outcome": "complete",
+      "delegation_id": "deleg_s4a0002"
+    }
+  }
+}

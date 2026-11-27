@@ -93,6 +93,7 @@ def test_grant_binds_to_exactly_one_process(monkeypatch):
     )
 
     # Absent marker fails OPEN: hand-driven workers / older dispatchers.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_grant")
     monkeypatch.delenv(KANBAN_OWNER_PID_ENV, raising=False)
     assert owns_kanban_worker_authority() is True
 

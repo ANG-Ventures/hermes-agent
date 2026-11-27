@@ -642,6 +642,7 @@ class _KanbanNotification:
     async def wake(self) -> None:
         """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
         from gateway.wake import deliver_wake
+        from gateway.wake_kind import KANBAN, kanban_wake_sub, wake_meta
         sub = self.sub
         if not self.is_push_adapter:
             # A served profile's raw-session wake runs in THAT profile's scope, in-process: the
@@ -650,7 +651,7 @@ class _KanbanNotification:
             # unprefixed self-post would resume the session in the DEFAULT profile's store.
             async with self._owner_scope():
                 await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
-                                   profile=self._served_wake_profile(),
+                                   profile=self._served_wake_profile(), wake_kind=KANBAN,
                                    notification_category="diagnostic" if self.wake_diagnostic else "result")
             self._log_woke()
             return
@@ -680,7 +681,9 @@ class _KanbanNotification:
                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
-                               notification_category="diagnostic" if self.wake_diagnostic else "result")
+                               notification_category="diagnostic" if self.wake_diagnostic else "result",
+                               wake_kind=KANBAN,
+                               metadata=wake_meta(sub=kanban_wake_sub(self.wake_kinds), card_id=self.task_id))
         self._log_woke()
 
     async def _send_event(self, ev: Any, msg: str) -> bool:

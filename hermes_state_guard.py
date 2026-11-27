@@ -30,8 +30,12 @@ def _real_platform_state_root() -> Optional[Path]:
     it precise is what keeps it armed. The account home is still not monkeypatchable from inside a
     test, so the property the old anchor protected is preserved."""
     try:
-        from hermes_state import _os_account_home
-        home = _os_account_home() or Path(os.path.expanduser("~"))
+        from hermes_state_roots import account_home
+        # Preserve the facade's patch seam when state is already loaded, without
+        # importing its auth/client graph merely to resolve an account directory.
+        state = sys.modules.get("hermes_state")
+        anchor = getattr(state, "_os_account_home", account_home)
+        home = anchor() or Path(os.path.expanduser("~"))
         if sys.platform == "win32":
             base = os.environ.get("LOCALAPPDATA", "").strip()
             root = Path(base) / "hermes" if base else home / "AppData" / "Local" / "hermes"

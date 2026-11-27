@@ -8,6 +8,7 @@ host it runs on. Tests pass their own ``spawn_fn``.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import sqlite3
@@ -105,7 +106,7 @@ def _write_pool(fleet: Path, *, roles=None, sidecar=None):
         "ace-media": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"},
     }}
     sidecar = sidecar if sidecar is not None else {
-        "schema": 1, "ssh_user": "kanbanw", "capacity_pct": 0.8,
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "capacity_pct": 0.8,
         "priority": ["ci-box", "ace-ai", "ace-media"], "profiles": ["alpha"],
         "studio_bound_skills": ["mac-only"],
         "hosts": {"ci-box": {"enabled": False, "absence": "optional"},
@@ -117,6 +118,133 @@ def _write_pool(fleet: Path, *, roles=None, sidecar=None):
     return sidecar
 
 
+@pytest.mark.parametrize("bad", [
+    {"roles": {}, "state": "active"},
+    {"roles": {"kanban-worker": {"slots": 0}}, "state": "active"},
+    {"roles": {"kanban-worker": {}}, "state": "invalid"},
+    None,
+])
+def test_reader_quarantines_invalid_role_host_not_whole_fleet(tmp_path, bad):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "ace-media": bad,
+        "studio-arm": {"roles": {}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai"]
+    assert any("ace-media" in w and "host dropped" in w for w in cfg.warnings)
+    assert any("studio-arm" in w and "non-empty" in w for w in cfg.warnings)
+    # Authoring validators remain strict; only the runtime read quarantines rows.
+    with pytest.raises(kwp.PoolError):
+        kwp.parse_roles(roles)
+
+
+@pytest.mark.parametrize("bad", [[], "kanban-worker", 7])
+def test_reader_drops_a_host_row_that_is_not_an_object(tmp_path, bad):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "ace-media": bad,
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai"]
+    assert any("ace-media" in w and "host dropped" in w for w in cfg.warnings)
+
+
+def test_reader_incident_shape_keeps_n_minus_one_hosts(tmp_path):
+    """2026-11-07 11:54: review-worker cut from every row left studio-arm ``roles: {}``
+    and the whole file was refused (pool=0). Only studio-arm may drop now."""
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {}, "ci-runner": {}}, "state": "active"},
+        "ace-media": {"roles": {"kanban-worker": {}}, "state": "active"},
+        "studio-arm": {"roles": {}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path)
+    assert cfg.refused is None
+    assert [h.name for h in cfg.pool_hosts] == ["ace-ai", "ace-media"]
+    assert [w for w in cfg.warnings if "studio-arm" in w] == [
+        "kanban pool: fleet-roles.json: host studio-arm: roles must be a non-empty object (host dropped)"]
+
+
+def test_reader_envelope_errors_still_refuse_the_file(tmp_path):
+    _write_pool(tmp_path, roles={"schema": 2, "hosts": {}})
+    assert kwp.read_pool(tmp_path).refused == "roles"
+    _write_pool(tmp_path, roles={"schema": 1, "hosts": []})
+    assert kwp.read_pool(tmp_path).refused == "roles"
+
+
+def _pager_calls(tmp_path, monkeypatch, rc=0):
+    from gateway import kanban_gate_tick as gt
+    script = tmp_path / "scripts" / "lib" / "episode_pager.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.touch()
+    calls = []
+    monkeypatch.setattr(gt.subprocess, "run", lambda argv, **kw: (
+        calls.append((argv, kw)) or gt.subprocess.CompletedProcess(argv, rc, "paged", "")))
+    return gt, calls
+
+
+def test_all_hosts_malformed_is_zero_pool_and_pages_with_per_host_reason(tmp_path, monkeypatch):
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {}, "state": "active"},
+        "ace-media": None,
+    }}
+    _write_pool(tmp_path / "fleet", roles=roles)
+    cfg = kwp.read_pool(tmp_path / "fleet")
+    assert cfg.refused is None and cfg.pool_hosts == ()
+    gt, calls = _pager_calls(tmp_path, monkeypatch)
+    assert gt.pool_health(tmp_path, cfg) is True
+    (argv, kw), = calls
+    assert argv[2:5] == ["page", "--producer", "kanban-pool-health"]
+    text = argv[argv.index("--text") + 1]
+    assert "0 usable hosts" in text and "ace-ai" in text and "ace-media" in text
+    assert argv[argv.index("--severity") + 1] == "notice"   # notice -> #logs
+    assert argv[argv.index("--via") + 1] == "fleet-alert"
+    assert kw["timeout"] == 10 and kw["stdin"] == gt.subprocess.DEVNULL
+
+
+def test_pool_health_pages_once_per_state_and_clears_on_recovery(tmp_path, monkeypatch):
+    gt, calls = _pager_calls(tmp_path, monkeypatch)
+    last = None
+    for cfg in (kwp.PoolConfig(), kwp.PoolConfig(refused="roles", warnings=("broken roles",)),
+                kwp.PoolConfig(pool_hosts=(_host(),)), kwp.PoolConfig(pool_hosts=(_host(),))):
+        last = gt.pool_health(tmp_path, cfg, last)
+    # bad, bad (same state: no spawn), healthy (clear), healthy (no spawn)
+    assert [argv[2] for argv, _ in calls] == ["page", "clear"]
+    assert last is False
+    assert all("pool-unavailable" in argv for argv, _ in calls)
+
+
+def test_pool_health_failed_send_retries_next_tick(tmp_path, monkeypatch):
+    gt, calls = _pager_calls(tmp_path, monkeypatch, rc=3)
+    last = gt.pool_health(tmp_path, kwp.PoolConfig())
+    assert last is None
+    gt.pool_health(tmp_path, kwp.PoolConfig(), last)
+    assert [argv[2] for argv, _ in calls] == ["page", "page"]
+
+
+def test_pool_health_noop_without_pager(tmp_path):
+    from gateway import kanban_gate_tick as gt
+    assert gt.pool_health(tmp_path, kwp.PoolConfig(), None) is None
+
+
+def test_idle_tick_still_pages_an_empty_pool(kanban_home, monkeypatch):
+    """A quiet board (no plan needed) must not hide pool=0 (t_c1c6eb0f)."""
+    _write_pool(kanban_home / "fleet", roles={"schema": 1, "hosts": {
+        "ace-ai": {"roles": {}, "state": "active"}}})
+    gt, calls = _pager_calls(kanban_home, monkeypatch)
+    gate, b = _admitting_builder(kanban_home / "fleet", V01)
+    assert b.plan_pool([{"slug": "default"}], {}) is None
+    assert gate.pool == {"planned": False, "reason": "not_needed"}
+    assert [argv[2] for argv, _ in calls] == ["page"]
+    b.plan_pool([{"slug": "default"}], {})        # throttled + same state: no second spawn
+    assert len(calls) == 1
+
+
 def test_reader_orders_by_priority_and_skips_disabled(tmp_path):
     _write_pool(tmp_path)
     hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
@@ -124,7 +252,7 @@ def test_reader_orders_by_priority_and_skips_disabled(tmp_path):
     cfg = kwp.read_pool(tmp_path)
     assert cfg.disabled == ("ci-box",) and "ci-box" in cfg.hosts
     # t_b20850d2: a legacy kanban-worker count is membership only, never capacity
-    assert all(h.ssh_user == "kanbanw" and h.slots is None for h in hosts)
+    assert all(h.ssh_user == "ace" and h.slots is None for h in hosts)
 
 
 def test_reader_drops_one_host_on_disagreement_and_refuses_structure(tmp_path):
@@ -135,9 +263,300 @@ def test_reader_drops_one_host_on_disagreement_and_refuses_structure(tmp_path):
     hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
     assert [h.name for h in hosts] == ["ace-ai", "ace-media"]
     assert any("ace-x" in w for w in warnings)
-    side["ssh_user"] = "ace"
+    side["ssh_user"] = "root"
     _write_pool(tmp_path, sidecar=side)
     assert kwp.load_pool(tmp_path, kanban_cfg={})[0] == []
+
+
+def test_reader_takes_a_per_host_ssh_user_and_falls_back_to_the_top_level(tmp_path):
+    """Option A (Ace 2026-11-20, t_5e87455b): a pool host's worker may run as the host's owner
+    account. ``hosts.<id>.ssh_user`` overrides the top-level ``ssh_user`` for that host only, so
+    the cutover flips host by host; every ssh the dispatcher makes to the host uses it."""
+    from hermes_cli import kanban_worker_hosts as kwh
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
+    assert warnings == []
+    by = {h.name: h for h in hosts}
+    assert by["ace-ai"].ssh_user == "ace" and by["ace-ai"].target == "ace@ace-ai"
+    assert by["ace-media"].ssh_user == "ace" and by["ace-media"].ssh_identity == "/k/worker"
+    assert kwp._ssh_argv(by["ace-ai"], "true")[-2] == "ace@ace-ai"
+    assert kwh.placement_env(by["ace-ai"], "/w")["TERMINAL_SSH_USER"] == "ace"
+    # the top level is a default, no longer locked to kanbanw
+    side["ssh_user"] = "alexgierczyk"
+    side["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h.ssh_user for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    assert by == {"ace-ai": "ace", "ace-media": "alexgierczyk"}
+
+
+def test_reader_ignores_a_reach_row_probed_under_another_login(tmp_path):
+    """Prism dcd859b63482: the matrix cron re-probes once a day (rows stay fresh 36 h). After a
+    host flips to its owner login, its kanbanw row proves nothing for the new login: its reach,
+    caps and logins are dropped until a row probed as the new login arrives."""
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    row = {"at": time.time(), "reach": {"studio": 0}, "caps": {"studio-state": True},
+           "logins": {"studio": "kanbanw"}, "user": "kanbanw"}
+    doc = {"schema": 1, "hosts": {"ace-ai": dict(row), "ace-media": {**row, "user": "ace"}}}
+    (tmp_path / kwp.REACH_FILE).write_text(json.dumps(doc))
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert set(cfg.reach) == {"ace-media"} and cfg.reach_status == "ok"
+    assert set(cfg.caps) == {"ace-media"} and set(cfg.reach_logins) == {"ace-media"}
+    assert any("ace-ai was probed as kanbanw" in w for w in cfg.warnings)
+    # the re-probe as the new login is read again
+    doc["hosts"]["ace-ai"]["user"] = "ace"
+    (tmp_path / kwp.REACH_FILE).write_text(json.dumps(doc))
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert set(cfg.reach) == {"ace-ai", "ace-media"} and not any("probed as" in w for w in cfg.warnings)
+
+
+def test_unlabeled_reach_row_counts_only_for_the_legacy_kanbanw_login(tmp_path):
+    """Prism e315557dce42: a schema-1 row with no ``user`` was written by the kanbanw-era cron.
+    It proves reach only for a kanbanw host, and none is placed any more (t_f55126b1): it counts for no host."""
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    row = {"at": time.time(), "reach": {"ci-box": 0}}
+    doc = {"schema": 1, "hosts": {"ace-ai": dict(row), "ace-media": dict(row)}}
+    (tmp_path / kwp.REACH_FILE).write_text(json.dumps(doc))
+    pool = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert set(pool.reach) == set() and pool.reach_status == "stale"
+    assert kwp.reach_allowed_hosts(body="reach: ci-box", skills=(), pool=pool) == ()
+    assert any("ace-ai was probed as kanbanw" in w for w in pool.warnings)
+
+
+def test_row_without_owner_login_and_key_is_not_placed_never_kanbanw(tmp_path):
+    """t_f55126b1: kanbanw is retired (Ace msg 1573287525165043742). A row that resolves to kanbanw, to
+    no login or to no key is a host the dispatcher does not place on: one warning naming the host and
+    the missing fields; the rest of the pool still places. Mutation: place it as kanbanw@host -> RED."""
+    side = _write_pool(tmp_path)
+    side["ssh_user"] = "kanbanw"      # hermes-home's writer still stamps the top level
+    side.pop("ssh_identity")
+    side["hosts"]["ace-ai"].update(ssh_user="ace", ssh_identity="/k/worker")
+    _write_pool(tmp_path, sidecar=side)
+    assert kwp.validate_sidecar(side) == []
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert cfg.refused is None and [h.target for h in cfg.pool_hosts] == ["ace@ace-ai"]
+    assert [w for w in cfg.warnings if "ace-media" in w] == [
+        "kanban pool: ace-media has no owner login and key (missing ssh_user, ssh_identity; "
+        "kanbanw is retired; host not placed)"]
+    # an owner login with no key; then no top-level login at all and a top-level key
+    side["hosts"]["ace-media"]["ssh_user"] = "ace"
+    _write_pool(tmp_path, sidecar=side)
+    assert any("ace-media has no owner login and key (missing ssh_identity;" in w
+               for w in kwp.read_pool(tmp_path, kanban_cfg={}).warnings)
+    side.pop("ssh_user")
+    side["hosts"]["ace-media"].pop("ssh_user")
+    side["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    assert kwp.validate_sidecar(side) == []
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert [h.target for h in cfg.pool_hosts] == ["ace@ace-ai"]
+    assert any("ace-media has no owner login and key (missing ssh_user;" in w for w in cfg.warnings)
+    assert kwp.worker_login(side, "ace-media") == (None, "/k/worker")
+    assert all(h.ssh_user != kwp.SSH_USER for h in cfg.pool_hosts)
+
+
+def test_owner_login_pins_the_worker_key_on_every_ssh_path(tmp_path):
+    """Apollo ruling 2026-11-20 03:55 (t_911ce504): on an owner login the worker env comes from a
+    forced command bound to a dedicated worker key. The Studio's default key is the owner's own,
+    unrestricted, so every dispatcher ssh to that host names the key with IdentitiesOnly=yes:
+    the probe/carry argv, the worker's terminal backend (TERMINAL_SSH_KEY) and the custody probe.
+    A login with no key is not placed (t_f55126b1)."""
+    from hermes_cli import kanban_worker_hosts as kwh
+    from tools.environments.ssh import SSHEnvironment
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/Users/x/.ssh/kanban_worker"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    argv = kwp._ssh_argv(by["ace-ai"], "true")
+    assert argv[argv.index("-i") + 1] == "/Users/x/.ssh/kanban_worker" and "IdentitiesOnly=yes" in argv
+    assert argv.index("IdentitiesOnly=yes") < argv.index("ace@ace-ai")
+    env = kwh.placement_env(by["ace-ai"], "/w")
+    assert env["TERMINAL_SSH_KEY"] == "/Users/x/.ssh/kanban_worker"
+    ssh = SSHEnvironment.__new__(SSHEnvironment)
+    ssh.port, ssh.key_path = 22, env["TERMINAL_SSH_KEY"]
+    assert ssh._target_flags("-p")[:4] == ["-i", "/Users/x/.ssh/kanban_worker", "-o", "IdentitiesOnly=yes"]
+    seen = []
+    kwh.remote_workspace_has_content(json.dumps({"env": env}),
+                                     runner=lambda a, **kw: seen.append(a) or type("P", (), {"returncode": 0})())
+    assert seen and seen[0][seen[0].index("-i") + 1] == "/Users/x/.ssh/kanban_worker" and "IdentitiesOnly=yes" in seen[0]
+    # an unkeyed PoolHost (never read_pool's) keeps ssh's own defaults
+    plain = dataclasses.replace(by["ace-media"], ssh_user="kanbanw", ssh_identity=None)
+    assert "-i" not in kwp._ssh_argv(plain, "true") and "TERMINAL_SSH_KEY" not in kwh.placement_env(plain, "/w")
+    # a top-level key is the default for every host; a per-host key beats it
+    side["ssh_identity"] = "/k/default"
+    _write_pool(tmp_path, sidecar=side)
+    keys = {h.name: h.ssh_identity for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    assert keys == {"ace-ai": "/Users/x/.ssh/kanban_worker", "ace-media": "/k/default"}
+    # a relative, spaced or dot-dot path refuses
+    for bad in ("k/rel", "/a b", "/a/../b", 5):
+        side["hosts"]["ace-ai"]["ssh_identity"] = bad
+        assert any("ssh_identity" in e for e in kwp.validate_sidecar(side)), bad
+
+
+def test_pinned_worker_key_never_shares_a_control_master(tmp_path, monkeypatch):
+    """t_3911e84c: an ssh that reuses an open ControlMaster never authenticates, so on an owner
+    login (ace@host, the operator's own user@host) the pinned worker key decided nothing: the call
+    rode the operator's ~/.ssh/cm master and skipped the forced-command wrapper. A keyed argv opts
+    out of every mux; a keyed and an unkeyed SSHEnvironment never share a socket. kanbanw hosts
+    with no key keep today's argv byte for byte."""
+    import tempfile
+    from hermes_cli import kanban_worker_hosts as kwh
+    from tools.environments.ssh import control_socket_path
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/Users/x/.ssh/kanban_worker"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    argv = kwp._ssh_argv(by["ace-ai"], "true")
+    assert "ControlMaster=no" in argv and "ControlPath=none" in argv
+    assert argv.index("ControlPath=none") < argv.index("ace@ace-ai")
+    seen = []
+    kwh.remote_workspace_has_content(json.dumps({"env": kwh.placement_env(by["ace-ai"], "/w")}),
+                                     runner=lambda a, **kw: seen.append(a) or type("P", (), {"returncode": 0})())
+    assert "ControlMaster=no" in seen[0] and "ControlPath=none" in seen[0]
+    plain = dataclasses.replace(by["ace-media"], ssh_user="kanbanw", ssh_identity=None)
+    assert kwp._ssh_argv(plain, "true") == [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "kanbanw@ace-media", "true"]
+    # a keyed probe that fell back to direct never `-O exit`s the shared ~/.ssh/cm master: that
+    # master is the operator's own session for the same user@host
+    exits = []
+    monkeypatch.setattr(kwp.subprocess, "run", lambda a, **kw: exits.append(a))
+    kwp._drop_stale_master(by["ace-ai"])
+    assert exits == []
+    kwp._drop_stale_master(plain)
+    assert exits and exits[0][:3] == ["ssh", "-O", "exit"]
+    # an unreadable key turns auth off: ssh would warn and log in with the ssh_config IdentityFile,
+    # the owner's own key (Prism e74bdeef952b; measured on the Studio)
+    from tools.environments.ssh import SSHEnvironment
+    off = ["-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no"]
+    key = tmp_path / "kanban_worker"
+    key.write_text("k")
+    ssh = SSHEnvironment.__new__(SSHEnvironment)
+    ssh.port = 22
+    for path, refused in (("/Users/x/.ssh/kanban_worker", True), (str(key), False)):
+        args = kwp.identity_args(path)
+        assert args[:2] == ["-i", path] and (args[-6:] == off) is refused, args
+        ssh.key_path = path
+        assert (ssh._target_flags("-p")[-6:] == off) is refused
+    assert kwp.identity_args(None) == [] and kwp.identity_args("") == []
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    plain = control_socket_path("ace", "ace-ai", 22)
+    keyed = control_socket_path("ace", "ace-ai", 22, key_path="/Users/x/.ssh/kanban_worker")
+    assert plain != keyed
+    assert control_socket_path("ace", "ace-ai", 22, key_path="") == plain
+    # a kanban run's scoped socket keeps its name: the footprint release finds it by user@host:port+run
+    assert control_socket_path("ace", "ace-ai", 22, "run7", key_path="/k") == \
+        control_socket_path("ace", "ace-ai", 22, "run7")
+
+
+def test_pinned_worker_key_fails_closed_on_both_ends(tmp_path, monkeypatch):
+    """t_3911e84c send-back. a04c57100fc5: a "~/..." key reads as unreadable to os.access, which turned
+    auth off for a readable key. fb4485599af6: ssh still lists the ssh_config IdentityFile (the owner's
+    key) after the worker key, and an agent key too, so a server that refuses the worker key logs the
+    owner in. Client: IdentityAgent=none. Remote: every keyed command runs behind a guard that exits 97
+    unless the forced command set FLEET_WORKER_SESSION=1, and a probe that gets 97 is unusable, never a
+    reused sample. kanbanw hosts keep today's argv and remote command byte for byte."""
+    import os
+    import subprocess as sp
+    from hermes_cli import kanban_worker_hosts as kwh
+    from tools.environments import ssh as ssh_mod
+    from tools.environments.ssh import SSHEnvironment
+    assert ssh_mod.WORKER_SESSION_GUARD == kwp.WORKER_SESSION_GUARD
+    # the guard itself, in a real shell
+    for shell in ("sh", "bash"):
+        cmd = [shell, "-c", kwp.WORKER_SESSION_GUARD + "echo ran"]
+        env = {k: v for k, v in os.environ.items() if k != "FLEET_WORKER_SESSION"}
+        no = sp.run(cmd, capture_output=True, text=True, env=env)
+        assert (no.returncode, no.stdout, no.stderr.strip()) == (97, "", "not a fleet worker session")
+        yes = sp.run(cmd, capture_output=True, text=True, env={**env, "FLEET_WORKER_SESSION": "1"})
+        assert (yes.returncode, yes.stdout) == (0, "ran\n")
+    # tilde key: expanded once, readable, auth stays on
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "x").write_text("k")
+    args = kwp.identity_args("~/.ssh/x")
+    assert args[:2] == ["-i", str(tmp_path / ".ssh" / "x")] and "PubkeyAuthentication=no" not in args
+    ssh = SSHEnvironment.__new__(SSHEnvironment)
+    ssh.port, ssh.key_path = 22, "~/.ssh/x"
+    flags = ssh._target_flags("-p")
+    assert flags[:2] == ["-i", str(tmp_path / ".ssh" / "x")] and "PubkeyAuthentication=no" not in flags
+    # no agent key is ever offered, on both argvs
+    assert "IdentityAgent=none" in args and "IdentityAgent=none" in flags
+    # the guard rides every keyed remote command: _ssh_argv, the custody probe, the terminal backend
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/Users/x/.ssh/kanban_worker"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    argv = kwp._ssh_argv(by["ace-ai"], "true")
+    assert "IdentityAgent=none" in argv and argv[-1] == kwp.WORKER_SESSION_GUARD + "true"
+    seen = []
+    fake = lambda a, **kw: seen.append(a) or type("P", (), {"returncode": 0})()
+    kwh.remote_workspace_has_content(json.dumps({"env": kwh.placement_env(by["ace-ai"], "/w")}), runner=fake)
+    plain = dataclasses.replace(by["ace-media"], ssh_user="kanbanw", ssh_identity=None)
+    kwh.remote_workspace_has_content(json.dumps({"env": kwh.placement_env(plain, "/w")}), runner=fake)
+    assert seen[0][-1].startswith(kwp.WORKER_SESSION_GUARD)
+    assert seen[1][-1] == seen[0][-1][len(kwp.WORKER_SESSION_GUARD):]  # kanbanw: today's script
+    sent = []
+    monkeypatch.setattr(ssh_mod, "run_capture", lambda cmd, **kw: sent.append(cmd))
+    monkeypatch.setattr(ssh_mod, "_popen_bash", lambda cmd, *a, **kw: sent.append(cmd) or type("P", (), {})())
+    for key in ("/k", ""):
+        env = SSHEnvironment.__new__(SSHEnvironment)
+        env.host, env.user, env.port, env.key_path, env.log_file = "h", "ace", 22, key, ""
+        env.control_socket = tmp_path / "s.sock"
+        env._run_ssh("echo hi", timeout=1)
+        env._run_bash("echo hi")
+    keyed_ssh, keyed_bash, plain_ssh, plain_bash = sent
+    assert keyed_ssh[-1] == kwp.WORKER_SESSION_GUARD + "echo hi" and plain_ssh[-1] == "echo hi"
+    assert kwp.WORKER_SESSION_GUARD in keyed_bash[-1] and kwp.WORKER_SESSION_GUARD not in plain_bash[-1]
+    # an unkeyed host: today's argv and remote command
+    assert kwp._ssh_argv(plain, "true") == [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "kanbanw@ace-media", "true"]
+    # a probe answered by the guard (rc 97) is unusable with that reason, even with a fresh last sample
+    mem = kwp.ProbeMemory()
+    calls = []
+
+    def ssh_run(rc):
+        def run(a, **kw):
+            calls.append(a)
+            return type("P", (), {"returncode": rc, "stdout": "0.5\n8\n" if rc == 0 else "",
+                                  "stderr": "" if rc == 0 else "not a fleet worker session\n"})()
+        return run
+    assert kwp.probe_host(by["ace-ai"], ssh_run(0), memory=mem) == (0.5, 8)
+    calls.clear()
+    assert kwp.probe_host(by["ace-ai"], ssh_run(97), memory=mem) is None
+    assert len(calls) == 1  # no direct retry: a second connection meets the same guard
+    note = kwp.probe_note(by["ace-ai"], mem)
+    assert "not a fleet worker session" in note and "reusing" not in note
+
+
+@pytest.mark.parametrize("where,value", [
+    ("top", ""), ("top", "root"), ("top", "a b"), ("top", 5), ("top", "-oProxyCommand=x"),
+    ("row", ""), ("row", "root"), ("row", "ace@ci-box"), ("row", None),
+])
+def test_reader_refuses_a_bad_ssh_user(tmp_path, where, value):
+    """A worker never logs in as root, and the name must be a plain login (it lands in an ssh
+    argv): anything else refuses the sidecar, as every structural error does."""
+    side = _write_pool(tmp_path)
+    if where == "top":
+        if value is None:
+            side.pop("ssh_user")
+        else:
+            side["ssh_user"] = value
+    else:
+        side["hosts"]["ace-ai"]["ssh_user"] = value
+    _write_pool(tmp_path, sidecar=side)
+    assert any("ssh_user" in e for e in kwp.validate_sidecar(side))
+    assert kwp.read_pool(tmp_path).refused == "sidecar"
 
 
 def test_reader_accepts_the_last_change_audit_field_and_still_refuses_unknown_row_keys(tmp_path):
@@ -192,13 +611,13 @@ def _studio_registered(fleet: Path, policy_hosts=None):
     roles = {"schema": 1, "hosts": {
         h: {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}
         for h in ("mac-studio", "ace-ai", "ace-media")}}
-    side = {"schema": 1, "ssh_user": "kanbanw", "capacity_pct": 0.8,
+    side = {"schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "capacity_pct": 0.8,
             "priority": ["mac-studio", "ace-ai", "ace-media"], "profiles": ["alpha"],
             "hosts": {h: {"enabled": True, "absence": "optional"}
                       for h in ("mac-studio", "ace-ai", "ace-media")}}
     _write_pool(fleet, roles=roles, sidecar=side)
     if policy_hosts is not None:
-        (fleet / "placement-policy.json").write_text(
+        (fleet / "allocation-policy.json").write_text(
             json.dumps({"schema": 1, "hosts": policy_hosts}), encoding="utf-8")
 
 
@@ -284,7 +703,7 @@ def test_probe_host_one_ssh_call_parses_or_fails_closed():
     assert kwp.probe_host(_host(), runner=runner) == (3.1, 16)
     argv, timeout = calls[0]
     assert len(calls) == 1 and timeout == 8
-    assert "ConnectTimeout=4" in argv and argv[-1] == "cat /proc/loadavg; getconf _NPROCESSORS_ONLN"
+    assert "ConnectTimeout=4" in argv and "@@hermes-probe-v1" in argv[-1]
     assert argv[-2] == "kanbanw@ace-ai"
     assert kwp.probe_host(_host(), runner=lambda a, **k: _Proc(255, "")) is None
     assert kwp.probe_host(_host(), runner=lambda a, **k: _Proc(0, "garbage")) is None
@@ -349,7 +768,7 @@ def test_plan_unreachable_reason_names_probe_error(monkeypatch, tmp_path):
     def probe(host):
         return kwp.probe_host(host, runner=lambda a, **k: _Proc(255, ""), memory=mem)
 
-    from hermes_cli import placement_policy as pp
+    from hermes_cli import allocation_policy as pp
     signal = kwp.TargetSignal(policy=pp.PlacementPolicy(), ledger_dir=tmp_path, clock=lambda: 1.0)
     p = kwp.plan([h], {}, probe=probe, signal=signal)
     why = p.detail["ace-ai"]["pressure"]
@@ -363,7 +782,13 @@ def _cgroup_ssh(argv, **kw):
     each core-count command the way the real host did as kanbanw."""
     cmd = argv[-1]
     load = "12.00 9.00 7.00 1/900 99"  # ordinary ace-ai load1, under 0.8 x 24
-    if "; getconf _NPROCESSORS_ONLN" in cmd:
+    if "SC_NPROCESSORS_ONLN" in cmd:
+        import json
+        return _Proc(0, "@@hermes-probe-v1\n" + json.dumps({
+            "schema": 1, "load1": 12.0, "load5": 9.0, "ncpu": 24,
+            "remote_now": 1791200100, "pressure_text": "{}",
+        }) + "\n")
+    if "os.cpu_count()" in cmd:
         ncpu = "24"
     elif "; nproc" in cmd:
         ncpu = "8"
@@ -651,10 +1076,10 @@ def test_human_review_lane_rows_are_dropped_before_routing(kanban_home, monkeypa
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         kinds = [r[0] for r in conn.execute(
             "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (review,))]
-    assert review in res.skipped_nonspawnable
+    assert review not in res.skipped_nonspawnable
     assert review not in res.placement_waits
     assert all(e["task_id"] != review for e in res.routes)
-    assert kinds.count("skipped_nonspawnable") == 1
+    assert kinds.count("needs_operator") == 1
     assert (work, "ace-ai") in spawned
 
 
@@ -707,7 +1132,7 @@ def _lineage(monkeypatch, mode):
 
 def _placement_waits(conn, tid):
     return [json.loads(r[0]) for r in conn.execute(
-        "SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' ORDER BY id",
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='allocation_wait' ORDER BY id",
         (tid,))]
 
 
@@ -729,7 +1154,7 @@ def test_placement_wait_event_written_once_then_deduplicated(kanban_home, lineag
         assert ev["reason"] == f"not_portable:linked(blocks->{parent})"
         assert ev["route"] == "wait" and ev["host"] is None and isinstance(ev["since"], int)
         conn.execute("UPDATE task_events SET created_at = created_at - 901 "
-                     "WHERE task_id=? AND kind='placement_wait'", (child,))
+                     "WHERE task_id=? AND kind='allocation_wait'", (child,))
         conn.commit()
         _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         evs = _placement_waits(conn, child)
@@ -750,7 +1175,7 @@ def test_placement_wait_new_episode_after_run_is_not_deduplicated(kanban_home, l
         # Backdate the first episode by 300 s (still inside the 900 s window).
         conn.execute("UPDATE task_events SET created_at = created_at - 300, payload = "
                      "json_set(payload, '$.since', json_extract(payload, '$.since') - 300) "
-                     "WHERE task_id=? AND kind='placement_wait'", (child,))
+                     "WHERE task_id=? AND kind='allocation_wait'", (child,))
         with kb.write_txn(conn):
             kb._append_event(conn, child, "claimed", {"run_id": 1})
             kb._append_event(conn, child, "requeued", {"reason": "test"})
@@ -885,7 +1310,8 @@ def test_prefilled_local_workspace_stays_local(kanban_home, tmp_path):
         conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), tid))
         conn.commit()
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
-    assert spawned == [] and res.placement_waits[tid] == "not_portable:local_files"
+    # t_e7c03f48: the reason names the first path the remote cannot reproduce (split_reason keeps the code).
+    assert spawned == [] and res.placement_waits[tid] == "not_portable:local_files(handoff.md)"
 
 
 # -- Prism round 1 (PR #1730) -----------------------------------------------
@@ -1490,7 +1916,7 @@ def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monk
         status = conn.execute("SELECT status FROM tasks WHERE id=?", (browser,)).fetchone()[0]
         assert status == "ready"
         aff = _events(conn, browser, "placement_affinity")
-        waits = _events(conn, browser, "placement_wait")
+        waits = _events(conn, browser, "allocation_wait")
         assert aff == [{"host": "mac-studio", "rule": "studio_manifest",
                         "matched_by": "skill:browser-access (manifest:host_affinity)"}]
         assert waits == [{"host": "mac-studio", "reason": "studio_affinity:studio_manifest",
@@ -1499,25 +1925,33 @@ def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monk
         _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
               spawn_paused="spilling")
         assert len(_events(conn, browser, "placement_affinity")) == 1
-        assert len(_events(conn, browser, "placement_wait")) == 1
+        assert len(_events(conn, browser, "allocation_wait")) == 1
         # Spawned in between (a claim), then waiting again for the same reason:
         # that is a NEW wait and is recorded.
         kb._append_event(conn, browser, "claimed", {"lock": "test"})
         conn.commit()
         _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
               spawn_paused="spilling")
-        assert len(_events(conn, browser, "placement_wait")) == 2
+        assert len(_events(conn, browser, "allocation_wait")) == 2
         # A (re)assignment ends the episode too (shared end-kind set, Prism
         # 75f6107b): the same wait is re-written, so the view still lists it.
         assert kb.assign_task(conn, browser, "alpha")
         _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
               spawn_paused="spilling")
-        assert len(_events(conn, browser, "placement_wait")) == 3
+        assert len(_events(conn, browser, "allocation_wait")) == 3
         from hermes_cli import kanban_placement_view as kpv
         assert browser in [h["task_id"] for h in kpv._held(conn)]
 
 
-def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home):
+@pytest.fixture
+def prose_pins_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The legacy body list (``STUDIO_BODY_RE``) binds only with t_c82eded0's kill switch off
+    (``kanban.placement.prose_pins_advisory: false``); the default is covered in
+    test_kanban_prose_pins_advisory.py."""
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {"prose_pins_advisory": False}})
+
+
+def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home, prose_pins_off):
     with kb.connect_closing() as conn:
         (cdp,) = _make(conn, 1, body="attach CDP to :9222 on the Studio")
         res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=1)
@@ -1525,7 +1959,7 @@ def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home):
     assert res.placement_affinity[cdp]["matched_by"] == "body::9222"
 
 
-def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_home):
+def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_home, prose_pins_off):
     """A bound card waits, then a tick evaluates it with no wait but it does
     not spawn (per-profile cap), then it waits again for the same reason:
     three episodes, three events (Prism 1ccf2233 / 5a51e524 on #1877)."""
@@ -1533,7 +1967,7 @@ def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_h
         (cdp,) = _make(conn, 1, body="signed-in browser work")
         spill = lambda: _plan(free=2, band="spilling")  # noqa: E731
         _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
-        assert [e["reason"] for e in _events(conn, cdp, "placement_wait")] == [
+        assert [e["reason"] for e in _events(conn, cdp, "allocation_wait")] == [
             "studio_affinity:studio_body"]
         # Room on the Studio, but the assignee is at its per-profile cap: the
         # card is evaluated with NO wait reason and still not claimed.
@@ -1546,18 +1980,18 @@ def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_h
         # Momus R-A (t_7133e03d): the per-profile hold is a named wait now,
         # so the episode turns over on the reason change instead of a clear.
         assert spawned == [] and res.placement_waits[cdp] == "per_profile_cap (alpha 1/1)"
-        waits = _events(conn, cdp, "placement_wait")
+        waits = _events(conn, cdp, "allocation_wait")
         assert waits[-1]["reason"] == "per_profile_cap (alpha 1/1)"
         conn.execute("UPDATE tasks SET status='done', claim_lock=NULL WHERE id=?", (busy,))
         conn.commit()
         _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
-        waits = _events(conn, cdp, "placement_wait")
+        waits = _events(conn, cdp, "allocation_wait")
         assert [w.get("reason", "cleared") for w in waits] == [
             "studio_affinity:studio_body", "per_profile_cap (alpha 1/1)",
             "studio_affinity:studio_body"]
         # Repeating the same wait writes nothing new.
         _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
-        assert len(_events(conn, cdp, "placement_wait")) == 3
+        assert len(_events(conn, cdp, "allocation_wait")) == 3
 
 
 def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home):
@@ -1587,7 +2021,7 @@ def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home)
         assert _events(conn, card, "placement_affinity")[-1] == {"cleared": True}
         # The binding's wait ends with it (Prism 0f21fb8c); the card's own
         # pool wait is then a new placement_wait (main's per-card writer).
-        assert [w.get("reason", "cleared") for w in _events(conn, card, "placement_wait")] == [
+        assert [w.get("reason", "cleared") for w in _events(conn, card, "allocation_wait")] == [
             "studio_affinity:studio_bound_skill", "cleared", "pool_full"]
         # Idempotent: an unbound card with a cleared history writes nothing.
         plan3 = spill()
@@ -1604,7 +2038,7 @@ def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home)
         assert [a.get("rule", "cleared") for a in aff] == [
             "studio_bound_skill", "cleared", "studio_bound_skill"]
         # ...and the same wait after the re-bind is a new episode, not a duplicate.
-        assert [w.get("reason", "cleared") for w in _events(conn, card, "placement_wait")] == [
+        assert [w.get("reason", "cleared") for w in _events(conn, card, "allocation_wait")] == [
             "studio_affinity:studio_bound_skill", "cleared", "pool_full",
             "studio_affinity:studio_bound_skill"]
         # A card that was never bound never gets a cleared event.
@@ -1615,7 +2049,7 @@ def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home)
         assert _events(conn, plain, "placement_affinity") == []
 
 
-def test_route_row_affinity_branch_is_reached_on_a_live_tick(kanban_home):
+def test_route_row_affinity_branch_is_reached_on_a_live_tick(kanban_home, prose_pins_off):
     """The studio-affinity branch in ``_route_row`` sits AFTER the remote-pin
     return and is reached for an unpinned bound card: the route carries
     ``studio_affinity:<rule>`` and the affinity map is filled (refutes Prism
@@ -1638,7 +2072,7 @@ def test_route_row_affinity_branch_is_reached_on_a_live_tick(kanban_home):
         assert pinned not in out
 
 
-def test_dry_run_shows_affinity_without_a_pool_plan_or_events(kanban_home):
+def test_dry_run_shows_affinity_without_a_pool_plan_or_events(kanban_home, prose_pins_off):
     with kb.connect_closing() as conn:
         (cdp,) = _make(conn, 1, body="signed-in browser task")
         res = kbd.dispatch_once(conn, dry_run=True, max_spawn=8, spillover=None,
@@ -1648,7 +2082,7 @@ def test_dry_run_shows_affinity_without_a_pool_plan_or_events(kanban_home):
         assert _events(conn, cdp, "placement_affinity") == []
 
 
-def test_dry_run_prose_host_line_is_not_a_pin(kanban_home):
+def test_dry_run_prose_host_line_is_not_a_pin(kanban_home, prose_pins_off):
     """A ``host: example.com`` header is prose, not a pin: affinity still shows."""
     with kb.connect_closing() as conn:
         (cdp,) = _make(conn, 1, body="host: example.com\nattach CDP :9222")
@@ -1687,8 +2121,10 @@ def test_manifest_targets_reads_host_affinity_naming_a_fleet_host(tmp_path, monk
 
 
 def test_manifest_target_refused_on_non_reaching_pool_host_allowed_once_reached():
+    # The target's own row is absent in these fixtures: a fresh ace-ai row reaches
+    # ace-ai by definition (t_8c580b20, test_kanban_reach_matrix).
     targets = {"vllm-gpu": "ace-ai"}
-    no_route = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255}})
+    no_route = _reach_cfg({"ace-media": {"ace-ai": 255}})
     # (1) every pool host is rc 255 to ace-ai: not portable, stays on the Studio.
     assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=no_route,
                                    targets=targets) == ()
@@ -1696,12 +2132,12 @@ def test_manifest_target_refused_on_non_reaching_pool_host_allowed_once_reached(
         False, "host_reach", None)
     # The live matrix also carries the Studio's own row (rc 0 to ace-ai): the
     # allowed set is then the Studio only, which take() never matches.
-    with_studio = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255},
+    with_studio = _reach_cfg({"ace-media": {"ace-ai": 255},
                               "mac-studio-m3u": {"ace-ai": 0}})
     assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=with_studio,
                                    targets=targets) == ("mac-studio-m3u",)
     # (2) a fixture row gives ace-media rc 0: portable, and take() is held to it.
-    routed = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 0}})
+    routed = _reach_cfg({"ace-media": {"ace-ai": 0}})
     assert _portable(skills=("vllm-gpu",), pool=routed, targets=targets) == (True, None, "policy")
     assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=routed,
                                    targets=targets) == ("ace-media",)
@@ -1732,7 +2168,7 @@ def test_gpu_card_never_spills_to_a_pool_host_without_a_route(kanban_home, monke
         p.band, p.spill_reason = "spilling", "load"
         return p
 
-    no_route = {"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255},
+    no_route = {"ace-media": {"ace-ai": 255},
                 "mac-studio-m3u": {"ace-ai": 0}}       # the live matrix shape
     with kb.connect_closing() as conn:
         (gpu,) = _make(conn, 1, priority=9, skills=["vllm-gpu"])
@@ -1747,7 +2183,7 @@ def test_gpu_card_never_spills_to_a_pool_host_without_a_route(kanban_home, monke
         assert (gpu, None) in spawned                      # local: the Studio reaches ace-ai
     with kb.connect_closing() as conn:
         (gpu2,) = _make(conn, 1, priority=9, skills=["vllm-gpu"])
-        routed = {"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 0}}
+        routed = {"ace-media": {"ace-ai": 0}}
         res, spawned = _tick(conn, spillover=plan_for(routed), spawn_limit=0,
                              spawn_paused="spilling")
         assert (gpu2, "ace-media") in spawned
@@ -1760,14 +2196,12 @@ def test_unnamed_host_bound_card_still_requires_its_manifest_target():
     targets = {"vllm-gpu": "ace-ai"}
     skills = ("ssh-machines", "vllm-gpu")
     aliases_ok = {"ace-media": 0, "mac-studio-m3u": 0}
-    no_route = _reach_cfg({"ace-ai": {**aliases_ok, "ace-ai": 255},
-                           "ace-media": {**aliases_ok, "ace-ai": 255}})
+    no_route = _reach_cfg({"ace-media": {**aliases_ok, "ace-ai": 255}})
     assert kwp.reach_allowed_hosts(body="fix it", skills=skills, pool=no_route,
                                    targets=targets) == ()
     assert _portable(body="fix it", skills=skills, pool=no_route, targets=targets) == (
         False, "host_reach", None)
-    routed = _reach_cfg({"ace-ai": {**aliases_ok, "ace-ai": 255},
-                         "ace-media": {**aliases_ok, "ace-ai": 0}})
+    routed = _reach_cfg({"ace-media": {**aliases_ok, "ace-ai": 0}})
     assert kwp.reach_allowed_hosts(body="fix it", skills=skills, pool=routed,
                                    targets=targets) == ("ace-media",)
     # An unprobed target (no column anywhere) fails closed in the fallback too.
@@ -1870,7 +2304,7 @@ def test_drained_pin_wait_posts_one_logs_line_after_15_min(kanban_home, monkeypa
         assert sent == []  # a fresh wait is not news
         conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
                      "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
-                     "AND kind='placement_wait'", (tid,))
+                     "AND kind='allocation_wait'", (tid,))
         conn.commit()
         _tick(conn, spillover=_drained_plan(), spawn_limit=4)
         _tick(conn, spillover=_drained_plan(), spawn_limit=4)
@@ -1905,7 +2339,7 @@ def test_drained_pin_latch_survives_a_tick_the_card_is_missing_from(kanban_home,
         _tick(conn, spillover=_drained_plan(), spawn_limit=4)
         conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
                      "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
-                     "AND kind='placement_wait'", (tid,))
+                     "AND kind='allocation_wait'", (tid,))
         conn.commit()
         now = int(time.time())
         assert len(kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now)) == 1
@@ -1927,7 +2361,7 @@ def test_drained_pin_corrupt_marker_posts_nothing_and_is_rewritten(kanban_home, 
         _tick(conn, spillover=_drained_plan(), spawn_limit=4)
         conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
                      "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
-                     "AND kind='placement_wait'", (tid,))
+                     "AND kind='allocation_wait'", (tid,))
         conn.commit()
         marker = kb.board_state_dir(None) / kdp._MARKER
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -2009,7 +2443,7 @@ def test_typo_pin_is_refused_with_one_comment_per_park(fleet_aliases):
         assert reason.startswith("pin_unknown_host:mac-studio-m3 (did you mean: ")
         assert "mac-studio-m3u->studio" in reason
         ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = "
-                          "'placement_wait' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                          "'allocation_wait' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
         assert json.loads(ev[0])["reason"] == reason
         for _ in range(2):
             _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)

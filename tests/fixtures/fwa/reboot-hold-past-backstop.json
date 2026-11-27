@@ -1,0 +1,48 @@
+{
+ "expect": {
+  "ci": true,
+  "ci-failover": true,
+  "cron": true,
+  "deploy": true,
+  "kanban": true,
+  "prism": true,
+  "reboot": true
+ },
+ "holds": [
+  {
+   "by": "fixture",
+   "card": "t_fixture",
+   "drive": true,
+   "end": {
+    "backstop_until": 1794070000,
+    "boot_id_at_pause": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+    "grace_s": 600,
+    "kind": "reboot"
+   },
+   "host": "ace-media",
+   "id": "20261107T120000Z-ace-media-a000000f",
+   "kind": "pause",
+   "lanes": [
+    "kanban",
+    "prism",
+    "ci",
+    "main",
+    "test-gate",
+    "batch",
+    "gpu",
+    "media",
+    "nas-ci",
+    "cron",
+    "deploy",
+    "ci-failover"
+   ],
+   "owner": "card:t_fixture",
+   "reason": "fixture a000000f",
+   "schema": 1,
+   "since": 1794026800,
+   "until": 1794070000
+  }
+ ],
+ "host": "ace-media",
+ "now": 1794070000
+}

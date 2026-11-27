@@ -1,0 +1,31 @@
+name: Vault page targeting
+on:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  chromium:
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --group dev --python 3.14
+      - run: uv pip install playwright==1.62.0
+      - run: uv run playwright install --with-deps chromium
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --global agent-browser@0.26.0
+      - name: Real Chromium and real CLI tool-session regression
+        env:
+          VAULT_TEST_REQUIRE_CLI: '1'
+        run: |
+          uv run --no-sync pytest tests/tools/test_browser_vault.py tests/tools/test_browser_vault_cards.py tests/tools/test_browser_vault_target.py tests/tools/test_browser_vault_cli_target.py tests/tools/test_browser_vault_browser_use.py -q --tb=short --junitxml=vault-target.xml
+          uv run --no-sync python -c "import xml.etree.ElementTree as E; s=E.parse('vault-target.xml').getroot().find('testsuite'); assert int(s.attrib['tests']) >= 143 and s.attrib['skipped'] == '0', s.attrib"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vault-target-results
+          path: vault-target.xml

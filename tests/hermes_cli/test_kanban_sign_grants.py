@@ -270,7 +270,7 @@ def test_granted_note_is_never_a_ruling(board, revoke):
 
     _home, a, _b = board
     with kb.connect_closing() as conn:
-        kb.block_task(conn, a, reason="needs a ruling")
+        kb.block_task(conn, a, reason="needs a ruling", kind="needs_input")
     g = _mint(a, verbs=["verdict"])
     # t_301365d1: the `APOLLO RULED:` marker form is refused at the insert; the colon-free form still
     # satisfies _is_ruling_answer, so the label readers are exercised on a granted row.

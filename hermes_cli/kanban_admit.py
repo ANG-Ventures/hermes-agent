@@ -18,12 +18,22 @@ checked against the card's FINAL route, after the pause hold and browser gate.
 
 What stays here: the operator token (``KANBAN_OPERATOR_TOKEN`` equal to the
 board's ``operator-token`` file), the kill switch ``kanban.admin_admit.enabled``,
-the canonical host name, the measured-danger floor callable (memory available
-below the host's ``mem_reserve_gb``, or load1 above threads x 1.5, refuses;
-unmeasured refuses too, fail closed; the refusal prints the number and the
-threshold) and the ``admission_override`` event payload. The dispatcher runs the
-floor INSIDE its tick lock right before take/claim, so the measurement it judges
-is the one the launch uses (Prism 84845601b3b9).
+the canonical host name, the floor callable and the ``admission_override``
+event payload. The dispatcher runs the floor INSIDE its tick lock right before
+take/claim, so the measurement it judges is the one the launch uses (Prism
+84845601b3b9).
+
+The floor is the canonical FWA predicate, ``fleet_placement.admission.admit()``,
+never a private threshold (Ace msg 1569308234441949345 "only fwa is the
+guard/gate"; msg 1569529863298359387: no consumer-side vetoes). The override
+contract: admit runs that predicate with ``cpu_saturable=True``, the predicate's
+own switch that makes the CPU line a score penalty instead of a refusal. That is
+the host admission band admit exists to override. Every other axis stands
+exactly as FWA prices it: memory available after the host table's
+``mem_reserve_gb`` (subtracted once, inside ``admit()``), the live leases of
+every consumer on the host, this card's measured estimate, PSI mem/io, process
+slots, the SLO guard, and an unmeasured or unreadable input refuses (fail
+closed). There is no load1 bar and no memory floor of admit's own.
 
 There is no bulk form, no ``--max`` and no reordering: the 09-29 load-243
 incident was a bulk override (t_689b81b7). Every admission writes an
@@ -33,6 +43,7 @@ headroom it overrode.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import math
 import os
@@ -42,12 +53,15 @@ from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.kanban_lazy import Module
+kbd = Module("hermes_cli.kanban_db_dispatch")
 
-EVENT = kbd.ADMISSION_EVENT
-LOAD_FACTOR = 1.5          # refuse when load1 > threads x LOAD_FACTOR
+from hermes_cli.kanban_dispatch_defaults import ADMISSION_EVENT as EVENT
+CONSUMER = "kanban"        # the placement consumer whose estimate prices one card (kanban_headroom.CONSUMER)
 LOCAL = "studio"           # the canonical name of the dispatcher's own host (kwp.PIN_STUDIO)
-_LOCK_WAIT_SECONDS = 30.0
+# A tick now holds the board lock only while it decides (kanban.dispatch.narrow_lock, t_f60f502f), so
+# admit waits for the next gap instead of handing the operator a "retry".
+_LOCK_WAIT_SECONDS = 300.0
 
 
 class AdmitRefused(RuntimeError):
@@ -56,15 +70,18 @@ class AdmitRefused(RuntimeError):
 
 @dataclass
 class Measure:
-    """The measured state of the target host the floor is judged on."""
+    """The FWA inputs for the target host: the admission sample, this card's
+    estimate, the host's limits and the live leases, as ``admission.admit()``
+    takes them. ``hid`` is the placement-table id leases are booked under."""
 
     host: str
-    load1: Optional[float]
-    threads: Optional[int]
-    mem_available_gb: Optional[float]
-    mem_reserve_gb: float
+    sample: dict
+    need: Any = None                            # admission.Estimate (None = unpriced: refuse)
+    limits: Any = None                          # admission.Limits (None = no host facts: refuse)
+    leases: tuple = ()
+    hid: Optional[str] = None
     extra: dict = field(default_factory=dict)   # band / headroom the admission overrides
-    threshold_error: Optional[str] = None       # why mem_reserve_gb is unknown (names the table)
+    threshold_error: Optional[str] = None       # why an FWA input is unreadable (names the file)
     boards: Optional[frozenset] = None          # boards the host can host (None = not asked)
 
 
@@ -84,24 +101,20 @@ def _finite(x) -> bool:
 
 
 def floor_refusal(m: Measure) -> Optional[str]:
-    """The measured-danger refusal line for ``m``, or None to admit. A
-    non-finite measurement or threshold (NaN, inf) is unmeasured: refuse."""
-    if not _finite(m.mem_reserve_gb):
-        why = f" ({m.threshold_error})" if m.threshold_error else ""
-        return (f"{m.host}: mem_reserve_gb {m.mem_reserve_gb!r} is not a finite threshold{why}; "
-                f"refusing, fail closed")
-    if not _finite(m.mem_available_gb):
-        return (f"{m.host}: memory available is unmeasured (threshold: mem_reserve_gb "
-                f"{m.mem_reserve_gb:g} GB); refusing, fail closed")
-    if m.mem_available_gb < m.mem_reserve_gb:
-        return (f"{m.host}: memory available {m.mem_available_gb:.1f} GB < mem_reserve_gb "
-                f"{m.mem_reserve_gb:g} GB")
-    if not _finite(m.load1) or not _finite(m.threads) or m.threads <= 0:
-        return f"{m.host}: load1/threads unmeasured (threshold: threads x {LOAD_FACTOR:g}); refusing, fail closed"
-    limit = m.threads * LOAD_FACTOR
-    if m.load1 > limit:
-        return f"{m.host}: load1 {m.load1:.1f} > threads {m.threads} x {LOAD_FACTOR:g} = {limit:g}"
-    return None
+    """The canonical FWA verdict for ``m`` under the override contract (CPU line
+    as a penalty, every other axis refusing), or None to admit."""
+    from hermes_cli.fleet_placement import admission as _ad
+
+    if m.threshold_error:
+        return f"{m.host}: {m.threshold_error}; refusing, fail closed"
+    if m.need is None or m.limits is None:
+        return f"{m.host}: FWA inputs unmeasured (estimate or host limits); refusing, fail closed"
+    v = _ad.admit(m.sample, m.need, m.leases, host=m.hid or m.host,
+                  limits=dataclasses.replace(m.limits, cpu_saturable=True))
+    m.extra["fwa_binding"], m.extra["fwa_free"] = v.binding, {k: round(float(x), 3) for k, x in v.free.items()}
+    if v.ok:
+        return None
+    return f"{m.host}: FWA refused: {v.reason} (binding {v.binding})"
 
 
 # -- host names ---------------------------------------------------------------
@@ -158,90 +171,124 @@ def canonical_host(word: str, pool, fleet_dir) -> str:
 
 # -- measurement --------------------------------------------------------------
 
-def _host_row(table, word: str, threads):
-    """``(threads, mem_reserve_gb, threshold_error)`` for ``word`` from the
-    placement table: its row, else ``threads`` / 0 GB (no table file, or no row).
-    ``table`` None is re-read from the file: a table that exists but cannot be
-    read is an unknown threshold, never "no reserve", so the reserve is NaN and
-    the floor refuses naming the table (Prism a6c5f61c871f, 6e8b5b41758b)."""
+def _fwa_inputs(table, word: str, consumer_need, *, now: float):
+    """``(hid, limits, need, leases, error)`` for ``word``: the placement-table row's
+    limits (``placement._limits``, the same the router uses), this card's estimate
+    on that host, and the shared ledger's live leases. ``table`` None is re-read
+    from the file. A truly absent table (or no row) is default limits and the
+    caller's estimate; the live ledger's leases still count. A table or ledger that exists but cannot be read is an
+    error (fail closed, naming the file; Prism a6c5f61c871f, d16d6de8bc5b)."""
+    from hermes_cli.fleet_placement import admission as _ad
     from hermes_cli.fleet_placement import placement as pl
 
     path = pl.fleet_root() / pl.TABLE_REL
+    lpath = pl.fleet_root() / pl.RESERVATIONS_REL
+
+    def _no_row(tbl):
+        # No table row is default limits, never "no leases": the live ledger still binds, and an unreadable one
+        # fails closed (Prism 891b269f644d / 5e9e08ea372d).
+        try:
+            return word, _ad.Limits(), consumer_need, tuple(pl.ledger_leases(lpath, now=now, table=tbl)), None
+        except Exception as exc:
+            return word, None, None, (), f"reservation ledger {lpath} unreadable: {exc}"
+
     try:
         if table is None:
             try:
                 path.stat()
             except FileNotFoundError:
-                # Only a truly absent table is "no reserve"; exists() would also
+                # Only a truly absent table is "no row"; exists() would also
                 # say False on PermissionError (py3.14), Prism d16d6de8bc5b.
-                return threads, 0.0, None
+                return _no_row(None)
             table = pl.load_hosts(path)
-        hid = table.resolve(word)
-        if hid:
-            return table.hosts[hid].threads, float(table.hosts[hid].mem_reserve_gb), None
     except Exception as exc:
-        return threads, float("nan"), f"placement table {path} unreadable: {exc}"
-    return threads, 0.0, None
+        return word, None, None, (), f"placement table {path} unreadable: {exc}"
+    hid = table.resolve(word)
+    if not hid:
+        return _no_row(table)
+    try:
+        leases = tuple(pl.ledger_leases(lpath, now=now, table=table))
+        need = consumer_need
+        if need is None:
+            fp = table.footprint(CONSUMER)
+            need = pl.admit_context(CONSUMER, fp, now=now, table=table, leases=leases).need(hid)
+    except Exception as exc:
+        return hid, None, None, (), f"reservation ledger {lpath} unreadable: {exc}"
+    return hid, pl._limits(table.hosts[hid]), need, leases, None
 
 
 def measure_local() -> Measure:
-    """This host: load1, threads and mem_reserve_gb from its placement-table row
-    (``local`` alias; os.cpu_count() / 0 GB without one), memory from psutil, and
-    the LoadGate band + allowance the admission overrides."""
+    """This host: the same sample the LoadGate feeds ``admit_class`` (cpu_busy,
+    MemAvailable, procs, PSI), the kanban estimate here, the host table's limits
+    via the ``local`` alias, every consumer's live leases, and the LoadGate band
+    + allowance the admission overrides."""
     from hermes_cli import kanban_load_gate as klg
 
     ctx = klg.utilization_context()
-    threads, reserve, terr = _host_row(None, klg.UTIL_HOST_ALIAS, os.cpu_count())
-    load1, _ = klg.sample_loadavg()
     gate = klg.gate_from_config(None)
     try:
         allowance, paused = gate.admit_now(running=None, cpu_block=0.25)
     except Exception as exc:
         allowance, paused = None, f"gate error: {exc}"
-    return Measure(LOCAL, load1, threads, ctx.get("mem_available_gb"), reserve, extra={
+    now = time.time()
+    hid, limits, need, leases, err = _fwa_inputs(None, klg.UTIL_HOST_ALIAS, ctx.get("need"), now=now)
+    procs, maxproc = klg.sample_user_procs()
+    sample = {"host": hid, "os": klg._os_name(), "at": now, "ncpu": gate.ncpu, "cpu_busy": gate.cpu_busy,
+              "mem_available_gb": ctx.get("mem_available_gb"), "mem_total_gb": ctx.get("mem_total_gb"),
+              "procs": procs, "maxproc": maxproc, **klg.sample_psi()}
+    return Measure(LOCAL, sample, need, limits, leases, hid=hid, extra={
         "band": gate.band, "gate_state": getattr(gate, "state", None), "spill_reason": gate.spill_reason,
-        "gate_allowance": allowance, "spawn_paused": paused, "admission": klg.ADMISSION,
-    }, threshold_error=terr)
+        "gate_allowance": allowance, "spawn_paused": paused, "admission": klg.ADMISSION, "load1": gate.load1,
+    }, threshold_error=err)
 
 
 def measure_remote(host, signal, workspaces_root: Optional[str] = None) -> Measure:
-    """One fresh probe of pool host ``host``: load1/ncpu plus, with the target
-    signal, its pressure file (memory, band); threads + mem_reserve_gb from its
-    placement-table row (ncpu / 0 GB without one); hot = the published kanban band.
-    With ``workspaces_root`` (the tick's ``kanban.workspaces_root``) the same
-    round-trip lists the boards the host can host, so the dispatcher's own
-    board_refusal sees them (Prism 9f96730083e6)."""
+    """One fresh probe of pool host ``host``: its pushed pressure sample (the
+    admission vector) read through the target signal's freshness policy; the
+    table row's limits, the card's estimate and the live leases as FWA reads
+    them; hot = the published kanban band. With ``workspaces_root`` (the tick's
+    ``kanban.workspaces_root``) the same round-trip lists the boards the host
+    can host, so the dispatcher's own board_refusal sees them (Prism
+    9f96730083e6). No signal or a stale sample = an unmeasured sample: refuse."""
     from hermes_cli import kanban_headroom as kh
     from hermes_cli import kanban_worker_pool as kwp
 
     kw = {"pressure_path": signal.policy.pressure_path} if signal is not None else {}
     if workspaces_root:
         kw["workspaces_root"] = workspaces_root
-    sample = kwp.probe_host(host, **kw)
-    load1 = ncpu = mem = None
-    band = pressure = None
-    boards = None
-    if isinstance(sample, kwp.HostSample):
-        load1, ncpu, boards = sample.load1, sample.ncpu, sample.boards
+    sample_raw = kwp.probe_host(host, **kw)
+    now = time.time()
+    sample: dict = {}
+    load1 = ncpu = band = pressure = boards = None
+    if isinstance(sample_raw, kwp.HostSample):
+        load1, ncpu, boards = sample_raw.load1, sample_raw.ncpu, sample_raw.boards
         if signal is not None:
             stale = signal.policy.stale_after_s
-            fields = kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text or "",
-                                      stale_after_s=stale, local_now=time.time())
-            # A stale/undated pressure sample is unmeasured memory (Prism 142f1bce53e2 / caafe5f5edc2).
-            mem = fields.get("mem_available_gb") if fields.get("sample_status") == "fresh" else None
-            got, pressure = kwp.read_pressure(sample.remote_now, sample.pressure_text or "", stale_after_s=stale)
+            fields = kh.sample_fields(sample_raw.load5, sample_raw.remote_now, sample_raw.pressure_text or "",
+                                      stale_after_s=stale, local_now=now)
+            # A stale/undated pressure sample is unmeasured (Prism 142f1bce53e2 / caafe5f5edc2).
+            if fields.get("sample_status") == "fresh":
+                sample = {k: v for k, v in fields.items() if k not in ("sample_status", "sample_at", "load5")}
+                sample["at"] = fields.get("sample_at")
+                sample.setdefault("ncpu", ncpu)
+            got, pressure = kwp.read_pressure(sample_raw.remote_now, sample_raw.pressure_text or "",
+                                              stale_after_s=stale)
             band = got[1] if got else kwp.BAND_UNKNOWN
-    elif sample is not None:
-        load1, ncpu = sample
+    elif sample_raw is not None:
+        load1, ncpu = sample_raw
     # kh.load_table() gives the signal None for an INVALID table as well as an
-    # absent one; _host_row re-reads the file, so only an absent table is 0 GB.
+    # absent one; _fwa_inputs re-reads the file, so only an absent table is no row.
     table = signal.placement_table if signal is not None else None
-    threads, reserve, terr = _host_row(table, host.name, ncpu)
+    hid, limits, need, leases, err = _fwa_inputs(table, host.name, None, now=now)
+    if need is None and err is None:
+        from hermes_cli.fleet_placement import admission as _ad
+        need = _ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior")    # no table row: the table's kanban prior
+    sample["host"] = hid
     # t_5d7e7171: no streak file; hot = the published band (admit_class's verdict) this probe
     hot = (band == kwp.BAND_HOT) if signal is not None and band != kwp.BAND_UNKNOWN else None
-    return Measure(host.name, load1, threads, mem, reserve, extra={
-        "band": band, "hot": hot, "pressure": pressure or None, "ncpu": ncpu,
-    }, threshold_error=terr, boards=boards)
+    return Measure(host.name, sample, need, limits, leases, hid=hid, extra={
+        "band": band, "hot": hot, "pressure": pressure or None, "ncpu": ncpu, "load1": load1,
+    }, threshold_error=err, boards=boards)
 
 
 # -- the verb -------------------------------------------------------------------
@@ -249,8 +296,8 @@ def measure_remote(host, signal, workspaces_root: Optional[str] = None) -> Measu
 def _running_host(conn, task, canon: Callable[[str], str] = lambda w: w) -> str:
     """The host the card's current run is on, canonicalised like ``--host``."""
     row = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND run_id = ? "
-        "ORDER BY id DESC LIMIT 1", (task.id, kb._kwh.PLACED_EVENT, task.current_run_id)).fetchone()
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN (?, ?) AND run_id = ? "
+        "ORDER BY id DESC LIMIT 1", (task.id, "worker_placed", "worker_allocated", task.current_run_id)).fetchone()
     if row is not None:
         try:
             import json
@@ -313,17 +360,61 @@ def admit(task_id: str, host_word: str, reason: str, *, kanban_cfg: Optional[dic
             raise AdmitRefused(f"{task_id}: status is {task.status}, admit takes a ready card only")
         payload = {"source": "cli admit", "actor": _actor(), "host": host, "reason": reason.strip()}
         floor = _floor(measure_local_fn or measure_local, measure_remote_fn, payload)
-        res = kbd.admit_once(conn, task_id, host, board=board, spawn_fn=spawn_fn, spillover=plan,
-                             admission_event=payload, admit_floor=floor,
-                             **_tick_knobs(kanban_cfg), lock_wait_s=_LOCK_WAIT_SECONDS)
+        try:
+            res = kbd.admit_once(conn, task_id, host, board=board, spawn_fn=spawn_fn, spillover=plan,
+                                 admission_event=payload, admit_floor=floor,
+                                 **_tick_knobs(kanban_cfg), lock_wait_s=_LOCK_WAIT_SECONDS)
+        except Exception as exc:
+            # The claim names THIS process; once it exits nothing heartbeats or
+            # finishes the run, so a launch that raised does not leave it behind (t_bf2c4ade).
+            raise AdmitRefused(f"{task_id}: launch failed ({exc})"
+                               f"{_release_failed_launch_claim(conn, task_id, f'admit launch raised: {exc}')}"
+                               ) from exc
         if res.skipped_locked:
-            raise AdmitRefused(f"{task_id}: board tick lock busy for {_LOCK_WAIT_SECONDS:.0f}s; retry")
+            raise AdmitRefused(f"{task_id}: board tick lock held for {_LOCK_WAIT_SECONDS:.0f}s by "
+                               f"{kb.format_dispatch_lock_skip(res.lock_holder)}")
         spawned = [x for x in res.spawned if x[0] == task_id]
         if not spawned:
-            raise AdmitRefused(f"{task_id}: {refusal_from(res, task_id)}")
+            raise AdmitRefused(f"{task_id}: {refusal_from(res, task_id)}"
+                               f"{_release_failed_launch_claim(conn, task_id, 'admit: not spawned')}")
         after = kb.get_task(conn, task_id)
-    return {"task_id": task_id, "host": host, "pid": getattr(after, "worker_pid", None),
-            "workspace": spawned[0][2], "payload": payload}
+    out = {"task_id": task_id, "host": host, "pid": getattr(after, "worker_pid", None),
+           "workspace": spawned[0][2], "payload": payload}
+    if out["pid"] is None:
+        # Reported spawned, no pid recorded yet. A missing pid is not proof that no
+        # worker launched (Prism 3515cb6bd1ed), so the claim stays; the dead-claimer
+        # launch bound releases it if no worker ever shows up (t_bf2c4ade).
+        out["note"] = ("no worker pid recorded yet; the worker may be starting. The claim is kept: "
+                       "if no worker shows up, the launch bound releases it")
+    return out
+
+
+def _release_failed_launch_claim(conn, task_id: str, why: str) -> str:
+    """Release the claim THIS process holds on ``task_id`` after a launch that
+    definitively did not happen (admit_once raised, or did not spawn the card)
+    (t_bf2c4ade). Re-checked under the release's write lock: a stamped worker
+    pid or a ``spawned``/``heartbeat`` row on the run keeps the claim. Returns
+    the operator-facing suffix, ``""`` when the claim is not ours to release."""
+    task = kb.get_task(conn, task_id)
+    if (task is None or task.status != "running" or task.worker_pid
+            or task.current_run_id is None or task.claim_lock != kb._claimer_id()):
+        return ""
+    run_id = int(task.current_run_id)
+
+    def _no_worker_evidence(c) -> bool:
+        row = c.execute("SELECT worker_pid FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is not None and row[0]:
+            return False
+        return c.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+                         "AND kind IN ('spawned','heartbeat') LIMIT 1", (task_id, run_id)).fetchone() is None
+
+    kbd._record_task_failure(conn, task_id, why, outcome="spawn_failed", release_claim=True,
+                             end_run=True, infrastructure=True,
+                             expected_run_id=run_id, precondition=_no_worker_evidence)
+    after = kb.get_task(conn, task_id)
+    if after is not None and after.claim_lock:
+        return "; a worker was recorded, so the claim was kept"
+    return f"; claim released, card is {getattr(after, 'status', 'gone')}"
 
 
 def _floor(measure_local_fn, measure_remote_fn, payload: dict):
@@ -336,14 +427,16 @@ def _floor(measure_local_fn, measure_remote_fn, payload: dict):
             return f"{host}: not a pool host of this plan; nothing measured", {}, None
         m = measure_local_fn() if host == LOCAL else measure_remote_fn(
             pool_host, getattr(plan, "signal", None))
+        refusal = floor_refusal(m)
+        mem = m.sample.get("mem_available_gb")
         measured = {
-            "load1": None if not _finite(m.load1) else round(m.load1, 2), "threads": m.threads,
-            "load_limit": None if not _finite(m.threads) else m.threads * LOAD_FACTOR,
-            "mem_available_gb": None if not _finite(m.mem_available_gb) else round(m.mem_available_gb, 2),
-            "mem_reserve_gb": m.mem_reserve_gb, **m.extra,
+            "cpu_busy": m.sample.get("cpu_busy"),
+            "mem_available_gb": round(float(mem), 2) if _finite(mem) else None,
+            "mem_reserve_gb": getattr(m.limits, "mem_reserve_gb", None),
+            "need_ram_gb": getattr(m.need, "ram_gb", None), **m.extra,
         }
         payload.update(measured)
-        return floor_refusal(m), measured, m.boards
+        return refusal, measured, m.boards
     return floor
 
 
@@ -380,6 +473,12 @@ def refusal_from(res, task_id: str) -> str:
             return f"refused on measured danger: {why[len(kbd.ADMIT_FLOOR) + 2:]}"
         if why.startswith(kbd.ADMIT_INELIGIBLE + ": "):
             return why[len(kbd.ADMIT_INELIGIBLE) + 2:]
+        from hermes_cli.kanban_studio_allowlist import override_command
+        cmd = override_command(task_id, why)
+        if cmd is not None:
+            # t_5d63270d (Prism c-e7592fee5f5910ad): admit never starts what default-deny holds; the override is the
+            # audited path (studio_override event + capability-gap ledger line), then admit again.
+            return f"held: {why}; to start it on the Studio run `{cmd}` first, then admit again"
         return f"held: {why}"
     for tid, why in res.workspace_refused:
         if tid == task_id:
@@ -414,6 +513,8 @@ def cmd_admit(args) -> int:
     p = res["payload"]
     print(f"kanban admit: {res['task_id']} spawned on {res['host']} pid={res['pid']} "
           f"(overrode band={p.get('band')} allowance={p.get('gate_allowance', '-')}; "
-          f"load1={p.get('load1')} / limit {p.get('load_limit')}, mem {p.get('mem_available_gb')} GB "
+          f"FWA binding={p.get('fwa_binding')} cpu_busy={p.get('cpu_busy')}, mem {p.get('mem_available_gb')} GB "
           f"/ reserve {p.get('mem_reserve_gb')} GB) event={EVENT}")
+    if res.get("note"):
+        print(f"kanban admit: {res['task_id']}: {res['note']}")
     return 0

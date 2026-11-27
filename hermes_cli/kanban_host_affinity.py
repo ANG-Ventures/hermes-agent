@@ -265,6 +265,12 @@ def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> 
         cfg = _kwp.PoolConfig()
     known = tuple(cfg.hosts or ()) or _kwp.known_host_ids(_kb.kanban_home() / "fleet")
     aliases = cfg.pin_aliases or _kwp.pin_aliases(_kb.kanban_home() / "fleet")
+    try:  # t_c82eded0: the same per-tick knob the planned path reads
+        from hermes_cli import kanban_db_dispatch as _kbd
+        from hermes_cli import kanban_host_capabilities as _khc
+        prose = _khc.read_prose_advisory(_kbd._root_kanban_cfg())
+    except Exception:
+        prose = True
     for r in rows:
         # Same pin rule as the planned path: only a REAL pin (any/studio/a known
         # host) is the operator's call; a prose ``host: example.com`` line is not.
@@ -277,7 +283,7 @@ def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> 
             skills = ()
         assignee = r["assignee"] or default_assignee
         manifest = manifest_affinity_safe(skills, assignee) if skills and assignee else {}
-        hit = _kwp.studio_affinity(r["body"], skills, cfg, manifest=manifest)
+        hit = _kwp.studio_affinity(r["body"], skills, cfg, manifest=manifest, prose_advisory=prose)
         if hit is not None:
             result.placement_affinity[r["id"]] = {
                 "host": _kwp.STUDIO_HOST, "rule": hit[0], "matched_by": hit[1]}
@@ -285,15 +291,17 @@ def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> 
 
 def _last_payloads(conn, task_ids, kind: str) -> Dict[str, dict]:
     """``{task_id: latest payload}`` of ``kind`` for the given cards, one query."""
+    from hermes_cli import kanban_placement_reasons as _pr
     ids = [t for t in dict.fromkeys(task_ids) if t]
     out: Dict[str, dict] = {}
+    names, km = _pr.kind_names(kind), _pr.kind_marks(kind)
     for i in range(0, len(ids), 500):
         chunk = ids[i:i + 500]
         marks = ",".join("?" * len(chunk))
         for tid, payload in conn.execute(
-                f"SELECT task_id, payload FROM task_events e WHERE kind = ? AND task_id IN ({marks}) "
-                "AND id = (SELECT MAX(id) FROM task_events WHERE task_id = e.task_id AND kind = ?)",
-                [kind, *chunk, kind]):
+                f"SELECT task_id, payload FROM task_events e WHERE kind IN ({km}) AND task_id IN ({marks}) "
+                f"AND id = (SELECT MAX(id) FROM task_events WHERE task_id = e.task_id AND kind IN ({km}))",
+                [*names, *chunk, *names]):
             out[tid] = json.loads(payload or "{}")
     return out
 
@@ -336,6 +344,11 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
                         _kb._append_event(conn, tid, "placement_affinity", dict(aff))
                 elif last is not None and not last.get("cleared"):
                     _kb._append_event(conn, tid, "placement_affinity", dict(CLEARED))
+                    if last.get("mode") == "enforce" and str(last.get("rule", "")).startswith("requires:"):
+                        _kb.add_comment(conn, tid, "dispatcher",
+                                        f"auto-pin released: {last['rule']} no longer binds under the current "
+                                        "body and skills. Placement re-evaluated this tick; other constraints "
+                                        "and host capacity still apply.")
                     # The binding's wait ends with it, or the same wait after a
                     # re-bind would read as a duplicate (Prism 0f21fb8c).
                     cleared_wait.add(tid)
@@ -343,16 +356,16 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
             for tid in cleared_wait:
                 lw = _last_payloads(conn, [tid], "placement_wait").get(tid)
                 if lw is not None and not lw.get("cleared"):
-                    _kb._append_event(conn, tid, "placement_wait", dict(CLEARED))
+                    _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, dict(CLEARED))
             for tid, aff in affinity.items():
                 reason = waits.get(tid)
                 last = conn.execute(
-                    "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
-                    "ORDER BY id DESC LIMIT 1", (tid, "placement_wait")).fetchone()
+                    f"SELECT id, payload FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks('placement_wait')}) "
+                    "ORDER BY id DESC LIMIT 1", (tid, *_pr.kind_names("placement_wait"))).fetchone()
                 last_payload = None if last is None else json.loads(last[1] or "{}")
                 if reason is None:
                     if tid in cleared and last_payload is not None and not last_payload.get("cleared"):
-                        _kb._append_event(conn, tid, "placement_wait", dict(CLEARED))
+                        _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, dict(CLEARED))
                     continue
                 payload = {"host": aff["host"], "reason": reason, "matched_by": aff["matched_by"]}
                 # Same episode boundary the readers use (kanban_placement_view
@@ -363,7 +376,7 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
                     "LIMIT 1" % ",".join("?" * len(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)),
                     (tid, last[0], *sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS))).fetchone() is not None
                 if last is None or ended or last_payload != payload:
-                    _kb._append_event(conn, tid, "placement_wait", payload)
+                    _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, payload)
     except Exception:
         _log.warning("kanban dispatch: could not record placement affinity events", exc_info=True)
 

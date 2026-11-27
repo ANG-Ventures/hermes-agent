@@ -27,6 +27,9 @@ DEFAULT_CODEX_MODELS: List[str] = [
     # (2026-09-30), but the Codex responses endpoint serves it (measured
     # 921,028-token request OK), so it is curated + forward-compat'd here.
     "gpt-6.1-sol",
+    # GPT-6.2 Sol (2026-11-17): served on the Codex responses endpoint and listed by the catalog at
+    # client_version 0.169.0. (GPT-6.2 Astra is left to live discovery, like gpt-6-astra.)
+    "gpt-6.2-sol",
     # GPT-6.1 Terra (2026-10-26): listed by all three account catalogs at client 0.162.1 (2026-11-06).
     "gpt-6.1-terra",
     "gpt-6-luna",

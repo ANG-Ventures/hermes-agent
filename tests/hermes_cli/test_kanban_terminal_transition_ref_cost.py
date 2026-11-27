@@ -145,7 +145,7 @@ def test_other_terminal_transitions_never_reach_the_ref_scan(
 ):
     tid, ws = _card_with_many_published_heads(board)
     calls = {
-        "block": lambda: kb.block_task(board, tid, reason="needs a decision"),
+        "block": lambda: kb.block_task(board, tid, reason="needs a decision", kind="needs_input"),
         "request_review": lambda: kb.request_review(
             board, tid, summary="please review", reviewer="argus",
         ),

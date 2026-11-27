@@ -2059,6 +2059,21 @@ def read_raw_config_readonly() -> Dict[str, Any]:
     return _read_raw_config_impl(want_deepcopy=False)
 
 
+def read_host_root_config() -> Dict[str, Any]:
+    """The host's ROOT ``config.yaml`` (``get_default_hermes_root()``), never a profile's, for
+    host-wide switches a profile-scoped worker must still see (``worktree_cache``,
+    ``kanban.workspaces_root``). Env-expanded, no defaults merged, no cache; ``{}`` when the
+    file is missing, unreadable, unparseable or not a mapping."""
+    from hermes_constants import get_default_hermes_root
+
+    try:
+        with open(get_default_hermes_root() / "config.yaml", encoding="utf-8-sig") as f:
+            data = fast_safe_load(f) or {}
+    except Exception:  # noqa: BLE001 - an unreadable host config reads as empty
+        return {}
+    return _expand_env_vars(data) if isinstance(data, dict) else {}
+
+
 def require_readable_config_before_write(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Refuse to replace an existing config.yaml that cannot be read or parsed; return the mapping.
     Guards two collapse-to-empty failure modes that would let a read-then-write caller silently

@@ -80,6 +80,12 @@ def _git(repo: Path, *args: str, env=None) -> bytes:
     return ks._git(repo, *args, env=env).stdout
 
 
+def _git_text(repo, *args: str) -> str:
+    """ks.stranded's git: raises on failure; ls-remote is the one network read."""
+    net = bool(args) and args[0] == "ls-remote"
+    return ks._git(repo, *args, network=net, timeout=60 if net else 30).stdout.decode("utf-8", "surrogateescape")
+
+
 @dataclass
 class Plan:
     workspace: Path
@@ -115,10 +121,12 @@ def _tree_bytes(workspace: Path) -> int:
 def _repo_dirt(repo: Path, key: str, workspace: Path, repo_set: set, files: list) -> Optional[tuple]:
     """Add the repository's untracked/ignored non-residue files to ``files``; return (head, diff) or None."""
     head = ks._git(repo, "rev-parse", "--verify", "HEAD", check=False)
-    unpushed = ks._git(repo, "rev-list", "--branches", "--tags",
-                       *(["HEAD"] if head.returncode == 0 else []), "--not", "--remotes", check=False)
-    if unpushed.returncode or unpushed.stdout.strip():
-        raise ReclaimHeld(f"repository {key} has local commits not on any remote")
+    try:
+        why = ks.stranded(_git_text, repo, ("HEAD",) if head.returncode == 0 else ())
+    except (ks.SurvivorUnavailable, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        raise ReclaimHeld(f"repository {key}: stranded work unknown ({type(exc).__name__})") from exc
+    if why:
+        raise ReclaimHeld(f"repository {key} has {why}")
     if _git(repo, "stash", "list").strip():
         raise ReclaimHeld(f"repository {key} has stashes")
     flags = _git(repo, "ls-files", "-v", "-z").decode("utf-8", "surrogateescape")

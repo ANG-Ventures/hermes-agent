@@ -69,11 +69,52 @@ def pin_unknown_host(word: str, suggestions=()) -> str:
     return f"{PIN_UNKNOWN_HOST}:{word}{tail}"
 
 # The task_event that records why a ready card was held this tick.
-PLACEMENT_WAIT_EVENT = "placement_wait"
+PLACEMENT_WAIT_EVENT = "allocation_wait"
 # The task_event on a run that was spawned on a pool host (host, reason, band).
-WORKER_PLACED_EVENT = "worker_placed"
+WORKER_PLACED_EVENT = "worker_allocated"
 # The task_event on every spawn, both routes (spec §4.1; written from Phase 2a).
-PLACEMENT_EVENT = "placement"
+PLACEMENT_EVENT = "allocation"
+# The task_event a continuation card carries naming its parent's host (kanban_continuation).
+PLACEMENT_HINT_EVENT = "allocation_hint"
+# The task_event of a held card moved off a paused/blocked host (kanban_pause_hold, kanban_placement_block).
+PLACEMENT_REROUTED_EVENT = "allocation_rerouted"
+# Rename wave 3 (t_7be48220, Fleet Work Allocation): each placement event kind gets an allocation name.
+# For one release readers accept BOTH names (historical rows are never rewritten); the writers above emit
+# the allocation name (writer step, t_7be48220 step 3). Readers query ``kind IN ({kind_marks(K)})`` with
+# ``*kind_names(K)`` and compare with ``normalize_kind(kind) == normalize_kind(K)``.
+KIND_ALIASES = {
+    "placement": "allocation",
+    "placement_wait": "allocation_wait",
+    "worker_placed": "worker_allocated",
+    "placement_hint": "allocation_hint",
+    "placement_rerouted": "allocation_rerouted",
+}
+_KIND_OLD = {new: old for old, new in KIND_ALIASES.items()}
+
+
+def normalize_kind(kind):
+    """The allocation name of an event kind: an old placement name maps to its new name, any other kind is
+    returned unchanged."""
+    return KIND_ALIASES.get(kind, kind)
+
+
+def kind_names(*kinds) -> tuple:
+    """Every name each of ``kinds`` is stored under (old placement name, then new allocation name), in order,
+    without duplicates. A kind outside :data:`KIND_ALIASES` stands for itself."""
+    out: list = []
+    for k in kinds:
+        new = KIND_ALIASES.get(k, k)
+        for name in (_KIND_OLD.get(new), new):
+            if name is not None and name not in out:
+                out.append(name)
+    return tuple(out)
+
+
+def kind_marks(*kinds) -> str:
+    """``?,?,...``: one SQL placeholder per name of :func:`kind_names` (``kinds``)."""
+    return ",".join("?" * len(kind_names(*kinds)))
+
+
 # A repeated identical reason is re-written only after this many seconds.
 PLACEMENT_WAIT_REFRESH_SECONDS = 900
 # A task_event of one of these kinds after the latest placement_wait ends that
@@ -260,6 +301,16 @@ def take_refusal_code(refusal) -> "str | None":
     """The vocabulary code of a take() refusal string, or None for no refusal."""
     code = split_reason(refusal)[0] if refusal else ""
     return code or None
+
+
+# A worktree card whose repo has an operator pin row that names no host able to take it now, and not the Studio
+# (t_fbe8a067): it waits, named, never falls back to the Studio.
+WORKTREE_PIN = "worktree_pin"
+
+
+def worktree_pin(hosts: str, detail: str) -> str:
+    """``worktree_pin (<pinned hosts>: <why none of them takes it>)``."""
+    return f"{WORKTREE_PIN} ({hosts}: {detail})"
 
 
 def not_portable(rule: str) -> str:

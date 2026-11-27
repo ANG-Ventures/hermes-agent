@@ -5393,11 +5393,9 @@ class SlackAdapter(BasePlatformAdapter):
                 channel_id, team_id, msg_ts, t("platform.slack.picker.switching", model=model_id)
             )
 
-            switch_failed = False
-            try:
-                confirmation = await on_model_selected(
-                    state["chat_id"], model_id, provider_slug
-                )
+            from gateway.platforms.base import call_model_selected
+
+            def _failed(text) -> bool:
                 # The gateway reports a failed in-place swap as a localized
                 # error-prefixed return string, not an exception (#50163).
                 # Compare against the same i18n prefix so both failure
@@ -5406,18 +5404,25 @@ class SlackAdapter(BasePlatformAdapter):
                     _error_prefix = t("gateway.model.error_prefix", error="").strip()
                 except Exception:
                     _error_prefix = "Error:"
-                if _error_prefix and str(confirmation).startswith(_error_prefix):
-                    switch_failed = True
+                return bool(_error_prefix) and str(text).startswith(_error_prefix)
+
+            async def _render(text, switch_failed=False):
+                # The confirmation renders before the gateway saves the switch.
+                header = t("platform.slack.picker.switch_failed_header" if switch_failed or _failed(text)
+                           else "platform.slack.picker.switched_header")
+                await self._update_picker_message(
+                    channel_id, team_id, msg_ts, f"{header}\n\n{text}"
+                )
+
+            try:
+                confirmation, rendered = await call_model_selected(
+                    on_model_selected, state["chat_id"], model_id, provider_slug, _render)
             except Exception as exc:
                 logger.error("[Slack] Model picker callback failed: %s", exc, exc_info=True)
-                confirmation = t("platform.slack.picker.switch_failed", error=str(exc))
-                switch_failed = True
-
-            header = t("platform.slack.picker.switch_failed_header" if switch_failed
-                       else "platform.slack.picker.switched_header")
-            await self._update_picker_message(
-                channel_id, team_id, msg_ts, f"{header}\n\n{confirmation}"
-            )
+                await _render(t("platform.slack.picker.switch_failed", error=str(exc)), switch_failed=True)
+                return
+            if not rendered:
+                await _render(confirmation)
             return
 
     async def send_clarify(

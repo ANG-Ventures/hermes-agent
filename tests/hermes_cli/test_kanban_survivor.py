@@ -187,6 +187,17 @@ def test_workspace_deletion_has_one_choke_point():
         # the mirror flock, never a workspace. Resuming them in place instead
         # promoted a killed fetch's tmp_pack residue into the precious mirror.
         ("kanban_clone.py", "_discard_dead_builds"),
+        # Reviewed exceptions (t_f3a411c2, operator 18:55 11-12 item 2): the background carry never deletes a
+        # workspace. Each target is built from staging_path() on the POOL host or is a local mkdtemp dir:
+        # remove_staging: rm -rf of <parent>/.carry-<leaf> on a pool host (a stale or failed carry's staging dir).
+        ("kanban_carry_background.py", "remove_staging"),
+        # carry_rebuild: xargs rm -rf of the paths deleted since HEAD, cd'd into the checkout inside the staging dir.
+        ("kanban_carry_background.py", "carry_rebuild"),
+        # make_bundle: shutil.rmtree of its own tempfile.mkdtemp(prefix="kanban-carry-") dir on the Studio.
+        ("kanban_carry_background.py", "make_bundle"),
+        # finalize: rm -rf of the staging dir after rsync merged it into the workspace (the workspace is the target
+        # of the merge, never of the rm).
+        ("kanban_carry_background.py", "finalize"),
     }
 
 

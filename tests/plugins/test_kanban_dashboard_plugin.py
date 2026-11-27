@@ -140,15 +140,11 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
         json={"title": "wait for indexed data", "assignee": "ops"},
     ).json()["task"]
 
-    conn = kbc.connect()
-    try:
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET status = 'scheduled' WHERE id = ?",
-                (task["id"],),
-            )
-    finally:
-        conn.close()
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "scheduled", "wake_at": 2_000_000_000},
+    )
+    assert response.status_code == 200, response.text
 
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200

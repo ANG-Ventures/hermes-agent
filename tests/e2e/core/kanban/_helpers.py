@@ -35,6 +35,13 @@ FAST_ENV = {
     "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS": "0",
 }
 
+# pc-c682bf78: a scratch HOME does not scope gh auth. An inherited GH_CONFIG_DIR points gh at the
+# operator's hosts.yml (and on macOS the login-keychain token it names), and a fleet gh wrapper on PATH
+# mints a live token without reading HOME. Children get a scratch GH_CONFIG_DIR, no token vars, and a
+# stub ``gh`` first on PATH that exits GH_STUB_RC, unless the Board opts in with ``allow_real_gh``.
+GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+GH_STUB_RC = 97
+
 
 def wait_until(pred: Callable[[], Any], timeout: float, what: str, interval: float = 0.1) -> Any:
     deadline = time.monotonic() + timeout
@@ -70,6 +77,7 @@ class Board:
     extra_config: str = ""
     env_extra: dict[str, str] = field(default_factory=dict)
     spawned_pids: set[int] = field(default_factory=set)
+    allow_real_gh: bool = False
 
     def __post_init__(self) -> None:
         self.home = self.root / "home"
@@ -108,13 +116,28 @@ class Board:
             "#!/bin/sh\n"
             f"PYTHONPATH={REPO} exec {PY} -m hermes_cli.main \"$@\"\n", encoding="utf-8")
         self.hermes_bin.chmod(0o755)
+        self.gh_config_dir = self.root / "gh-config"
+        self.gh_config_dir.mkdir(parents=True, exist_ok=True)
+        self.gh_stub_dir = self.root / "gh-stub-bin"
+        self.gh_stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = self.gh_stub_dir / "gh"
+        stub.write_text(
+            "#!/bin/sh\n"
+            "echo \"e2e Board blocks real gh (pc-c682bf78): gh $*; opt in with Board(allow_real_gh=True)\" >&2\n"
+            f"exit {GH_STUB_RC}\n", encoding="utf-8")
+        stub.chmod(0o755)
 
     # env / processes -------------------------------------------------------
     def env(self) -> dict[str, str]:
         env = {k: v for k, v in environ_snapshot().items()
                if not k.startswith("HERMES_") and not k.endswith(("_API_KEY", "_TOKEN"))}
         env.pop("PYTEST_CURRENT_TEST", None)
+        for var in GH_TOKEN_VARS:
+            env.pop(var, None)
+        if not self.allow_real_gh:
+            env["PATH"] = os.pathsep.join(p for p in (str(self.gh_stub_dir), env.get("PATH", "")) if p)
         env.update({
+            "GH_CONFIG_DIR": str(self.gh_config_dir), "GH_PROMPT_DISABLED": "1",
             "HOME": str(self.home), "HERMES_HOME": str(self.hermes_home),
             "HERMES_BIN": str(self.hermes_bin), "PYTHONPATH": str(REPO),
             "NO_COLOR": "1", "TERM": "dumb",

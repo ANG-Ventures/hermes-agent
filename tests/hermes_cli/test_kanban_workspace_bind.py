@@ -165,7 +165,7 @@ def test_ac1_dispatch_spawns_the_blocks_child_on_the_pool(home, monkeypatch):
             (t.id, k["placement"].name if k.get("placement") else None)) or 1,
             max_spawn=8, spawn_paused="test", spawn_limit=0, spillover=_plan(),
             reconcile_orphans=False)
-        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='placement'",
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='allocation'",
                           (b,)).fetchone()
     assert any(t == b and h for t, h in spawned), (spawned, res.placement_waits)
     assert json.loads(ev[0])["route"] == "remote-policy"

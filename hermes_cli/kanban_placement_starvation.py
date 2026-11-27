@@ -50,12 +50,23 @@ _FIXES = (
     ("requires:",
      "the capability the card requires is on no pool host it may use. Fix: correct the "
      "`requires:` line, or pin the host that serves it."),
+    ("studio_default_deny:",
+     "the card needs a capability only the Mac Studio has, and it is not on the Studio allowlist "
+     "(kanban.placement.studio_default_deny.allow), so it waits instead of starting there (t_062a5948). Fix: the "
+     "operator runs `hermes kanban studio-override <card> --capability <cap> --why \"<reason>\"` (one run), or "
+     "allowlists the capability, or a pool host gains it; if the card does not really need it, correct its "
+     "`requires:` line."),
+    ("studio_capability_only:",
+     "the card was kept off the pool but names no Studio-only capability, so it waits instead of running "
+     "on the Studio (t_9965b8d5). Fix: if it needs the Studio, add `requires: <studio-only capability>` "
+     "(studio-state, control-plane, browser-session, obsidian-vault, ...); else fix what the detail names "
+     "(commit/push the worktree, drop the shared workspace) so it ports."),
     ("not_portable:linked",
      "a link to a live card (named in the detail) holds it off the pool, so its `host:` pin "
      "is not honoured while that edge is live. Fix: drop the pin, or relink the edge "
      "`--kind derived-from` if it is lineage only."),
     ("not_portable:",
-     "a placement rule keeps it off every host that has room. Fix: read `kanban placement <id>` "
+     "a placement rule keeps it off every host that has room. Fix: read `kanban allocation <id>` "
      "and correct the body line that rule names."),
 )
 
@@ -98,10 +109,10 @@ def starved_holds(conn, waits: Mapping[str, str], now: int, *,
         count, start, latched = 0, None, False
         for kind, created, raw in conn.execute(
             "SELECT kind, created_at, payload FROM task_events WHERE task_id = ? "
-            "AND kind IN (?, ?, %s) ORDER BY id DESC" % ",".join("?" * len(ends)),
-            (tid, _pr.PLACEMENT_WAIT_EVENT, STARVED_EVENT, *ends),
+            "AND kind IN (?, ?, ?, %s) ORDER BY id DESC" % ",".join("?" * len(ends)),
+            (tid, *_pr.kind_names(_pr.PLACEMENT_WAIT_EVENT), STARVED_EVENT, *ends),
         ):
-            if kind not in (_pr.PLACEMENT_WAIT_EVENT, STARVED_EVENT):
+            if kind not in (*_pr.kind_names(_pr.PLACEMENT_WAIT_EVENT), STARVED_EVENT):
                 break  # episode end
             try:
                 pl = json.loads(raw or "{}")
@@ -129,7 +140,7 @@ def starved_holds(conn, waits: Mapping[str, str], now: int, *,
 def comment_body(hit: Mapping) -> str:
     return (f"⏳ placement: held `{hit['code']}` for {hit['waited'] // 60} min "
             f"({hit['events']} placement_wait events) and it will not clear on its own: "
-            f"{hit['fix']} Then `kanban placement {hit['task_id']}` shows the new route.")
+            f"{hit['fix']} Then `kanban allocation {hit['task_id']}` shows the new route.")
 
 
 def notify_starved_holds(conn, waits: Mapping[str, str], now: int) -> list[dict]:

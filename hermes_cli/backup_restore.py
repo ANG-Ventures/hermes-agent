@@ -113,6 +113,11 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     dst_conn: Optional[sqlite3.Connection] = None
     try:
         dst_conn = sqlite3.connect(str(dst))
+        # This connection checkpoints (TRUNCATE, then again at close) and rewrites every page of a possibly
+        # live state.db: it needs the same macOS F_FULLFSYNC barrier as the owner's writer (t_e8c62e86).
+        from hermes_state_wal import _apply_macos_checkpoint_barrier, _enforce_macos_synchronous_full
+        _apply_macos_checkpoint_barrier(dst_conn)
+        _enforce_macos_synchronous_full(dst_conn)
         try:
             # Force a WAL checkpoint so the backup starts from a clean
             # state rather than writing on top of a deep WAL.

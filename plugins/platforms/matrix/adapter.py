@@ -2565,12 +2565,20 @@ class MatrixAdapter(BasePlatformAdapter):
         prompt.resolved = True
         registry.pop(reacts_to, None)
         args = selection if isinstance(selection, tuple) else (selection,)
-        try:
-            confirmation = await prompt.on_selected(room_id, *args)
+        async def _render(text):  # a /model confirmation renders before the gateway saves the switch
             if redact_bot_reactions:
                 await self._redact_bot_model_picker_reactions(room_id, prompt)
-            if confirmation:
-                await self.send(room_id, confirmation, reply_to=reacts_to)
+            if text:
+                await self.send(room_id, text, reply_to=reacts_to)
+
+        try:
+            if redact_bot_reactions and len(args) == 2:  # the /model picker: (model_id, provider_slug)
+                from gateway.platforms.base import call_model_selected
+                confirmation, rendered = await call_model_selected(prompt.on_selected, room_id, *args, _render)
+            else:
+                confirmation, rendered = await prompt.on_selected(room_id, *args), False
+            if not rendered:
+                await _render(confirmation)
         except Exception as exc:
             logger.error("Failed to %s from Matrix reaction: %s", verbs[0], exc)
             await self.send(room_id, t("platform.matrix.picker.failed", action=t(verbs[1]), error=str(exc)),

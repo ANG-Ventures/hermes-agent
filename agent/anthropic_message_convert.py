@@ -564,16 +564,6 @@ def _keep_valid_latest_thinking(content: List[Any], signature_dead: bool) -> Lis
     return new_content
 
 
-def _keep_signed_thinking_only(content: List[Any]) -> List[Any]:
-    """Older assistant turn inside a contiguous preserved-thinking window: signed blocks are what
-    the API binds, an unsigned one is dropped exactly as the latest-only path strips it."""
-    return [
-        b for b in content
-        if _block_type(b) not in _THINKING_TYPES
-        or (b.get("data") if b.get("type") == "redacted_thinking" else b.get("signature"))
-    ]
-
-
 def _manage_thinking_signatures(
     result: List[Dict[str, Any]], base_url: str | None, model: str | None,
     *, preserve_thinking: bool = False, thinking_window: str = "latest",
@@ -588,7 +578,8 @@ def _manage_thinking_signatures(
     native path despite not being anthropic.com. ``preserve_thinking`` (the per-provider
     ``providers.<name>.preserve_thinking`` flag, resolved by the caller) does the same for a relay
     in front of Anthropic: first-party for THIS decision only. ``thinking_window="contiguous"``
-    keeps signed blocks on every assistant turn, not just the latest (``agent.preserved_thinking``).
+    sends every assistant turn as the latest one is sent (signed kept, unsigned demoted to text), so
+    no turn's bytes change between compactions (``agent.preserved_thinking``).
     """
     is_third_party = (
         _is_third_party_anthropic_endpoint(base_url) and not _is_nous_portal_endpoint(base_url) and not preserve_thinking
@@ -599,6 +590,7 @@ def _manage_thinking_signatures(
     )
     contiguous = preserve_thinking and thinking_window == "contiguous"
     last_assistant_idx = next((i for i in range(len(result) - 1, -1, -1) if result[i].get("role") == "assistant"), None)
+    volatile_idx = None
     for idx, m in _assistant_block_lists(result):
         if is_kimi:
             pass  # shared cleanup below still strips cache markers + the flag
@@ -610,19 +602,66 @@ def _manage_thinking_signatures(
             ]
             m["content"] = new_content or [_text_block("(empty)")]
         elif is_third_party or (idx != last_assistant_idx and not contiguous):
-            m["content"] = _strip_thinking(m["content"]) or [_text_block("(thinking elided)")]
-        elif idx != last_assistant_idx:
-            # Orphan-stripping mutated THIS turn: every signature on it is dead, same as the latest-turn rule.
-            keep = [] if m.get("_thinking_signature_invalidated") else _keep_signed_thinking_only(m["content"])
-            m["content"] = (keep or _strip_thinking(m["content"])) or [_text_block("(thinking elided)")]
+            m["content"] = _older_turn_thinking(m)
         else:
+            # A contiguous window sends every turn exactly as it was sent while it was the latest
+            # (t_d785218c): a turn's bytes never change between compactions, so each request reads
+            # the whole previous one back and there is nothing for the #317 hoist to move.
+            as_older = None if contiguous else _older_turn_thinking(m)
             new_content = _keep_valid_latest_thinking(m["content"], bool(m.get("_thinking_signature_invalidated")))
             m["content"] = new_content or [_text_block("(empty)")]
+            if as_older is not None and _wire_blocks(m["content"]) != _wire_blocks(as_older):
+                volatile_idx = idx
         # cache_control on thinking blocks interferes with signature validation.
         for b in m["content"]:
             if _block_type(b) in _THINKING_TYPES:
                 b.pop("cache_control", None)
         m.pop("_thinking_signature_invalidated", None)  # internal flag, never on the wire
+    if volatile_idx is not None:
+        _hoist_markers_before(result, volatile_idx)
+
+
+def _older_turn_thinking(m: Dict[str, Any]) -> List[Any]:
+    """The thinking an assistant turn is sent with once it is no longer the latest one (window ``latest``)."""
+    return _strip_thinking(m["content"]) or [_text_block("(thinking elided)")]
+
+
+def _wire_blocks(blocks: List[Any]) -> List[Any]:
+    """Blocks as the cache compares them: ``cache_control`` is not part of the prefix bytes."""
+    return [{k: v for k, v in b.items() if k != "cache_control"} if isinstance(b, dict) else b for b in blocks]
+
+
+def _hoist_markers_before(result: List[Dict[str, Any]], volatile_idx: int) -> None:
+    """Move every cache breakpoint at or after ``volatile_idx`` onto the messages before it.
+
+    The latest assistant turn is sent with its thinking now and without it next request
+    (``_keep_valid_latest_thinking`` vs ``_older_turn_thinking``), so its bytes change and a
+    breakpoint on or after it writes an entry no later request can read: every thinking tool-loop
+    step re-wrote the whole conversation on the a-family lanes (t_65e9cc2c). The messages before it
+    are final, so their breakpoints are read back next request. The final message is exempt: no
+    later request reuses a request that ends on it, and nothing follows it to move markers from.
+    """
+    if volatile_idx >= len(result) - 1:
+        return
+    removed: List[Dict[str, Any]] = []
+    for m in result[volatile_idx:]:
+        content = m.get("content")
+        if isinstance(cc := m.pop("cache_control", None), dict):
+            removed.append(cc)
+        for b in content if isinstance(content, list) else []:
+            if isinstance(b, dict) and isinstance(cc := b.pop("cache_control", None), dict):
+                removed.append(cc)
+    for m in reversed(result[:volatile_idx]):
+        if not removed:
+            break
+        if isinstance(m.get("content"), str):  # same prompt bytes as one text block
+            m["content"] = [_text_block(m["content"])]
+        content = m.get("content")
+        if not isinstance(content, list) or any(_cache_control_of(b) for b in content) or m.get("cache_control"):
+            continue
+        carrier = next((b for b in reversed(content) if isinstance(b, dict) and _block_type(b) not in _THINKING_TYPES), None)
+        if carrier is not None:
+            carrier["cache_control"] = dict(removed.pop())
 
 
 def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:

@@ -12,7 +12,7 @@ from hermes_state_common import (
     escape_like as _escape_like
 )
 from hermes_startup_watchdog import report_startup_progress
-from hermes_state_lockowners import hold_ended, hold_started
+from hermes_state_lockowners import ensure_watchdog, hold_ended, hold_started
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -411,6 +411,7 @@ class SessionMaintenanceMixin:
             optimized = self.optimize_fts()  # manages its own lock
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
+        ensure_watchdog()  # never inside the lock (t_6e1c17e7)
         with self._lock:
             self._raise_if_db_replaced()
             if self._conn is None:

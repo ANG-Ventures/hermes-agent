@@ -36,6 +36,22 @@ def _fleet_root() -> Path:
     return get_default_hermes_root()
 
 
+# gateway.log keeps only ``gateway*`` loggers (hermes_logging.COMPONENT_PREFIXES), so this one line is named there.
+_gw_log = logging.getLogger("gateway.kanban_access_bound_pin")
+_missing_noted = False
+
+
+def _note_missing_entry_point(mod) -> None:
+    """One WARNING per process: the loaded hook has no ``create_refusal``, so studio-requires-reason is open."""
+    global _missing_noted
+    if _missing_noted:
+        return
+    _missing_noted = True
+    _gw_log.warning("studio-requires-reason: %s has no create_refusal(); the board-side check fails OPEN "
+                    "until hooks-installed/current is republished (hooks-install.py sync --check)",
+                    getattr(mod, "__file__", "?"))
+
+
 def _load_hook(root: Path):
     for rel in HOOK_CANDIDATES:
         path = root / rel
@@ -76,6 +92,30 @@ def refusal(body: Optional[str]) -> Optional[str]:
         return mod.verdict(body, mod.pool_hosts(root))
     except Exception:
         _log.debug("access-bound pin: verdict raised; failing open", exc_info=True)
+        return None
+
+
+def studio_refusal(body: Optional[str]) -> Optional[str]:
+    """The hook's studio-requires-reason refusal for this create body, or None (t_4743853f).
+
+    Delegates to the hook module's ``create_refusal(body, root)`` (hermes-home#10978), which owns
+    the verdict and its kill switch ``STUDIO_REQUIRES_REASON=0``. Fail open on no module, an older
+    module without that entry point, or a raise. The access-bound off-marker does not disarm it.
+    An older module is logged once per process to gateway.log (t_6524e9e8: on 2026-11-12 a stale
+    hooks-installed/current with no ``create_refusal`` failed this open, silently, for 3.5 h)."""
+    if not body:
+        return None
+    root = _fleet_root()
+    mod = _load_hook(root)
+    fn = getattr(mod, "create_refusal", None) if mod is not None else None
+    if fn is None:
+        if mod is not None:
+            _note_missing_entry_point(mod)
+        return None
+    try:
+        return fn(body, root)
+    except Exception:
+        _log.debug("studio-requires-reason: create_refusal raised; failing open", exc_info=True)
         return None
 
 

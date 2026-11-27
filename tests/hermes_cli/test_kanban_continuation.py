@@ -133,7 +133,7 @@ def test_hint_is_durable_comment_and_event(db):
     with kb.write_txn(db):
         kc.create_hints(db, child["id"], 'redo ' + parent["id"])
     assert 'recreate with --continues' in db.execute("SELECT body FROM task_comments").fetchone()[0]
-    assert db.execute("SELECT COUNT(*) FROM task_events WHERE kind='placement_hint'").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM task_events WHERE kind='allocation_hint'").fetchone()[0] == 1
 
 
 def test_warn_deduplicates_observation(db):
@@ -308,7 +308,7 @@ def test_full_dispatch_retry_uses_remote_origin(tmp_path, monkeypatch):
         assert kb.get_task(conn, tid).origin_host == 'ace-media'
         assert conn.execute('SELECT host FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == 'ace-media'
         placement = json.loads(conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='placement'", (tid,)).fetchone()[0])
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='allocation'", (tid,)).fetchone()[0])
         assert (placement['route'], placement['rule'], placement['host']) == ('remote-pin', 'origin', 'ace-media')
 
 
@@ -376,7 +376,7 @@ def test_gateway_plan_pool_reads_origin_state_in_the_load_probe(tmp_path, monkey
     (fleet / kwp.ROLES_FILE).write_text(json.dumps({'schema': 1, 'hosts': {
         'ace-media': {'roles': {'kanban-worker': {'slots': 4}}, 'state': 'active'}}}))
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        'schema': 1, 'ssh_user': 'kanbanw', 'capacity_pct': 0.8, 'priority': ['ace-media'],
+        'schema': 1, 'ssh_user': 'ace', 'ssh_identity': '/k/worker', 'capacity_pct': 0.8, 'priority': ['ace-media'],
         'profiles': ['alpha'], 'hosts': {'ace-media': {'enabled': True, 'absence': 'optional'}}}))
     ws = str(tmp_path / 'ws')
     with kb.connect_closing() as conn:
@@ -542,7 +542,7 @@ def test_continues_source_fresh_path_spawns_under_require_mount(mounted_home):
 # so the access-bound rule (spec §2.6) must hold on the origin path too.
 @pytest.mark.parametrize("body", [
     "requires: control-plane-read\nRead the board.\n",
-    "sqlite3 -readonly ~/.hermes/kanban.db 'select 1'\n",
+    "requires: control-plane-read\nsqlite3 -readonly ~/.hermes/kanban.db 'select 1'\n",
 ])
 @pytest.mark.parametrize("with_caps", [True, False])
 def test_access_bound_continuation_never_routes_to_origin(db, body, with_caps):
@@ -556,5 +556,8 @@ def test_access_bound_continuation_never_routes_to_origin(db, body, with_caps):
 
 
 def test_access_bound_origin_reason_names_the_access(db):
-    res = route(db, card(db, body="cat ~/.hermes/fleet/kanban-pool.json\n"))
+    # t_b720fdea: only the declaration binds now; a map is passed so the declared word is judged as access.
+    ctx = khc.CapabilityTick(khc.CapabilityMap(capabilities=("control-plane",),
+                             hosts={"ace-media": frozenset()}), "enforce", (), ("ace-media",))
+    res = route(db, card(db, body="requires: control-plane-read\ncat ~/.hermes/fleet/kanban-pool.json\n"), caps=ctx)
     assert res[0] == "wait" and "access control-plane-read is Studio-only" in res[1]

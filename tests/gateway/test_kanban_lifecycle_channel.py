@@ -48,16 +48,20 @@ def _runner(adapter):
     return runner
 
 
-def _set_channel(value):
+def _set_channel(value, digest=0):
+    """Pins ``lifecycle_digest_seconds`` (default 0 = one post per line) so the routing tests
+    read immediate posts; ``digest=None`` leaves the key absent (the r143 default applies)."""
     path = get_hermes_home() / "config.yaml"
     cfg = yaml.safe_load(path.read_text()) if path.exists() else {}
     cfg = cfg or {}
     cfg.setdefault("kanban", {})["lifecycle_channel"] = value
+    if digest is not None:
+        cfg["kanban"]["lifecycle_digest_seconds"] = digest
     path.write_text(yaml.safe_dump(cfg))
 
 
 def _card(conn, priority=0, mode="notify+wake"):
-    tid = kb.create_task(conn, title="card", assignee="worker", priority=priority)
+    tid = kb.create_task(conn, boomerang_wake=False, title="card", assignee="worker", priority=priority)
     kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="origin",
                       chat_type="group", user_id="u1", delivery_mode=mode)
     return tid
@@ -359,3 +363,75 @@ def test_multi_subscriber_card_digests_one_line(tmp_path, monkeypatch):
     tid, adapter, runner = _run_digest(tmp_path, monkeypatch, 900, make, clock)
     assert adapter.sent == []
     assert len(runner._kanban_lifecycle_digest) == 1
+
+
+# --- r143: default-on digest and per-card repeat collapse ---------------------------------
+
+
+def test_digest_defaults_on_when_key_absent_and_explicit_zero_stays_off(tmp_path, monkeypatch):
+    """r143: the knob was never set on the fleet, so #logs got 1,728 single lines in 48 h.
+    An ABSENT key now means DEFAULT_DIGEST_SECONDS; an explicit 0 keeps one post per line."""
+    from gateway.kanban_lifecycle_digest import DEFAULT_DIGEST_SECONDS, resolve_digest_seconds
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["kanban"]["lifecycle_digest_seconds"] == DEFAULT_DIGEST_SECONDS
+
+    path = get_hermes_home() / "config.yaml"
+    path.write_text(yaml.safe_dump({"kanban": {"lifecycle_channel": f"telegram:{LOG}"}}))
+    assert resolve_digest_seconds() == DEFAULT_DIGEST_SECONDS == 1800
+    path.write_text(yaml.safe_dump({"kanban": {"lifecycle_channel": f"telegram:{LOG}",
+                                               "lifecycle_digest_seconds": 0}}))
+    assert resolve_digest_seconds() == 0
+    path.write_text(yaml.safe_dump({"kanban": {"lifecycle_digest_seconds": "junk"}}))
+    assert resolve_digest_seconds() == 0
+
+
+def test_unset_digest_holds_routed_lines_in_a_real_tick(tmp_path, monkeypatch):
+    """No ``lifecycle_digest_seconds`` key: the three routed lines are held, not posted."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "lc.db"))
+    kb.init_db()
+    _set_channel(f"telegram:{LOG}", digest=None)
+    with kb.connect_closing() as conn:
+        _three(conn)
+    adapter = RecordingAdapter()
+    runner = _runner(adapter)
+    asyncio.run(_tick(monkeypatch, runner))
+    assert adapter.sent == [], adapter.sent
+    assert len(runner._kanban_lifecycle_digest) == 3
+    assert len(adapter.handled) == 3, "wakes are never delayed by the digest"
+
+
+def test_card_bouncing_through_review_is_one_line_per_window():
+    """r143: t_7c67ef3a re-entered review 10 times in 20 h (each a real review_requested
+    after a send-back). Within one window a card's repeats of one kind are ONE line, the
+    newest, tagged xN; other cards and other kinds of the same card stay separate."""
+    from gateway.kanban_lifecycle_digest import render
+
+    def rr(tid, note):
+        return (f"👀 [default] @human:apollo Kanban {tid} ready for review — SDLC L3: green trunk"
+                f"\nauto-routed: PR ANG-Ventures/hermes-home#{note} still open")
+
+    lines = [rr("t_7c67ef3a", 10048), rr("t_aaaa0001", 1), rr("t_7c67ef3a", 10048),
+             rr("t_7c67ef3a", 10520),
+             "✔ [default] @human:apollo Kanban t_7c67ef3a done — SDLC L3: green trunk"]
+    text = render(lines)
+    assert text.startswith("🗂 **kanban lifecycle** — 5 transition(s) (👀 4 · ✔ 1)"), text
+    ready = [ln for ln in text.splitlines() if "t_7c67ef3a ready for review" in ln]
+    assert ready == ["👀 [default] @human:apollo Kanban t_7c67ef3a ready for review ×3 — SDLC L3: green trunk"]
+    assert text.count("t_aaaa0001") == 1
+    assert "Kanban t_7c67ef3a done — SDLC L3" in text
+    # Same collapse in the compact tier (titles that do not fit the full tier).
+    long_title = " — " + "a long card title " * 12
+    many = [f"✔ [default] @w Kanban t_{i:08x} done{long_title}" for i in range(12)]
+    many += [f"👀 [default] @w Kanban t_0000beef ready for review{long_title}"] * 4
+    compact = render(many)
+    assert "👀 t_0000beef×4 a long card title" in compact and compact.count("t_0000beef") == 1
+    assert "16 transition(s)" in compact
+
+
+def test_blocked_reason_containing_done_is_tagged_after_the_verb():
+    from gateway.kanban_lifecycle_digest import render
+
+    line = "⏸ [default] @w Kanban t_0000cafe blocked: waits until the deploy is done"
+    text = render([line, line, "✔ [default] @w Kanban t_00000001 done — x"])
+    assert "Kanban t_0000cafe blocked ×2: waits until the deploy is done" in text, text

@@ -475,7 +475,111 @@ def _chrome_procs(profile: str, exclude: int | None = None) -> list[int]:
     return out
 
 
-@pytest.mark.skipif(not POSIX, reason="POSIX sessions only")
+def _chrome_tree(browser: int, browser_birth: float) -> dict[int, tuple[float, bool]]:
+    """Browser + every descendant: pid -> (birth, is a ``--type=`` helper).
+
+    macOS helpers do not repeat ``--user-data-dir`` in argv, so the profile
+    path names only the browser there; the process tree names them all.
+    """
+    try:
+        root = kb.psutil.Process(browser)
+        if root.create_time() != browser_birth:
+            return {}
+        procs = [root, *root.children(recursive=True)]
+        if not root.is_running():
+            return {}
+    except kb.psutil.Error:
+        return {}
+    tree = {}
+    for p in procs:
+        try:
+            born = p.create_time()
+            helper = any(a.startswith("--type=") for a in kb._safe_cmdline(p))
+            if p.is_running():
+                tree[p.pid] = (born, helper)
+        except kb.psutil.Error:
+            continue
+    return tree
+
+
+@pytest.mark.parametrize("recycled", [None, "root", "helper"])
+def test_chrome_snapshot_rejects_recycled_identities(monkeypatch, recycled):
+    from types import SimpleNamespace
+
+    births = {1234: 10.0, 5678: 20.0}
+    helper = SimpleNamespace(pid=5678, create_time=lambda: 20.0,
+                             is_running=lambda: births[5678] == 20.0)
+
+    def children(recursive):
+        assert recursive
+        if recycled == "helper":
+            births[5678] = 30.0
+        return [helper]
+
+    root = SimpleNamespace(pid=1234, create_time=lambda: births[1234],
+                           is_running=lambda: births[1234] == 10.0, children=children)
+    if recycled == "root":
+        births[1234] = 40.0
+    monkeypatch.setattr(kb.psutil, "Process", lambda pid: root)
+    monkeypatch.setattr(kb, "_member_birth", births.get)
+    monkeypatch.setattr(kb, "_safe_cmdline", lambda p: ["--type=gpu"] if p is helper else [])
+    tree = _chrome_tree(1234, 10.0)
+    expected = {} if recycled == "root" else {1234: (10.0, False)}
+    if recycled is None:
+        expected[5678] = (20.0, True)
+    assert tree == expected
+
+
+def _remember_chrome_tree(
+    tree: dict[int, tuple[float, bool]], snapshot: dict[int, tuple[float, bool]],
+) -> None:
+    for pid, identity in snapshot.items():
+        if pid not in tree:
+            tree[pid] = identity
+            _STARTED.append((pid, identity[0]))
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("recycled", [False, True])
+def test_saved_chrome_tree_teardown_preserves_process_identity(tmp_path, monkeypatch, recycled):
+    # Drive the real fixture teardown with synthetic identities, never real signals.
+    with monkeypatch.context() as m:
+        fixture = conn.__wrapped__(tmp_path, m)
+        next(fixture)
+        signals = []
+        births = {1234: 10.0, 5678: 30.0}
+        m.setattr(kb, "_member_birth", births.get)
+        m.setattr(os, "getpgid", lambda pid: pid)
+        def signal(pid, sig):
+            if sig == 0:
+                raise ProcessLookupError(pid)
+            signals.append(pid)
+
+        m.setattr(os, "killpg", signal)
+        m.setattr(os, "kill", signal)
+        try:
+            tree = {}
+            _remember_chrome_tree(tree, {1234: (10.0, True)})
+            if recycled:
+                births[1234] = 20.0
+            _remember_chrome_tree(tree, {
+                1234: (births[1234], True), 5678: (30.0, True),
+            })
+            if recycled:
+                assert (1234, births[1234]) not in _STARTED
+            assert tree[1234] == (10.0, True)
+        finally:
+            with pytest.raises(StopIteration):
+                next(fixture)
+        assert set(signals) == ({5678} if recycled else {1234, 5678})
+
+
+def _tree_survivors(tree: dict[int, tuple[float, bool]]) -> list[int]:
+    return [pid for pid, (born, _) in tree.items()
+            if kb._member_birth(pid) == born and kb._pid_alive(pid)]
+
+
+@pytest.mark.platforms("posix")
 def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     _skip_if_host_saturated()
     chrome = _headless_chrome()
@@ -502,14 +606,21 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     kb._register_worker_identity(worker.pid, tid, task.current_run_id, spawned_at)
     assert kbd._set_worker_pid(conn, tid, worker.pid)
     browser = int(worker.stdout.readline())
-    _track(browser)
+    browser_birth = kb._member_birth(browser)
+    assert browser_birth is not None
+    _STARTED.append((browser, browser_birth))
     deadline = time.monotonic() + 15
-    # The worker's own argv carries the profile path: count only Chrome's processes.
-    while time.monotonic() < deadline and len(_chrome_procs(profile, worker.pid)) < 2:
+    # A real helper (renderer/gpu/utility) in the browser's tree, not argv
+    # matches on the profile path (t_5dc9a37a).
+    tree = _chrome_tree(browser, browser_birth)
+    while time.monotonic() < deadline and not any(h for _, h in tree.values()):
         time.sleep(0.2)
-    leaked = _chrome_procs(profile, worker.pid)
-    assert len(leaked) >= 2, "Chrome did not start its helpers; drill proves nothing"
-    _track(*leaked)
+        tree = _chrome_tree(browser, browser_birth)
+    assert any(h for _, h in tree.values()), \
+        f"Chrome did not start its helpers; drill proves nothing ({tree})"
+    observed = tree
+    tree = {}
+    _remember_chrome_tree(tree, observed)
     # The live per-run census sees the browser too (Linux Chrome erases its
     # environ window; the profile path under the card workspace names it).
     key = (tid, str(task.current_run_id))
@@ -530,12 +641,14 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
         time.sleep(0.05)
     assert worker.pid in exited
     assert kb._pid_alive(browser), "Chrome died with its worker; drill proves nothing"
+    _remember_chrome_tree(tree, _chrome_tree(browser, browser_birth))
 
     assert kb.reap_exited_worker_leftovers(conn, exited, grace=5.0) == [tid]
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and _chrome_procs(profile):
+    while time.monotonic() < deadline and (_chrome_procs(profile) or _tree_survivors(tree)):
         time.sleep(0.2)
     assert _chrome_procs(profile) == [], "Chrome outlived its card"
+    assert _tree_survivors(tree) == [], "Chrome helpers outlived their card"
 
 
 # ---------------------------------------------------------------------------

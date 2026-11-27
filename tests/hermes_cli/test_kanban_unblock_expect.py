@@ -27,7 +27,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 def _blocked(conn, reason="unblock_when: after:+1m"):
     t = kb.create_task(conn, title="parked", assignee="daedalus")
-    assert kb.block_task(conn, t, reason=reason)
+    assert kb.block_task(conn, t, reason=reason, kind="needs_input")
     return t
 
 
@@ -70,8 +70,8 @@ def test_new_comment_between_read_and_write_is_left_blocked(kanban_home):
 
 def test_expectation_refuses_a_non_blocked_card(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="scheduled", assignee="daedalus")
-        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (t,))
+        t = kb.create_task(conn, title="scheduled", assignee="daedalus",
+                           until=int(time.time()) + 3600)
         assert not kb.unblock_task(conn, t, expect_block_event=0)
         assert kb.unblock_task(conn, t)   # without an expectation the old behaviour holds
 

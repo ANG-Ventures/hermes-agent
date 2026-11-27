@@ -1190,8 +1190,12 @@ def _state(conn, task_id):
     return (json.loads(row[0]), row[1], json.loads(row[2]) if row[2] else None) if row else ({}, None, None)
 
 
-def record_baseline(conn, task_id, workspace):
-    """Record once, before dispatch; retries must not reset the task's base."""
+def record_baseline(conn, task_id, workspace, *, run_id=None):
+    """Record once, before dispatch; retries must not reset the task's base.
+
+    ``run_id``: write only while that run still owns the card (same transaction), else raise
+    ``ClaimLost`` (Prism c08a3c9d1616, t_89e3e083): a successor run must not inherit this launch's base.
+    """
     from hermes_cli.kanban_delegations_board import conn_is_delegations
 
     if conn_is_delegations(conn):
@@ -1218,6 +1222,11 @@ def record_baseline(conn, task_id, workspace):
             bases[key] = head.stdout.decode().strip() if head.returncode == 0 else None
         _warn_borrowed_from_workspace(repo, key, workspace)
     with kb.write_txn(conn):
+        if run_id is not None and conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (task_id, int(run_id)),
+        ).fetchone() is None:
+            raise kb.ClaimLost(f"{task_id}: run {run_id} no longer owns the card")
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
             "ON CONFLICT(task_id) DO NOTHING",
@@ -2233,12 +2242,11 @@ def _snapshot(repo, base, prefix, *, irreversible_delete=False):
 _SNAPSHOT_TIMEOUT = 300
 
 
-def _capture(repo, key, workspace, recorded=None):
+def _capture(repo, key, workspace, recorded=None, *, retain_unbased_history=False):
     """One repository's survivor material: (remote ref, base, snapshot bytes).
 
-    Extracted verbatim from `preserve`'s loop so the object-reading steps sit
-    inside a single `try` the caller can classify. ``recorded`` is the
-    repository's dispatch-time base from `bases` (see `_recorded_base`).
+    ``recorded`` is the dispatch-time base. With ``retain_unbased_history``,
+    (None, None, None) means retain the checkout instead of bundling its history.
     """
     storage_cache = {}
     published = list(_published_refs(repo, workspace, storage_cache))
@@ -2266,6 +2274,8 @@ def _capture(repo, key, workspace, recorded=None):
             return ref, None, None
     base = _recorded_base(repo, recorded, published, _base(repo, published))
     if base is None:
+        if retain_unbased_history and head.returncode == 0:
+            return None, None, None
         _require_live_boundary(repo, published)
     prefix = "" if key == "." else key + "/"
     return None, base, _snapshot(repo, base, prefix)
@@ -3174,7 +3184,7 @@ def _merge_refs(fresh, recorded):
                           if not isinstance(ref, dict) or ref.get("repository") not in seen]
 
 
-def _record(conn, task_id, survivor, previous):
+def _record(conn, task_id, survivor, previous, *, retain_reason=None):
     """The ONLY writer of the survivor column -- and therefore the only place
     the non-shrink invariant can be enforced for every exit at once.
 
@@ -3196,6 +3206,8 @@ def _record(conn, task_id, survivor, previous):
         )
         if survivor and survivor != previous:
             kb._append_event(conn, task_id, "workspace_survivor", survivor)
+        if retain_reason:
+            _hold_in_txn(conn, task_id, retain_reason)
     return survivor
 
 
@@ -3341,6 +3353,19 @@ def _nested_beside_landed(conn, task_id, metadata, evidence, explicit, previous,
     ), previous)
 
 
+def _follow_up_board(conn, card):
+    """Where a ``--survivor-none`` follow-up card lives: ``""`` on this card's own board, the
+    slug of the ONE other board holding it, or ``None`` when no board does (or it is ambiguous
+    or a board is unreadable: never a guess). A follow-up is often minted on the board that owns
+    the work, not the one the closing card sits on (pc-d96e13d5)."""
+    if kb.get_task(conn, card):
+        return ""
+    try:
+        return kb.board_of_task(card)
+    except (kb.KanbanBoardDerivationError, OSError, sqlite3.Error):
+        return None
+
+
 def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
              survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
              survivor_none=False, survivor_reason=None, content_survivor=None):
@@ -3423,10 +3448,15 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 raise SurvivorUnavailable("survivor_unavailable: survivor-none cannot be mixed with remote claims")
             reason = (survivor_reason or "").strip()
             followups = re.findall(r"\bt_[0-9a-f]{8}\b", reason)
-            if not reason or len(followups) != 1 or not kb.get_task(conn, followups[0]):
-                raise SurvivorUnavailable("survivor_unavailable: survivor-none needs a reason naming one existing follow-up card")
-            return _record(conn, task_id, {"kind": "none", "reason": reason,
-                                            "follow_up_card": followups[0]}, previous)
+            follow_board = _follow_up_board(conn, followups[0]) if len(followups) == 1 else None
+            if not reason or follow_board is None:
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: survivor-none needs a reason naming one existing follow-up "
+                    "card (on any board, e.g. 'follow-up <board>:t_xxxxxxxx')")
+            none = {"kind": "none", "reason": reason, "follow_up_card": followups[0]}
+            if follow_board:
+                none["follow_up_board"] = follow_board
+            return _record(conn, task_id, none, previous)
         stage = "remote survivor verification"
         explicit = _verified_explicit(task_id, survivor_ref, survivor_pr,
                                       unbound=survivor_unbound)
@@ -3727,6 +3757,14 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # external path below records `explicit` on its own; seeding it
                 # here too would duplicate the ref.
                 carried = [dict(ref, repository=key) for key, ref in sorted(explicit.items())]
+        # A bound, explicitly named merge proves delivery, not the contents of
+        # a surviving checkout. Prefer the normal ref/patch proof, but do not
+        # pack that checkout's entire history just to close the card. Limit the
+        # fallback to one present repository with no competing recovery claims.
+        merge = explicit.get(None) if survivor_pr and len(explicit) == 1 else None
+        retain_unbased_history = (not cleanup and len(repos) == 1 and not missing
+                                  and merge is not None and merge.get("state") == "MERGED"
+                                  and not merge.get("unbound"))
         patches, refs, bundles, repositories = [], list(carried), list(carried_bundles), []
         for repo in repos:
             key = str(repo.relative_to(workspace))
@@ -3738,7 +3776,14 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 refs.append(dict(stub_ref, repository=key))
                 continue
             try:
-                ref, base, data = _capture(repo, key, workspace, (bases or {}).get(key))
+                ref, base, data = _capture(repo, key, workspace, (bases or {}).get(key),
+                                           retain_unbased_history=retain_unbased_history)
+                if (ref, base, data) == (None, None, None):
+                    # Publish the hold with the PR evidence: local cleanup must
+                    # not try to recapture or delete the retained workspace.
+                    return _record(conn, task_id, {"kind": "ref", "refs": [dict(merge, repository=key)]},
+                                   previous, retain_reason="survivor_unavailable: workspace retained after "
+                                   "merged PR close; no verified base for local history")
                 irreversible = False
                 if base is not None and data and len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
                     # Only deleted-file preimages are dropped, and those are
@@ -3890,21 +3935,77 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         raise _refusal(reason) from exc
 
 
-# The remote deleter's proof, shipped as ONE argv over ssh (keep it < 4 KB: fleet-nas seccomp note).
+# "Does this clone hold commits no remote has?" (t_19c48fb7). ONE source, exec'd here for local callers
+# (kanban_reclaim) and spliced into _REMOTE_PROOF for the ssh probe. Unpushed BRANCH commits (plus any
+# `extra` revs, e.g. HEAD) are stranded. A tag is stranded only when its commit is off every remote AND
+# the remote does not advertise that same tag: `rev-list --tags --not --remotes` alone read a clean
+# clone as stranded whenever origin carries a tag on no branch (courierwatch-v1, port_stranded on
+# t_6e7909d1/t_a982e7eb). `git(d,*args)->str` must raise on failure: unreadable remote tags = unknown,
+# and the caller holds, never "clean". Returns the stranded reason or ''.
+_STRANDED_SRC = r'''
+def stranded(git,d,extra=()):
+ if git(d,'rev-list','--branches',*extra,'--not','--remotes').strip(): return 'local commits not on any remote'
+ if not git(d,'rev-list','--tags','--not','--remotes').strip(): return ''
+ seen=set()
+ for r in git(d,'remote').split():
+  try: seen|={tuple(l.split('\t')) for l in git(d,'ls-remote','--tags',r).splitlines()}
+  except Exception: raise RuntimeError('remote tags unreadable: stranded work unknown')
+ own=[n for s,n in (l.split(' ',1) for l in git(d,'for-each-ref','--format=%(objectname) %(refname)','refs/tags').splitlines()) if (s,n) not in seen]
+ if own and git(d,'rev-list',*own,'--not','--remotes').strip(): return 'local commits not on any remote'
+ return ''
+'''
+exec(_STRANDED_SRC)
+
+
+# The remote deleter's proof, shipped as ONE argv over ssh. Linux caps one argv string at MAX_ARG_STRLEN
+# (128 KiB); the test pins it < 8 KB so it stays reviewable (t_f47e4e3f: a 64 KB argv ran on ace-media, ci-box and
+# fleet-nas; the fleet-nas seccomp note is middlewared's cron exec filter, not an argv length limit).
 # Only independently durable CLEAN repositories (or an empty dir) may be removed remotely. Untracked
 # scratch/dirty work is held, never mistaken for the Studio's empty copy of the same path. Dirt that is
 # all residue (R/F == _RESIDUE_DIRS/_RESIDUE_FILES, untracked or ignored, no hidden-edit flag) is clean.
-_REMOTE_PROOF = r'''import os,sys,subprocess,shutil,fnmatch
+# HEAD durability (t_3af8cae9, t_f47e4e3f): the clone must have no alternates, grafts, refs/replace, shallow file
+# or partial-clone setting, and EVERY remote's effective url must be GitHub (G; never shallow, cannot borrow this
+# clone's objects), else held unsupported:<shape> before either answer. Then HEAD is durable when it is an
+# advertised tip, or an ancestor of one: first the advertised heads already in this clone (no fetch), then the
+# remote's HEAD, then the remaining heads (hermes-home advertises ~1,200; fetching them all cost 6 s of 12).
+# Refuse, don't model: those shapes change what rev-list calls an ancestor (Prism 4ad6b4e63f59, 051b2f1f71e3).
+# A refs/replace ref holds even at an exact tip: its target may live only here (Prism b6d2f9d152e3).
+_REMOTE_PROOF = r'''import os,sys,subprocess,shutil,fnmatch,re
+os.environ['GIT_NO_REPLACE_OBJECTS']='1'
+G=('https://github.com/','git@github.com:','ssh://git@github.com/');U='HEAD durability unknown'
 from pathlib import Path
+E=RuntimeError
 R=("__pycache__", ".pytest_cache", ".venv", "node_modules", ".mypy_cache", ".ruff_cache")
 F=("*.pyc", ".coverage")
 p=Path(sys.argv[1])
 if not p.is_absolute() or str(p.resolve())!=str(p) or p.is_symlink(): sys.exit(12)
 if not p.exists(): sys.exit(0)
-def git(repo,*args):
- r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,timeout=12,stdin=subprocess.DEVNULL)
- if r.returncode: raise RuntimeError('git proof failed')
+def git(repo,*args,i=None):
+ r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,timeout=12,input=(i or '').encode())
+ if r.returncode:raise E('git proof failed')
  return r.stdout.decode('utf-8','surrogateescape')
+'''+_STRANDED_SRC+r'''def durable(d,sha):
+ e=lambda x:(d/git(d,'rev-parse','--git-path',x).strip()).exists()
+ for k,t in('alternates',e('objects/info/alternates')),('grafts',e('info/grafts')),('shallow',e('shallow')),('partial_clone',re.search(r'partialclone=.|\.promisor=(true|yes|on|1)$',git(d,'config','-l').lower(),re.M)):
+  if t:raise E('unsupported:'+k)
+ n=git(d,'remote').split();w=''
+ for r in n:
+  if not git(d,'ls-remote','--get-url',r).startswith(G):raise E('unsupported:remote_not_github')
+ for r in n:
+  try:
+   a=[l.split('\t')for l in git(d,'ls-remote',r).splitlines()]
+   if any(s==sha for s,_ in a):return 1
+   m=[s for s,x in a if x.startswith('refs/heads/')]
+   k={l.split()[0]for l in git(d,'cat-file','--batch-check',i=''.join(s+'\n'for s in m)).splitlines()if l.split()[1:2]==['commit']}
+   c=0
+   for t in([],[s for s,x in a if x=='HEAD'],m):
+    t=sorted(set(t)-k)
+    if t:git(d,'fetch','-q','--no-tags','--no-write-fetch-head',r,*t);k|=set(t)
+    elif c:continue
+    c=1
+    if k and git(d,'rev-list','--count','--stdin',i=sha+'\n'+''.join('^'+s+'\n'for s in k))=='0\n':return 1
+  except Exception:w=U
+ if w:raise E(w)
 def res(s):
  q=[x for x in s.rstrip('/').split('/') if x]
  ds=q if s.endswith('/') else q[:-1]
@@ -3923,22 +4024,24 @@ def h(d):
 def prove(d):
  g=d/'.git'
  if g.is_symlink() or g.exists():
-  if g.is_symlink() or g.is_file(): raise RuntimeError('registered worktree or redirected .git requires git worktree remove')
+  if g.is_symlink() or g.is_file():raise E('registered worktree or redirected .git requires git worktree remove')
   st=[r for r in git(d,'status','--porcelain=v1','-z','--untracked-files=all','--ignored','--ignore-submodules=none').split('\0') if r]
-  if st and not all(r[:2] in('??','!!') and res(r[3:]) and not h(d/r[3:]) for r in st): raise RuntimeError('dirty, ignored or untracked work')
-  if any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2): raise RuntimeError('skip-worktree or assume-unchanged files')
-  if git(d,'stash','list'): raise RuntimeError('stashes')
-  if git(d,'rev-list','--branches','--tags','--not','--remotes'): raise RuntimeError('local commits not on any remote')
-  sha=git(d,'rev-parse','HEAD').strip()
-  remotes=git(d,'remote').splitlines()
-  if not any(any(line.split()[0]==sha for line in git(d,'ls-remote',remote).splitlines()) for remote in remotes):
-   raise RuntimeError('HEAD has no independently durable ref')
+  if st and not all(r[:2] in('??','!!') and res(r[3:]) and not h(d/r[3:]) for r in st):raise E('dirty, ignored or untracked work')
+  if any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2):raise E('skip-worktree or assume-unchanged files')
+  if git(d,'stash','list'):raise E('stashes')
+  if git(d,'for-each-ref','refs/replace'):raise E('unsupported:replace_refs')
+  w=stranded(git,d)
+  if w:raise E(w)
+  if not durable(d,git(d,'rev-parse','HEAD').strip()):raise E('HEAD has no independently durable ref')
   return
  for f in d.iterdir():
-  if f.is_symlink() or not f.is_dir(): raise RuntimeError('unpreserved scratch files')
+  if f.is_symlink() or not f.is_dir():raise E('unpreserved scratch files')
   prove(f)
 try:
  prove(p)
+ if sys.argv[2:]==['check']:
+  print(git(p,'rev-parse','HEAD').strip() if (p/'.git').is_dir() else '')
+  sys.exit(0)
  shutil.rmtree(p)
  print('removed')
 except Exception as e:
@@ -3968,10 +4071,10 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
                 raise SurvivorUnavailable("survivor_unavailable: reclaim held (needs a local scratch tree "
                                           "and a task connection)")
             workspace = Path(path).expanduser().resolve(strict=True)
-            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
+            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):  # noqa: root-equality -- equality refuses deletion too
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             kanban_reclaim.verify_unchanged(workspace, reclaimed)
-            shutil.rmtree(workspace)
+            shutil.rmtree(workspace)  # noqa: gate-dominance -- caller gates liveness; verify_unchanged above gates reclaim proof
             kanban_reclaim.record(conn, task_id, reclaimed)
             return True
         if remote_host is not None:
@@ -4007,7 +4110,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
             ):
                 raise SurvivorUnavailable("survivor_unavailable: no task connection or durable ref")
         else:
-            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
+            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):  # noqa: root-equality -- equality refuses deletion too
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             preserve(conn, task_id, cleanup=True, workspace=workspace)
             push_unpushed_survivor(conn, task_id, workspace)
@@ -4036,7 +4139,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
             if result.returncode:
                 raise SurvivorUnavailable("survivor_unavailable: git refused workspace removal")
         else:
-            shutil.rmtree(workspace)
+            shutil.rmtree(workspace)  # noqa: gate-dominance -- caller gates liveness; branches above refuse missing survivor proof
         return True
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
         reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: removal failed"

@@ -160,6 +160,16 @@ CONTENTALIAS_ERROR_CODES: Mapping[str, BridgeCode] = {
     # aliased input) and reports only this code, so the cause is upstream's.
     "upstream_failure": BridgeCode(_LANE, "upstream error via content-alias",
                                    "upstream error, body withheld by the alias layer", ours=False),
+    # Not a refusal: the alias layer's upstream READ failed (reader.go: any non-EOF
+    # source error -> stream_transport). On the Studio dtlr/alr units that leg runs
+    # through the seat's box forwarder (tinyproxy :18814), but a timeout or reset from
+    # upstream through a healthy forwarder carries the same code, and the unit reports
+    # only the code (no dial text reaches the row), so this names the leg, not a culprit
+    # (t_6e7909d1).
+    "stream_transport": BridgeCode(_LANE, "upstream connection failed",
+                                   "the unit's upstream connection failed on the box forwarder leg "
+                                   "(the forwarder refused or dropped it, or the upstream dropped it)",
+                                   ours=False),
 }
 
 
@@ -214,6 +224,8 @@ def bridge_code_where(code: str) -> str:
     """``at the relay`` / ``at the DPX alias layer`` / ``at the bridge``."""
     if code == "mode_not_allowed":
         return "at the relay"
+    if code == CONTENTALIAS_PREFIX + "stream_transport":
+        return "reported by the DPX unit"
     return ("at the DPX alias layer" if str(code).startswith(CONTENTALIAS_PREFIX)
             else "at the bridge")
 

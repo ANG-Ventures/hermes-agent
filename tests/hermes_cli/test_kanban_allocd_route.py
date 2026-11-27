@@ -21,10 +21,12 @@ from __future__ import annotations
 import dataclasses
 import json
 import shutil
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,7 +39,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli.fleet_placement import placement
-from hermes_cli import placement_policy as pp
+from hermes_cli import allocation_policy as pp
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "kanban_placement" / "allocd_replay.json"
 JOB_FIELDS = tuple(f.name for f in dataclasses.fields(placement.Job))
@@ -87,7 +89,24 @@ class FakeAllocd:
         if path == "/admit":
             return self.admit(req)
         if path == "/release":
-            return (200, {"released": True}) if placement.release(req["reservation_id"]) else (410, {"gone": True})
+            refused = None
+            if req.get("actual") is not None:   # do_release: a refused actual still ends the lease, unrecorded
+                try:
+                    ok = placement.release(req["reservation_id"], owner=req["consumer"], actual=req["actual"],
+                                           actual_source=req.get("actual_source"))
+                except placement.ActualRefused as exc:
+                    refused = str(exc)
+                    ok = placement.release(req["reservation_id"], owner=req["consumer"])
+            else:
+                ok = placement.release(req["reservation_id"])
+            if not ok:
+                return 410, {"gone": True}
+            return 200, {"released": True, **({"actual_refused": refused} if refused else {})}
+        if path == "/demand/publish":       # the pair door's enqueue / withdraw / queue verbs (t_dd7a1b7d)
+            return 200, {"schema": 1, "workload": req.get("workload"), "host": req.get("host"), "ok": True,
+                         "door": {"at": self.clock()}}
+        if path == "/demand/authorize":
+            return self.authorize(req)
         if path == "/renew":
             ok = placement.renew(req["reservation_id"], ttl_s=req.get("ttl_s", 1800.0), now=self.clock())
             return (200, {"renewed": True}) if ok else (410, {"gone": True})
@@ -127,6 +146,21 @@ class FakeAllocd:
                 out["unified"] = True
             return 200, out
         return 409, {"refused": True, "reason": d.reason}
+
+    def authorize(self, req):
+        """allocd's door authorize with an existing capacity lease: the SAME row is retagged to the pair identity
+        ``<workload>@<host>`` (its release then names that owner) and its id comes back."""
+        rid, owner = req.get("existing_reservation_id"), f"{req['workload']}@{req['host']}"
+        rpath = placement.reservations_path()
+        with placement._locked(rpath):
+            doc = placement._read_ledger(rpath)
+            row = next((r for r in doc["rows"] if r.get("id") == rid), None)
+            if row is None:
+                return 409, {"reason": "capacity", "detail": f"no live row {rid}"}
+            row["consumer"] = owner
+            placement._write_ledger(rpath, doc)
+        return 200, {"schema": 1, "workload": req["workload"], "host": req["host"], "id": req["id"],
+                     "reservation_id": rid, "until": self.clock() + 90, "reused": False}
 
     @staticmethod
     def confirm_class(table, consumer, job, rid, samples, *, now, stale_after_s):
@@ -640,10 +674,293 @@ def test_dispatch_off_worker_placed_has_no_route_marker(home, monkeypatch):
             kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=4, spawn_paused=None, spawn_limit=0,
                               spillover=plan, reconcile_orphans=False)
             payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
-                                              (tid, "worker_placed")).fetchone()[0])
+                                              (tid, "worker_allocated")).fetchone()[0])
             kb.complete_task(conn, tid, summary="done")
     finally:
         loud.close()
     assert kh.RESERVATION_KEY in payload and kh.RESERVATION_VIA_KEY not in payload
     assert loud.requests == []
 
+
+
+# -- t_26acfaa2: the run-end release carries the run's measured use (FWA footprints) ---------------
+
+def _dispatch_on(home, *, door_on=False):
+    f = Fleet()
+    _pressure_from_fleet(home, f)
+    plan = _plan(home, f, now=time.time())
+    plan.signal.allocd = kh.ALLOCD_ON
+    conn = kb.connect()
+    tid = kb.create_task(conn, title="c", assignee="alpha")
+    kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, *, board=None, placement=None: FAKE_PID,
+                      max_spawn=4, spawn_paused=None, spawn_limit=0, spillover=plan, reconcile_orphans=False)
+    run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+    rid, via = kh.run_reservation(conn, tid, run_id)
+    # with the door on the run's lease is the door's (run_reservation hands it no rid: _end_run leaves it alone)
+    assert (rid, via) == (None, None) if door_on else (rid and via == kh.VIA_ALLOC_CLIENT)
+    placed = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_allocated'",
+                                     (tid,)).fetchone()[0])
+    assert placed["target"].endswith(f"@{placed['host']}") and not placed["target"].startswith("kanbanw@")
+    return conn, tid, run_id, rid, placed["host"], placed["target"]   # target: the owner login the pool row names
+
+
+def _releases(allocd, rid):
+    return [r for p, r in allocd.requests if p == "/release" and r["reservation_id"] == rid]
+
+
+def _usage_rows(home):
+    p = placement.class_usage_path()
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()] if p.exists() else []
+
+
+def test_run_end_release_carries_actual_source_and_host(home, allocd, monkeypatch):
+    seen = []
+
+    def measure(fp):
+        seen.append(dict(fp))
+        return {"host": fp["host"], "cpus": 0.4, "ram_gb": 1.25, "gpu_mib": 0.0, "cpu_s": 120.0, "wall_s": 300.0}
+
+    monkeypatch.setattr(kh, "measure_run_footprint", measure)
+    conn, tid, run_id, rid, host, target = _dispatch_on(home)
+    try:
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+    assert seen == [{"host": host, "target": target, "port": 22, "run_id": run_id}]
+    [req] = _releases(allocd, rid)
+    assert req["actual_source"] == kh.FOOTPRINT_SOURCE == "cgroup"
+    assert req["actual"]["host"] == host and req["actual"]["ram_gb"] == 1.25
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    [row] = _usage_rows(home)
+    assert row["host"] == host and row["ram_gb"] == 1.25
+
+
+def test_measurement_failure_still_releases_without_actual(home, allocd, monkeypatch, caplog):
+    def measure(fp):
+        raise RuntimeError("no live ssh master")
+
+    monkeypatch.setattr(kh, "measure_run_footprint", measure)
+    conn, tid, run_id, rid, host, _target = _dispatch_on(home)
+    with caplog.at_level("INFO", logger=kh.__name__):
+        try:
+            kb.complete_task(conn, tid, summary="done")
+        finally:
+            conn.close()
+    assert _releases(allocd, rid) == [{"consumer": "kanban", "reservation_id": rid}]
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    assert [m for m in caplog.messages if "carries no actual" in m and "no live ssh master" in m]
+    assert _usage_rows(home) == []
+
+
+def test_host_mismatch_is_the_servers_refusal_not_a_crash(home, allocd, monkeypatch, caplog):
+    monkeypatch.setattr(kh, "measure_run_footprint",
+                        lambda fp: {"host": "some-other-box", "cpus": 0.4, "ram_gb": 1.0, "gpu_mib": 0.0})
+    conn, tid, run_id, rid, host, _target = _dispatch_on(home)
+    with caplog.at_level("WARNING", logger=kh.__name__):
+        try:
+            kb.complete_task(conn, tid, summary="done")
+        finally:
+            conn.close()
+    [req] = _releases(allocd, rid)
+    assert req["actual"]["host"] == "some-other-box"
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)   # the lease still ended
+    assert _usage_rows(home) == []                                              # the measurement did not land
+    assert [m for m in caplog.messages if "actual not recorded" in m]
+
+
+# -- t_dd7a1b7d: the path live spawns take. With the door on (fcfs), the start upgrades the capacity lease to
+# kanban@<host> and writes door_authorized; _end_run then leaves the lease to the door, and the NEXT dispatcher
+# tick's lifecycle sweep (kanban_priority_door.maintain) is what releases it. That release must carry the actual.
+
+def _door_on(home):
+    (home / "fleet" / "admission-priority.json").write_text(json.dumps({"schema": 1, "priority_mode": "fcfs"}),
+                                                           encoding="utf-8")
+    d = home / alloc_client.TOKENS_REL
+    d.mkdir(parents=True, exist_ok=True)
+    for name in ("kanban", "asap-operator", "test-gate", "test-gate-local-venue",
+                 *(f"kanban@{h}" for h in TABLE["hosts"])):
+        (d / name).write_text(f"tok-{name.replace('@', '-')}\n", encoding="utf-8")
+
+
+def _door_run_ended(home, monkeypatch, measure):
+    """A pool-host spawn through the REAL dispatch tick with the door on, its run completed, then one more tick."""
+    from hermes_cli import kanban_priority_door as door
+    _door_on(home)
+    assert door.enabled()
+    monkeypatch.setattr(kh, "measure_run_footprint", measure)
+    conn, tid, run_id, _cap_rid, host, target = _dispatch_on(home, door_on=True)
+    try:
+        grant = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
+                                        (tid, run_id, door.EVENT)).fetchone()[0])
+        kb.complete_task(conn, tid, summary="done")
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: FAKE_PID, max_spawn=4, spawn_paused=None, spawn_limit=0,
+                          reconcile_orphans=False)
+        released = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
+                                (tid, run_id, door.RELEASED)).fetchone()[0]
+    finally:
+        conn.close()
+    return tid, run_id, grant, host, target, released
+
+
+def test_door_run_release_carries_actual_through_the_lifecycle_sweep(home, allocd, monkeypatch):
+    seen = []
+
+    def measure(fp):
+        seen.append(dict(fp))
+        return {"host": fp["host"], "cpus": 0.4, "ram_gb": 1.25, "gpu_mib": 0.0, "cpu_s": 120.0, "wall_s": 300.0}
+
+    tid, run_id, grant, host, target, released = _door_run_ended(home, monkeypatch, measure)
+    assert grant["consumer"] == f"kanban@{host}"
+    assert seen == [{"host": host, "target": target, "port": 22, "run_id": run_id}]
+    [req] = _releases(allocd, grant["reservation_id"])
+    assert req["consumer"] == f"kanban@{host}"
+    assert req["actual_source"] == kh.FOOTPRINT_SOURCE == "cgroup"
+    assert req["actual"]["host"] == host and req["actual"]["ram_gb"] == 1.25
+    assert released == 1
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    [row] = _usage_rows(home)
+    assert row["host"] == host and row["ram_gb"] == 1.25
+    assert row["class"] == placement.job_class_for("kanban")
+
+
+def test_door_run_measurement_failure_still_releases(home, allocd, monkeypatch, caplog):
+    def measure(fp):
+        raise RuntimeError("no live ssh master")
+
+    with caplog.at_level("INFO"):
+        tid, run_id, grant, host, _target, released = _door_run_ended(home, monkeypatch, measure)
+    assert _releases(allocd, grant["reservation_id"]) == [
+        {"consumer": f"kanban@{host}", "reservation_id": grant["reservation_id"]}]
+    assert released == 1
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    assert [m for m in caplog.messages if "carries no actual" in m and "no live ssh master" in m]
+    assert _usage_rows(home) == []
+
+
+def test_door_run_refused_actual_is_a_warning_and_the_lease_ends(home, allocd, monkeypatch, caplog):
+    measure = lambda fp: {"host": "some-other-box", "cpus": 0.4, "ram_gb": 1.0, "gpu_mib": 0.0}
+    with caplog.at_level("WARNING"):
+        tid, run_id, grant, host, _target, released = _door_run_ended(home, monkeypatch, measure)
+    [req] = _releases(allocd, grant["reservation_id"])
+    assert req["actual"]["host"] == "some-other-box"
+    assert released == 1                                                        # marked: never released twice
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    assert _usage_rows(home) == []
+    assert [m for m in caplog.messages if "actual not recorded" in m]
+
+
+def _fake_ssh(script_out, *, check_rc=0, rc=0):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if "-O" in argv:
+            return SimpleNamespace(returncode=check_rc, stdout="", stderr="")
+        return SimpleNamespace(returncode=rc, stdout=script_out, stderr="")
+    return run, calls
+
+
+@pytest.fixture
+def sock(tmp_path, monkeypatch):
+    import tempfile
+    from tools.environments.ssh import control_socket_path
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    s = control_socket_path("kanbanw", "ace-media", 22, "run7")
+    s.parent.mkdir(parents=True, exist_ok=True)
+    s.touch()
+    return s
+
+
+FP = {"host": "ace-media", "target": "kanbanw@ace-media", "port": 22, "run_id": 7}
+
+
+def test_measure_reads_the_runs_own_master(sock):
+    run, calls = _fake_ssh("fp 1610612736 600000000   1200 512\n")
+    got = kh.measure_run_footprint(FP, runner=run)
+    assert got == {"host": "ace-media", "cpus": 0.5, "ram_gb": 1.5, "cpu_s": 600.0, "wall_s": 1200.0, "gpu_mib": 512.0}
+    assert all(c[:3] == ["ssh", "-S", str(sock)] and "ControlMaster=no" in c for c in calls)
+    assert calls[0][-3:] == ["-O", "check", "kanbanw@ace-media"]
+
+
+def test_measure_without_nvidia_smi_leaves_gpu_unmeasured(sock):
+    run, _ = _fake_ssh("fp 1073741824 1000000 10 -\n")
+    assert "gpu_mib" not in kh.measure_run_footprint(FP, runner=run)
+
+
+@pytest.mark.parametrize("out,check_rc,rc", [("", 255, 0), ("no session scope: /user.slice\n", 0, 3),
+                                             ("garbage\n", 0, 0)])
+def test_measure_refuses_a_dead_master_or_unreadable_scope(sock, out, check_rc, rc):
+    run, calls = _fake_ssh(out, check_rc=check_rc, rc=rc)
+    with pytest.raises(RuntimeError):
+        kh.measure_run_footprint(FP, runner=run)
+    if check_rc:
+        assert len(calls) == 1   # never a fresh connection that would measure a new session
+
+
+def _sibling(plain, tag="ab12cd34"):
+    s = plain.with_name(f"{plain.stem[:8]}{tag}.sock")   # SSHEnvironment._control_socket_for's SendEnv master
+    s.touch()
+    return s
+
+
+def _per_socket_ssh(outs):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        out = outs[argv[2]]
+        if "-O" in argv:
+            return SimpleNamespace(returncode=255 if out is None else 0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout=out, stderr="")
+    return run, calls
+
+
+def test_measure_sums_the_execution_master_with_the_plain_one(sock):
+    sib = _sibling(sock)
+    run, calls = _per_socket_ssh({str(sock): "fp 1073741824 1000000 100 -\n",
+                                  str(sib): "fp 2147483648 199000000 400 256\n"})
+    got = kh.measure_run_footprint(FP, runner=run)
+    assert got == {"host": "ace-media", "cpus": 0.5, "ram_gb": 3.0, "cpu_s": 200.0, "wall_s": 400.0, "gpu_mib": 256.0}
+    assert {c[2] for c in calls} == {str(sock), str(sib)}
+
+
+def test_measure_reads_the_execution_master_when_the_plain_one_is_gone(sock):
+    sock.unlink()
+    sib = _sibling(sock)
+    run, _ = _per_socket_ssh({str(sib): "fp 1073741824 2000000 10 -\n"})
+    assert kh.measure_run_footprint(FP, runner=run)["ram_gb"] == 1.0
+
+
+def test_measure_skips_a_dead_sibling_master(sock):
+    sib = _sibling(sock)
+    run, calls = _per_socket_ssh({str(sock): "fp 1073741824 1000000 10 -\n", str(sib): None})
+    assert kh.measure_run_footprint(FP, runner=run)["ram_gb"] == 1.0
+    assert len([c for c in calls if c[2] == str(sib)]) == 1   # its -O check only: never a fresh connection
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash fragment")
+@pytest.mark.parametrize("smi,want", [("exit 9", "-"), ("echo '41, 300'; echo '99, 7'", "300"), (None, "-")])
+def test_gpu_fragment_never_reports_a_failed_query_as_zero(tmp_path, smi, want):
+    import subprocess
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    if smi is not None:
+        (bindir / "nvidia-smi").write_text(f"#!/bin/sh\n{smi}\n")
+        (bindir / "nvidia-smi").chmod(0o755)
+    (tmp_path / "cgroup.procs").write_text("41\n")
+    for tool in ("awk", "printf"):
+        real = shutil.which(tool)
+        if real:
+            (bindir / tool).symlink_to(real)
+    out = subprocess.run(["/bin/bash", "-c", f'd={tmp_path}; ' + kh._FOOTPRINT_GPU_SH + 'echo "$g"'],
+                         env={"PATH": str(bindir)}, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert out.stdout.strip() == want, out.stderr
+
+
+def test_measure_with_no_socket_never_runs_ssh(tmp_path, monkeypatch):
+    import tempfile
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    run, calls = _fake_ssh("fp 1 1 1 0\n")
+    with pytest.raises(RuntimeError, match="no live ssh master"):
+        kh.measure_run_footprint(FP, runner=run)
+    assert calls == []

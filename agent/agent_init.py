@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from contextlib import suppress
 from datetime import datetime
@@ -517,7 +518,9 @@ def _finalize_routing(agent, api_mode, credential_pool):
             _AGGREGATOR_PROVIDERS, normalize_model_for_provider
         )
 
-        if agent.provider not in _AGGREGATOR_PROVIDERS:
+        # A slot's id is normalized on every lane, aggregators included: the view holds bare ids
+        # (kimi-k3.1-pro) and openrouter needs the vendor prefix /model validated.
+        if agent.provider not in _AGGREGATOR_PROVIDERS or getattr(agent, "_model_slot", None):
             agent.model = normalize_model_for_provider(agent.model, agent.provider)
 
     # Nous model policy follows the ROUTE (the welcome host serves one model); a credential-pool
@@ -957,6 +960,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             _refused_entries.append((_fb_provider, "no usable credentials"))
             continue
         agent._fallback_activated = True
+        from hermes_cli.model_registry import slot_resolve
+        agent._fallback_model_slot = slot_resolve(_fb["model"])[1] or ""  # turn row's model_slot
         if _fb_provider.strip().lower() == "moa":
             # The chokepoint handed back the preset's aggregator client, which only proves the
             # preset resolves and its aggregator has credentials. A MoA entry means the preset
@@ -1481,8 +1486,9 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                     with suppress(Exception):
                         _unavailable_reason = _mp.unavailable_reason()
                     _warn_memory_provider_unavailable(_mem_provider_name, _unavailable_reason)
-                if agent._memory_manager.providers:
-                    agent._memory_manager.initialize_all(**_memory_provider_init_kwargs(agent, platform))
+                # False when the provider instance was refused as another profile's (#140058).
+                if agent._memory_manager.providers and agent._memory_manager.initialize_for_agent(
+                        **_memory_provider_init_kwargs(agent, platform)):
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
@@ -1874,6 +1880,9 @@ def _scope_context_length_to_default_runtime(
         from hermes_cli.config import split_model_config_default
         _default, _ = split_model_config_default(_default)
     _configured_default_model = str(_default or "").strip()
+    # A slot default (``sol``) describes whatever id the slot resolves to now.
+    from hermes_cli.model_registry import slot_resolve
+    _configured_default_model = str(slot_resolve(_configured_default_model)[0] or "")
     _configured_default_runtime_model = _configured_default_model
     _active_runtime_model = agent.model
     if _configured_default_model:
@@ -2204,6 +2213,9 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.compression_enabled = cs.enabled
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor
+    # The tail walk asks the preflight's predicate on this agent (Prism e401e23b1d4b).
+    with suppress(Exception):
+        _cc._route_owner = weakref.ref(agent)
     # Micro-compaction has no pre-compress checkpoint hook; suppress it while the gate is
     # armed (mirrors native_compaction.py).
     if cs.checkpoint_required and cs.micro_compact:
@@ -2475,6 +2487,10 @@ def _snapshot_primary_runtime(agent):
         "compressor_provider": getattr(_cc, "provider", agent.provider),
         "compressor_context_length": _cc.context_length,
         "compressor_threshold_tokens": _cc.threshold_tokens,
+        # The slot of the route captured here: after a startup fallback that is the rung's, which
+        # the first turn's restore re-applies (turn row model_slot, t_5c87d313).
+        "model_slot": (getattr(agent, "_fallback_model_slot", None) if agent._fallback_activated
+                       else getattr(agent, "_model_slot", None)) or None,
     }
     if agent.api_mode == "anthropic_messages":
         agent._primary_runtime.update({
@@ -2610,6 +2626,9 @@ def init_agent(
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
     agent.session_cwd = cwd or None
+    # A slot name (``sol``) becomes its current id before anything reads agent.model.
+    from agent.model_slots import apply_slot_at_init
+    apply_slot_at_init(agent)
     # Shared iteration budget: parent creates, children inherit.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     # CLI replaces this with _cprint so raw ANSI status lines go through prompt_toolkit's

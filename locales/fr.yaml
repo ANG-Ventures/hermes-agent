@@ -70,6 +70,9 @@ gateway:
     err_switch_failed: "Le passage au modèle {model} a échoué ({error}) ; le modèle {current} est conservé."
     err_config_not_updated: "config.yaml non mis à jour ({error})"
     err_stale_override: "enregistré dans config.yaml, mais l'ancienne surcharge de session n'a pas été effacée ({error})"
+    saving_global: "Actif pour cette session ; enregistrement dans config.yaml après cette réponse."
+    save_failed: "⚠️ Changement de modèle actif pour cette session, mais l'enregistrement a échoué : {error}"
+    save_interrupted: "⚠️ Changement de modèle actif pour cette session, mais l'enregistrement a été interrompu (enregistré : {saved})."
     next_turn_only: "    (prochain tour uniquement — rétabli après une réponse)"
     switch_cancelled: "🟡 Changement de modèle annulé. Le modèle actuel est inchangé ({model})."
     guard_confirm: |-
@@ -525,7 +528,7 @@ gateway:
     stopped: "⚡ Arrêté. Vous pouvez continuer cette session."
     no_active: "Aucune tâche active à arrêter."
     force_stopped_pending: "⚡ Arrêt forcé. L'agent était encore en cours de démarrage — session déverrouillée."
-    queue_held: "{count} prompt(s) en file retenu(s). /queue run les libère, /queue list les affiche, /queue clear les supprime."
+    queue_held: "{count} prompt(s) en file retenu(s). Ils s'exécutent après le prochain tour terminé ; /queue run les lance maintenant, /queue clear les supprime."
     queue_released: "Libération de {count} prompt(s) en file maintenant, dans l'ordre."
   title:
     db_unavailable: "Base de données des sessions indisponible."
@@ -875,6 +878,7 @@ gateway:
     reject_model: "L'agent est en cours d'exécution — attendez ou faites /stop d'abord, puis changez de modèle."
     reject_codex_runtime: "L'agent est en cours d'exécution — attendez ou faites /stop d'abord, puis changez de runtime."
     reject_moa: "L'agent est en cours d'exécution — attendez ou faites /stop d'abord, puis lancez /moa."
+    stop_settling: "⏳ /stop is still finishing the previous turn — /{command} could not run yet. Send it again in a moment."
     drain_queued: "⏳ Gateway {action} — mis en file pour le prochain tour, une fois qu'il sera de retour."
     drain_rejected: "⏳ Le gateway est {action} et n'accepte pas d'autre tour pour le moment."
     drain_rejected_new_work: "⏳ Le gateway est {action} et n'accepte pas de nouveau travail pour le moment."
@@ -949,7 +953,7 @@ gateway:
     moved: "Élément {source} de la file déplacé vers {destination}."
     refused_command: "Non mis en file : /{command} est une commande, et les commandes ne peuvent pas être mises en file comme prompts. Envoyez-la seule."
     cap_reached: "Non mis en file : la file est pleine ({cap} éléments). Utilisez /queue list, /queue rm N ou /queue clear."
-    added_to_held: "Ajouté à la file retenue ({count} retenu(s)). /queue run les libère."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "{count} prompt(s) en file libéré(s) ; ils s'exécutent ensuite, dans l'ordre."
     released_interrupting: "Interruption du tour en cours ; libération de {count} prompt(s) en file dans l'ordre."
     dropped_on_reset: "{count} prompt(s) en file supprimé(s) avec l'ancienne conversation."
@@ -1048,7 +1052,7 @@ gateway:
     working_heartbeat: "⏳ En cours — {minutes} min{detail}"
     thinking_prefix: "💬 {text}"
     tool_head: "{emoji} {tool}"
-    wake_head: "🔔 wake · {label}"
+    wake_head: "🔔 {label}"
     tool_verbose: |-
       {emoji} {tool}({keys})
       {args}
@@ -1073,8 +1077,11 @@ gateway:
     action_shutting_down: "en cours d'arrêt"
     action_restarting: "en cours de redémarrage"
     cron_interrupted: "⚠️ La tâche planifiée '{job}' a été interrompue car Hermes est {action} ; aucun résultat pour cette exécution. Elle se relancera selon son planning, ou lancez-la maintenant avec `hermes cron run {job}` une fois Hermes de retour."
-    notice_shutdown: "⚠️ Hermes s'arrête — votre tâche en cours va être interrompue. Une fois de retour en ligne, envoyez n'importe quel message et j'essaierai de reprendre là où nous en étions."
-    notice_restart: "⚠️ Hermes redémarre — votre tâche en cours va être interrompue. Envoyez n'importe quel message après le redémarrage et j'essaierai de reprendre là où vous en étiez."
+    notice_shutdown: "⚠️ Hermes s’arrête."
+    notice_restart: "⚠️ Hermes redémarre."
+    active_interruption: "Votre tâche en cours peut être interrompue."
+    continue_prompt: "Si Hermes revient en ligne, vous pouvez demander à poursuivre le travail interrompu."
+    continue_auto: "Si Hermes revient en ligne et que les contrôles de récupération le permettent, le travail interrompu peut reprendre automatiquement."
   startup:
     handoff_thread_title: "Hermes — {title}"
     restarted: "♻ Gateway redémarré avec succès. Votre session continue."
@@ -3882,6 +3889,7 @@ display:
     aux_failure_label: "revue en arrière-plan"
   notice:
     uncompressed_context_overflow: "⚠️ Le contexte de session (~{tokens} tokens) dépasse la fenêtre de contexte du modèle (~{context_length} tokens) alors que la compression est désactivée (compression.enabled: false). Utilisez /compact pour compresser l'historique ou activez la compression dans config.yaml."
+    compression_store_unavailable: "⚠️ Le contexte dépasse le seuil de compression (~{tokens} tokens >= {threshold}) mais la compression ne peut pas s'exécuter : le stockage de compaction est endommagé (erreur de base de données). /compress utilise le même stockage et n'aidera pas. Utilisez /new pour démarrer une nouvelle session."
 explainer:
   no_reply_prefix: "⚠️ Pas de réponse : "
   empty_response: "{model} n'a produit aucune réponse cette fois, même après plusieurs tentatives. Envoyez `continue` pour réessayer, ou changez de modèle avec /model."

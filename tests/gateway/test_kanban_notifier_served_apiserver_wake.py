@@ -138,7 +138,7 @@ def _make_runner(*, adapter=None, routes=None, builder_adapters=None):
 def _subscription(*, chat_id=SESSION, profile="builder"):
     """One completed card whose origin is the raw session id, as the Relay origin creates it."""
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="relay origin", assignee="builder", session_id=WORKER_SESSION)
+        task = kb.create_task(conn, boomerang_wake=False, title="relay origin", assignee="builder", session_id=WORKER_SESSION)
         kbn.add_notify_sub(conn, task_id=task, platform="api_server", chat_id=chat_id,
                            chat_type="dm", notifier_profile=profile, delivery_mode="notify+wake")
         kb.complete_task(conn, task, summary="done once")

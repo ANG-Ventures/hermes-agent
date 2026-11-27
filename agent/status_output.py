@@ -129,7 +129,10 @@ class StatusOutputMixin:
     def _warn_context_overflow_blocked(self, reason: str, preflight_tokens: int, threshold_tokens: int) -> None:
         """Warn (deduped on the block *kind* — ``cooldown`` / ``ineffective`` — not the countdown string;
         cleared by ``_clear_context_overflow_warn``) when context is over the threshold but compression is blocked."""
-        _warn_kind = (reason or "unknown").split(":", 1)[0]
+        _block_kind = (reason or "unknown").split(":", 1)[0]
+        # The last attempt failed on a damaged compaction store: /compress hits the same store, so say so.
+        _store_down = getattr(getattr(self, "context_compressor", None), "last_compress_store_unavailable", False) is True
+        _warn_kind = "store_unavailable" if _store_down else _block_kind
         _warn_key = ("ctx_overflow_blocked", _warn_kind)
         if getattr(self, "_last_ctx_overflow_warn", None) == _warn_key:
             return
@@ -137,8 +140,12 @@ class StatusOutputMixin:
         from agent.conversation_compression import CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE
 
         # cooldown + anti-thrash (ineffective) are both "compression blocked".
-        if _warn_kind in ("cooldown", "ineffective"):
+        if _block_kind in ("cooldown", "ineffective"):
             self._touch_activity(f"compression blocked ({reason})", provenance=ActivityProvenance.AGENT_COMPRESSION_COOLDOWN)
+        if _store_down:
+            self._emit_warning(t("display.notice.compression_store_unavailable",
+                                 tokens=f"{preflight_tokens:,}", threshold=f"{threshold_tokens:,}"))
+            return
         self._emit_warning(CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
             tokens=preflight_tokens, threshold=threshold_tokens, reason=reason,
         ))

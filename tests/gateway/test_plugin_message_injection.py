@@ -173,7 +173,9 @@ async def test_dispatch_uses_stored_origin_and_adapter_message_path():
         event.source,
         allow_adapter_delegation=False,
     )
+    assert event.wake_kind == "plugin"  # t_17ba87a6: header reads "🔔 plugin wake · notify-plugin"
     assert event.metadata == {
+        "wake_name": "notify-plugin",
         "hermes_plugin_id": "notify-plugin",
         "hermes_plugin_injection": True,
         "gateway_session_key": entry.session_key,

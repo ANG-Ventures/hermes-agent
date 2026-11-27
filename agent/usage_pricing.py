@@ -778,6 +778,45 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         cache_read_cost_per_million_above=Decimal("0.20"),
         cache_write_cost_per_million_above=Decimal("5.00"),
     ),
+    # ── OpenAI GPT-6.2 Sol / Astra ───────────────────────────────────────
+    # Rates from models.dev api.json openai.models["gpt-6.2-sol"/"gpt-6.2-astra"].cost (read
+    # 2026-11-17). Sol: $2 / $10 / $0.10 cache read / $2.50 cache write; above 272K prompt tokens
+    # (whole request) $4 / $15 / $0.20 / $5. Astra: $8 / $40 / $0.40 / $10; above 272K $16 / $60 /
+    # $0.80 / $20. Astra is CHEAPER than gpt-6-astra ($10/$50): not the gpt-6-astra row.
+    (
+        "openai",
+        "gpt-6.2-sol",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.10"),
+        cache_write_cost_per_million=Decimal("2.50"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="models-dev-gpt-6.2-2026-11-17",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("4.00"),
+        output_cost_per_million_above=Decimal("15.00"),
+        cache_read_cost_per_million_above=Decimal("0.20"),
+        cache_write_cost_per_million_above=Decimal("5.00"),
+    ),
+    (
+        "openai",
+        "gpt-6.2-astra",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("8.00"),
+        output_cost_per_million=Decimal("40.00"),
+        cache_read_cost_per_million=Decimal("0.40"),
+        cache_write_cost_per_million=Decimal("10.00"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="models-dev-gpt-6.2-2026-11-17",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("16.00"),
+        output_cost_per_million_above=Decimal("60.00"),
+        cache_read_cost_per_million_above=Decimal("0.80"),
+        cache_write_cost_per_million_above=Decimal("20.00"),
+    ),
     # ── OpenAI GPT-6.1 Terra ─────────────────────────────────────────────
     # Rates from models.dev api.json openai.models["gpt-6.1-terra"].cost (read 2026-11-06):
     # $1 / $5 / $0.05 cache read / $1.25 cache write; above 272K prompt tokens (whole
@@ -1028,6 +1067,24 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://www.anthropic.com/claude/fable",
         pricing_version="anthropic-pricing-2026-09",
+    ),
+    # ── Anthropic Claude Fable 5.2 ───────────────────────────────────────
+    # Launched 2026-11-09. Repriced DOWN from Fable 5.1: $8/$40 per MTok,
+    # cache read $0.20, cache write $10.00, no context tiers. Values from
+    # models.dev (anthropic.models.claude-fable-5-2.cost, fetched 2026-11-09),
+    # NOT inferred from the 5.1 row. Subscription relays price NOTIONAL via
+    # is_notional_anthropic_provider(); this entry supplies the metered rate.
+    (
+        "anthropic",
+        "claude-fable-5-2",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("8.00"),
+        output_cost_per_million=Decimal("40.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("10.00"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="anthropic-pricing-2026-11",
     ),
     # ── Anthropic Claude Sonnet 5 ────────────────────────────────────────
     # Launched 2026-06-30. Introductory pricing ($2/$10 per MTok) runs
@@ -1444,6 +1501,59 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-4-argon/",
         pricing_version="google-gemini-4-argon-intro-2026-09-30",
+    ),
+    # gemini-4-carbon Standard paid tier, read 2026-11-11 from the pricing page:
+    # $2 in / $10 out (thinking included) / $0.10 cached input per 1M through
+    # 2026-11-30, then $4 / $20 / $0.20 from 2026-12-01. Implicit caching only,
+    # so no cache-write price. Served on the Ultra sub as gemini-4-carbon-high
+    # (cpa); effort ids resolve here via _strip_gemini_effort_suffix (t_fed0d5bb).
+    (
+        "google",
+        "gemini-4-carbon",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.10"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-gemini-4-carbon-intro-2026-11-11",
+        superseded_at=datetime(2026, 12, 1, tzinfo=timezone.utc),
+        superseded_by=PricingEntry(
+            input_cost_per_million=Decimal("4.00"),
+            output_cost_per_million=Decimal("20.00"),
+            cache_read_cost_per_million=Decimal("0.20"),
+            source="official_docs_snapshot",
+            source_url="https://ai.google.dev/gemini-api/docs/pricing",
+            pricing_version="google-gemini-4-carbon-2026-12-01",
+        ),
+    ),
+    # gemini-4-neon / gemini-4-hydrogen Standard paid tier, read 2026-11-26 from the
+    # pricing page: flat across the 1M window, no dated change listed. Neon $3 in /
+    # $15 out (thinking included) / $0.15 cached input per 1M; Hydrogen $1.50 /
+    # $7.50 / $0.075. Implicit caching only, so no cache-write price. The
+    # gemini-bridge serves them as gemini-4-{neon,hydrogen}-<effort>; those ids
+    # resolve here via _strip_gemini_effort_suffix (subs-bake price_coverage, t_469fa2ce).
+    (
+        "google",
+        "gemini-4-neon",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.15"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-gemini-4-neon-2026-11-26",
+    ),
+    (
+        "google",
+        "gemini-4-hydrogen",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.50"),
+        output_cost_per_million=Decimal("7.50"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-gemini-4-hydrogen-2026-11-26",
     ),
     # gemini-3.8-flash Standard paid tier, read 2026-09-28 from the pricing page.
     # These are the launch rates Google lists "through December 31, 2026"; the
@@ -2047,6 +2157,27 @@ _OPENAI_ULTRAFAST_PRICING: Dict[str, PricingEntry] = {
         cache_write_cost_per_million_above=Decimal("30.00"),
     ),
 }
+# GPT-6.2 Sol / Astra (t_9720ecae): "Ultrafast costs 3 times the Standard rate through February 28,
+# 2027, and 6 times the Standard rate starting March 1, 2027 (Pacific time)" (same pricing page,
+# checked 2026-11-20; its 6.2 table reads $6/$30/$0.30/$7.50 Sol and $24/$120/$1.20/$30 Astra).
+# Built from the Standard rows so the weekly Standard drift lint covers them too.
+_ULTRAFAST_62_SWITCH = datetime(2027, 3, 1, 8, tzinfo=timezone.utc)  # 2027-03-01 00:00 PST
+
+
+def _ultrafast_times_standard(model: str, factor: int, version: str, **extra: Any) -> PricingEntry:
+    std = _OFFICIAL_DOCS_PRICING[("openai", model)]
+    scaled = {f.name: getattr(std, f.name) * factor for f in fields(PricingEntry)
+              if f.name.endswith("_per_million") or f.name.endswith("_per_million_above")
+              if getattr(std, f.name) is not None}
+    return replace(std, **scaled, source_url="https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast",
+                   pricing_version=version, **extra)
+
+
+for _m62 in ("gpt-6.2-sol", "gpt-6.2-astra"):
+    _OPENAI_ULTRAFAST_PRICING[_m62] = _ultrafast_times_standard(
+        _m62, 3, "openai-ultrafast-6.2-intro-2026-11", superseded_at=_ULTRAFAST_62_SWITCH,
+        superseded_by=_ultrafast_times_standard(_m62, 6, "openai-ultrafast-6.2-2027-03"))
+del _m62
 # The Hermes-side "-900k" Codex picker variant requests Ultrafast too (model_supports_ultrafast strips it),
 # and is the same model on the wire: alias it so its served-ultrafast turns price.
 _OPENAI_ULTRAFAST_PRICING.update({f"{_m}-900k": _e for _m, _e in list(_OPENAI_ULTRAFAST_PRICING.items())})
@@ -2073,6 +2204,10 @@ for _base_6 in ("gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"):
         ("openai", _base_6)
     ]
 del _base_6
+# GPT-6.2 Sol/Astra: only the "-900k" picker alias (no "-pro" SKU is known for 6.2).
+for _base_62 in ("gpt-6.2-sol", "gpt-6.2-astra"):
+    _OFFICIAL_DOCS_PRICING[("openai", f"{_base_62}-900k")] = _OFFICIAL_DOCS_PRICING[("openai", _base_62)]
+del _base_62
 
 # The direct Gemini provider currently exposes preview IDs for these two
 # models. Keep the official snapshot keyed by both their documented stable
@@ -2495,6 +2630,14 @@ def resolve_billing_route(
     provider_name = (provider or "").strip().lower()
     base = (base_url or "").strip().lower()
     model = (model_name or "").strip()
+    # A slot name (``sol``, ``cpa/sol``) is priced as the id it resolves to; a recorded slot turn
+    # heals on the next reprice. Literal ids and a missing view pass through.
+    from hermes_cli.model_registry import slot_resolve
+    _resolved, _slot = slot_resolve(model)
+    if _slot:
+        model = str(_resolved)
+        if "/" in model and model.split("/", 1)[0].lower() == provider_name:
+            model = model.split("/", 1)[1]  # ``cpa/sol`` on provider cpa: the lane is the provider
     if not provider_name and "/" in model:
         inferred_provider, bare_model = model.split("/", 1)
         if inferred_provider in {"anthropic", "openai", "google"}:
@@ -3047,6 +3190,24 @@ def _effective_pricing_entry(
     return entry
 
 
+def _registry_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+    """Slot aliases P7 (t_efde9d1a): the registry row's price (config/model-meta.json), read
+    before the built-in snapshot tables; None (no view, no row, no input+output) falls back."""
+    from hermes_cli.model_registry import registry_pricing
+
+    rates = registry_pricing(route.model)
+    if rates is None:
+        return None
+    return PricingEntry(
+        input_cost_per_million=Decimal(rates["input"]),
+        output_cost_per_million=Decimal(rates["output"]),
+        cache_read_cost_per_million=Decimal(rates["cache_read"]) if "cache_read" in rates else None,
+        cache_write_cost_per_million=Decimal(rates["cache_write"]) if "cache_write" in rates else None,
+        source="official_docs_snapshot",
+        pricing_version="model-registry",
+    )
+
+
 def get_pricing_entry(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -3067,7 +3228,13 @@ def _resolve_pricing_entry(
         return None
     if route.billing_mode == "subscription_included":
         return _INCLUDED_ENTRY
+    # The registry row (config/model-meta.json) replaces the built-in snapshot tables only. On a
+    # metered relay route the relay's configured tariff wins over it, and the row prices the id
+    # when that lookup has nothing (Prism df9e5fd55d0d, Apollo 2026-11-20).
+    registry_entry = _registry_pricing_entry(route)
     if route.provider == "openrouter":
+        if registry_entry is not None:
+            return _external_pricing_entry(route) or registry_entry
         # Notional relays (openai-codex, provider: openrouter routes) and any
         # model absent from the curated snapshot price from the configured
         # external catalog — models.dev by default, OpenRouter as fallback
@@ -3095,6 +3262,8 @@ def _resolve_pricing_entry(
             return snapshot
         return _external_pricing_entry(route)
 
+    if registry_entry is not None:
+        return registry_entry
     bundled_entry = _lookup_official_docs_pricing(route)
     if bundled_entry:
         return bundled_entry
@@ -3346,10 +3515,121 @@ def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
     return CostResult(amount_usd=None, status="unknown", source=source, label="n/a", notes=notes)
 
 
+def _price_buckets(entry: PricingEntry, usage: CanonicalUsage, above: bool, notes: list[str]):
+    """The four per-class Decimals for ``usage`` at one context tier, or an unknown CostResult."""
+    parts: list[Decimal] = []
+    for tokens, rate, rate_above, note, is_cache_write in (
+        (usage.input_tokens, entry.input_cost_per_million, entry.input_cost_per_million_above, (), False),
+        (usage.output_tokens, entry.output_cost_per_million, entry.output_cost_per_million_above, (), False),
+        (usage.cache_read_tokens, entry.cache_read_cost_per_million, entry.cache_read_cost_per_million_above,
+         ("cache-read pricing unavailable for route",), False),
+        (usage.cache_write_tokens, entry.cache_write_cost_per_million, entry.cache_write_cost_per_million_above,
+         ("cache-write pricing unavailable for route",), True),
+    ):
+        if above and rate_above is not None:
+            rate = rate_above
+        if rate is None and is_cache_write and tokens and entry.input_cost_per_million is not None:
+            # No published cache-write rate. For OpenAI-family routes (and any
+            # provider that doesn't charge a separate cache-write premium) the
+            # live models API omits this field by design — cache-write tokens
+            # are just input tokens that were also written to cache and are
+            # billed at the regular input rate. So if we DO know the input
+            # rate, price cache-write at the input rate rather than dropping
+            # the entire turn as unpriced (which silently loses real spend).
+            # Only bail when input pricing is ALSO missing (truly unpriceable).
+            rate = entry.input_cost_per_million
+            if above and entry.input_cost_per_million_above is not None:
+                rate = entry.input_cost_per_million_above
+            _note = "cache-write priced at input rate (no separate cache-write rate published)"
+            if _note not in notes:
+                notes.append(_note)
+        if rate is None:
+            if tokens:
+                return _unknown_cost(entry.source, *note)
+            parts.append(_ZERO)
+            continue
+        parts.append(Decimal(tokens) * rate / _ONE_MILLION)
+    return parts
+
+
+def _multi_request_tier_parts(
+    entry: PricingEntry, usage: CanonicalUsage, notes: list[str], *, last_prompt: int,
+    last_usage: Optional[CanonicalUsage], requests: Optional[int],
+):
+    """Price a bill that sums several requests' prompts on a context-tiered route (t_044f701c).
+
+    Only the LAST request's prompt (``last_prompt``, and its buckets ``last_usage``) is reported;
+    the remainder R = S - L is the sum of the earlier prompts. Every earlier prompt is <= R, so
+    R <= T means every earlier request was below the tier; with exactly two requests R IS the
+    earlier request. Anything else cannot be tiered per request: unknown, never one guessed tier.
+    """
+    threshold = entry.tier_threshold_tokens
+    if last_usage is not None and prompt_tokens_unknown(last_usage):
+        # The last request's prompt is unmeasured: its placeholder zeros must not pick a tier or a
+        # split. Every request is <= S, so S <= T is still exact at base; otherwise unknown.
+        if usage.prompt_tokens <= threshold:
+            return _price_buckets(entry, usage, False, notes)
+        return _unknown_cost(
+            entry.source, "context tier mixed across requests; last request's prompt unmeasured",
+        )
+    remainder = max(int(usage.prompt_tokens) - int(last_prompt), 0)
+    last_above = last_prompt > threshold
+    if remainder <= threshold:
+        earlier_above = False
+    elif requests == 2:
+        earlier_above = True
+    else:
+        n = "several" if requests is None else str(requests)
+        return _unknown_cost(
+            entry.source,
+            f"context tier mixed across {n} requests; per-request prompt sizes unavailable",
+        )
+    if earlier_above == last_above:
+        return _price_buckets(entry, usage, last_above, notes)
+    if last_usage is None:
+        return _unknown_cost(
+            entry.source, "context tier mixed across requests; last request's token split unavailable",
+        )
+    rest = CanonicalUsage(
+        input_tokens=usage.input_tokens - last_usage.input_tokens,
+        cache_read_tokens=usage.cache_read_tokens - last_usage.cache_read_tokens,
+        cache_write_tokens=usage.cache_write_tokens - last_usage.cache_write_tokens,
+    )
+    if min(rest.input_tokens, rest.cache_read_tokens, rest.cache_write_tokens) < 0:
+        return _unknown_cost(entry.source, "relay bill smaller than its last request; unpriceable")
+    last = CanonicalUsage(
+        input_tokens=last_usage.input_tokens, cache_read_tokens=last_usage.cache_read_tokens,
+        cache_write_tokens=last_usage.cache_write_tokens,
+    )
+    # The relay reports output only as a sum, so its per-request tier is unknown: price it at the
+    # higher of the two tiers (an upper bound, never an under-bill) and say so.
+    output_only = CanonicalUsage(output_tokens=usage.output_tokens)
+    notes.append(
+        "context tier mixed across 2 requests; prompts priced per request, output priced at the "
+        "higher tier (per-request output split unavailable)"
+    )
+    priced = [
+        _price_buckets(entry, rest, earlier_above, notes),
+        _price_buckets(entry, last, last_above, notes),
+        _price_buckets(entry, output_only, True, notes),
+    ]
+    for part in priced:
+        if isinstance(part, CostResult):
+            return part
+    return [sum(column, _ZERO) for column in zip(*priced)]
+
+
 def estimate_usage_cost(
     model_name: str, usage: CanonicalUsage, *, provider: Optional[str] = None,
     base_url: Optional[str] = None, api_key: Optional[str] = None,
+    tier_prompt_tokens: Optional[int] = None,
+    tier_last_usage: Optional[CanonicalUsage] = None,
+    tier_requests: Optional[int] = None,
 ) -> CostResult:
+    """``tier_prompt_tokens``: the LAST request's own prompt when ``usage`` bills several requests
+    (a multi-request relay, t_caa85ee7); None = ``usage`` is one request. On a context-tiered route
+    the bill is priced per request where the payload allows it (``tier_last_usage`` = the last
+    request's own buckets, ``tier_requests`` = N) and is UNKNOWN where it does not (t_044f701c)."""
     from providers import get_provider_profile
     profile = get_provider_profile(provider or '')
     reported = profile.get_usage_cost(model_name, usage) if profile else None
@@ -3378,49 +3658,28 @@ def estimate_usage_cost(
         if not entry:
             return _unknown_cost("official_docs_snapshot", "fast-mode pricing unavailable for model")
     if route.provider == "openai" and _served_openai_tier(usage) == "ultrafast":
-        entry = _OPENAI_ULTRAFAST_PRICING.get(route.model)
+        entry = _effective_pricing_entry(_OPENAI_ULTRAFAST_PRICING.get(route.model))
         if not entry:
             return _unknown_cost("official_docs_snapshot", "ultrafast pricing unavailable for model")
     if not entry:
         return _unknown_cost("none")
 
     # Whole-request context tier (e.g. Gemini Pro >200k prompts): above the
-    # threshold the *_above rates apply to the entire request; None falls back.
-    above = entry.tier_threshold_tokens is not None and usage.prompt_tokens > entry.tier_threshold_tokens
-    amount = _ZERO
+    # threshold the *_above rates apply to the entire request.
     notes: list[str] = []
-    parts: list[Decimal] = []
-    for tokens, rate, rate_above, note, is_cache_write in (
-        (usage.input_tokens, entry.input_cost_per_million, entry.input_cost_per_million_above, (), False),
-        (usage.output_tokens, entry.output_cost_per_million, entry.output_cost_per_million_above, (), False),
-        (usage.cache_read_tokens, entry.cache_read_cost_per_million, entry.cache_read_cost_per_million_above,
-         ("cache-read pricing unavailable for route",), False),
-        (usage.cache_write_tokens, entry.cache_write_cost_per_million, entry.cache_write_cost_per_million_above,
-         ("cache-write pricing unavailable for route",), True),
-    ):
-        if above and rate_above is not None:
-            rate = rate_above
-        if rate is None and is_cache_write and tokens and entry.input_cost_per_million is not None:
-            # No published cache-write rate. For OpenAI-family routes (and any
-            # provider that doesn't charge a separate cache-write premium) the
-            # live models API omits this field by design — cache-write tokens
-            # are just input tokens that were also written to cache and are
-            # billed at the regular input rate. So if we DO know the input
-            # rate, price cache-write at the input rate rather than dropping
-            # the entire turn as unpriced (which silently loses real spend).
-            # Only bail when input pricing is ALSO missing (truly unpriceable).
-            rate = entry.input_cost_per_million
-            if above and entry.input_cost_per_million_above is not None:
-                rate = entry.input_cost_per_million_above
-            notes.append("cache-write priced at input rate (no separate cache-write rate published)")
-        if rate is None:
-            if tokens:
-                return _unknown_cost(entry.source, *note)
-            parts.append(_ZERO)
-            continue
-        part = Decimal(tokens) * rate / _ONE_MILLION
-        parts.append(part)
-        amount += part
+    if tier_prompt_tokens is not None and entry.tier_threshold_tokens is not None:
+        priced = _multi_request_tier_parts(
+            entry, usage, notes, last_prompt=int(tier_prompt_tokens),
+            last_usage=tier_last_usage, requests=tier_requests,
+        )
+    else:
+        above = (entry.tier_threshold_tokens is not None
+                 and usage.prompt_tokens > entry.tier_threshold_tokens)
+        priced = _price_buckets(entry, usage, above, notes)
+    if isinstance(priced, CostResult):
+        return priced
+    parts: list[Decimal] = priced
+    amount = sum(parts, _ZERO)
     # Fork: per-class cost attribution (CostResult cost_*_usd fields), priced at
     # the tier-aware rates resolved above. The four parts sum to amount_usd.
     cost_input, cost_output, cost_cache_read, cost_cache_write = parts

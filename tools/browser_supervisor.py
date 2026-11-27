@@ -63,7 +63,11 @@ def _schedule(coro, loop, *, timeout: float):
     fut = safe_schedule_threadsafe(coro, loop)
     if fut is None:
         raise _LoopUnavailable("Browser supervisor loop unavailable")
-    return fut.result(timeout=timeout)
+    try:
+        return fut.result(timeout=timeout)
+    except TimeoutError:
+        fut.cancel()
+        raise
 
 
 def _fail(error: str) -> Dict[str, Any]:
@@ -114,6 +118,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         self._recent_dialogs: List[DialogRecord] = []
         self._frames: Dict[str, FrameInfo] = {}
         self._active = False
+        self._detach_tasks: set[asyncio.Task] = set()
         # Supervisor loop machinery — populated in start().
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -209,7 +214,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         return {"ok": True, "dialog": dialog.to_dict()}
 
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
-                         await_promise: bool = True, timeout: float = 10.0) -> Dict[str, Any]:
+                         await_promise: bool = True, timeout: float = 10.0,
+                         target_id: Optional[str] = None, deadline: Optional[float] = None,
+                         dispatch_guard=None) -> Dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
@@ -224,12 +231,80 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if not session_id:
             return _fail("supervisor has no attached page session")
 
+        expires = min(deadline if deadline is not None else float("inf"), time.monotonic() + timeout)
+        gate = threading.Lock()
+        state = {"revoked": False, "outcome": "not_dispatched", "response": None}
+        quiesced = threading.Event()
+
+        def remaining():
+            budget = expires - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("Browser evaluation deadline expired")
+            return budget
+
         def _run_eval(by_value: bool) -> Dict[str, Any]:
-            # userGesture: clipboard / fullscreen APIs need user activation.
             params = {"expression": expression, "returnByValue": by_value,
                       "awaitPromise": await_promise, "userGesture": True}
-            coro = self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout)
-            return _schedule(coro, loop, timeout=timeout + 1)
+            async def evaluate():
+                pinned_session = session_id
+                attached = False
+                try:
+                    if target_id:
+                        info = (await self._cdp("Target.getTargetInfo", {"targetId": target_id}, timeout=remaining()))["result"]["targetInfo"]
+                        if info.get("type") != "page" or info.get("targetId") != target_id:
+                            raise RuntimeError("Selected Browser Use target is not a live page; select a tab and retry")
+                        reply = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=remaining())
+                        pinned_session = reply["result"]["sessionId"]
+                        attached = True
+                    # Revocation and dispatch are serialized even if cancellation is
+                    # delayed by setup. Once authorized, loss of an ACK is UNKNOWN.
+                    with gate:
+                        if state["revoked"]:
+                            raise TimeoutError("Browser evaluation was cancelled")
+                        budget = remaining()
+                        guard = dispatch_guard() if dispatch_guard else contextlib.nullcontext()
+                        guard.__enter__()
+                        state["outcome"] = "unknown"
+                    try:
+                        response = await self._cdp("Runtime.evaluate", params,
+                            session_id=pinned_session, timeout=budget)
+                        state["response"] = response
+                        state["outcome"] = "acknowledged"
+                        return response
+                    finally:
+                        guard.__exit__(None, None, None)
+                finally:
+                    if attached:
+                        async def detach():
+                            with contextlib.suppress(Exception):
+                                await asyncio.wait_for(self._cdp(
+                                    "Target.detachFromTarget", {"sessionId": pinned_session},
+                                    timeout=1.0), timeout=1.0)
+                        task = asyncio.create_task(detach())
+                        self._detach_tasks.add(task)
+                        task.add_done_callback(self._detach_tasks.discard)
+                    quiesced.set()
+
+            async def bounded():
+                try:
+                    budget = remaining()
+                    return await asyncio.wait_for(evaluate(), timeout=budget)
+                finally:
+                    quiesced.set()
+            # The loop enforces the absolute deadline. The sync timeout is a
+            # watchdog only; its revocation also prevents late setup dispatch.
+            try:
+                return _schedule(bounded(), loop, timeout=max(0.0, expires - time.monotonic()) + 1)
+            except Exception:
+                with gate:
+                    state["revoked"] = True
+                # Do not return a definitely-not-dispatched outcome while setup
+                # still owns a coroutine capable of reaching the write boundary.
+                if not quiesced.wait(1):
+                    state["outcome"] = "unknown"
+                if state["outcome"] == "acknowledged":
+                    return state["response"]
+                raise
 
         try:
             response = _run_eval(return_by_value)
@@ -237,8 +312,16 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             # Deep-serializing live DOM nodes / NodeLists / Window can blow past
             # CDP's recursion guard (``Object reference chain is too long``).
             # Retry once with returnByValue=False so Chrome returns the description.
-            if not (return_by_value and "reference chain is too long" in str(exc).lower()):
-                return _err(exc)
+            if not target_id and dispatch_guard is None:
+                if not (return_by_value and "reference chain is too long" in str(exc).lower()):
+                    return _err(exc)
+                with gate:
+                    state["revoked"] = False
+                quiesced.clear()
+            else:
+                return {"ok": False, "outcome": state["outcome"],
+                        "error": ("Browser evaluation outcome unknown; it may have run. Inspect the page before retrying."
+                                  if state["outcome"] == "unknown" else "Browser evaluation was not dispatched; select a live tab and retry.")}
             try:
                 response = _run_eval(False)
             except Exception as exc2:
@@ -277,8 +360,6 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         async def _attach(target_id: str) -> str:
             attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
             sid = attach["result"]["sessionId"]
-            await self._enable_page_domains(sid, timeout=timeout)
-            await self._install_dialog_bridge(sid)
             return sid
 
         async def _focus() -> Dict[str, Any]:
@@ -302,9 +383,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                     if not probe.get("result", {}).get("result", {}).get("value"):
                         await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
                         continue
+                # Rejected tabs must remain untouched: the dialog bridge mutates window APIs.
+                await self._enable_page_domains(sid, timeout=timeout)
+                await self._install_dialog_bridge(sid)
                 with self._state_lock:
                     self._page_session_id = sid
-                return {"ok": True, "url": url}
+                return {"ok": True, "url": url, "target_id": target_id}
             return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept and candidates else ""))
 
         try:

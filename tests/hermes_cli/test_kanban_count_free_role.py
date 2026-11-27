@@ -55,7 +55,7 @@ def test_count_free_review_worker_row_does_not_refuse_the_pool(tmp_path):
         "nas-fleet": {"roles": {"review-worker": {}}, "state": "active"},
     }}), encoding="utf-8")
     (tmp_path / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-media"], "profiles": ["alpha"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "priority": ["ace-media"], "profiles": ["alpha"],
         "hosts": {"ace-media": {"enabled": True, "absence": "optional"}},
     }), encoding="utf-8")
     cfg = kwp.read_pool(tmp_path, kanban_cfg={})
@@ -70,7 +70,8 @@ def test_live_slot_counts_do_not_shape_the_pool_budget(tmp_path):
         "ace-media": {"roles": {"kanban-worker": {"slots": 12}}, "state": "active"},
     }}), encoding="utf-8")
     (tmp_path / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-ai", "ace-media"], "profiles": ["alpha"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker",
+        "priority": ["ace-ai", "ace-media"], "profiles": ["alpha"],
         "hosts": {"ace-ai": {"enabled": True, "absence": "required"},
                   "ace-media": {"enabled": True, "absence": "optional"}},
     }), encoding="utf-8")
@@ -86,7 +87,8 @@ def test_read_pool_carries_count_free_hosts(tmp_path):
         "ace-media": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"},
     }}), encoding="utf-8")
     (tmp_path / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-ai", "ace-media"], "profiles": ["alpha"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker",
+        "priority": ["ace-ai", "ace-media"], "profiles": ["alpha"],
         "hosts": {"ace-ai": {"enabled": True, "absence": "required"},
                   "ace-media": {"enabled": True, "absence": "optional"}},
     }), encoding="utf-8")
@@ -146,8 +148,10 @@ def test_allocd_admits_a_count_free_host_past_the_old_count_until_it_refuses(sig
     monkeypatch.setattr(kh, "pool_key", lambda table, cands, h: h if h in cands else None)
     running = OLD_COUNT + 2  # past the old count already
     legacy = _allocd_plan(sig, AI, running)
-    assert kh.structural_free(legacy, "ace-ai") == 0
-    assert legacy.take("alpha") is None and legacy.refusal == "pool_full" and admitted == []
+    # t_2158f095 (one guard per start): an allocd take is not capped by a legacy count either; the plan's own
+    # slots stay the real count for every take that does not ask allocd (test_kanban_fwa_no_slot_cap.py).
+    assert legacy.slots["ace-ai"] == 0
+    assert kh.structural_free(legacy, "ace-ai") == kwp.UNCOUNTED_TICK_FREE
 
     p = _allocd_plan(sig, FREE_AI, running)
     assert kh.structural_free(p, "ace-ai") == kwp.UNCOUNTED_TICK_FREE

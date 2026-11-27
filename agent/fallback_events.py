@@ -36,7 +36,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,9 @@ TRIGGER_CLASSES = (
 # the exception, never from text: there is no error response (t_778185f3).
 NO_FIRST_BYTE_BUDGET_CLASS = "no_first_byte_budget"
 _BUDGET_CUT_EXC = "FallbackWallBudgetExceeded"
+# The early cut for a model the relay states it cannot serve (fallback_wall_budget):
+# the relay's quota_model, read from its /health + /eligibility answer.
+_RELAY_EXHAUSTED_EXC = "RelayModelExhausted"
 # OUR bridge/relay refused the request SHAPE for this lane (400
 # tui_tools_unsupported / tui_images_unsupported, relay mode_not_allowed):
 # named from the body's machine code, never from Anthropic text (t_1ed37625).
@@ -175,6 +178,173 @@ def relay_synthetic_error(body: Any, text: Optional[str] = None) -> Optional[str
         return None
 
 
+class CreditLaneCode(NamedTuple):
+    """How a fallback row names one credit-lane relay ``error.type`` (t_4c447d32).
+
+    ``trigger_class``: the §4.1 class the code means (documentation; the
+    contract test pins it to the vocabulary). It is NOT returned by
+    :func:`classify_trigger`, which drives the sticky arm and the quota gate:
+    the card is labels-only, and e.g. ``quota_model`` would bench a recovered
+    primary for 6 h (Prism 16f26d03b5d4). ``head``: the announce head label (2-3
+    words). ``hop``: the leg that failed (``fallback_policy.HOPS``). ``cause``:
+    the rider when the message names no seat. ``seat_cause``: the rider when
+    it does (``{seat}``, ``{exc}`` = `` (TimeoutError)`` or empty, ``{took}`` =
+    `` in 120 s`` or empty, ``{size}`` = ``1.7 MB, `` or empty); None means
+    the code never carries a seat and ``cause`` is always used."""
+
+    trigger_class: str
+    head: str
+    hop: str
+    cause: str
+    seat_cause: Optional[str] = None
+
+
+# Every OWN ``error.type`` the credit-lane relay (claude-pool
+# ``credit_lane_relay.py`` ``_err(...)``, face claude-elr, :18821) answers with,
+# in the Anthropic error shape ``{"type":"error","error":{"type":<code>,...}}``.
+# These are the relay's answers, never Anthropic's: before this table every one
+# rendered "unclassified error (hop unknown, relay sent no seat)" (2026-11-18
+# 21:28, dead-letter 0252b0fcf1). tests/agent/test_fallback_credit_lane_codes.py
+# pins it against the relay's list.
+_NOT_ANTHROPIC = "(ours, not Anthropic)"
+CREDIT_LANE_ERROR_CODES: Dict[str, CreditLaneCode] = {
+    # The request was SENT on a seat's key, then the read failed (timeout, reset).
+    # Generation may be billed, so the relay does not re-send it.
+    "credit_upstream_read_failed": CreditLaneCode(
+        "conn", "seat read failed", "proxy→anthropic",
+        "relay could not read Anthropic's answer (relay sent no seat), not re-sent",
+        "no answer from Anthropic through {seat}{exc}, request was sent, not re-sent"),
+    # Our upload of the request body from the Studio to the seat's box did not
+    # finish (claude-pool#470): Anthropic never had a complete request.
+    "credit_upstream_write_failed": CreditLaneCode(
+        "conn", "upload failed", "relay→bridge",
+        "our upload to the seat's box did not finish{took} ({size}Studio to box link; "
+        "ours, not Anthropic), not re-sent",
+        "our upload to {seat} did not finish{took} ({size}Studio to box link; "
+        "ours, not Anthropic), not re-sent"),
+    # The credit-key ledger was reloaded/rotated while the request was in flight;
+    # the relay drops the answer of the stale key.
+    "credit_generation_changed": CreditLaneCode(
+        "conn", "credit key changed", "relay",
+        f"credit key changed mid-request at the relay {_NOT_ANTHROPIC}, not re-sent"),
+    # The answer's anthropic-organization-id did not match the ledger org for
+    # the key; the relay quarantines that key.
+    "credit_org_mismatch": CreditLaneCode(
+        "auth", "credit org mismatch", "relay",
+        f"answer came from the wrong org {_NOT_ANTHROPIC}, key quarantined",
+        f"answer came from the wrong org on {{seat}} {_NOT_ANTHROPIC}, key quarantined"),
+    # No credit key left to try (exhausted / rate limited / auth / egress down /
+    # none loaded): the lane-wide refusal, like the pool's "no eligible sub".
+    "credit_lane_exhausted": CreditLaneCode(
+        "quota_model", "no credit key", "relay",
+        "no eligible credit key at the relay{why}"),
+    # credit-lane.json enabled:false (operator switch).
+    "credit_lane_off": CreditLaneCode(
+        "pool_pressure", "credit lane off", "relay",
+        "credit lane disabled at the relay (credit-lane.json)"),
+    # body_refusal: credits do not cover Claude Code requests.
+    "credit_lane_cc_body": CreditLaneCode(
+        "lane_incapable", "lane refused request", "relay",
+        f"credit lane does not serve Claude Code requests {_NOT_ANTHROPIC}"),
+    # body_refusal: Fable while the lane's fable toggle is off.
+    "credit_lane_fable_off": CreditLaneCode(
+        "lane_incapable", "Fable disabled", "relay",
+        f"credit lane has Fable switched off {_NOT_ANTHROPIC}"),
+}
+_CREDIT_SEAT_RE = re.compile(r"\b(?:on|for) (local|sub-vps-\d+)\b")
+_CREDIT_EXC_RE = re.compile(r"\(([A-Z]\w*(?:Error|Exception|Timeout))\)")
+_CREDIT_WHY_RE = re.compile(r"no eligible credit key \(([a-z_]+)\)")
+_CREDIT_LIMIT_RE = re.compile(r"\bof a (\d+(?:\.\d+)?) s limit\b")
+_CREDIT_ELAPSED_RE = re.compile(r"\bafter (\d+(?:\.\d+)?) s\b")
+_CREDIT_MB_RE = re.compile(r"\bwith (\d+(?:\.\d+)?) MB to send\b")
+
+
+def _credit_error_obj(body: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(body, dict):
+        return None
+    inner = body.get("error")
+    return inner if isinstance(inner, dict) else body
+
+
+def credit_lane_code(body: Any, text: Optional[str] = None) -> Optional[str]:
+    """The credit-lane relay code of an error (a key of
+    :data:`CREDIT_LANE_ERROR_CODES`), else None. Reads only ``error.type`` of
+    the Anthropic-shaped body (or the inner object the SDK passes): a
+    ``credit_*`` string elsewhere in the text is not the relay's answer.
+    ``text`` is unused; kept so callers pass the same pair as the other readers."""
+    cand = str((_credit_error_obj(body) or {}).get("type") or "").strip().lower()
+    return cand if cand in CREDIT_LANE_ERROR_CODES else None
+
+
+def _credit_message(body: Any, text: Optional[str]) -> str:
+    obj = _credit_error_obj(body)
+    msg = (obj or {}).get("message")
+    return str(msg) if isinstance(msg, str) else str(text or "")
+
+
+def credit_lane_seat(body: Any, text: Optional[str] = None) -> Optional[str]:
+    """The seat (credit key persona) a credit-lane message names
+    (``... on sub-vps-12 ...`` / ``... for local``), else None."""
+    m = _CREDIT_SEAT_RE.search(_credit_message(body, text))
+    return m.group(1) if m else None
+
+
+def credit_lane_exc(body: Any, text: Optional[str] = None) -> Optional[str]:
+    """The exception class a credit-lane message names (``(TimeoutError)``), else None."""
+    m = _CREDIT_EXC_RE.search(_credit_message(body, text))
+    return m.group(1) if m else None
+
+
+def credit_lane_why(body: Any, text: Optional[str] = None) -> Optional[str]:
+    """Why ``credit_lane_exhausted`` found no key (``exhausted``, ``egress_down``, ...)."""
+    m = _CREDIT_WHY_RE.search(_credit_message(body, text))
+    return m.group(1) if m else None
+
+
+def credit_lane_upload(body: Any, text: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """``(limit_s, mb)`` an upload-failed message names (``of a 120 s limit``,
+    ``with 1.7 MB to send``); each None when absent."""
+    msg = _credit_message(body, text)
+    lim, mb = _CREDIT_LIMIT_RE.search(msg), _CREDIT_MB_RE.search(msg)
+    return (lim.group(1) if lim else None), (mb.group(1) if mb else None)
+
+
+_CREDIT_TIMEOUT_HEADS = {"credit_upstream_read_failed": "seat timed out",
+                         "credit_upstream_write_failed": "upload timed out"}
+
+
+def credit_lane_head(code: str, exc: Optional[str] = None) -> Optional[str]:
+    """The head label of a credit-lane code: ``seat timed out`` / ``upload
+    timed out`` when the read / upload failed on a timeout, else the table's
+    own label."""
+    entry = CREDIT_LANE_ERROR_CODES.get(str(code or ""))
+    if entry is None:
+        return None
+    if code in _CREDIT_TIMEOUT_HEADS and exc and (
+            exc == "TimeoutError" or exc.endswith("Timeout")):
+        return _CREDIT_TIMEOUT_HEADS[code]
+    return entry.head
+
+
+def in_stream_error_body(body: Any) -> bool:
+    """True for an Anthropic-shaped error event (``{"type": "error", "error":
+    {...}}``): the error JSON a relay sends in-stream after it answered 200."""
+    return (isinstance(body, dict) and body.get("type") == "error"
+            and isinstance(body.get("error"), dict))
+
+
+def anthropic_credit_refusal(body: Any) -> bool:
+    """True when ``body`` is Anthropic's own error (its ``req_`` request id)
+    whose message says the key's credits ran out ("Your credit balance is too
+    low", t_2ff17f3d). Never a relay's own answer: those carry no request id."""
+    if not in_stream_error_body(body) or not str(body.get("request_id") or "").startswith("req_"):
+        return False
+    from agent.fallback_policy import _CREDIT_NEEDLES
+
+    msg = str(body["error"].get("message") or "").lower()
+    return any(n in msg for n in _CREDIT_NEEDLES)
+
+
 _CONN_EXC_NAMES = frozenset((
     "APIConnectionError", "APITimeoutError", "ConnectError", "ConnectTimeout",
     "ReadError", "ReadTimeout", "RemoteProtocolError", "IncompleteRead",
@@ -280,6 +450,8 @@ def classify_trigger(*, text: Optional[str] = None,
     """
     if exc_name == _BUDGET_CUT_EXC:
         return NO_FIRST_BYTE_BUDGET_CLASS, "harness"
+    if exc_name == _RELAY_EXHAUSTED_EXC:
+        return "quota_model", "relay_probe"
     h = _lower_headers(headers)
     rc = (h.get("x-relay-error-class") or "").strip().lower()
     if rc:
@@ -427,23 +599,29 @@ def relay_error_class(error: Any) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def pending_trigger_class(agent: Any) -> Optional[str]:
-    """Peek (do NOT consume) the §4.1 class of the stashed failing call, so
-    the failover arm/gate can branch on class before the ledger row consumes
-    the slot. None when nothing fresh is stashed. Never raises."""
+def pending_trigger(agent: Any) -> Optional[Tuple[str, str]]:
+    """Peek (do NOT consume) ``(trigger_class, class_source)`` of the stashed
+    failing call. None when nothing fresh is stashed. Never raises."""
     try:
         pending = getattr(agent, "_pending_fallback_error", None)
         if not isinstance(pending, dict):
             return None
         if time.monotonic() - float(pending.get("at") or 0) > _PENDING_MAX_AGE_S:
             return None
-        cls, _src = classify_trigger(
+        return classify_trigger(
             text=pending.get("text"), http_status=pending.get("status"),
             headers=pending.get("headers"), body=pending.get("body"),
             exc_name=pending.get("exc"), floor=pending.get("floor"))
-        return cls
     except Exception:  # noqa: BLE001
         return None
+
+
+def pending_trigger_class(agent: Any) -> Optional[str]:
+    """Peek (do NOT consume) the §4.1 class of the stashed failing call, so
+    the failover arm/gate can branch on class before the ledger row consumes
+    the slot. None when nothing fresh is stashed. Never raises."""
+    trig = pending_trigger(agent)
+    return trig[0] if trig else None
 
 
 def quota_seat_on_relay(agent: Any) -> bool:
@@ -1030,7 +1208,8 @@ def stash_api_error(agent: Any, api_error: BaseException,
     """
     try:
         response = getattr(api_error, "response", None)
-        headers = _lower_headers(getattr(response, "headers", None))
+        headers = (_lower_headers(getattr(response, "headers", None))
+                   or _lower_headers(getattr(api_error, "relay_headers", None)))
         body = getattr(api_error, "body", None)
         if not isinstance(body, dict) and response is not None:
             # OpenAI SDK passes ``data.get("error", data)``: a relay's
@@ -1047,8 +1226,25 @@ def stash_api_error(agent: Any, api_error: BaseException,
             msg = str(error_context.get("message") or "")
         if not msg:
             msg = str(api_error)
+        # Notice-only reset evidence, never the harness's sticky cooldown.
+        from agent.agent_runtime_helpers import extract_api_error_context
+        from agent.credential_pool import _parse_absolute_timestamp
+
+        quota_reset_at = None
+        if isinstance(api_error, Exception):
+            try:
+                quota_reset_at = _parse_absolute_timestamp(
+                    extract_api_error_context(api_error).get("reset_at"))
+                if quota_reset_at is not None:
+                    # Reject malformed/non-finite/out-of-range upstream timestamps.
+                    import datetime
+
+                    datetime.datetime.fromtimestamp(quota_reset_at, datetime.timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                quota_reset_at = None
         agent._pending_fallback_error = {
             "at": time.monotonic(),
+            "quota_reset_at": quota_reset_at,
             "status": status_code if isinstance(status_code, int) else None,
             "text": msg[:2000],
             "headers": {k: v for k, v in headers.items()
@@ -1212,6 +1408,24 @@ def fable_allowance(headers: Any) -> Optional[dict]:
             import datetime as _d
             reset = _d.datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
         return {"exhausted": int(n), "of": int(m), "earliest_reset": reset}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def relay_next_seat_in_s(headers: Any) -> Optional[float]:
+    """Seconds until the relay's next seat recovers, else None.
+
+    A relay ``quota_seat`` carries ``Retry-After = next_seat_in_s`` (claude-pool
+    ``_quota_class``, spec D2): the pool is out only until that seat frees. Any
+    other class, or no/junk Retry-After, -> None. Never raises."""
+    try:
+        h = _lower_headers(headers)
+        if (h.get("x-relay-error-class") or "").strip() != "quota_seat":
+            return None
+        from agent.retry_utils import parse_retry_after_seconds
+
+        s = parse_retry_after_seconds(h.get("retry-after"))
+        return float(s) if s is not None and 0 < s < float("inf") else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -1383,8 +1597,8 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
     else:
         trigger_class, class_source = None, None
     err_head = None
-    if kind == "failover" and text and isinstance(status, int) and status >= 400 \
-            and isinstance(body, dict):
+    if kind == "failover" and text and isinstance(status, int) and isinstance(body, dict) \
+            and (status >= 400 or in_stream_error_body(body)):
         err_head = _scrub(text)[:ERR_HEAD_MAX] or None
     turn_id = str(getattr(agent, "_current_turn_id", "") or "") or None
     session_id = str(getattr(agent, "session_id", "") or "") or None
@@ -1428,6 +1642,8 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         # t_a8dc8b21: a non-relay provider's own error text and, for
         # OpenRouter, whose limit tripped. In memory for the notice only
         # (not ledger columns); the rendered notice_text carries it.
+        if pending and pending.get("quota_reset_at") is not None:
+            row["quota_reset_at"] = pending["quota_reset_at"]  # notice only
         p_msg, p_scope = provider_error_detail(from_provider, body, headers, status)
         if p_msg and not row.get("provider_message"):
             row["provider_message"] = p_msg
@@ -1448,6 +1664,9 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         elig = pool_eligible(headers)
         if elig is not None and "pool_eligible" not in row:
             row["pool_eligible"] = elig
+        nxt = relay_next_seat_in_s(headers)
+        if nxt is not None and trigger_class == "quota_seat" and "next_seat_in_s" not in row:
+            row["next_seat_in_s"] = nxt   # notice only (t_18148399)
         fa = fable_allowance(headers)
         if fa is not None and "fable_allowance" not in row:
             row["fable_allowance"] = fa   # notice only, not a ledger column
@@ -1488,6 +1707,38 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
             if bcode:
                 row["bridge_code"] = bcode
                 row["hop"] = bridge_code_hop(bcode)
+        ccode = credit_lane_code(body, text)
+        if ccode:
+            # The credit-lane relay wrote the body; its message names the seat
+            # and the exception (t_4c447d32). Notice-only fields.
+            from agent.fallback_policy import normalize_hop
+
+            row["credit_code"] = ccode
+            row["hop"] = normalize_hop(CREDIT_LANE_ERROR_CODES[ccode].hop)
+            c_seat = credit_lane_seat(body, text)
+            if c_seat and (not row.get("seat") or row.get("seat") == "unknown"):
+                row["seat"] = c_seat
+            for key, val in (("credit_exc", credit_lane_exc(body, text)),
+                             ("credit_why", credit_lane_why(body, text))):
+                if val:
+                    row[key] = val
+            if ccode == "credit_upstream_write_failed":
+                for key, val in zip(("credit_limit_s", "credit_mb"),
+                                    credit_lane_upload(body, text)):
+                    if val:
+                        row[key] = val
+                # How long the upload ran before it failed; the limit is not the
+                # elapsed time when the link reset early (Prism 7271372ea8e6).
+                m_el = _CREDIT_ELAPSED_RE.search(_credit_message(body, text))
+                if m_el:
+                    row["credit_elapsed_s"] = m_el.group(1)
+        if (not row.get("hop") and not ccode and status == 200
+                and anthropic_credit_refusal(body)):
+            # t_2ff17f3d: Anthropic's own credit-balance refusal (its request_id),
+            # relayed in-stream after a 200. A req_ id names who answered, not the
+            # route: a direct API-key 400 refusal keeps its hop empty (Prism
+            # 97aa866b62d0), so only the measured in-stream case is inferred.
+            row["hop"] = "proxy→anthropic"
         # §4.8: a direct pin's seat and hop are knowable locally (no relay
         # headers by design, #1260). Pooled rows are left as they are.
         try:

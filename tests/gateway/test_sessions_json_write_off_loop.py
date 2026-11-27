@@ -348,7 +348,12 @@ def test_mirror_write_is_inline_with_no_running_loop(tmp_path, monkeypatch):
     real = utils_mod.atomic_replace
 
     def probe(tmp_p, target):
-        seen["thread"] = threading.current_thread()
+        # Only the sessions.json rename is under test. _make_store() above also queued a
+        # runtime-status write (the DB-handle health publish), which renames
+        # gateway_state.json on the gateway-runtime-status-writer thread whenever it lands
+        # (t_3187cbec).
+        if Path(target).name == "sessions.json":
+            seen["thread"] = threading.current_thread()
         return real(tmp_p, target)
 
     monkeypatch.setattr(utils_mod, "atomic_replace", probe)

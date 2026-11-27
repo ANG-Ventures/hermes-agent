@@ -10,7 +10,7 @@ From the repository root, use a small build context:
 ```sh
 context=$(mktemp -d)
 cp .github/runner/Dockerfile.* "$context/"
-cp .github/scripts/install-ci-tool.sh "$context/"
+cp .github/scripts/{install-ci-tool,download-ci-asset}.sh "$context/"
 docker build -f "$context/Dockerfile.heavy" -t ci-runner-heavy:node20 "$context"
 docker build -f "$context/Dockerfile.ang-hermes" -t ci-runner-ang-hermes:arch-candidate "$context"
 ```
@@ -31,7 +31,7 @@ binary, so `--version` alone does not prove portability. Then install the exact
 `scripts/run_tests.sh --files`, on both architectures. Offline installer gates:
 `python -m pytest tests/test_ci_tool_install.py -q`.
 
-After review, deploy the Dockerfiles AND the matching installer into
+After review, deploy the Dockerfiles AND both matching installer scripts into
 `/opt/ci-runners` together before building. Keep the candidate tag separate from
 `ci-runner-ang-hermes:1` until release approval. Do not stop active job containers;
 a pool rollout must drain/replace idle runners only. Adding an arm64 host to the

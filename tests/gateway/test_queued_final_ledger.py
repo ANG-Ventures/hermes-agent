@@ -243,6 +243,8 @@ async def test_a_chained_queued_turn_carries_its_own_inbound_id():
         source=topic, message_id="6002", channel_prompt=None, message_type=None,
         internal=False, metadata={}, reply_expected=None)
 
+    from gateway.queue_mgmt import mark_inflight
+    mark_inflight(runner, turn_ctx.session_key, pending_event)   # as the drain does after its pop
     await GatewayRunner._run_agent_queued_followup(
         runner, turn_ctx, adapter=None, pending="hi again", pending_event=pending_event,
         response="resp", result={"interrupted": True, "messages": []}, stream_task=None)
@@ -302,6 +304,8 @@ async def test_a_deeper_chain_keeps_the_innermost_inbound_id():
     GatewayRunner, runner, turn_ctx, pending_event = _chain_runner_and_ctx(
         {"final_response": "done", "messages": [], "queued_terminal_inbound_id": "6003"})
 
+    from gateway.queue_mgmt import mark_inflight
+    mark_inflight(runner, turn_ctx.session_key, pending_event)   # as the drain does after its pop
     merged = await GatewayRunner._run_agent_queued_followup(
         runner, turn_ctx, adapter=None, pending="hi again", pending_event=pending_event,
         response="resp", result={"interrupted": True, "messages": []}, stream_task=None)

@@ -8,7 +8,7 @@ next tick sees no origin and spawns the card on another host (Prism 76b7233abe29
 class after Momus CB1 and N1). So the hold predicate (``kanban_pause_hold``) must run BEFORE every route
 entry, not after it.
 
-ROUTE ENTRIES: ``_route_row``, ``origin_route``, ``clear_lost_state``. Every call to one of them in
+ROUTE ENTRIES: ``_route_row``, ``_route_row_base``, ``origin_route``, ``clear_lost_state``. Every call to one of them in
 ``hermes_cli/`` must match a row in ``SITES`` below: ``(file, enclosing function, callee) -> (guard, ...)``,
 one guard per call in source order (a second call in the same function needs its own entry).
 
@@ -22,7 +22,8 @@ one guard per call in source order (a second call in the same function needs its
     (``kanban_pause_hold.held_routes``); ``_review_pause_pins`` proves the review loop is the one fed by
     ``gate_rows`` (which already dropped held review rows).
   * ``guard`` None means the call is internal to another route entry that is itself guarded at its callers
-    (``origin_route`` -> ``clear_lost_state``, ``_route_row`` -> ``origin_route``).
+    (``origin_route`` -> ``clear_lost_state``). ``_route_row`` is a wrapper (t_9965b8d5): it must pass
+    ``held=held`` to ``_route_row_base``, whose early exit on ``held`` decides before its ``origin_route``.
 
 A NEW call site (no row) is red: decide the hold before it (``kanban_pause_hold.held_routes`` / ``decide``),
 then add the row with its guard. A row whose site is gone is red too (stale), so the table only describes
@@ -41,7 +42,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
-ENTRIES = frozenset({"_route_row", "origin_route", "clear_lost_state"})
+ENTRIES = frozenset({"_route_row", "_route_row_base", "origin_route", "clear_lost_state"})
 SCAN = "hermes_cli"
 
 Key = Tuple[str, str, str]  # (repo-relative file, enclosing function, callee)
@@ -50,8 +51,13 @@ SITES: Dict[Key, Tuple[Optional[str], ...]] = {
     # ready-lane no-plan continuation branch, then the review loop
     ("hermes_cli/kanban_db_dispatch.py", "_dispatch_once_locked", "origin_route"): ("_pause_held",
                                                                                      "_review_pause_pins"),
-    ("hermes_cli/kanban_db_dispatch.py", "_route_row", "origin_route"): ("held",),
+    ("hermes_cli/kanban_db_dispatch.py", "_route_row", "_route_row_base"): ("held=held",),
+    ("hermes_cli/kanban_db_dispatch.py", "_route_row_base", "origin_route"): ("held",),
     ("hermes_cli/kanban_continuation.py", "origin_route", "clear_lost_state"): (None,),
+    # kanban create's placement preview (t_0a5740f3): held_routes([row]) decides first, then passes held=
+    ("hermes_cli/kanban_create_placement.py", "preview_line", "_route_row"): ("held=held",),
+    # its no-plan branch mirrors the dispatcher's: origin_route only for a row not in held
+    ("hermes_cli/kanban_create_placement.py", "_unplanned_route", "origin_route"): ("held",),
 }
 
 
@@ -175,6 +181,9 @@ def _dispatch_once_locked(conn, rows, plan):
             origin_route(conn, row)
 
 def _route_row(conn, row, plan, held=None):
+    return _route_row_base(conn, row, plan, held=held)
+
+def _route_row_base(conn, row, plan, held=None):
     if held and row["id"] in held:
         return held[row["id"]]
     return origin_route(conn, row)
@@ -183,17 +192,29 @@ _FIX_CONT = '''
 def origin_route(conn, row):
     clear_lost_state(conn, row["id"], "h")
 '''
+_FIX_PREVIEW = '''
+def preview_line(conn, row, plan):
+    held = held_routes([row], {})
+    if row["id"] in held:
+        return held[row["id"]]
+    return _route_row(conn, row, plan, held=held)
+
+def _unplanned_route(conn, row, held):
+    if row["origin_host"] and row["id"] not in held:
+        return origin_route(conn, row)
+'''
 
 
 def _selftest() -> int:
     import tempfile
 
-    def run(dispatch: str) -> List[str]:
+    def run(dispatch: str, preview: str = _FIX_PREVIEW) -> List[str]:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / SCAN).mkdir()
             (root / SCAN / "kanban_db_dispatch.py").write_text(dispatch, encoding="utf-8")
             (root / SCAN / "kanban_continuation.py").write_text(_FIX_CONT, encoding="utf-8")
+            (root / SCAN / "kanban_create_placement.py").write_text(preview, encoding="utf-8")
             return check(root)
 
     cases = {
@@ -210,10 +231,16 @@ def _selftest() -> int:
         "unguarded no-plan loop": (_FIX_OK.replace(' and r["id"] not in _pause_held', ""), 1),
         "new route entry": (_FIX_OK + "\ndef other(conn, r):\n    origin_route(conn, r)\n", 1),
         "stale row": (_FIX_OK.replace("    return origin_route(conn, row)\n", "    return None\n"), 1),
+        # t_9965b8d5: the wrapper must hand the held set through, or _route_row_base's early exit never fires
+        "wrapper drops held=": (_FIX_OK.replace("_route_row_base(conn, row, plan, held=held)",
+                                                 "_route_row_base(conn, row, plan)"), 1),
+        # t_0a5740f3: the create preview routes one card; it must hand the held set through too
+        "preview drops held=": ((_FIX_OK, _FIX_PREVIEW.replace("plan, held=held)", "plan)")), 1),
+        "preview no-plan origin unguarded": ((_FIX_OK, _FIX_PREVIEW.replace(' and row["id"] not in held', "")), 1),
     }
     bad = 0
     for name, (src, want) in cases.items():
-        got = run(src)
+        got = run(*src) if isinstance(src, tuple) else run(src)
         ok = (len(got) == 0) if want == 0 else (len(got) >= 1)
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {len(got)} finding(s)")
         for line in got:

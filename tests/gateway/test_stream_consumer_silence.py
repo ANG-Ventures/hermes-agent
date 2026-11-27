@@ -77,6 +77,259 @@ def _sent_and_edited(adapter):
     return texts
 
 
+@pytest.mark.asyncio
+async def test_human_fold_releases_internal_commentary_before_final():
+    from gateway.run_busy import GatewayBusySessionMixin
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.turn_context import TurnContext
+
+    runner = GatewayBusySessionMixin()
+    turn = SimpleNamespace(agent=None, event=None, ctx=None)
+    runner._session_state = lambda key: SimpleNamespace(turn=turn)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="test")
+    agent = object()
+    turn.agent = agent
+    turn.event = MessageEvent(text="wake", source=source, internal=True)
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(adapter, "test", StreamConsumerConfig(internal_event=True))
+    ctx = TurnContext(persist_user_display_kind="internal_notification",
+                      interim_assistant_messages_enabled=True, _run_still_current=lambda: True)
+    ctx.stream_consumer_holder[0] = consumer
+    turn.ctx = ctx
+    consumer.on_commentary("old commentary")
+    consumer._drain_queue()
+    assert consumer._internal_held == ["old commentary"]
+    human = MessageEvent(text="please answer", source=source, reply_expected=True)
+    await asyncio.to_thread(runner._fold_into_running_turn, agent, "test", human)
+    await asyncio.to_thread(runner._fold_into_running_turn, agent, "test", human)
+    consumer.on_commentary("new commentary")
+    delivered = asyncio.Event()
+    original_send = adapter.send.side_effect
+    async def send(**kwargs):
+        if kwargs.get("content") == "new commentary":
+            delivered.set()
+        return SimpleNamespace(success=True, message_id="sent")
+    adapter.send.side_effect = send
+    task = asyncio.create_task(consumer.run())
+    try:
+        await asyncio.wait_for(delivered.wait(), 2)
+        assert _sent_and_edited(adapter) == ["old commentary", "new commentary"]
+        assert ctx.persist_user_display_kind == "internal_notification"
+        assert ctx.effective_display_kind is None
+    finally:
+        task.cancel()
+        await task
+        adapter.send.side_effect = original_send
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth_cap", [False, True])
+async def test_receiving_turn_policy_survives_queued_return(monkeypatch, tmp_path, depth_cap):
+    from tests.gateway.test_queued_followup_turn_clock_and_leftover_steer import _drive, SESSION_KEY, _source
+    from gateway.platforms.event import MessageEvent
+    from gateway.turn_context import TurnContext
+
+    contexts = []
+    runner_ref = []
+    previous = TurnContext(persist_user_display_kind="internal_notification")
+
+    def prepare(runner):
+        runner_ref.append(runner)
+        runner._MAX_INTERRUPT_DEPTH = 0 if depth_cap else 5
+        runner._session_state(SESSION_KEY).turn.event = MessageEvent(
+            text="opening", source=_source(), reply_expected=False, internal=True)
+        build = runner._run_agent_build_turn_context
+
+        def build_turn(*args, **kwargs):
+            # Reused agent identity can still be published while its old ctx is present.
+            runner._session_state(SESSION_KEY).turn.ctx = previous
+            kwargs["persist_user_display_kind"] = "internal_notification"
+            kwargs["reply_expected"] = True
+            ctx, turn_runner, adapter = build(*args, **kwargs)
+            contexts.append(ctx)
+            return ctx, turn_runner, adapter
+
+        runner._run_agent_build_turn_context = build_turn
+
+    def script(idx, queue_followup):
+        runner = runner_ref[0]
+        ctx = contexts[-1]
+        # Do not wait for the 50ms tracker: steer can arrive before its next tick.
+        agent = ctx.agent_holder[0]
+        runner._session_state(SESSION_KEY).turn.agent = agent
+        runner._fold_into_running_turn(agent, SESSION_KEY, MessageEvent(
+            text="human steer", source=_source(), reply_expected=False))
+        if idx == 0:
+            queue_followup("queued")
+        return {"final_response": "NO_REPLY", "messages": [], "api_calls": 1}
+
+    _, _, _, result = await _drive(monkeypatch, tmp_path, script, prepare=prepare)
+    assert not previous.human_engaged, "steer promoted the previous cached-agent context"
+    assert all(ctx.human_engaged for ctx in contexts)
+    assert all(ctx.reply_expected is True for ctx in contexts), "opening event overwrote receiving obligation"
+    assert all(ctx.persist_user_display_kind == "internal_notification" for ctx in contexts)
+    prefix = "effective" if depth_cap else "queued_terminal"
+    assert result[prefix + "_display_kind"] is None
+    assert result[prefix + "_reply_expected"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["depth_cap", "discarded", "recursive"])
+async def test_cleanup_steer_updates_only_returned_owner_policy(monkeypatch, tmp_path, path):
+    from tests.gateway.test_queued_followup_turn_clock_and_leftover_steer import _drive, SESSION_KEY, _source
+    from gateway.platforms.event import MessageEvent
+
+    contexts = []
+    runner_ref = []
+
+    def prepare(runner):
+        runner_ref.append(runner)
+        runner._MAX_INTERRUPT_DEPTH = 0 if path == "depth_cap" else 5
+        build = runner._run_agent_build_turn_context
+        cleanup = runner._run_agent_cleanup_turn_tasks
+
+        def build_turn(*args, **kwargs):
+            kwargs["persist_user_display_kind"] = "internal_notification"
+            kwargs["reply_expected"] = False
+            ctx, worker, adapter = build(*args, **kwargs)
+            contexts.append(ctx)
+            return ctx, worker, adapter
+
+        async def cleanup_turn(ctx, **kwargs):
+            # Accepted human steer during an awaited cleanup, after return selection.
+            await asyncio.sleep(0)
+            if ctx is contexts[0]:
+                agent = ctx.agent_holder[0]
+                runner._session_state(SESSION_KEY).turn.agent = agent
+                runner._fold_into_running_turn(agent, SESSION_KEY, MessageEvent(
+                    text="late human steer", source=_source(), reply_expected=True))
+            await cleanup(ctx, **kwargs)
+
+        runner._run_agent_build_turn_context = build_turn
+        runner._run_agent_cleanup_turn_tasks = cleanup_turn
+        if path == "discarded":
+            async def discard(**kwargs):
+                return None
+            runner._prepare_profile_scoped_inbound_message_text = discard
+
+    def script(idx, queue_followup):
+        if idx == 0:
+            if path == "recursive":
+                # Parent is human-engaged; the terminal internal child must stay quiet.
+                runner = runner_ref[0]
+                agent = contexts[0].agent_holder[0]
+                runner._session_state(SESSION_KEY).turn.agent = agent
+                runner._fold_into_running_turn(agent, SESSION_KEY, MessageEvent(
+                    text="parent human steer", source=_source(), reply_expected=True))
+            queue_followup("queued")
+        return {"final_response": "NO_REPLY", "messages": [], "api_calls": 1}
+
+    _, _, calls, result = await _drive(monkeypatch, tmp_path, script, prepare=prepare)
+    assert all(ctx.persist_user_display_kind == "internal_notification" for ctx in contexts)
+    if path == "recursive":
+        assert len(calls) == 2
+        assert result["queued_terminal_display_kind"] == "internal_notification"
+        assert result["queued_terminal_reply_expected"] is False
+        assert result["effective_reply_expected"] is False
+    else:
+        assert len(calls) == 1
+        assert contexts[0].human_engaged
+        assert result["effective_display_kind"] is None
+        assert result["effective_reply_expected"] is True
+
+
+@pytest.mark.parametrize("case", ["internal", "heartbeat", "stale", "wrong_agent", "muted", "scheduled", "display_off"])
+def test_fold_promotion_guards(case):
+    from gateway.run_busy import GatewayBusySessionMixin
+    from gateway.platforms.event import MessageEvent
+    from gateway.turn_context import TurnContext
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    runner = GatewayBusySessionMixin()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="test")
+    agent = object()
+    ctx = TurnContext(persist_user_display_kind="internal_notification",
+                      _run_still_current=lambda: case != "stale",
+                      mute_notification_reply=case == "muted",
+                      scheduled_heartbeat=case == "scheduled")
+    consumer = GatewayStreamConsumer(_make_adapter(), "test", StreamConsumerConfig(internal_event=True),
+                                     run_still_current=ctx._run_still_current)
+    if case != "display_off":
+        ctx.stream_consumer_holder[0] = consumer
+    opening = MessageEvent(text="wake", source=source, internal=True)
+    turn = SimpleNamespace(agent=agent, ctx=ctx, event=opening)
+    runner._session_state = lambda key: SimpleNamespace(turn=turn)
+    event = MessageEvent(text="request", source=source, internal=case == "internal", reply_expected=True)
+    if case == "heartbeat":
+        event._heartbeat_session_id = "heartbeat"
+    runner._fold_into_running_turn(object() if case == "wrong_agent" else agent, "test", event)
+    assert ctx.human_engaged == (case in {"muted", "scheduled", "display_off"})
+    assert consumer._queue.empty()
+    assert opening.internal is True
+    assert ctx.persist_user_display_kind == "internal_notification"
+
+
+@pytest.mark.asyncio
+async def test_promoted_reply_cannot_silently_disappear():
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.config import Platform
+
+    runner = GatewayTurnMixin()
+    runner.async_session_store = SimpleNamespace(clear_resume_pending=AsyncMock())
+    runner._clear_restart_failure_count = AsyncMock()
+    result = {"final_response": "NO_REPLY", "effective_display_kind": None, "messages": []}
+    response, silent, _ = await runner._hmwa_shape_agent_response(
+        result, SimpleNamespace(chat_id="test", platform=Platform.TELEGRAM), [],
+        SimpleNamespace(session_id="test"), None, None, 0, "test", "telegram", 0,
+        persist_user_display_kind="internal_notification", reply_expected=True)
+    assert not silent
+    assert response and response != "NO_REPLY"
+
+
+@pytest.mark.parametrize("quiet", ["off", "mute", "heartbeat", "enabled"])
+def test_promoted_stream_setup_preserves_display_switches(quiet):
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+    from gateway.config import StreamingConfig
+
+    adapter = _make_adapter()
+    ctx = TurnContext(
+        human_engaged=True, persist_user_display_kind="internal_notification",
+        source=SimpleNamespace(chat_id="test"), user_config={},
+        resolve_display_setting=lambda *args: False,
+        interim_assistant_messages_enabled=quiet != "off",
+        mute_notification_reply=quiet == "mute", scheduled_heartbeat=quiet == "heartbeat",
+        _run_still_current=lambda: True)
+    runner = SimpleNamespace(
+        config=SimpleNamespace(streaming=StreamingConfig()),
+        _delivery_adapter_for=lambda source: adapter,
+        _build_stream_consumer_config=lambda *a, **k: (StreamConsumerConfig(), None))
+    consumer, _, _, enabled = TurnRunner(runner, ctx)._setup_stream_consumer("telegram")
+    if quiet == "enabled":
+        assert enabled and consumer is not None
+        assert consumer._drain_queue().got_human_engagement
+    else:
+        assert consumer is None and not enabled
+
+
+@pytest.mark.asyncio
+async def test_queued_promotion_is_abandoned_after_generation_dies():
+    current = True
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(adapter, "test", StreamConsumerConfig(internal_event=True),
+                                     run_still_current=lambda: current)
+    consumer.on_commentary("never deliver")
+    consumer._drain_queue()
+    consumer.on_human_engagement()
+    current = False
+    await consumer.run()
+    assert not adapter.send.called
+    assert consumer.cfg.internal_event
+
+
 class TestStreamedSilenceSuppression:
     @pytest.mark.asyncio
     async def test_no_reply_only_stream_is_fully_suppressed(self):

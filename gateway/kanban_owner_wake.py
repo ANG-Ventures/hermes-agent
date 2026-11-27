@@ -55,6 +55,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -62,6 +63,7 @@ from gateway import kanban_notify_suppress as _ns
 from gateway import kanban_wake_freshness as _fresh
 
 logger = logging.getLogger(__name__)
+_WINDOWS = os.name == "nt"
 
 COALESCE_SECONDS = 600.0
 FIRST_RUN_LOOKBACK_SECONDS = 600
@@ -75,6 +77,7 @@ STATE_FILENAME = "kanban_owner_wake.json"
 SCAN_KINDS = (
     "blocked", "stalled", "crashed", "gave_up", "timed_out", "reclaimed",
     "completed", "review_requested", "skipped_nonspawnable", "review_deadman",
+    "mechanical_wake",
 )
 STUCK_KINDS = frozenset({"stalled", "crashed", "gave_up", "timed_out"})
 # Kinds the per-subscription notify+wake path turns into a wake. The owner-wake
@@ -95,6 +98,14 @@ TRIGGER_LAST_BLOCKER = "last_blocker_done"
 TRIGGER_RED_HANDBACK = "red_handback"
 TRIGGER_WOKE_NONSPAWNABLE = "woke_nonspawnable"
 TRIGGER_REVIEW_DEADMAN = "review_deadman"
+# t_6a70430e: a card-owned MECHANICAL wake (hermes-home scripts/lib/card_mechanical_wake.py: a detached job's
+# failure/handoff, an obligation reconciler routine wake) on a boomerang-wake card, as an event instead of a
+# direct control-socket turn. Off boomerang it is the owner turn, like every other row.
+TRIGGER_MECHANICAL_WAKE = "mechanical_wake"
+# Event kinds whose producer resolves the recipient itself and may carry an alerts-home / fallback session key
+# (t_3151f3fd review deadman; t_6a70430e mechanical wake). hermes-home card_mechanical_wake.consumer_ready() reads
+# this name in the LOADED tree before a producer puts a routed recipient on a mechanical_wake event.
+ROUTED_RECIPIENT_KINDS = (TRIGGER_REVIEW_DEADMAN, TRIGGER_MECHANICAL_WAKE)
 
 _WAKE_OFF_RE = re.compile(r"^\s*wake\s*:\s*off\s*$", re.I | re.M)
 # A block reason that names WHEN or ON WHAT the card can move again.
@@ -202,17 +213,99 @@ def label_pending(health: Optional[dict]) -> bool:
     return all(v is True for v in verdicts)
 
 
-def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
-    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown)."""
+RED_LABELS_ENV = "PR_RED_LABELS"              # "0" = kill switch: the full failing list, as before
+RED_LABELS_STATE_ENV = "PR_RED_LABELS_STATE"  # path override (tests); same name hermes-home reads
+
+
+def red_labels_for(repo: str, number: int, head: Any) -> Optional[dict]:
+    """The hermes-home ``state/pr-red-labels.json`` entry (t_a4c54629) for ``repo#number`` at ``head``, or None:
+    kill switch, no head, unreadable file, no entry, another head, or unreadable counts. An all-zero entry
+    (no CI red at this head) is returned too: :func:`pr_is_red_or_dirty` reads a failing Prism next to it as
+    the round cap or a Prism refusal, never as a red (t_265197b1)."""
+    if os.environ.get(RED_LABELS_ENV, "1").strip() == "0" or not head:
+        return None
+    path = os.environ.get(RED_LABELS_STATE_ENV)
+    if not path:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None  # hermetic: no live state from pytest unless a test points at a file
+        from hermes_constants import get_default_hermes_root
+
+        path = str(get_default_hermes_root() / "state" / "pr-red-labels.json")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    want = f"{repo}#{number}".lower()
+    entry = next((v for k, v in data.items() if str(k).lower() == want), None)
+    if not isinstance(entry, dict) or str(entry.get("head") or "") != str(head):
+        return None
+    counts = entry.get("counts")
+    try:
+        if not isinstance(counts, dict):
+            return None
+        sum(int(v or 0) for v in counts.values())
+    except (TypeError, ValueError):
+        return None
+    return entry
+
+
+def _all_zero(labels: Optional[dict]) -> bool:
+    return bool(labels) and not sum(int(v or 0) for v in (labels.get("counts") or {}).values())
+
+
+# The Prism review check (app ang-prism). It is not CI: hermes-home's red labeller never counts it.
+_PRISM_CHECK_RE = re.compile(r"^(?:.+ / )?prism$", re.IGNORECASE)
+# The check-run title Prism writes when its round cap is spent at this head (home#12163 @ 94859564).
+_PRISM_CAP_RE = re.compile(r"no further review|round cap", re.IGNORECASE)
+
+
+def _prism_text(title: Any) -> str:
+    """t_265197b1: a failing Prism check at a head the labeller graded all-zero is not a red of the PR."""
+    if _PRISM_CAP_RE.search(str(title or "")):
+        return "Prism: no further review at this head (operator finalizes)"
+    return "Prism check failed"
+
+
+def _labelled_red(labels: dict) -> str:
+    """``red (OWN): a, b; MAIN reds: m`` (+ ``; STALE-BASE s: rebase``); ``red: 0 own (MAIN reds: m)`` when OWN is 0."""
+    counts = labels.get("counts") or {}
+    own = [str(n) for n in labels.get("own") or [] if n]
+    n_own, n_main, n_stale = (int(counts.get(k) or 0) for k in ("OWN", "MAIN", "STALE-BASE"))
+    text = (f"red (OWN): {', '.join(own[:6]) or n_own}; MAIN reds: {n_main}" if n_own
+            else f"red: 0 own (MAIN reds: {n_main})")
+    if n_stale:
+        text += f"; STALE-BASE {n_stale}: rebase"
+    return text
+
+
+def pr_is_red_or_dirty(health: Optional[dict], labels: Optional[dict] = None) -> Optional[str]:
+    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown).
+    ``labels`` (:func:`red_labels_for` at this head) swaps the raw failing list for OWN names + the MAIN count.
+    An all-zero ``labels`` names a failing Prism check as Prism's (cap / refusal), never ``red: prism``; any
+    other failing check the labeller did not count stays in the raw list."""
     if not health or str(health.get("state") or "").lower() != "open":
         return None
     parts = []
     names = [] if label_pending(health) else list(health.get("failing") or [])
-    urls = list(health.get("failing_urls") or [])
-    failing = [f"{n} <{u}>" if u else str(n)
-               for n, u in zip(names, urls + [""] * (len(names) - len(urls))) if n]
-    if failing:
+    pad = len(names)
+    urls = list(health.get("failing_urls") or []) + [""] * pad
+    titles = list(health.get("failing_titles") or []) + [None] * pad
+    prism = []
+    if _all_zero(labels):
+        prism = [f"{_prism_text(t)} <{u}>" if u else _prism_text(t)
+                 for n, u, t in zip(names, urls, titles) if n and _PRISM_CHECK_RE.match(str(n))]
+        keep = [i for i, n in enumerate(names) if not (n and _PRISM_CHECK_RE.match(str(n)))]
+        names, urls = [names[i] for i in keep], [urls[i] for i in keep] + [""] * pad
+        labels = None
+    failing = [f"{n} <{u}>" if u else str(n) for n, u in zip(names, urls) if n]
+    if failing and labels:
+        parts.append(_labelled_red(labels))
+    elif failing:
         parts.append("red: " + ", ".join(failing[:6]))
+    parts.extend(prism)
     if str(health.get("mergeable_state") or "").lower() == "dirty":
         parts.append("dirty (merge conflict)")
     return "; ".join(parts) or None
@@ -245,6 +338,8 @@ def describe(item: dict) -> str:
     elif trig == TRIGGER_REVIEW_DEADMAN:
         out = (f"waiting {item.get('waiting_min') or '?'}m in review on you with no owner comment (review deadman "
                "tier 1): land it, request changes, or comment why it waits")
+    elif trig == TRIGGER_MECHANICAL_WAKE:
+        out = f"{item.get('source') or 'automation'} reported on this card: read it and decide what it needs"
     else:
         out = str(item.get("kind"))
     if reason:
@@ -430,6 +525,8 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
         out["failing"] = [str(r.get("name") or "?") for r in red]
         # the run each verdict came from, so the wake is verifiable in one click (t_121bd42e)
         out["failing_urls"] = [str(r.get("html_url") or "") for r in red]
+        # Prism's own verdict line (round cap vs refusal), read by pr_is_red_or_dirty (t_265197b1)
+        out["failing_titles"] = [str((r.get("output") or {}).get("title") or "") for r in red]
         if red and REVIEW_LABEL not in [x.strip().lower() for x in out["labels"]] and any(_LABEL_GATE_RE.match(n) for n in out["failing"]) \
                 and all(_LABEL_GATE_RE.match(n) or _REQUIRED_ROLLUP_RE.match(n) for n in out["failing"]):
             # only when label_pending could hold: verify EVERY failing run's own annotations (unreadable -> False)
@@ -492,7 +589,7 @@ def handback_pr_verdict(kb: Any, conn: Any, task: dict, payload: Optional[dict],
         if memo[key] is None:
             raise PrHealthUnknown(f"{ref.repo}#{ref.number}")
         health = memo[key]
-        bad = pr_is_red_or_dirty(health)
+        bad = pr_is_red_or_dirty(health, red_labels_for(ref.repo, int(ref.number), health.get("head")))
         if bad:
             label = f"{ref.repo}#{ref.number}"
             states.append(f"{label} {bad}")
@@ -535,6 +632,7 @@ class WakeState:
         self.last_wake: dict[str, float] = {}
         self.row_failures: dict[str, int] = {}  # "board|event" -> failed classifications
         self.red_seen: dict[str, float] = {}  # S5: red_key -> when it last woke an owner
+        self._persisted: Optional[str] = None
         self._load()
 
     def _load(self) -> None:
@@ -547,28 +645,47 @@ class WakeState:
             self.pending = dict(raw.get("pending") or {})
             self.last_wake = {str(k): float(v) for k, v in (raw.get("last_wake") or {}).items()}
             self.red_seen = {str(k): float(v) for k, v in (raw.get("red_seen") or {}).items()}
+            self._persisted = self._serialize()
+
+    def _serialize(self) -> str:
+        # Compare immutable snapshots: pending items can be edited in place.
+        return json.dumps({"cursors": self.cursors, "pending": self.pending,
+                           "last_wake": self.last_wake, "red_seen": self.red_seen},
+                          sort_keys=True)
 
     def write_owner_wake_state(self, now: float) -> None:
-        """Blocking (fsync + rename): call via ``asyncio.to_thread`` only."""
+        """Checkpoint changed state. Blocking: call via ``asyncio.to_thread``."""
         self.last_wake = {k: v for k, v in self.last_wake.items() if now - v < COALESCE_SECONDS * 6}
         _ns.note_red_seen(self.red_seen, (), now)
-        data = {"cursors": self.cursors, "pending": self.pending, "last_wake": self.last_wake,
-                "red_seen": self.red_seen}
+        snapshot = self._serialize()
+        if snapshot == self._persisted:
+            return
+        # A failed write (including a directory fsync after rename) cannot seed a cache hit.
+        self._persisted = None
+        tmp = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".owner-wake-", dir=str(self.path.parent))
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
+                fh.write(snapshot)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
-            dfd = os.open(str(self.path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            tmp = None
+            # Native Windows cannot open directories with os.open for fsync.
+            if not _WINDOWS:
+                dfd = os.open(str(self.path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
         except OSError as exc:
             logger.warning("kanban owner-wake: cannot persist state %s: %s", self.path, exc)
+            if tmp is not None:
+                with suppress(OSError):
+                    os.unlink(tmp)
+            return
+        self._persisted = snapshot
 
 
 def state_path() -> Path:
@@ -735,7 +852,7 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
             rows = conn.execute(
                 f"SELECT e.id, e.task_id, e.kind, e.payload, e.run_id, e.created_at, "
                 f"{actor} AS actor_sid, {actor_profile} AS actor_profile, "
-                f"t.session_id AS home_sid, t.title, t.body, "
+                f"t.session_id AS home_sid, t.title, t.body, t.boomerang_wake, "
                 f"t.result FROM task_events e JOIN tasks t ON t.id = e.task_id "
                 f"WHERE e.id > ? AND e.kind IN ({marks}) ORDER BY e.id LIMIT ?",
                 (cursor, *SCAN_KINDS, SCAN_LIMIT),
@@ -759,12 +876,16 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
                 state.row_failures.pop(fkey, None)
                 if item is not None:
                     item["queued_at"] = now
-                    key = f"{slug}|{r['task_id']}"
+                    rkey = routed_recipient(item)
+                    key = f"{slug}|{r['task_id']}" + (f"|to:{rkey}" if rkey else "")
                     card = state.pending.setdefault(key, {
-                        "board": slug, "task_id": r["task_id"], "home_sid": r["home_sid"] or "",
+                        "board": slug, "task_id": r["task_id"], "home_sid": rkey or r["home_sid"] or "",
                         "title": r["title"] or "", "items": [],
                     })
-                    card["home_sid"] = r["home_sid"] or card.get("home_sid") or ""
+                    if rkey:
+                        card["recipient"] = rkey  # t_3151f3fd: woken in place of the home, never re-homed
+                    else:
+                        card["home_sid"] = r["home_sid"] or card.get("home_sid") or ""
                     card["items"].append(item)
                     queued += 1
                 state.cursors[slug] = max(state.cursors[slug], int(r["id"]))
@@ -774,6 +895,22 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
         finally:
             conn.close()
     return queued
+
+
+def routed_recipient(item: dict) -> str:
+    """t_3151f3fd: the session KEY a review_deadman event names as its recipient, else "".
+
+    hermes-home's review deadman resolves the recipient itself (recipient(): a card whose
+    home lives in #alerts, or whose home has no live gateway, pages the newest live operator
+    wake sub). On a boomerang card it now emits the event on those routes too, carrying
+    ``recipient_session_key``; the owner-wake then wakes THAT session (or hands it to a
+    boomerang child routed there), never the #alerts home. Any other kind: ""."""
+    if item.get("kind") not in ROUTED_RECIPIENT_KINDS:
+        return ""
+    p = item.get("payload") or {}
+    if p.get("recipient_route") not in ("alerts-home", "fallback"):
+        return ""
+    return str(p.get("recipient_session_key") or "").strip()
 
 
 def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
@@ -790,6 +927,12 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
             "event_ts": r["created_at"], "payload": payload if isinstance(payload, dict) else None}
     if kind == "blocked":
         trig = classify_block(payload)
+        if trig is None and "boomerang_wake" in r.keys() and r["boomerang_wake"]:
+            # Admission only: the boomerang classifier still owns the disposition.
+            from gateway.kanban_boomerang_wake import enabled
+
+            if enabled():
+                trig = "blocked_assess"
         if trig is None:
             return None
         item.update(trigger=trig, reason=_clip((payload or {}).get("reason")))
@@ -810,6 +953,10 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
             return None   # a plain ready card on a human assignee, not a scheduled wake
         item.update(trigger=TRIGGER_WOKE_NONSPAWNABLE, assignee=str((payload or {}).get("assignee") or ""))
     elif kind == "review_requested":
+        # t_54f4fde6: a handback parked on the review-hold lane is no decision yet; the hand-off to the
+        # operator writes a fresh review_requested that wakes as usual.
+        if kb.is_review_hold_assignee((payload or {}).get("reviewer")):
+            return None
         verdict = handback_pr_verdict(kb, conn, {"id": r["task_id"], "result": r["result"]}, payload,
                                       r["run_id"], pr_health, memo)
         if not verdict["state"]:
@@ -819,6 +966,10 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
     elif kind == "review_deadman":
         # t_1e0ffee4: the review deadman's tier-1 page as an event (hermes-home kanban-review-deadman.py)
         item.update(trigger=TRIGGER_REVIEW_DEADMAN, waiting_min=(payload or {}).get("waiting_min"))
+    elif kind == "mechanical_wake":
+        p = payload or {}
+        item.update(trigger=TRIGGER_MECHANICAL_WAKE, source=_clip(p.get("source"), 80),
+                    reason=_clip(p.get("text")))
     else:
         return None
     return item
@@ -985,21 +1136,32 @@ async def deliver_turn(runner: Any, entry: Any, text: str,
                        cards: Optional[list[dict]] = None) -> bool:
     """Enqueue one handoff turn into ``entry``'s session. Raises on no route.
 
+    Header: ``kanban wake · <sub> · <card>``; the sub-kind comes from the cards' item kinds/triggers
+    (``gateway.wake_kind.kanban_wake_sub``: a boomerang re-surface trigger reads ``boomerang``), the
+    card only when the turn carries exactly one.
+
     Returns the adapter's admission receipt (``event._gateway_accepted is True``): False when the
     turn was not taken, e.g. a busy session whose queue is at ``_BUSY_QUEUE_MAX_PENDING``."""
     from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.wake_kind import KANBAN, kanban_wake_sub, single_card, wake_meta
 
     source = dataclasses.replace(entry.origin)
     adapter = runner._adapter_for_source(source)  # noqa: SLF001
     if adapter is None:
         raise RuntimeError(f"no live adapter for {getattr(source.platform, 'value', source.platform)}")
+    _items = [i for c in cards or [] for i in c.get("items") or []]
     event = MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=source,
         internal=True,
         allow_gateway_control=False,
+        wake_kind=KANBAN,
         metadata={
+            **wake_meta(
+                sub=kanban_wake_sub([i.get("kind") for i in _items], [i.get("trigger") for i in _items]),
+                card_id=single_card(c.get("task_id") for c in cards or []),
+            ),
             "kanban_owner_wake": True,
             "gateway_session_key": entry.session_key,
             # Not strict: a turn queued behind a busy session survives a
@@ -1013,7 +1175,9 @@ async def deliver_turn(runner: Any, entry: Any, text: str,
                                   [i.get("kind") for i in c.get("items") or []],
                                   max((i.get("event_ts") or 0 for i in c.get("items") or []),
                                       default=None),
-                                  render_prompt([c]))
+                                  render_prompt([c]),
+                                  closed_news=any(_fresh.closed_card_news(i.get("kind"), i.get("payload"))
+                                                  for i in c.get("items") or []))
                 for c in cards or []
             ],
         },
@@ -1051,6 +1215,10 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     if pr_health is None and use_default_pr_health:
         pr_health = default_pr_health()
     await asyncio.to_thread(scan, state, now, pr_health)
+    # Checkpoint queued inputs before dispatch when storage is available, but
+    # don't withhold an owner wake if the checkpoint fails.
+    if state.pending:
+        await asyncio.to_thread(state.write_owner_wake_state, now)
 
     from gateway import kanban_boomerang_wake as _ah
 
@@ -1082,7 +1250,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         # needs nothing from its owner any more.
         live = []
         for i in card["items"]:
-            if _fresh.is_stale(current.get("status"), str(i.get("kind") or "")):
+            if _fresh.is_stale(current.get("status"), str(i.get("kind") or ""), i.get("payload")):
                 _fresh.log_dropped(card["task_id"], str(i.get("kind")), i.get("event_ts"),
                                    "owner-wake", current.get("status"), now)
             else:
@@ -1091,7 +1259,8 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             state.pending.pop(key, None)
             continue
         card["items"] = live
-        card["home_sid"] = str(current.get("session_id") or "")
+        # t_3151f3fd: a routed review_deadman keeps the recipient the producer resolved
+        card["home_sid"] = card.get("recipient") or str(current.get("session_id") or "")
         card["title"] = current.get("title") or card.get("title") or ""
         try:
             entry = await asyncio.to_thread(resolve_owner, store, card["home_sid"],
@@ -1171,10 +1340,13 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     for session_key, (entry, cards) in by_session.items():
         text = render_prompt([c for _k, c in cards])
         try:
-            await deliver_turn(runner, entry, text, [c for _k, c in cards])
+            accepted = await deliver_turn(runner, entry, text, [c for _k, c in cards])
         except Exception as exc:
             logger.warning("kanban owner-wake: wake of %s failed (%s); held for retry",
                            session_key, exc)
+            continue
+        if not accepted:
+            logger.debug("kanban owner-wake: wake of %s not accepted; held for retry", session_key)
             continue
         turns += 1
         for key, card in cards:

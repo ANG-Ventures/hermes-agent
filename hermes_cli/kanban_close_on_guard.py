@@ -372,3 +372,68 @@ def refusal(author: str, body: str) -> Optional[str]:
     except CloseOnLineRefused as exc:
         return str(exc)
     return None
+
+
+# ── deadman hold (t_238f3f04, t_5a5e36db) ─────────────────────────────────────────────────────────────
+# The home review deadman reads a hold with this exact pattern on ANY line (review_deadman_core._HOLD_RE) and
+# honours it only when operator_identity.comment_can_hold(author, body). A hold any other author stores printed
+# "Comment added"/ok and held nothing: refused here, in add_comment, so the CLI, the kanban_comment tool and a
+# worker run share one check.
+HOLD_RE = re.compile(r"^\s*deadman:\s*hold\s+(\S+)", re.I | re.M)
+
+
+class HoldAuthorRefused(ValueError):
+    """A ``deadman: hold <ISO>`` line under an author the deadman does not honour."""
+
+
+def _kernel_can_hold(author: str) -> bool:
+    """The deadman's author rule when the fleet library is absent: an operator label, never ``unverified:``,
+    a subagent or a bot (operator_identity.is_operator, MACHINE_SUFFIXES)."""
+    from hermes_cli.kanban_identity import UNVERIFIED_AUTHOR_PREFIX, is_operator_label
+
+    a = str(author or "").strip().lower()
+    if a.startswith(UNVERIFIED_AUTHOR_PREFIX) or a.endswith(("(subagent)", "[bot]")):
+        return False
+    return is_operator_label(a)
+
+
+def check_hold_author(task_id: str, author: str, body: str) -> None:
+    """Raise :class:`HoldAuthorRefused` when ``body`` carries a hold line ``author`` cannot hold with.
+
+    A kernel/automation author (:data:`MACHINE_AUTHORS`) is never refused: its body quotes free text (a
+    boomerang-wake summary, a dispatcher reason), the deadman ignores that author by name, and refusing it
+    would drop the whole comment, sometimes after the write it records (t_5b3065cf). Stored and logged."""
+    if not HOLD_RE.search(body or ""):
+        return
+    if str(author or "").strip().lower() in MACHINE_AUTHORS:
+        logger.info("kanban comment by %s on %s quotes a deadman hold line; stored, holds nothing",
+                    str(author).strip(), task_id)
+        return
+    lib = _load("operator_identity")
+    fn = getattr(lib, "comment_can_hold", None)
+    try:
+        ok = bool(fn(author, body)) if fn is not None else _kernel_can_hold(author)
+    except Exception:  # noqa: BLE001 -- an unreadable fleet predicate falls back to the kernel rule
+        ok = _kernel_can_hold(author)
+    if ok:
+        return
+    is_op = getattr(lib, "is_operator", None)
+    try:
+        author_ok = bool(is_op(author)) if is_op is not None else False
+    except Exception:  # noqa: BLE001 -- unreadable: fall back to the author message
+        author_ok = False
+    if author_ok:
+        # The author can hold; the body is what the deadman reads as automation (t_5b3065cf).
+        raise HoldAuthorRefused(
+            f"`deadman: hold` in a comment the deadman reads as automation (it leads with a marker such as "
+            f"[review-merge-pass], or carries a machine review_coverage record) holds nothing, even from "
+            f"{str(author).strip()}; post the hold line alone in its own comment, no marker; not posted"
+        )
+    from hermes_cli import kanban_db as kb
+
+    token_file = str(kb.operator_token_path()).replace(str(Path.home()), "~", 1)
+    raise HoldAuthorRefused(
+        f"`deadman: hold` from {str(author).strip()} holds nothing; post it as the operator: "
+        f"{kb.OPERATOR_TOKEN_ENV}=$(cat {token_file}) hermes kanban comment "
+        f"{task_id} --author apollo '<body>'; not posted"
+    )

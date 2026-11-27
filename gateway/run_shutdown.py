@@ -1154,13 +1154,32 @@ class GatewayShutdownMixin:
             return False
         return True
 
+    def _shutdown_notice_text(self, *, active: bool, profile=None) -> str:
+        """Render inside the owning profile scope; recovery is not scheduled at stop time."""
+        msg = t("gateway.shutdown.notice_restart" if self._restart_requested else "gateway.shutdown.notice_shutdown")
+        if getattr(self, "_console_session_lost", False) and not self._restart_requested:
+            # Set by the SIGTERM handler only when no restart was requested and the console left this user.
+            from gateway.shutdown_forensics import SESSION_LOST_FIRST_LINE
+            msg = f"{SESSION_LOST_FIRST_LINE}\n{msg}"
+        if not active:
+            return msg
+        from gateway.run import _resume_interrupted_turns_mode, _RESUME_UNATTENDED_MODES
+        from gateway.warning_notifications import effective_user_config
+        cfg = effective_user_config()
+        # Config wins over the startup env bridge. A secondary profile must never borrow
+        # the launch profile's process-global policy when its own key is absent.
+        agent_cfg = cfg.get("agent")
+        agent_cfg = agent_cfg if isinstance(agent_cfg, dict) else {}
+        mode = agent_cfg.get("resume_interrupted_turns", "prompt" if profile else _resume_interrupted_turns_mode())
+        continuation = "continue_auto" if str(mode).strip().lower() in _RESUME_UNATTENDED_MODES else "continue_prompt"
+        return " ".join((msg, t("gateway.shutdown.active_interruption"), t(f"gateway.shutdown.{continuation}")))
+
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
         """
         restart_source = self._restart_command_source if self._restart_requested else None
-        msg = t("gateway.shutdown.notice_restart" if self._restart_requested else "gateway.shutdown.notice_shutdown")
         restart_key = None
         if restart_source is not None:
             with suppress(Exception):
@@ -1170,7 +1189,7 @@ class GatewayShutdownMixin:
         notified: set[tuple[str, str, Optional[str]]] = set()
         from gateway.response_filters import lifecycle_notice_muted
         from gateway.warning_notifications import effective_user_config
-        lifecycle_cfg = effective_user_config()
+
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
@@ -1189,13 +1208,9 @@ class GatewayShutdownMixin:
                     adapter = self._authorization_adapter(platform, profile)
                 if not adapter:
                     continue
-                if not self._notice_allowed(platform, "active session"):
-                    continue
-                # A page channel does not take the shutdown notice (t_75a91ccc). The requester's own
-                # chat on an in-chat /restart still does: there it is the command's answer.
-                if restart_key != dedup_key and lifecycle_notice_muted(platform, chat_id, lifecycle_cfg):
-                    logger.info("Shutdown notice not posted to page channel %s:%s", platform_str, chat_id)
-                    notified.add(dedup_key)  # latch: the home-channel pass must not re-target it
+                profile_cfg = (getattr(self, "_profile_configs", None) or {}).get(profile)
+                platform_cfg = profile_cfg.platforms.get(platform) if profile_cfg is not None else None
+                if not self._notice_allowed(platform, "active session", platform_cfg):
                     continue
                 reply_to_message_id = getattr(source, "message_id", None)
                 if reply_to_message_id is None and restart_key == dedup_key:
@@ -1211,16 +1226,24 @@ class GatewayShutdownMixin:
             # shape as the stall watcher). The requester's own chat on an in-chat /restart is the
             # requested outcome of that command and is never suppressed.
             async def _send_active(adapter=adapter, chat_id=chat_id, platform_str=platform_str,
-                                   metadata=metadata, dedup_key=dedup_key):
+                                   metadata=metadata, dedup_key=dedup_key, profile=profile):
                 if await self._send_shutdown_notice(
-                    adapter, chat_id, msg, "active chat", platform_str, metadata=metadata
+                    adapter, chat_id, self._shutdown_notice_text(active=True, profile=profile),
+                    "active chat", platform_str, metadata=metadata
                 ):
                     notified.add(dedup_key)
             from gateway.warning_notifications import present_notification
             from gateway.run import _async_profile_runtime_scope
-            scope = (_async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
-                     if source is not None else nullcontext())
+            profile_home = (self._resolve_profile_home_for_source(source) if source is not None else
+                            (getattr(self, "_served_profile_homes", None) or {}).get(profile))
+            scope = _async_profile_runtime_scope(profile_home) if profile_home else nullcontext()
             async with scope:
+                # Page-channel policy belongs to this profile too. An in-chat /restart
+                # answer remains exempt; latch suppression so the home pass cannot re-target it.
+                if restart_key != dedup_key and lifecycle_notice_muted(platform, chat_id, effective_user_config()):
+                    logger.info("Shutdown notice not posted to page channel %s:%s", platform_str, chat_id)
+                    notified.add(dedup_key)
+                    continue
                 presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key,
                                                        chat_id=chat_id, thread_id=thread_id,
                                                        parent_id=getattr(source, "parent_chat_id", None))
@@ -1255,9 +1278,7 @@ class GatewayShutdownMixin:
             dedup_key = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=profile)
             if dedup_key in notified:
                 continue
-            if lifecycle_notice_muted(platform, home.chat_id, lifecycle_cfg):
-                logger.info("Shutdown notice not posted to page channel %s:%s (home)", platform.value, home.chat_id)
-                continue
+
             try:
                 metadata = self._thread_metadata_for_target(platform, home.chat_id, home.thread_id, adapter=adapter)
             except Exception as e:
@@ -1267,7 +1288,8 @@ class GatewayShutdownMixin:
                 continue
             async def _send_home(adapter=adapter, home=home, platform=platform, metadata=metadata):
                 if await self._send_shutdown_notice(
-                    adapter, str(home.chat_id), msg, "home channel", platform.value, metadata=metadata,
+                    adapter, str(home.chat_id), self._shutdown_notice_text(active=False),
+                    "home channel", platform.value, metadata=metadata,
                 ):
                     notified.add(dedup_key)
             from gateway.warning_notifications import present_notification
@@ -1275,6 +1297,9 @@ class GatewayShutdownMixin:
             # present_notification reads the ACTIVE profile's display settings: bind the served one's.
             profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
             async with _async_profile_runtime_scope(profile_home) if profile_home else nullcontext():
+                if lifecycle_notice_muted(platform, home.chat_id, effective_user_config()):
+                    logger.info("Shutdown notice not posted to page channel %s:%s (home)", platform.value, home.chat_id)
+                    continue
                 await present_notification(_send_home, platform=platform, chat_id=getattr(home, "chat_id", None), thread_id=getattr(home, "thread_id", None))
 
     # Agent finalization / resource cleanup
@@ -1987,6 +2012,7 @@ class GatewayShutdownMixin:
             _interrupted = mark_running_jobs_interrupted(
                 f"Gateway shutdown ({phase}) killed the job's tool subprocess before the run finished.",
                 lock_timeout=_SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S,
+                replay_marker=True,
             )
             if _interrupted:
                 logger.warning(
@@ -2052,6 +2078,9 @@ class GatewayShutdownMixin:
         self._clear_plugin_message_injector()
         self._draining = True
         self._mark_api_runs_shutdown_requested()
+        # Pending registry claims have no transcript to resume. Preserve their
+        # original input before a stuck claim can consume the shutdown leash.
+        await self._preserve_pending_session_claims()
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
         if callable(stop_room_worker):
@@ -2327,6 +2356,7 @@ class GatewayShutdownMixin:
     async def _stop_release_runtime_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
         from gateway.run import GatewayRunner
+        await self._preserve_pending_session_claims()
         for _task in list(self._background_tasks):
             # _restart_task awaits _stop_task: cancelling it would tunnel into _stop_impl and skip _shutdown_event.set().
             if _task is self._stop_task or _task is self._restart_task:
@@ -2336,6 +2366,14 @@ class GatewayShutdownMixin:
         # CancelledError into this _stop_impl and skip _shutdown_event.set() / _exit_code = 75 (#12875). It
         # self-terminates anyway.
         self._background_tasks.clear()
+        # Acquisitions own their worker until it returns, even when cancelled.
+        # Join them before draining the durable releases they may enqueue.
+        _claims = tuple(getattr(self, "_active_session_claim_tasks", ()))
+        for _claim in _claims:
+            _claim.cancel()
+        if _claims:
+            await asyncio.gather(*_claims, return_exceptions=True)
+        await self._drain_active_session_releases()
         ctx.api_live = self._active_api_run_count()
         # Fork: sweep follow-ups still parked in adapter queues into the restart spool before the
         # adapters (and their queues) die with the process.
@@ -2348,6 +2386,7 @@ class GatewayShutdownMixin:
         self.adapters.clear()
         for _session_key in list(self._running_agents):
             self._release_running_agent_state(_session_key)
+        await self._drain_active_session_releases()
         # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
         # Off-loop (fork): each payload ends in an unbounded os.replace inside the timed shutdown path.
         # Pass the LIVE view with drain=True rather than a dict() copy: the offload's await is a window in

@@ -166,6 +166,7 @@ def _generate(tmp_path: Path, *extra: str) -> dict:
         [
             sys.executable,
             str(_RUNNER),
+            "--event=push",
             "--generate-slices",
             "4",
             "--paths",
@@ -304,7 +305,9 @@ def test_test_job_reads_the_per_slice_runs_on():
     `vars.CI_RUNNER_LABELS` would leave every stamp inert with no test failing.
     """
     job = _tests_workflow()["jobs"]["test"]
-    assert job["runs-on"] == "${{ fromJSON(matrix.slice.runs_on) }}", job["runs-on"]
+    assert "fromJSON(matrix.slice.runs_on)" in job["runs-on"]
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in job["runs-on"]
+    assert "|| 'ubuntu-latest'" in job["runs-on"]
 
 
 def test_generate_step_forwards_both_repo_variables():

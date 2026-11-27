@@ -35,7 +35,12 @@ DEAD_BOOT = "2147483646:1.0"
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
+    from tools import file_state
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # _child_main runs in THIS process here and sets the process-wide FORCE_CROSS_PROCESS (#154,
+    # right for the real child process); restore it so a later test sees the knobs, not the leak.
+    monkeypatch.setattr(file_state, "FORCE_CROSS_PROCESS", file_state.FORCE_CROSS_PROCESS)
     ad._reset_for_tests()
     _drain()
     spawned: list = []
@@ -204,6 +209,9 @@ def test_sigkill_escalation_reaches_a_tool_that_outlived_its_leader(_isolated, t
 
 # ── 2d058dbbdb27: a spawned child is never lost to a pid.json failure ──────
 def test_pid_file_failure_after_popen_still_returns_the_live_child(_isolated, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr("tools.process_registry.restart_safe_gateway_child_argv",
+                        lambda command, **kw: SimpleNamespace(mode="in_process", argv=command))
     real_popen = subprocess.Popen
 
     def _popen(argv, **kwargs):
@@ -219,6 +227,7 @@ def test_pid_file_failure_after_popen_still_returns_the_live_child(_isolated, tm
         real_write(path, data)
 
     monkeypatch.setattr(dd.subprocess, "Popen", _popen)
+    monkeypatch.setattr(dd.macos_spawn, "available", lambda: False)  # pin the Popen path on macOS too
     monkeypatch.setattr(dd, "_write_json", _write_json)
     record = _record("deleg_pidfile", owner="boot-a:1.0")
 
@@ -643,6 +652,9 @@ def test_the_detached_worker_refuses_a_process_handoff_it_cannot_deliver(tmp_pat
 
 # 65089d8d2a59: the worker runs PM's dependency boot (lease + activate) before its imports
 def test_spawned_worker_is_marked_to_boot_pm_dependencies(_isolated, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr("tools.process_registry.restart_safe_gateway_child_argv",
+                        lambda command, **kw: SimpleNamespace(mode="in_process", argv=command))
     seen: dict = {}
     real_popen = subprocess.Popen
 
@@ -653,6 +665,7 @@ def test_spawned_worker_is_marked_to_boot_pm_dependencies(_isolated, tmp_path, m
         return proc
 
     monkeypatch.setattr(dd.subprocess, "Popen", _popen)
+    monkeypatch.setattr(dd.macos_spawn, "available", lambda: False)  # pin the Popen path on macOS too
     record = _record("deleg_pm", owner="boot-a:1.0")
     _REAL_SPAWN_CHILD(record=record, attempt_id=record["attempt"]["attempt_id"], profile_home=tmp_path,
                       continuation=None, live_delegation_id=None)

@@ -107,7 +107,7 @@ def local_relay_restart_wait_s() -> float:
 
 
 def relay_drain_wait_s() -> float:
-    """``fallback.relay_drain_wait_s`` (default 150, see
+    """``fallback.relay_drain_wait_s`` (default 300, see
     ``retry_utils.RELAY_DRAIN_WAIT_DEFAULT_S``): how long a relay deploy-drain
     503 is waited out on the SAME model before the fallback chain. ``0``
     disables."""
@@ -247,6 +247,33 @@ def _eligibility_fn(agent: Any):
     return _cached
 
 
+def _primary_capacity_hold(agent: Any) -> Optional[str]:
+    """The refusal reason when the primary's relay states it has no capacity for the
+    primary model (every Fable seat's allowance used up, or no seat eligible), else None.
+
+    2026-11-13: a session fell back off claude-dtlr/claude-fable-5-2 after 600 s of
+    silence and the next turn "recovered" straight back to it while 23 of 25 seats had
+    no Fable allowance left, so every turn looped dtlr -> btpr -> alr -> dtlr."""
+    provider, model = primary_route(agent)
+    rt = getattr(agent, "_primary_runtime", None) or {}
+    base_url = str(rt.get("base_url") or "") if isinstance(rt, dict) else ""
+    try:
+        # Every pool relay face (alr, dtlr, btpr, bpr ...), not only the /eligibility
+        # warm-seat lanes: dtlr has no seat signal, so without this its episodes
+        # returned on the ``transient`` branch the moment the cooldown passed.
+        from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS
+        if provider.strip().lower() not in _POOL_CAPABILITY_PROVIDERS or not base_url or not model:
+            return None
+        from agent.fork_ext.relay_capacity import capacity_phrase, exhausted, model_capacity
+        cap = model_capacity(base_url, model)
+        if not exhausted(cap):
+            return None
+        return f"relay: no capacity for {model} ({capacity_phrase(cap) or 'no seat eligible'})"
+    except Exception:  # noqa: BLE001 — unknown is never a hold
+        logger.debug("relay capacity hold check failed", exc_info=True)
+        return None
+
+
 def _bench_fn(agent: Any, key: StickyKey, now: float):
     if not fp.is_direct_pin(key.primary_provider):
         return None
@@ -265,6 +292,12 @@ def restore_allowed(agent: Any, *, probe: bool, now: Optional[float] = None) -> 
     rl_until = getattr(agent, "_rate_limited_until", 0) or 0
     if rl_until > time.monotonic():
         return fp.Decision(False, None, "cooldown")
+    if probe:
+        # Whatever ended the primary's last turn (a stall cut, a quota refusal, no
+        # sticky episode at all): never return to a model the relay says it cannot serve.
+        held = _primary_capacity_hold(agent)
+        if held:
+            return fp.Decision(False, None, held)
     if not sticky_policy_enabled():
         return fp.Decision(True, None, "sticky_policy off")
     now = time.time() if now is None else now
@@ -363,11 +396,14 @@ def pre_failover(agent: Any, reason: Any,
         # on class; only quota_model / rate_upstream / refusal / unclassified
         # reach their old behaviour.
         skip = fp.skips_quota_gate(cls)
-        plan = FailoverPlan(cls, window, skip, skip, False, ra, reset)
+        plan = FailoverPlan(cls, window, skip,
+                            fp.skips_legacy_arm(cls, getattr(agent, "provider", "")), False, ra, reset)
         if on_fallback(agent):
             key = key_for(agent)
             state = _state(key)
-            if state is not None and state.active:
+            # The relay's capacity answer for the primary model is read in one place,
+            # _primary_capacity_hold, at each gate that can put a session back on it.
+            if state is not None and state.active and not _primary_capacity_hold(agent):
                 d = fp.fallback_failed_allowed(
                     state, cls, now, primary_provider=key.primary_provider,
                     eligibility=_eligibility_fn(agent),
@@ -644,6 +680,7 @@ def decide_rebuild_for_agent(agent: Any, *, user_route: bool = False) -> str:
             return "primary"
         sid = str(getattr(agent, "session_id", "") or "") or None
         rd = fp.decide_rebuild(store(), key, now, live_session_id=sid,
+                               capacity_hold=lambda: _primary_capacity_hold(agent),
                                eligibility=_eligibility_fn(agent),
                                direct_pin_benched=_bench_fn(agent, key, now),
                                refusal_arm=warm_refusal_arm(key))

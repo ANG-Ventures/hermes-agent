@@ -24,6 +24,9 @@ SCRIPT_REL = Path("scripts") / "session-overview.py"
 TIMEOUT_S = 240
 # session-overview.py's stderr line for an empty census (exit 2): "no born-here cards for <ids>"
 NO_CARDS_MARK = "no born-here cards for"
+# rc=3: the report printed in full, led by a `ROADMAP STALE <age>: ...` line (hermes-home t_ab90d44c). /overview shows
+# it as is, so the reader sees the warning first.
+STALE_ROADMAP_RC = 3
 
 
 def overview_script(root: Optional[Path] = None) -> Path:
@@ -89,7 +92,7 @@ def render_overview(
     # rc=2 is also argparse's usage-error code: only the script's own empty-census line means "no cards"
     if p.returncode == 2 and not out and NO_CARDS_MARK in (p.stderr or ""):
         return f"/overview: no cards were born in this chat's sessions ({session_id} and its lineage)."
-    if p.returncode != 0 or not out:
+    if p.returncode not in (0, STALE_ROADMAP_RC) or not out:
         err = ((p.stderr or "").strip().splitlines() or [f"rc={p.returncode}"])[-1][:300]
         logger.warning("/overview failed rc=%s: %s", p.returncode, err)
         return f"/overview: session-overview.py failed (rc={p.returncode}): {err}"

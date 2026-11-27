@@ -32,7 +32,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 def _card(conn, session_id, title="card"):
-    return kb.create_task(conn, title=title, assignee="w", session_id=session_id)
+    return kb.create_task(conn, boomerang_wake=False, title=title, assignee="w", session_id=session_id)
 
 
 # --- item 3: pings carry home ----------------------------------------------
@@ -110,7 +110,7 @@ def test_notifier_delivers_home_line_in_ping_and_wake(tmp_path, monkeypatch):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="home ping", assignee="worker", session_id=sid)
+        tid = kb.create_task(conn, boomerang_wake=False, title="home ping", assignee="worker", session_id=sid)
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
                           chat_type="dm", delivery_mode="notify+wake")
         kb.complete_task(conn, tid, summary="done")
@@ -165,7 +165,7 @@ def test_events_carry_bound_actor(kanban_home):
     with kb.connect_closing() as conn:
         tid = _card(conn, HOME)
         with kb.mutation_actor(session_ids=(HOME,), profile="apollo"):
-            assert kb.block_task(conn, tid, reason="needs input")
+            assert kb.block_task(conn, tid, reason="needs input", kind="needs_input")
         rows = [r for r in _events(conn, tid) if r["kind"] == "blocked"]
         assert rows and rows[-1]["actor_profile"] == "apollo"
         assert rows[-1]["actor_session_id"] == HOME

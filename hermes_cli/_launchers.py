@@ -433,6 +433,47 @@ def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> 
     return current
 
 
+def _current_store_spelling(target: Path, store_python: Path, repo_root: Path) -> Path:
+    """``store_python`` spelled through the store path a working ``target`` already uses.
+
+    A stand-in HERMES_HOME whose tools/ links to the real store resolves the same store
+    under a private path. Rewriting the shared launcher with that spelling exits 127 once
+    the stand-in is removed (ci-box 11-25, 2 h 50 min, t_926efa60). The direction is
+    decided by who owns the store, with one check on this run's own store path:
+
+    - it is a symlink (this home borrows another home's store): it never writes its own
+      spelling. A working launcher whose store resolves to the same store keeps its own
+      spelling, so an unchanged pin is byte-identical and a repin stays durable; a missing
+      or broken launcher is repaired through the RESOLVED store (when that file exists), so
+      a launcher minted by a stand-in never points through the stand-in;
+    - it is a real directory (this home owns its store, however the home is reached), or
+      it was named by HERMES_RUNTIME_DIR, a payload manifest or an install stamp (those
+      come back resolved): publish this run's spelling, as before. That moves a launcher
+      minted through a stand-in back to the real home's path.
+
+    A missing or broken launcher is always repaired. Not covered here, same as before:
+    a stand-in that is a symlink to the whole real home (its tools/ is then a real
+    directory seen through the link) still respells, and a legacy-venv launcher (an
+    interpreter path with fewer than three parents) is still rewritten by a stand-in run.
+    """
+    try:
+        new_store = store_root(repo_root)
+        if not _launcher_works(target):
+            if not new_store.is_symlink():
+                return store_python
+            resolved = new_store.resolve() / store_python.relative_to(new_store)
+            return resolved if resolved.is_file() else store_python
+        if not new_store.is_symlink():
+            return store_python  # this home owns its store
+        old_store = _shell_launcher_python(target).parents[2]
+        if old_store == new_store or old_store.resolve() != new_store.resolve():
+            return store_python
+        respelled = old_store / store_python.relative_to(new_store)
+        return respelled if respelled.is_file() else store_python
+    except (IndexError, OSError, RuntimeError, ValueError):
+        return store_python
+
+
 def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     """Publish one launcher bound to store Python, or refuse missing tools."""
     repo_root = Path(repo_root)
@@ -447,6 +488,7 @@ def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
                 "launchers: %s keeps %s; not rebinding to %s (another store, e.g. a test HERMES_HOME)",
                 target, kept, store_python)
             return target
+        store_python = _current_store_spelling(target, store_python, repo_root)
     if store_python is not None:
         path = mint_launcher(name, repo_root, out_dir, store_python, None)
         if path is not None and path.suffix == ".cmd":
@@ -522,6 +564,9 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
         local = root / ".hermes" / "bin"
         if len(ensure_install_launchers(root, local)) != len(WINDOWS_BIN_LAUNCHERS):
             return {"ok": False, "error": "source launcher publication failed"}
+        # The tree's own .hermes/bin is still repaired; only the PATH exposure is withheld.
+        if _in_kanban_workspace(root):
+            return {"ok": True, "skipped": "kanban-workspace"}
         dirs = [Path.home() / ".local" / "bin"]
         # Repair existing FHS/custom-home exposure, but never create new global
         # entries or reclaim a convenience that was repointed to another root.
@@ -536,6 +581,47 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
         return {"ok": True, "written": written}
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def _in_kanban_workspace(root: Path) -> bool:
+    """A tree inside a kanban task workspace never publishes PATH commands.
+
+    The workspace is reaped when its card closes, so a ~/.local/bin launcher into it
+    exits 127 from then on (Studio ~/.local/bin/hermes-agent into t_e45c8c8d, t_fc2aac5e).
+    """
+    roots = [os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()]
+    try:
+        from hermes_cli import kanban_db
+
+        roots.extend(str(path) for path in kanban_db.workspace_root_candidates())
+        # Every board, not just the current one: the configured root holds
+        # <root>/<board>/..., and legacy named boards keep boards/<slug>/workspaces.
+        roots.extend(str(path) for path in kanban_db.boards_root().glob("*/workspaces"))
+        # default's legacy root is not under boards/, so the glob misses it once another board is current.
+        roots.append(str(kanban_db.kanban_home() / "kanban" / "workspaces"))
+        from hermes_cli.kanban_workspace_policy import configured_root
+
+        roots.append(str(configured_root()[0] or ""))
+    except Exception:  # noqa: BLE001 - a broken board config must not stop an update
+        pass
+    try:
+        # configured_root() reads the active profile; a host sets workspaces_root in its root
+        # config.yaml only (no Studio worker profile carries it), so read that one as well.
+        from hermes_cli.config import read_host_root_config
+
+        host_kanban = read_host_root_config().get("kanban") or {}
+        raw = host_kanban.get("workspaces_root") if isinstance(host_kanban, dict) else None
+        if isinstance(raw, str) and Path(raw).expanduser().is_absolute():
+            roots.append(raw)
+    except Exception:  # noqa: BLE001 - an unreadable host config must not stop an update
+        pass
+    for entry in filter(None, roots):
+        try:
+            if root.is_relative_to(Path(entry).expanduser().resolve()):
+                return True
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return False
 
 
 def _merge_user_path(existing: str, entry: str) -> str | None:

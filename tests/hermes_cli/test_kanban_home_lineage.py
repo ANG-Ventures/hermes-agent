@@ -60,7 +60,7 @@ def _state_db() -> Path:
 
 def _card(conn, sid, assignee="worker-a"):
     tid = kb.create_task(conn, title="card", assignee=assignee, session_id=sid)
-    assert kb.block_task(conn, tid, reason="needs input")
+    assert kb.block_task(conn, tid, reason="needs input", kind="needs_input")
     return tid
 
 

@@ -279,6 +279,24 @@ def file_carries(entry: dict, cand: Optional[bytes], mb: Optional[bytes], head: 
     return frontmatter_carries(before[0], mine[0], target[0]) and lines_carry(before[1], mine[1], target[1])
 
 
+def _deleted_by(repo: str, entry: dict, mb: Optional[bytes], at: dict, full: str, tip: str,
+                mb_sha: str, descends: list) -> bool:
+    """t_1b2322fe: is this PR file superseded because the named commit DELETED it?
+
+    True only when the PR modified (not added) the file, it existed at the PR's merge-base, it is
+    absent at the named ``full`` sha AND at the default-branch tip (a later re-add is live content
+    the PR may still owe), and ``full`` descends from the merge-base (an older sha that predates
+    the file would also lack it). ``descends`` memoizes the one ancestry read per PR."""
+    if entry.get("status") not in ("modified", "changed") or mb is None:
+        return False
+    if at.get(full) is not None or at.get(tip) is not None:
+        return False
+    if not descends:
+        descends.append(str(_json([f"repos/{repo}/compare/{mb_sha}...{full}"]).get("status") or "")
+                        in ("ahead", "identical"))
+    return descends[0]
+
+
 def pr_content_check(repo: str, number: int, sha: str) -> Optional[dict]:
     """``{"sha": <carrier>, "requested": <full sha>, "default": <branch>, "differs": [paths]}``.
 
@@ -290,6 +308,10 @@ def pr_content_check(repo: str, number: int, sha: str) -> Optional[dict]:
     every file that commit does not carry. Empty ``differs`` therefore means that commit alone carries
     all of the PR's content, so it is safe to record as survivor evidence (Prism 6265717768a4). The
     PR side is measured from the merge-base of base and head, never ``base.sha`` (a later main).
+
+    Supersession by deletion (t_1b2322fe): a file the PR modified that the requested ``sha`` (and
+    the tip) no longer has is counted carried at that sha, per :func:`_deleted_by`, and listed
+    under ``"deleted"``. Every other PR file must still carry at the same sha.
     """
     try:
         full = str(_json([f"repos/{repo}/commits/{quote(sha)}"]).get("sha") or "")
@@ -317,6 +339,8 @@ def pr_content_check(repo: str, number: int, sha: str) -> Optional[dict]:
             return None
         candidates = list(dict.fromkeys((full, tip)))
         missing = {ref: [] for ref in candidates}
+        deleted: list = []
+        descends: list = []  # memo: is the requested sha a descendant of the PR's merge-base?
         for entry in files:
             path = str(entry.get("filename") or "")
             if not path:
@@ -326,16 +350,23 @@ def pr_content_check(repo: str, number: int, sha: str) -> Optional[dict]:
             mb = None if status == "added" else _file_bytes(repo, old_path, mb_sha)
             head = None if status == "removed" else _file_bytes(repo, path, head_sha)
             renamed_from = old_path if status == "renamed" and old_path != path else None
+            at = {ref: _file_bytes(repo, path, ref) for ref in candidates}
             for ref in candidates:
                 # A rename is carried at its NEW path, and only once the old path is gone (Prism
                 # 1b9ec408800f): a copy beside the original is not the PR's rename.
-                if (not file_carries(entry, _file_bytes(repo, path, ref), mb, head)
+                if (not file_carries(entry, at[ref], mb, head)
                         or (renamed_from and _file_bytes(repo, renamed_from, ref) is not None)):
+                    if ref == full and _deleted_by(repo, entry, mb, at, full, tip, mb_sha, descends):
+                        deleted.append(path)
+                        continue
                     missing[ref].append(path)
         chosen = min(candidates, key=lambda ref: len(missing[ref]))
     except (_Unreadable, ValueError, TypeError, AttributeError):
         return None
-    return {"sha": chosen, "requested": full, "default": default, "differs": missing[chosen]}
+    out = {"sha": chosen, "requested": full, "default": default, "differs": missing[chosen]}
+    if deleted and chosen == full:
+        out["deleted"] = deleted
+    return out
 
 
 def default_content_check() -> Optional[ContentCheckFn]:

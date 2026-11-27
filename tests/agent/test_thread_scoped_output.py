@@ -166,3 +166,39 @@ def test_silence_survives_redirect_restoring_an_older_proxy(monkeypatch):
     finally:
         release.set()
         sys.stdout, sys.stderr = original_stdout, original_stderr
+
+
+def test_alternating_safe_stdio_and_silence_installs_do_not_stack(monkeypatch):
+    """Regression: each fresh agent build ran ``_install_safe_stdio()`` and a worker
+    later entered ``thread_scoped_silence()``. Each wrapper only recognised ITSELF, so
+    the pair added two layers per build; after enough builds one attribute lookup
+    (``sys.stdout.line_buffering``) walked hundreds of ``__getattr__`` hops and the
+    gateway died with ``RecursionError: maximum recursion depth exceeded``.
+    """
+    from agent.process_bootstrap import _SafeWriter, _install_safe_stdio
+
+    real_out, real_err = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stdout", real_out)
+    monkeypatch.setattr(sys, "stderr", real_err)
+    monkeypatch.setattr(thread_output, "_installed", {})
+    monkeypatch.setattr(thread_output, "_routing_states", {})
+
+    for _ in range(50):
+        _install_safe_stdio()
+        with thread_scoped_silence():
+            sys.stdout.write("dropped\n")
+        sys.stdout.write("kept\n")
+
+    for stream, real in ((sys.stdout, real_out), (sys.stderr, real_err)):
+        layers = list(thread_output.iter_wrapped_streams(stream))
+        names = [type(s).__name__ for s in layers]
+        assert layers[-1] is real, names
+        assert names.count("_SafeWriter") == 1, names
+        assert names.count("_ThreadRoutingStream") == 1, names
+        assert len(layers) == 3, names
+
+    # Both behaviours survive composition: silencing still routes, and the
+    # attribute pass-through that blew the stack resolves to the real stream.
+    assert "dropped" not in real_out.getvalue()
+    assert real_out.getvalue().count("kept\n") == 50
+    assert sys.stdout.getvalue() == real_out.getvalue()

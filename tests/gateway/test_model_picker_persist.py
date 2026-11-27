@@ -31,7 +31,10 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 
-class _FakePickerAdapter:
+from tests.gateway.test_turn_lease_flush_window import _Adapter
+
+
+class _FakePickerAdapter(_Adapter):
     """Minimal adapter that looks picker-capable and captures the callback.
 
     ``_handle_model_command`` gates the picker path on
@@ -40,6 +43,7 @@ class _FakePickerAdapter:
     """
 
     def __init__(self):
+        super().__init__()
         self.captured_callback = None
 
     async def send_model_picker(self, *, on_model_selected, **kwargs):
@@ -346,7 +350,7 @@ async def test_global_switch_keeps_session_override_when_config_write_fails(tmp_
 
     assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["model"]["default"] == "old-model"
     assert "Saved to config.yaml" not in confirmation
-    assert "disk full" in confirmation
+    assert any("OSError" in line for line in adapter.sent)
     assert runner._session_model_override(session_key)["model"] == "gpt-5.5"
     assert runner.session_store.get_model_override(session_key)["model"] == "gpt-5.5"
 
@@ -423,6 +427,6 @@ async def test_global_switch_reports_failed_stale_override_cleanup(tmp_path, mon
 
     confirmation = await _typed_global(runner)
 
-    assert "store locked" in confirmation
+    assert any("OSError" in line for line in runner.adapters[Platform.TELEGRAM].sent)
     assert "Saved to config.yaml" not in confirmation
     assert runner._session_model_override(session_key)["model"] == "gpt-5.5"

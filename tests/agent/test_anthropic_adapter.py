@@ -15,6 +15,9 @@ from agent.credential_pool import PooledCredential
 from agent.anthropic_message_convert import _to_plain_data, convert_messages_to_anthropic, convert_tools_to_anthropic, normalize_model_name
 from agent.transports import get_transport
 
+# A preserve_thinking relay with a contiguous window: assistant bytes are stable across requests.
+_PRESERVING_RELAY = "http://127.0.0.1:18810/anthropic"
+
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -853,7 +856,10 @@ class TestConvertMessages:
             {"role": "tool", "tool_call_id": "tc_1", "content": "contents"},
         ])
 
-        _system, converted = convert_messages_to_anthropic(messages)
+        # contiguous window: this turn's bytes do not change next request, so its breakpoint stays
+        # on it (a latest-only window moves it to the messages before it, t_65e9cc2c).
+        _system, converted = convert_messages_to_anthropic(
+            messages, base_url=_PRESERVING_RELAY, preserve_thinking=True, thinking_window="contiguous")
         assistant = next(m for m in converted if m.get("role") == "assistant")
         marked = [
             b for b in assistant["content"]
@@ -899,7 +905,8 @@ class TestConvertMessages:
             {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
         ], native_anthropic=True)
 
-        _, result = convert_messages_to_anthropic(messages)
+        _, result = convert_messages_to_anthropic(
+            messages, base_url=_PRESERVING_RELAY, preserve_thinking=True, thinking_window="contiguous")
         assistant_msg = [m for m in result if m["role"] == "assistant"][0]
         thinking, tool_use = assistant_msg["content"]
 

@@ -21,7 +21,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli import placement_ledger as pl
-from hermes_cli import placement_policy as pp
+from hermes_cli import allocation_policy as pp
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "kanban_placement"
 POLICY = pp.PlacementPolicy()  # PRD §5.3 values (fallback until schema 1 lands)
@@ -308,8 +308,9 @@ def test_probe_reads_pressure_in_the_same_round_trip():
 
     s = kwp.probe_host(HOSTS[0], runner=runner, pressure_path="/var/lib/placement/host-pressure.json")
     assert len(calls) == 1
-    assert calls[0][-1] == ("cat /proc/loadavg; getconf _NPROCESSORS_ONLN; date +%s; "
-                            "cat /var/lib/placement/host-pressure.json 2>/dev/null; true")
+    assert calls[0][-1].startswith("python3 -c ")
+    assert "@@hermes-probe-v1" in calls[0][-1]
+    assert "/var/lib/placement/host-pressure.json" in calls[0][-1]
     assert (s.load1, s.ncpu, s.remote_now) == (3.1, 24, 1791200100.0)
     assert json.loads(s.pressure_text)["load_ratio"] == 0.5
 
@@ -333,7 +334,7 @@ def board(tmp_path, monkeypatch):
     (fleet / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
         h: {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"} for h in ("ace-ai", "ace-media")}}))
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ci-box", "ace-ai", "ace-media"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "priority": ["ci-box", "ace-ai", "ace-media"],
         "profiles": ["alpha"],
         "hosts": {"ci-box": {"enabled": False, "absence": "optional"},
                   "ace-ai": {"enabled": True, "absence": "required"},
@@ -345,8 +346,11 @@ def _ssh(fleet: Fleet):
     """A fake ``ssh`` runner answering the real probe command from the fixture."""
     def runner(argv, **kw):
         host = argv[-2].split("@", 1)[1]
-        assert argv[-1].startswith("cat /proc/loadavg; getconf _NPROCESSORS_ONLN; date +%s; cat ")
-        out = f"{fleet.load1[host]:.2f} 1.00 1.00 1/100 1\n24\n{int(fleet.now[host])}\n{fleet.text[host]}\n"
+        assert argv[-1].startswith(kwp.WORKER_SESSION_GUARD + "python3 -c ")   # keyed owner login
+        assert "@@hermes-probe-v1" in argv[-1]
+        out = "@@hermes-probe-v1\n" + json.dumps(dict(
+            schema=1, load1=fleet.load1[host], load5=1.0, ncpu=24,
+            remote_now=int(fleet.now[host]), pressure_text=fleet.text[host])) + "\n"
         return SimpleNamespace(returncode=0, stdout=out)
     return runner
 

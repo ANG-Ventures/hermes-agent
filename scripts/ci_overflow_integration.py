@@ -70,6 +70,16 @@ def fallback_predicate(workflow_text: str) -> CheckResult:
         if gate not in matrix:
             problems.append(f"placement matrix not gated by {gate!r}")
     e2e_runs_on = str((jobs.get("e2e") or {}).get("runs-on", ""))
+    # The independent fork guard wraps, but must not replace, the static fallback.
+    trust = ("(github.event_name == 'push' || github.event_name == 'merge_group' || "
+             "(github.event_name == 'pull_request' && "
+             "github.event.pull_request.head.repo.full_name == github.repository))")
+    guarded = re.fullmatch(
+        r"\$\{\{\s*" + re.escape(trust) + r" && \((.*)\) \|\| 'ubuntu-latest'\s*\}\}",
+        e2e_runs_on,
+    )
+    if guarded:
+        e2e_runs_on = guarded.group(1)
     if not e2e_runs_on.rstrip("} ").endswith("|| '[\"ubuntu-latest\"]'))") or "vars.CI_RUNNER_LABELS" not in e2e_runs_on:
         problems.append("e2e runs-on does not end in the static CI_RUNNER_LABELS fallback")
     if json.dumps(LOCAL_LABELS).replace(" ", "") in e2e_runs_on.replace(" ", "").replace("'", ""):

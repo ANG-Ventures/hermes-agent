@@ -5,15 +5,21 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 ``kanban_db.<name>`` keeps working.
 """
 from __future__ import annotations
+from contextvars import ContextVar
 import contextlib
+import functools
 import hashlib
+import json
+import os
 import random
 import re
 import secrets
 import shutil
 import sqlite3
+import sys
 import threading
 import time
+import socket
 from dataclasses import dataclass
 from dataclasses import field
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -27,6 +33,7 @@ from typing import Optional
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
+_INIT_DEADLINE = ContextVar("kanban_init_deadline", default=None)
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
 # Cap on ``<db>.corrupt.<hash>.bak`` quarantines per board: content-addressing
@@ -41,13 +48,30 @@ _CORRUPT_BACKUP_RETENTION = 10
 _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
 
+# Cross-process healthy verdict: ``_INITIALIZED_PATHS`` is per-process, so every
+# fresh CLI/worker process re-ran a full integrity_check (~2-3 s on a 740 MB
+# board) under the init lock and queued the rest behind it (t_5e8801d8). A clean
+# check leaves ``<db>.integrity-ok`` bound to the file (see _db_fingerprint);
+# it is trusted for the TTL only. Env override (seconds, 0 disables), env-only like
+# the busy timeout so connect() never loads config.yaml.
+_INTEGRITY_STAMP_TTL_ENV = "HERMES_KANBAN_INTEGRITY_STAMP_TTL_SECONDS"
+_INTEGRITY_STAMP_TTL_SECONDS = 900
+
+# A corrupt verdict is acted on (quarantine copy, REINDEX, KanbanDbCorruptError)
+# only when a second integrity read on a fresh connection, after this pause,
+# agrees. One transient read error (SQLITE_IOERR_SHORT_READ zero-fills the page,
+# so integrity_check reports it as a damaged page instead of raising) must not
+# start the raw copy of db + -wal + -shm (t_3200d600).
+_CORRUPT_CONFIRM_DELAY_SECONDS = 0.25
+
 
 def _resolve_busy_timeout_ms() -> int:
     """Return the SQLite busy timeout for Kanban connections. Kanban is the
     shared cross-profile dispatch bus, so worker stampedes are expected; a
     long timeout lets WAL serialize writers instead of surfacing transient
     ``database is locked`` failures."""
-    return _kb._env_int("HERMES_KANBAN_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS, minimum=1)
+    timeout = _kb._env_int("HERMES_KANBAN_BUSY_TIMEOUT_MS", DEFAULT_BUSY_TIMEOUT_MS, minimum=1)
+    return timeout
 
 
 def _sqlite_connect(path: Path) -> sqlite3.Connection:
@@ -119,6 +143,21 @@ def _unlock(handle) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _read_init_holder(handle):
+    try:
+        handle.seek(0)
+        return handle.read(2048).decode("utf-8", errors="replace").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _stamp_init_holder(handle):
+    handle.seek(0)
+    handle.truncate()
+    handle.write(json.dumps({"pid": os.getpid(), "host": socket.gethostname()}).encode())
+    handle.flush()
+
+
 @contextlib.contextmanager
 def _cross_process_init_lock(path: Path):
     """Serialize first-connect WAL/schema/integrity setup across processes.
@@ -139,6 +178,7 @@ def _cross_process_init_lock(path: Path):
     acquired = False
     try:
         deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
+        holder = None
         while True:
             try:
                 acquired = _try_lock_nb(handle)
@@ -146,7 +186,12 @@ def _cross_process_init_lock(path: Path):
                 acquired = False
             if acquired or time.monotonic() >= deadline:
                 break
+            if holder is None:
+                holder = _read_init_holder(handle)
+                _kb._log.warning("kanban init waiting on %s holder=%s", lock_path, holder)
             time.sleep(_INIT_LOCK_POLL_SECONDS)
+        if acquired:
+            _stamp_init_holder(handle)
         if not acquired:
             _kb._log.warning(
                 "kanban init lock for %s not acquired within %.0fs — proceeding "
@@ -184,7 +229,7 @@ def _dispatch_tick_lock(db_path: Path):
     lock is the defense-in-depth that prevents two dispatchers from ever writing concurrently *regardless of
     how the second one got there*.
     """
-    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    lock_path = _tick_lock_path(db_path)
     handle = None
     acquired = False
     try:
@@ -199,24 +244,21 @@ def _dispatch_tick_lock(db_path: Path):
         # a no-op so a probe failure never blocks dispatch.
         acquired = True
         handle = None
+    state = None
     try:
         if acquired and handle is not None:
-            try:
-                # Keep byte zero for msvcrt; never replace/unlink a lock inode.
-                handle.truncate(1)
-                handle.write(_kb.json.dumps({
-                    "pid": _kb.os.getpid(),
-                    "monotonic": time.monotonic(),
-                    "acquire_site": "hermes_cli.kanban_db:_dispatch_tick_lock",
-                }).encode("utf-8"))
-                handle.flush()
-            except OSError:
-                _kb._log.debug("Could not stamp board dispatch lock", exc_info=True)
+            _stamp_tick_lock(handle)
+            state = _HeldTickLock(handle)
+            _HELD_TICK_LOCKS[str(lock_path)] = state
         yield acquired
     finally:
+        if state is not None and _HELD_TICK_LOCKS.get(str(lock_path)) is state:
+            del _HELD_TICK_LOCKS[str(lock_path)]
         if handle is not None:
             try:
-                if acquired:
+                # A TickLockWindow left released (an exception between release and hold): the flock is
+                # not ours, and the stamp on the shared file is the current holder's. Leave both alone.
+                if acquired and (state is None or state.held):
                     try:
                         handle.truncate(1)
                         handle.flush()
@@ -227,6 +269,140 @@ def _dispatch_tick_lock(db_path: Path):
                 pass
             finally:
                 handle.close()
+
+
+def _tick_lock_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + ".dispatch.lock")
+
+
+def _stamp_tick_lock(handle) -> None:
+    try:
+        # Keep byte zero for msvcrt; never replace/unlink a lock inode.
+        handle.truncate(1)
+        handle.write(_kb.json.dumps({
+            "pid": _kb.os.getpid(),
+            "monotonic": time.monotonic(),
+            "acquire_site": "hermes_cli.kanban_db:_dispatch_tick_lock",
+        }).encode("utf-8"))
+        handle.flush()
+    except OSError:
+        _kb._log.debug("Could not stamp board dispatch lock", exc_info=True)
+
+
+class _HeldTickLock:
+    """The open lock file of a tick lock THIS process acquired; ``held`` is False while a
+    :class:`TickLockWindow` has handed it back."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.held = True
+
+
+# lock path -> the holder state, while this process holds that board's tick lock.
+_HELD_TICK_LOCKS: dict = {}
+
+
+class TickLockWindow:
+    """Hand the board's tick lock back during slow per-card work, and time every phase (t_f60f502f).
+
+    Measured 2026-11-08 on the Studio: a tick held ``.dispatch.lock`` for 60-300 s, almost all of it
+    after the claim (workspace resolve, worktree / pool clone, the spawn), so ``kanban admit`` was
+    refused for minutes. The work after a claim writes only the claimed run, every write ownership-
+    checked (``record_placement``, ``_claim_still_held``); SQLite serializes the writes themselves.
+    So the tick decides and claims under the lock, :meth:`release` hands it back for that work, and
+    :meth:`hold` takes it again before the next decision. A launcher that dies while released leaves a
+    claimed run with no pid: the crash reaper skips it (``worker_pid IS NOT NULL``) and the claim TTL
+    reclaims it.
+
+    ``enabled=False`` (``kanban.dispatch.narrow_lock: false``) or no lock held by this process (the
+    unguarded fallback, a test lock): release/hold are no-ops, timing still runs. :meth:`mark` books
+    the wall time since the previous mark to ``phase`` (held) and ``phase.unlocked`` (released).
+    """
+
+    WARN_EVERY_S = 60.0
+    POLL_S = 0.05
+
+    def __init__(self, db_path: Optional[Path] = None, *, enabled: bool = True, clock=time.monotonic):
+        self._db_path = db_path
+        self._state = (_HELD_TICK_LOCKS.get(str(_tick_lock_path(db_path)))
+                       if enabled and db_path is not None else None)
+        self._clock = clock
+        now = clock()
+        self._held_since: Optional[float] = now
+        self._released_since: Optional[float] = None
+        self._held_s = 0.0
+        self._unlocked_s = 0.0
+        self._mark_at = now
+        self._mark_unlocked = 0.0
+        self.windows = 0
+        self.phases: dict = {}
+
+    @property
+    def released(self) -> bool:
+        return self._released_since is not None
+
+    def release(self) -> None:
+        if self._state is None or self.released:
+            return
+        now = self._clock()
+        try:
+            self._state.handle.truncate(1)
+            self._state.handle.flush()
+        except OSError:
+            _kb._log.debug("Could not clear board dispatch lock stamp", exc_info=True)
+        _unlock(self._state.handle)
+        self._state.held = False
+        self._held_s += now - self._held_since
+        self._held_since, self._released_since = None, now
+        self.windows += 1
+
+    @property
+    def active(self) -> bool:
+        """True when :meth:`release` really hands the board lock back (narrow_lock on, lock held here)."""
+        return self._state is not None
+
+    def hold(self) -> bool:
+        """Take the lock back, waiting as long as it takes: every holder now keeps it only for decisions.
+        True when it was handed back, i.e. the board may have moved since this tick last read it."""
+        if not self.released:
+            return False
+        start = self._clock()
+        warn_at = start + self.WARN_EVERY_S
+        while True:
+            try:
+                if _try_lock_nb(self._state.handle):
+                    break
+            except OSError:
+                pass
+            now = self._clock()
+            if now >= warn_at:
+                _kb._log.warning("kanban tick lock: re-taking %s, waited %.0fs (holder %s)",
+                                 self._db_path, now - start, _kb._read_dispatch_lock_holder(self._db_path))
+                warn_at = now + self.WARN_EVERY_S
+            time.sleep(self.POLL_S)
+        self._state.held = True
+        _stamp_tick_lock(self._state.handle)
+        now = self._clock()
+        self._unlocked_s += now - self._released_since
+        self._held_since, self._released_since = now, None
+        return True
+
+    def held_s(self) -> float:
+        now = self._clock()
+        return self._held_s + (now - self._held_since if self._held_since is not None else 0.0)
+
+    def _unlocked_total(self, now: float) -> float:
+        return self._unlocked_s + (now - self._released_since if self._released_since is not None else 0.0)
+
+    def mark(self, phase: str) -> None:
+        now = self._clock()
+        unlocked = self._unlocked_total(now)
+        spent, off = now - self._mark_at, unlocked - self._mark_unlocked
+        if spent - off > 0:
+            self.phases[phase] = self.phases.get(phase, 0.0) + (spent - off)
+        if off > 0:
+            self.phases[phase + ".unlocked"] = self.phases.get(phase + ".unlocked", 0.0) + off
+        self._mark_at, self._mark_unlocked = now, unlocked
 
 # Periodic explicit WAL checkpoint from the dispatcher tick: a passive
 # autocheckpoint can be starved on a busy multi-process board (any open reader
@@ -298,9 +474,14 @@ def _validate_sqlite_header(path: Path) -> None:
         return
     # Byte-level probe: must run BEFORE any connection to this path exists
     # (read_header_bytes_preopen refuses once one is live, because the close()
-    # would cancel this process's POSIX locks).
-    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+    # would cancel this process's POSIX locks). Its registry only sees tracked
+    # connections; a plain sqlite3.connect on the board (the board anchor, a
+    # helper) holds a descriptor it cannot see, so ask the descriptor table too
+    # (t_54b8e6cc).
+    from hermes_cli.sqlite_safe_read import process_holds_open_fd, read_header_bytes_preopen
 
+    if process_holds_open_fd(path):
+        return
     head = read_header_bytes_preopen(path, length=64)
     if head is None or head.startswith(_SQLITE_HEADER):
         return
@@ -372,7 +553,17 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     of the same bytes reuse one backup while changed bytes get a separate one.
     Returns the main backup path, or ``None`` if the copy failed (the caller
     still raises loudly). Writes are confined to the DB's parent directory:
-    the basename derives only from ``path.name`` + content hash."""
+    the basename derives only from ``path.name`` + content hash.
+
+    The open-handle check and every raw read/copy run inside
+    ``database_offline`` for THIS database only, so a tracked connection
+    (``connect_tracked``) to it in this process cannot open between the check
+    and the copy: it waits until the copy is done. Opens and closes of every
+    other database (other boards, state.db) never wait on the copy. NOT covered: a plain
+    ``sqlite3.connect`` (or any other opener that bypasses ``connect_tracked``)
+    racing this copy in this process. The fd scan only sees handles already
+    open when it runs. Other processes are never excluded, so the copy is not
+    a coherent SQLite snapshot."""
     # Pin the resolved parent (``resolve()`` collapses ``..`` and symlinks); we
     # only ever write inside it.
     resolved = path.resolve()
@@ -383,9 +574,19 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     # must only run once the board is out of service. Another SessionDB/kanban
     # connection in this process would still be at risk — so REFUSE rather than
     # warn-and-proceed: losing a forensic copy beats corrupting the live DB.
-    from hermes_cli.sqlite_safe_read import has_live_connection
+    from hermes_cli.sqlite_safe_read import (
+        LiveConnectionError,
+        database_offline,
+        process_holds_open_fd,
+    )
 
-    if has_live_connection(resolved):
+    sidecars = [parent / (base_name + suffix) for suffix in ("-wal", "-shm")]
+    try:
+        with database_offline(resolved, what="quarantine"):
+            if any(process_holds_open_fd(p) for p in (resolved, *sidecars)):
+                raise LiveConnectionError(f"{resolved} has an open descriptor in this process")
+            return _copy_corrupt_db(resolved, parent, base_name, sidecars)
+    except LiveConnectionError:
         _kb._log.error(
             "refusing to quarantine %s: a connection to it is still open in "
             "this process, and fingerprinting the file would cancel that "
@@ -393,6 +594,20 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             resolved,
         )
         return None
+
+
+def _copy_corrupt_db(resolved: Path, parent: Path, base_name: str, sidecars: list[Path]) -> Optional[Path]:
+    """The raw reads and copies of :func:`_backup_corrupt_db`; the caller holds
+    this database in ``database_offline``."""
+    # One copy per corruption episode. A broken board keeps taking writes on
+    # already-open connections, so its hash changes between refused opens and
+    # content addressing alone copied the whole file on every one (10 x 512 MB
+    # in 7 min on 11-17, t_54b8e6cc). The episode ends when a clean integrity
+    # verdict is stamped or the file is replaced (new inode).
+    fingerprint = _db_fingerprint(resolved)
+    existing = _episode_backup(resolved, fingerprint)
+    if existing is not None:
+        return existing
     digest = hashlib.sha256()
     try:
         with resolved.open("rb") as handle:
@@ -412,9 +627,8 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         # A NEW backup landed — enforce the retention cap so mutating-corruption
         # loops can't accumulate quarantines forever.
         _prune_corrupt_backups(parent, base_name, keep=candidate)
-    for suffix in ("-wal", "-shm"):
-        sidecar = parent / (base_name + suffix)
-        sidecar_backup = parent / (candidate.name + suffix)
+    for sidecar in sidecars:
+        sidecar_backup = parent / (candidate.name + sidecar.name[len(base_name):])
         if (
             sidecar.parent != parent or not sidecar.exists()
             or sidecar_backup.parent != parent or sidecar_backup.exists()
@@ -422,7 +636,47 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             continue
         with contextlib.suppress(OSError):
             shutil.copy2(sidecar, sidecar_backup)
+    _record_episode_backup(resolved, fingerprint, candidate)
     return candidate
+
+
+def _corrupt_episode_path(resolved: Path) -> Path:
+    return resolved.with_name(resolved.name + ".corrupt-episode.json")
+
+
+def _episode_backup(resolved: Path, fingerprint: Optional[dict]) -> Optional[Path]:
+    """The quarantine copy already taken of this exact file (same dev/ino/birth)
+    since its last clean integrity verdict, or ``None``."""
+    if fingerprint is None:
+        return None
+    try:
+        data = json.loads(_corrupt_episode_path(resolved).read_text(encoding="utf-8-sig"))
+        same_file = all(data[key] == fingerprint[key] for key in ("dev", "ino", "birth"))
+        backup = resolved.parent / Path(str(data["backup"])).name
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    return backup if same_file and backup.is_file() else None
+
+
+def _end_corrupt_episode(resolved: Path) -> None:
+    """A verified-clean verdict (stamp, REINDEX repair, or ``repair_db`` ok)
+    ends the copy episode: the next corruption is a new incident."""
+    with contextlib.suppress(OSError):
+        _corrupt_episode_path(resolved).unlink(missing_ok=True)
+
+
+def _record_episode_backup(resolved: Path, fingerprint: Optional[dict], backup: Path) -> None:
+    if fingerprint is None:
+        return
+    marker = _corrupt_episode_path(resolved)
+    tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+    record = {key: fingerprint[key] for key in ("dev", "ino", "birth")}
+    try:
+        tmp.write_text(json.dumps({**record, "backup": backup.name, "at": time.time()}), encoding="utf-8")
+        os.replace(tmp, marker)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 # Repairable integrity_check error classes — both *index-scoped*: the table
 # b-tree is intact and REINDEX rebuilds the index losslessly. The index name is
@@ -526,6 +780,113 @@ def _probe_for_corruption(resolved: Path) -> tuple[Optional[list[str]], Optional
     return messages, f"integrity_check returned {messages[0] if messages else '<no row>'!r}"
 
 
+def _confirm_corruption(
+    resolved: Path, messages: Optional[list[str]], reason: str,
+) -> tuple[Optional[list[str]], Optional[str]]:
+    """Re-probe a corrupt verdict on a fresh connection before anything acts on
+    it. Returns the confirming probe's ``(messages, reason)``: ``reason`` is
+    ``None`` when the second read is clean (the first was transient).
+    ``OperationalError`` on the re-probe propagates raw, as in the first probe."""
+    time.sleep(_CORRUPT_CONFIRM_DELAY_SECONDS)
+    confirm_messages, confirm_reason = _probe_for_corruption(resolved)
+    if confirm_reason is None:
+        _kb._log.warning(
+            "kanban DB %s: first integrity read said %s, a fresh connection "
+            "%.2fs later reads clean; treating it as a transient read error "
+            "(no quarantine copy).",
+            resolved, reason, _CORRUPT_CONFIRM_DELAY_SECONDS,
+        )
+    return confirm_messages, confirm_reason
+
+
+def _integrity_stamp_path(resolved: Path) -> Path:
+    return resolved.with_name(resolved.name + ".integrity-ok")
+
+
+@functools.lru_cache(maxsize=1)
+def _boot_id() -> str:
+    """Per-boot id (Linux ``boot_id``, macOS ``kern.bootsessionuuid``); ``""``
+    when unknown. Not a boot time: a clock step moves that."""
+    with contextlib.suppress(OSError):
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8-sig").strip()
+    if sys.platform == "darwin":
+        with contextlib.suppress(OSError, AttributeError):
+            import ctypes
+            import ctypes.util
+
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            buf, size = ctypes.create_string_buffer(64), ctypes.c_size_t(64)
+            if libc.sysctlbyname(b"kern.bootsessionuuid", buf, ctypes.byref(size), None, ctypes.c_size_t(0)) == 0:
+                return buf.value.decode("ascii", "ignore").strip()
+    return ""
+
+
+def _db_fingerprint(resolved: Path) -> Optional[dict]:
+    """What a stamp is bound to. ``stat`` only: opening the DB file outside
+    SQLite would drop this process's POSIX locks on it.
+
+    The inode alone trusts a same-inode rewrite (Prism ed5edb9798ea), and the
+    mtime cannot be used: checkpoints move it every few seconds on a live
+    board. So: ``boot`` invalidates across a power loss / panic (the torn-page
+    case), ``birth`` (where the OS has it) across delete-and-recreate inode
+    reuse, and ``size`` is a floor checked by the reader: SQLite only shrinks
+    the file on VACUUM, while a copy of an older backup over the same inode
+    usually does."""
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        return None
+    return {
+        "dev": st.st_dev,
+        "ino": st.st_ino,
+        "birth": getattr(st, "st_birthtime", None),
+        "boot": _boot_id(),
+        "size": st.st_size,
+    }
+
+
+def _integrity_stamp_is_fresh(resolved: Path, fingerprint: Optional[dict]) -> bool:
+    """True iff the stamp names this exact file in this boot, the file has not
+    shrunk below the checked size, and the stamp is younger than the TTL.
+    Missing/unreadable/malformed/foreign/expired/future stamps are False."""
+    ttl = _kb._env_int(_INTEGRITY_STAMP_TTL_ENV, _INTEGRITY_STAMP_TTL_SECONDS, minimum=0)
+    if ttl <= 0 or fingerprint is None:
+        return False
+    try:
+        data = json.loads(_integrity_stamp_path(resolved).read_text(encoding="utf-8-sig"))
+        same_file = all(data[key] == fingerprint[key] for key in ("dev", "ino", "birth", "boot"))
+        not_shrunk = fingerprint["size"] >= int(data["size"])
+        age = time.time() - float(data["checked_at"])
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+    return same_file and not_shrunk and 0 <= age < ttl
+
+
+def _write_integrity_stamp(resolved: Path, fingerprint: Optional[dict], checked_at: float) -> None:
+    """Record a clean verdict for ``fingerprint`` (taken before the check);
+    skipped if the file was swapped during the check. Best effort: a failed
+    write only costs the next process a full check."""
+    if fingerprint is None:
+        return
+    after = _db_fingerprint(resolved)
+    if after is None or any(after[key] != fingerprint[key] for key in ("dev", "ino", "birth")):
+        return
+    stamp = _integrity_stamp_path(resolved)
+    tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps({**fingerprint, "checked_at": checked_at}), encoding="utf-8")
+        os.replace(tmp, stamp)
+        _corrupt_episode_path(resolved).unlink(missing_ok=True)  # clean verdict ends the episode
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _drop_integrity_stamp(resolved: Path) -> None:
+    with contextlib.suppress(OSError):
+        _integrity_stamp_path(resolved).unlink()
+
+
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
@@ -536,8 +897,10 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     the file + sidecars and raise :class:`KanbanDbCorruptError` so callers
     never recreate the schema on top of a damaged DB. ``OperationalError``
     (lock/busy) is NOT corruption and propagates raw (no spurious backup).
-    No-op for missing / zero-byte files and paths already proven healthy this
-    process. All writes are confined to the resolved path's parent.
+    No-op for missing / zero-byte files, paths already proven healthy this
+    process, and a fresh ``<db>.integrity-ok`` stamp for this exact file
+    (another process's clean verdict within the TTL). All writes are confined
+    to the resolved path's parent.
     """
     try:
         resolved = path.resolve()
@@ -545,9 +908,17 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     if _missing_or_empty(resolved) or str(resolved) in _INITIALIZED_PATHS:
         return
-    messages, reason = _probe_for_corruption(resolved)
-    if reason is None:
+    fingerprint = _db_fingerprint(resolved)
+    if _integrity_stamp_is_fresh(resolved, fingerprint):
         return
+    checked_at = time.time()
+    messages, reason = _probe_for_corruption(resolved)
+    if reason is not None:
+        messages, reason = _confirm_corruption(resolved, messages, reason)
+    if reason is None:
+        _write_integrity_stamp(resolved, fingerprint, checked_at)
+        return
+    _drop_integrity_stamp(resolved)
     # Quarantine FIRST — both the repair and fail-closed paths preserve the
     # pre-touch bytes before anything mutates the file.
     backup = _backup_corrupt_db(resolved)
@@ -565,6 +936,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
                 "integrity_check now clean. Pre-repair copy kept at %s.",
                 resolved, ", ".join(index_names), _backup_label(backup),
             )
+            _end_corrupt_episode(resolved)
             return
         reason = (
             f"{reason}; REINDEX auto-repair attempted but integrity_check "
@@ -627,6 +999,8 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
 
     with _cross_process_init_lock(resolved):
         messages, reason = _probe_for_corruption(resolved)
+        if reason is not None:
+            messages, reason = _confirm_corruption(resolved, messages, reason)
         if messages is None:
             # Same quarantine the connect-time guard takes when sqlite
             # refuses to open the file at all.
@@ -635,8 +1009,10 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
                 backup_path=_backup_corrupt_db(resolved),
             )
         if reason is None:
+            _end_corrupt_episode(resolved)
             return RepairResult(status="ok", db_path=resolved, messages=messages)
 
+        _drop_integrity_stamp(resolved)
         # Quarantine FIRST — identical policy to the connect-time guard.
         backup = _backup_corrupt_db(resolved)
         index_names = _repairable_index_names(messages)
@@ -647,6 +1023,8 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
         # to re-probe instead of trusting the stale healthy-path cache.
         with _INIT_LOCK:
             _INITIALIZED_PATHS.discard(str(resolved))
+        if repaired:
+            _end_corrupt_episode(resolved)
         return RepairResult(
             status="repaired" if repaired else "corrupt",
             db_path=resolved,
@@ -738,10 +1116,130 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     return conn, out
 
 
+def _initialization_signature():
+    """Invalidate receipts whenever any initializer implementation changes."""
+    import hashlib
+    root = Path(__file__).parent
+    digest = hashlib.sha256()
+    for name in ("kanban_db_connect.py", "kanban_db.py", "kanban_failure_ownership.py",
+                 "kanban_lifecycle_guards.py"):
+        digest.update((root / name).read_bytes())
+    return digest.hexdigest()
+
+
+# Hash ONCE, at import: the bytes this process loaded. Re-reading the files per
+# call let a pre-deploy process run its OLD migrator, then stamp the NEW on-disk
+# signature, so no process re-ran the migration (artifact_pointer, t_f5019c7b).
+_INITIALIZATION_SIGNATURE = _initialization_signature()
+
+
+@functools.lru_cache(maxsize=1)
+def _schema_sql_columns() -> dict[str, frozenset[str]]:
+    """Columns SCHEMA_SQL declares per table, read from a throwaway in-memory build."""
+    mem = sqlite3.connect(":memory:")
+    try:
+        mem.executescript(_kb.SCHEMA_SQL)
+        tables = [r[0] for r in mem.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND substr(name, 1, 7) != 'sqlite_'")]
+        return {t: frozenset(r[1] for r in mem.execute(f"PRAGMA table_info({t})")) for t in tables}
+    finally:
+        mem.close()
+
+
+def _initialization_is_current(conn):
+    # All checks are reads: fresh writer processes need no write transaction on
+    # an already-migrated board. SQLite invalidates the receipt on any schema DDL.
+    if not _table_exists(conn, "kanban_initialization"):
+        return False
+    row = conn.execute("SELECT signature, schema_version FROM kanban_initialization WHERE id=1").fetchone()
+    if not (row and row[0] == _INITIALIZATION_SIGNATURE
+            and row[1] == conn.execute("PRAGMA main.schema_version").fetchone()[0]):
+        return False
+    # A receipt is not proof of the schema: a board already stamped current while missing a
+    # declared column (artifact_pointer, t_7a79b915) re-initializes instead of staying broken.
+    return all(cols <= {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+               for table, cols in _schema_sql_columns().items())
+
+
+def _record_initialization(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS kanban_initialization "
+                 "(id INTEGER PRIMARY KEY CHECK(id=1), signature TEXT, schema_version INTEGER)")
+    conn.execute("INSERT OR REPLACE INTO kanban_initialization VALUES (1, ?, ?)",
+                 (_INITIALIZATION_SIGNATURE, conn.execute("PRAGMA main.schema_version").fetchone()[0]))
+
+
+_FORCE_INITIALIZATION = ContextVar("kanban_force_initialization", default=False)
+
+
+def _open_initialized_with_retry(path, initialize):
+    """Retry transient schema/WAL lock failures within the existing init budget."""
+    deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
+    delay = _INIT_LOCK_POLL_SECONDS
+    while True:
+        token = _INIT_DEADLINE.set(deadline)
+        try:
+            conn, result = _open_configured(path, initialize)
+            conn.execute(f"PRAGMA busy_timeout={_kb._env_int('HERMES_KANBAN_BUSY_TIMEOUT_MS', DEFAULT_BUSY_TIMEOUT_MS, minimum=1)}")
+            return conn, result
+        except sqlite3.OperationalError as exc:
+            if not any(word in str(exc).lower() for word in ("locked", "busy")):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            # SQLite doesn't expose an external writer's PID. The advisory
+            # init owner is known; don't falsely label it the SQLite writer.
+            _kb._log.warning(
+                "kanban SQLite init for %s waiting on writer (pid unavailable); "
+                "init owner pid=%s; retry in %.2fs", path, os.getpid(), min(delay, remaining),
+            )
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.5)
+        finally:
+            _INIT_DEADLINE.reset(token)
+
+
+_READ_ONLY = ContextVar("kanban_read_only", default=False)
+
+
+@contextlib.contextmanager
+def read_scope(enabled=True):
+    # Emergency rollback to legacy initialized connections; explicit readonly=True
+    # remains authoritative for callers that require a read-only connection.
+    enabled = enabled and os.environ.get("HERMES_KANBAN_READ_ONLY", "1") != "0"
+    token = _READ_ONLY.set(enabled)
+    try:
+        yield
+    finally:
+        _READ_ONLY.reset(token)
+
+
+def _connect_readonly(path):
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    conn = connect_tracked(
+        path.resolve().as_uri() + "?mode=ro", tracking_path=path, uri=True,
+        isolation_level=None, timeout=_resolve_busy_timeout_ms() / 1000.0,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.text_factory = _kb._lossy_text
+        conn.execute(f"PRAGMA busy_timeout={_resolve_busy_timeout_ms()}")
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA cell_size_check=ON")
+        if not _schema_is_present(conn):
+            raise _kb.KanbanDbNotABoardError(path)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    readonly: bool = False,
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
@@ -771,9 +1269,14 @@ def connect(
     # explicit ``db_path=`` too: a probe that hands connect() the live path
     # directly is the same leak through a different door. ``init_db`` routes
     # through here, so it is covered as well.
+    from agent.delegation_context import kanban_path_is_fenced
+    if readonly or _READ_ONLY.get():
+        _kb._refuse_noncanonical_board_path(path)
+        if kanban_path_is_fenced(path):
+            return _kb._connect_delegated_child(path)
+        return _connect_readonly(path)
     _kb._assert_live_board_write_allowed(path)
     _kb._refuse_noncanonical_board_path(path)  # before the mkdir (t_1462ab0d)
-    from agent.delegation_context import kanban_path_is_fenced
     if kanban_path_is_fenced(path):
         # Reads must not enter schema/backfill write transactions. Never create a
         # missing board or migrate on a descendant's behalf; the owner initializes it.
@@ -831,15 +1334,32 @@ def connect(
         def _init_if_needed(conn: sqlite3.Connection) -> None:
             # Idempotent; runs under _INIT_LOCK so same-process dispatcher
             # threads can't race the ALTER TABLE pass with stale PRAGMA snapshots.
-            if resolved not in _INITIALIZED_PATHS:
+            if resolved not in _INITIALIZED_PATHS and (
+                    _FORCE_INITIALIZATION.get() or not _initialization_is_current(conn)):
                 conn.executescript(_kb.SCHEMA_SQL)
-                _migrate_add_optional_columns(conn)
+                # Column-presence gates one-shot backfills. Roll back both the
+                # ALTER and its backfill together if initialization is retried.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _migrate_add_optional_columns(conn)
+                    conn.execute("COMMIT")
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+                # Audit installation uses executescript (an implicit commit),
+                # so it follows the atomic additive/backfill migration.
                 _kb._ensure_status_audit(conn)
-                _INITIALIZED_PATHS.add(resolved)
+                from hermes_cli.kanban_failure_ownership import migrate
+                migrate(conn)
+                from hermes_cli.kanban_lifecycle_guards import install
+                install(conn)
+                _record_initialization(conn)
+            _INITIALIZED_PATHS.add(resolved)
             _kb._install_status_audit_marker(conn)
 
         try:
-            conn, _ = _open_configured(path, _init_if_needed)
+            conn, _ = _open_initialized_with_retry(path, _init_if_needed)
         except Exception:
             if creating:
                 _kb._discard_stub_db(path)
@@ -848,7 +1368,7 @@ def connect(
 
 
 @contextlib.contextmanager
-def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = None):
+def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = None, readonly: bool = False):
     """Open a kanban DB connection and guarantee it is closed on exit. Use
     instead of ``with kb.connect() as conn:`` — sqlite3's context manager only
     commits/rolls back, it does NOT close the fd, so long-lived processes
@@ -856,7 +1376,7 @@ def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = No
 
     See #33159 for the production incident.
     """
-    conn = connect(db_path=db_path, board=board)
+    conn = connect(db_path=db_path, board=board, **({"readonly": True} if readonly else {}))
     try:
         yield conn
     finally:
@@ -895,8 +1415,12 @@ def init_db(
     # Clear the cache entry so connect() re-runs schema + migrations.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(str(path.resolve()))
-    with contextlib.closing(connect(path)):
-        pass
+    token = _FORCE_INITIALIZATION.set(True)
+    try:
+        with contextlib.closing(connect(path)):
+            pass
+    finally:
+        _FORCE_INITIALIZATION.reset(token)
     return path
 
 # Nullable/defaulted columns of the v1 ``tasks`` CREATE TABLE that external
@@ -1005,6 +1529,8 @@ _TASK_RUN_COLUMNS = (
     ("resources", "resources TEXT NOT NULL DEFAULT '[]'"),
     # Where the run executed (t_8bfdcc07): pool host id or 'studio'.
     ("host", "host TEXT"),
+    # Why the run started no worker (t_4b313c15): operator | synthetic | refused; NULL = a worker ran / legacy.
+    ("no_worker_class", "no_worker_class TEXT"),
 )
 
 
@@ -1107,6 +1633,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "task_comments", "grant_id", "grant_id TEXT"
             )
+    if _table_exists(conn, "sign_grants") and "closed_at" not in _column_names(conn, "sign_grants"):
+        # A background batch that ended normally closes its grant (t_4548202f).
+        _add_column_if_missing(conn, "sign_grants", "closed_at", "closed_at INTEGER")
 
     # task_links gained a ``kind`` column (blocks | derived-from). Every
     # pre-existing edge was created under the single gating semantics, so the
@@ -1190,6 +1719,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "boomerang_wake" not in cols:
         # After workspace_of (fresh column order). Ace 2026-10-22 (t_7be18632).
         _add_column_if_missing(conn, "tasks", "boomerang_wake", "boomerang_wake INTEGER")
+    if "artifact_pointer" not in cols:
+        # After boomerang_wake (fresh column order). t_328f78fc; backfill is the module's CLI.
+        _add_column_if_missing(conn, "tasks", "artifact_pointer", "artifact_pointer TEXT")
     # Every init while the pre-rename ``auto_handle`` column exists: pre-update code may
     # still write it after an earlier copy (Prism 4158abbc3b1b).
     _migrate_legacy_boomerang_column(conn, cols)
@@ -1274,7 +1806,7 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
     write_txn serializes against concurrent dispatchers, and the per-row
     UPDATE uses ``current_run_id IS NULL`` as a CAS guard so a racing claim
     can't produce an orphaned row."""
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         inflight = conn.execute(
             "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
             "       max_runtime_seconds, last_heartbeat_at, started_at "
@@ -1355,7 +1887,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT, resources TEXT NOT NULL DEFAULT '[]', host TEXT)",
+        " error TEXT, resources TEXT NOT NULL DEFAULT '[]', host TEXT, no_worker_class TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -1408,7 +1940,9 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     if not drifted:
         return
 
-    conn.execute("BEGIN IMMEDIATE")
+    # Compose with the outer optional-column migration transaction. A
+    # savepoint also remains atomic when this helper is called standalone.
+    conn.execute("SAVEPOINT rebuild_drifted_tables")
     try:
         for table in drifted:
             create_sql, index_sqls = _REBUILD_SPECS[table]
@@ -1432,10 +1966,11 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
             conn.execute(f"DROP TABLE {table}_legacy")
             for index_sql in index_sqls:
                 conn.execute(index_sql)
-        conn.execute("COMMIT")
+        conn.execute("RELEASE SAVEPOINT rebuild_drifted_tables")
     except Exception:
         with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute("ROLLBACK")
+            conn.execute("ROLLBACK TO SAVEPOINT rebuild_drifted_tables")
+            conn.execute("RELEASE SAVEPOINT rebuild_drifted_tables")
         raise
 
 

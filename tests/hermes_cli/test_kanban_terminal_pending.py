@@ -56,12 +56,12 @@ def _approve(conn, task_id, head=HEAD, verdict="APPROVE"):
     kb.add_comment(conn, task_id, "default", "review_coverage: " + json.dumps(rec))
 
 
-def _operator_review_claim(conn, title="approved, landing"):
+def _operator_review_claim(conn, title="approved, landing", reviewer="human"):
     """The 10-13 shape: ``claim --review`` from a CLI pid that has exited, no worker pid, claim expired."""
     tid = kb.create_task(conn, title=title, assignee="builder")
     impl = kb.claim_task(conn, tid)
     assert impl
-    assert kb.request_review(conn, tid, summary="ready", reviewer="human", expected_run_id=impl.current_run_id)
+    assert kb.request_review(conn, tid, summary="ready", reviewer=reviewer, expected_run_id=impl.current_run_id)
     host = kb._claimer_id().rpartition(":")[0]
     assert kb.claim_review_task(conn, tid, claimer=f"{host}:{_dead_pid()}", operator_claim=True)
     with kb.write_txn(conn):
@@ -435,7 +435,10 @@ def test_extended_workerless_lease_holds_no_worker_slot(home, monkeypatch, all_a
     from hermes_cli import kanban_db_dispatch as kbd
 
     with kb.connect() as conn:
-        tid = _operator_review_claim(conn)
+        # A worker-profile reviewer: a ready card assigned to the `human` sentinel is parked in todo by the
+        # lifecycle entry guard (#126) and never spawns, so it cannot probe the per-profile slot (t_7296326e).
+        tid = _operator_review_claim(conn, reviewer="reviewbot")
+        assert kb.get_task(conn, tid).assignee == "reviewbot"
         _approve(conn, tid)
         _land_request(home, tid)
         assert kb.release_stale_claims(conn) == 0

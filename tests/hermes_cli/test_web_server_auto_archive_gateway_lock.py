@@ -18,6 +18,7 @@ import pytest
 
 from hermes_cli.profiles import _check_gateway_running
 from hermes_cli import web_server_sessions as wss
+from tests import rig_parent_watch
 
 pytestmark = pytest.mark.platforms("posix")  # POSIX flock holder
 
@@ -76,7 +77,9 @@ def test_serve_auto_archive_defers_to_a_live_gateway_for_the_profile(archive_pro
     holder = subprocess.Popen(
         [sys.executable, str(entrypoint), str(lock_path), "gateway", "run"],
         stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+        start_new_session=True,  # + parent-death watch: a killed pytest leaves no lookalike (t_c791d60f)
     )
+    rig_parent_watch.track(holder.pid)
     stdout = holder.stdout
     assert stdout is not None
     try:
@@ -91,6 +94,7 @@ def test_serve_auto_archive_defers_to_a_live_gateway_for_the_profile(archive_pro
     finally:
         holder.terminate()  # by PID: the process this test spawned
         holder.wait(timeout=10)
+        rig_parent_watch.untrack(holder.pid)
         stdout.close()
 
     # Gateway gone: the serve-side sweep is the only archiver left and must run.

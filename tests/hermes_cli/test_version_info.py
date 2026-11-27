@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from hermes_cli.version_info import (
     VersionInfo,
     _derived_version,
@@ -134,6 +136,37 @@ def test_stamp_version_info_ignores_fallback_commit(tmp_path, monkeypatch):
 def test_stamp_version_info_returns_none_when_file_missing(tmp_path, monkeypatch):
     monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
     assert _stamp_version_info() is None
+
+
+@pytest.mark.parametrize("git_failure", ["timeout", "nonzero", "no_repo"])
+def test_code_identity_retries_missing_commit_and_caches_recovery(tmp_path, monkeypatch, git_failure):
+    from hermes_cli import version_info
+
+    monkeypatch.setattr(version_info, "_resolve_stamp_file", lambda: None)
+    available = git_failure != "no_repo"
+    monkeypatch.setattr(version_info, "_resolve_repo_dir", lambda: tmp_path if available else None)
+    recovered = False
+    head = "a" * 40
+    head_reads = []
+
+    def run_git(command, **kwargs):
+        if command == ["git", "rev-parse", "HEAD"]:
+            head_reads.append(command)
+            if not recovered:
+                if git_failure == "timeout":
+                    raise subprocess.TimeoutExpired(command, 3)
+                return subprocess.CompletedProcess(command, 128, "", "git failed")
+            return subprocess.CompletedProcess(command, 0, head, "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(version_info.subprocess, "run", run_git)
+    assert version_info.get_code_identity()["sha"] is None
+    recovered = available = True
+    assert version_info.get_code_identity()["sha"] == "a" * 40
+    reads_after_recovery = len(head_reads)
+    head = "b" * 40  # The checkout advances, but this process still runs the recovered boot.
+    assert version_info.get_code_identity()["sha"] == "a" * 40
+    assert len(head_reads) == reads_after_recovery
 
 
 def test_get_version_info_unknown_when_no_stamp_and_no_git(monkeypatch):

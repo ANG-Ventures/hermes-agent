@@ -25,7 +25,7 @@ def generate(monkeypatch, capsys, tmp_path, count=None, scope="full", weights=(0
     monkeypatch.setattr(mod, "_discover_files", lambda roots: files)
     monkeypatch.setattr(mod, "_compute_lpt_slices", lambda *a: [[f] for f in files])
     monkeypatch.setattr(mod, "_load_durations", lambda root: {mod._format_file(f, ROOT): d for f, d in zip(files, weights)})
-    args = [str(SCRIPT), "--generate-slices", "4", "--self-hosted-labels", POOL, "--self-hosted-slots", "2", "--test-scope", scope]
+    args = [str(SCRIPT), "--event=push", "--generate-slices", "4", "--self-hosted-labels", POOL, "--self-hosted-slots", "2", "--test-scope", scope]
     if count is not None:
         args += [f"--arm-hosted-slices={count}"]
     monkeypatch.setattr(sys, "argv", args)
@@ -48,7 +48,7 @@ def test_disabled_or_invalid_arm_count_preserves_routing(monkeypatch, capsys, tm
 
 def test_real_cli_scoped_plugin_preserves_core_smoke():
     plugin = next(p.name for p in sorted((ROOT / "tests/plugins").iterdir()) if p.is_dir() and any(p.glob("test_*.py")))
-    proc = subprocess.run([sys.executable, str(SCRIPT), "--generate-slices", "4", "--test-scope", f"plugin:{plugin}", "--arm-hosted-slices", "3", "--self-hosted-labels", POOL], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--event=push", "--generate-slices", "4", "--test-scope", f"plugin:{plugin}", "--arm-hosted-slices", "3", "--self-hosted-labels", POOL], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
     assert proc.returncode == 0, proc.stderr
     slices = json.loads(proc.stdout)["slice"]
     assert [(s["name"], s["runs_on"]) for s in slices[:2]] == [(f"plugin {plugin}", ARM), ("core smoke", POOL)]
@@ -67,7 +67,8 @@ def test_workflow_binds_arm_variable_and_keeps_e2e_x64():
     step = next(s for s in jobs["generate"]["steps"] if s.get("id") == "matrix")
     assert step["env"].get("CI_ARM_HOSTED_SLICES") == "${{ vars.CI_ARM_HOSTED_SLICES }}"
     assert '--arm-hosted-slices="$CI_ARM_HOSTED_SLICES"' in step["run"]
-    assert jobs["test"]["runs-on"] == "${{ fromJSON(matrix.slice.runs_on) }}"
+    assert "fromJSON(matrix.slice.runs_on)" in jobs["test"]["runs-on"]
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in jobs["test"]["runs-on"]
     assert "X64" in jobs["e2e"]["runs-on"]
 
 
@@ -86,7 +87,7 @@ def generate_floor(monkeypatch, capsys, slots, arm="3", x64_min="2", weights=WEI
     monkeypatch.setattr(mod, "_discover_files", lambda roots: files)
     monkeypatch.setattr(mod, "_compute_lpt_slices", lambda *a: [[f] for f in files])
     monkeypatch.setattr(mod, "_load_durations", lambda root: {mod._format_file(f, ROOT): d for f, d in zip(files, weights)})
-    args = [str(SCRIPT), "--generate-slices", str(len(files)), "--self-hosted-labels", POOL,
+    args = [str(SCRIPT), "--event=push", "--generate-slices", str(len(files)), "--self-hosted-labels", POOL,
             "--self-hosted-slots", str(slots), f"--arm-hosted-slices={arm}"]
     if x64_min is not None:
         args.append(f"--x64-hosted-min={x64_min}")

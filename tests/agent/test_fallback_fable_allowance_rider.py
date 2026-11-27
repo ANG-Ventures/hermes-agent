@@ -69,7 +69,8 @@ def test_non_fable_rate_limit_tail_unchanged():
     before = fp.format_cause_rider(base, tz=UTC)
     assert "Fable weekly allowance" not in before
     # t_d6227140: "all subs" already says it; no " · pool had no other seat".
-    assert before == "model budget capped at the relay on all subs, 18:40:00", before
+    assert before == ("model budget capped for the requested model via claude-alr "
+                      "(model-specific, not account-wide) at the relay on all subs, 18:40:00"), before
     # zero exhausted: not a Fable allowance event, the old tail stays
     zero = _row(fable_allowance={"exhausted": 0, "of": 25, "earliest_reset": None})
     assert fp.format_cause_rider(zero, tz=UTC) == before
@@ -87,6 +88,8 @@ def test_live_failover_banner_carries_the_tail(_home, monkeypatch):
 
     _patch_resolver(monkeypatch)
     a = _alr_agent()
+    # quota_model is pool-wide: a Fable rung on another relay face is skipped (t_5188f4ed).
+    a._fallback_chain = [{"provider": "claude-btpr", "model": "claude-opus-5-5"}]
     err = _Err({"error": "no eligible sub for the requested model; this model's budget "
                          "is capped on every subscription while other models are unaffected"},
                503, {"x-relay-error-class": "quota_model", "x-relay-error-hop": "relay",

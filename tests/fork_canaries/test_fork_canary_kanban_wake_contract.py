@@ -120,6 +120,9 @@ def _paths(turns) -> list:
 
 
 def _card(env, home="group", **kw) -> str:
+    # These rows pin the PLAIN wake contract; a boomerang-level card hands its mechanical
+    # wakes to a child instead, so opt out of the creation default (t_c24b1cc7).
+    kw.setdefault("boomerang_wake", False)
     with kb.connect_closing() as conn:
         return kb.create_task(conn, title=kw.pop("title", "card"), assignee="worker",
                               session_id=env[home].session_id, **kw)
@@ -246,6 +249,7 @@ def test_w7_needs_input_block_with_wake_sub_is_one_notifier_turn(env):
     tid = _card(env)
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))  # a block notice needs a blocked card
         kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})  # noqa: SLF001
     turns = _tick(env)
     assert _paths(turns) == ["notifier"], _msg("W7", "a needs_input block with a wake sub must wake once", turns)
@@ -377,6 +381,7 @@ def test_w14_worker_needs_input_block_still_wakes_and_kill_switch_restores(env):
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn), \
             kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))  # a block notice needs a blocked card
         kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})  # noqa: SLF001
     turns = list(_tick(env))
     assert _paths(turns) == ["notifier"], _msg("W14", "a worker's needs_input block must wake once", turns)
@@ -506,6 +511,7 @@ def auto_env(env):
         seen.append(entry)
 
     keys = lambda: {e["key"] for e in seen}  # noqa: E731 -- recorded children stay "running"
+    env["real_run_entry"] = ah.run_entry
     env["monkeypatch"].setattr(ah, "run_entry", record)
     env["monkeypatch"].setattr(ah, "_INFLIGHT", {})
     env["monkeypatch"].setattr(ah, "_alive", lambda key: key in keys())
@@ -520,29 +526,93 @@ def _auto_card(env, **kw) -> str:
     return _card(env, boomerang_wake=True, **kw)
 
 
-def test_w18_boomerang_wake_red_handback_is_one_dispatch_zero_turns(auto_env):
+def test_w18_boomerang_wake_dirty_handback_is_one_dispatch_zero_turns(auto_env):
     """One event through both paths (notifier sub + owner-wake reason e) = ONE child, no turn.
 
     RED-PROVABLE: drop the claim check in owner_wake_filter -> two dispatches."""
     env = auto_env
-    env["health"][(REPO, 2118)] = {"state": "open", "mergeable_state": "clean", "failing": ["lint"]}
+    env["health"][(REPO, 2118)] = {"state": "open", "mergeable_state": "dirty", "failing": ["lint"]}
     tid = _auto_card(env)
     _sub(tid)
     _handback(tid, 2118)
     turns = _tick(env)
-    assert turns == [], _msg("W18", "a boomerang-wake red handback still woke the owner", turns)
+    assert turns == [], _msg("W18", "a boomerang-wake dirty handback still woke the owner", turns)
     assert len(env["dispatched"]) == 1, f"FORK CANARY {FEATURE} W18: dispatches={env['dispatched']}"
 
 
-def test_w19_boomerang_wake_needs_input_still_one_notifier_turn(auto_env):
-    """INV-5: a judgment event on an opted-in card is today's one turn, never a child."""
+def test_w18b_boomerang_wake_unconflicted_red_handback_forks_nothing(auto_env):
+    """t_88864f95 (Ace 2026-11-14): an unconflicted red takes the green row: no child, the notifier's one turn.
+
+    RED-PROVABLE: put "red" back on the own_repo_review_red row -> one dispatch, zero turns."""
+    env = auto_env
+    env["health"][(REPO, 2119)] = {"state": "open", "mergeable_state": "clean", "failing": ["lint"]}
+    tid = _auto_card(env)
+    _sub(tid)
+    _handback(tid, 2119)
+    turns = _tick(env)
+    assert env["dispatched"] == [], f"FORK CANARY {FEATURE} W18b: dispatches={env['dispatched']}"
+    assert _paths(turns) == ["notifier"], _msg("W18b", "an unconflicted red must wake like green", turns)
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_w19_boomerang_wake_needs_input_assessed_before_owner_turn(auto_env, resolved):
+    """A label is not a ruling: one child, then one contextual unresolved handback.
+
+    RED-PROVABLE: restore blocked_needs_input SURFACE -> an immediate owner turn.
+    Resolved prerequisites stay child-only; duplicate ticks/results never wake twice.
+    """
+    from gateway import kanban_boomerang_wake as ah
+
     env = auto_env
     tid = _auto_card(env)
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn):
-        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})  # noqa: SLF001
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "prerequisite unavailable"})
+    assert _tick(env) == []
+    assert _tick(env) == []
+    assert len(env["dispatched"]) == 1
+    entry = env["dispatched"][0]
+    assert entry["row"] == "blocked_assess"
+    evidence = "read prerequisite: healthy" if resolved else "read prerequisite: access denied"
+    verdict = {"action": "retry" if resolved else "surface", "evidence": [evidence],
+               "summary": "prerequisite restored" if resolved else "owner must assess missing access"}
+    if resolved:
+        verdict["block_resolution"] = {"resolved": True, "authority": "existing", "check": evidence}
+    final = (f"<<<BOOMERANG-VERDICT nonce={entry['verdict_nonce']}>>>\n"
+             f"{json.dumps(verdict)}\n<<<END-VERDICT>>>")
+
+    async def parent(*_a, **_kw):
+        return object(), "fork"
+
+    env["monkeypatch"].setattr(ah, "parent_resolver", parent)
+    env["monkeypatch"].setattr(ah, "run_child", lambda *_a: ("completed", final))
+    for _ in range(2):
+        asyncio.run(env["real_run_entry"](env["runner"], entry, ah.BoomerangWakeState()))
     turns = _tick(env)
-    assert _paths(turns) == ["notifier"] and env["dispatched"] == [], _msg("W19", "needs_input boomerang-woken", turns)
+    assert len(env["dispatched"]) == 1
+    assert len(turns) == (0 if resolved else 1), _msg("W19", "wrong owner handback count", turns)
+    with kb.connect_closing() as conn:
+        assert (kb.get_task(conn, tid).status == "blocked") is (not resolved)
+        surfaced = [c for c in kb.list_comments(conn, tid) if "surfaced:" in c.body]
+        assert len(surfaced) == (0 if resolved else 1)
+    if not resolved:
+        assert tid in turns[0].text
+        assert verdict["summary"] in turns[0].text
+        assert evidence in turns[0].text
+
+
+def test_w19_no_owner_preserves_native_block_wake(auto_env):
+    env = auto_env
+    tid = _auto_card(env)
+    _sub(tid)
+    env["monkeypatch"].setattr(ow, "resolve_owner", lambda *_a: None)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "missing access"})
+    turns = _tick(env)
+    assert _paths(turns) == ["notifier"] and env["dispatched"] == []
+    assert len(_tick(env)) == 1
 
 
 def test_w20_kill_switch_off_auto_card_wakes_as_today(auto_env):

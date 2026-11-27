@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from hermes_cli import kanban_placement_reasons as _pr
-from hermes_cli import kanban_worker_pool as _kwp
+from hermes_cli.kanban_lazy import Module
+_kwp = Module("hermes_cli.kanban_worker_pool")
 
 HELD_ROWS_SHOWN = 20
 TOP_REASONS_SHOWN = 5
@@ -70,10 +71,11 @@ def _running(conn) -> List[dict]:
             ev = {}
             for kind, raw in conn.execute(
                 "SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ? "
-                "AND kind IN (?, ?) ORDER BY id",
-                (tid, run_id, _pr.WORKER_PLACED_EVENT, _pr.PLACEMENT_EVENT),
+                f"AND kind IN ({_pr.kind_marks(_pr.WORKER_PLACED_EVENT, _pr.PLACEMENT_EVENT)}) ORDER BY id",
+                (tid, run_id, *_pr.kind_names(_pr.WORKER_PLACED_EVENT, _pr.PLACEMENT_EVENT)),
             ).fetchall():
-                ev[kind] = _payload(raw)  # latest of each kind wins
+                # latest of each kind wins; a placement-named (historical) row reads as its allocation name
+                ev[_pr.normalize_kind(kind)] = _payload(raw)
             wp = ev.get(_pr.WORKER_PLACED_EVENT)
             pl = ev.get(_pr.PLACEMENT_EVENT) or {}
             if wp is not None:
@@ -90,10 +92,10 @@ def _held(conn) -> List[dict]:
     rows = conn.execute(
         "SELECT t.id, t.assignee, e.id, e.payload, e.created_at FROM tasks t "
         "JOIN task_events e ON e.id = (SELECT MAX(id) FROM task_events "
-        "  WHERE task_id = t.id AND kind = ?) "
+        "  WHERE task_id = t.id AND kind IN (?, ?)) "
         "WHERE t.status = 'ready' AND NOT EXISTS (SELECT 1 FROM task_events x "
         "  WHERE x.task_id = t.id AND x.id > e.id AND x.kind IN (%s))" % ",".join("?" * len(end)),
-        (_pr.PLACEMENT_WAIT_EVENT, *end),
+        (*_pr.kind_names(_pr.PLACEMENT_WAIT_EVENT), *end),
     ).fetchall()
     out = []
     for tid, assignee, _eid, raw, created in rows:
@@ -105,7 +107,7 @@ def _held(conn) -> List[dict]:
             continue
         out.append({"task_id": tid, "assignee": assignee, "code": code,
                     "detail": p.get("detail"), "route": p.get("route"), "host": p.get("host"),
-                    "since": p.get("since") or created, "at": created})
+                    "since": p.get("since") or created, "at": created, "event_id": _eid})
     return out
 
 
@@ -274,9 +276,15 @@ def _task_block(conn, task_id: str, now: float) -> Optional[Dict[str, Any]]:
         if r["task_id"] == task_id:
             placed = {"host": r["host"], "rule": r["rule"], "run_id": r["run_id"]}
     last = conn.execute(
-        "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
-        "ORDER BY id DESC LIMIT 1", (task_id, _pr.PLACEMENT_EVENT)).fetchone()
+        f"SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks(_pr.PLACEMENT_EVENT)}) "
+        "ORDER BY id DESC LIMIT 1", (task_id, *_pr.kind_names(_pr.PLACEMENT_EVENT))).fetchone()
     held = next((h for h in _held(conn) if h["task_id"] == task_id), None)
+    if held is not None and str(held["code"]).startswith("studio_affinity:") and conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind = 'edited' LIMIT 1",
+            (task_id, held["event_id"])).fetchone():
+        # A capability hold is a verdict on the body as it WAS; an override line added since
+        # (`host: any`, `requires: none`) is only read by the next tick that routes cards.
+        held = dict(held, stale=True)
     return {"task_id": task_id, "status": status, "run_id": run_id, "now": now,
             "running_on": placed,
             "last_placement": None if last is None else dict(_payload(last[0]), at=last[1]),
@@ -298,6 +306,9 @@ def format_task(blk: Mapping) -> List[str]:
     if h:
         out.append(f"  held: {h['code']} host={h.get('host') or '-'} since {_age(now, h.get('since'))} ago"
                    + (f" ({h['detail']})" if h.get("detail") else ""))
+        if h.get("stale"):
+            out.append("  (body edited after this hold: the dispatcher re-reads it on its next routing tick; "
+                       "an `auto-pin released:` comment confirms the release)")
     if not (run or last or h):
         out.append("  no placement recorded")
     return out

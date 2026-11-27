@@ -122,7 +122,7 @@ def _create_and_subscribe_as(source: SessionSource, entry) -> tuple[str, dict]:
         conn = kb.connect()
         try:
             tid = kb.create_task(
-                conn, title="worker card", assignee="worker",
+                conn, boomerang_wake=False, title="worker card", assignee="worker",
                 session_id=entry.session_key,
             )
             # Wake is opt-in (t_6d6e9467); this file tests wake routing.
@@ -274,7 +274,7 @@ def test_backfill_never_repoints_a_named_lane(env):
     ``user_id`` guard exists to prevent. The pair is one identity."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="w")
+        tid = kb.create_task(conn, boomerang_wake=False, title="t", assignee="w")
         kbn.add_notify_sub(
             conn, task_id=tid, platform="feishu", chat_id=CHAT,
             chat_type="group", user_id=OPEN_ID,
@@ -316,7 +316,7 @@ def test_legacy_rows_without_the_columns_behave_exactly_as_before(
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="legacy", assignee="w", session_id=human.session_key,
+            conn, boomerang_wake=False, title="legacy", assignee="w", session_id=human.session_key,
         )
         # Exactly the columns a pre-migration writer supplied, plus the
         # delivery_mode the first-add migration stamps on every pre-existing
@@ -344,13 +344,13 @@ def test_child_tasks_inherit_the_full_identity(env):
     truncated copy would re-open the phantom on every derived card."""
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="p", assignee="w")
+        parent = kb.create_task(conn, boomerang_wake=False, title="p", assignee="w")
         kbn.add_notify_sub(
             conn, task_id=parent, platform="slack", chat_id="C1",
             chat_type="group", user_id="U1", user_id_alt="alt-1",
             scope_id=SLACK_TEAM,
         )
-        child = kb.create_task(conn, title="c", assignee="w", parents=(parent,))
+        child = kb.create_task(conn, boomerang_wake=False, title="c", assignee="w", parents=(parent,))
         row = kbn.list_notify_subs(conn, child)[0]
         assert row["user_id"] == "U1"
         assert row["user_id_alt"] == "alt-1"

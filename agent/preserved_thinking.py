@@ -16,9 +16,14 @@ one dropped block (reported in the response's ``input_transformations``) instead
 mode is never ``error``: the harness still has known prefix edits (steer re-render, compaction,
 resume notices) and ``agent/turn_recovery.py``'s thinking_signature 400 recovery stays the backstop.
 
-``providers.<name>.preserve_thinking_window`` (``latest`` default | ``contiguous``) widens the
-replay from the latest assistant turn to every assistant turn; off by default, measured before it
-is widened.
+``providers.<name>.preserve_thinking_window`` (``latest`` | ``contiguous``) picks how much thinking
+is replayed. ``contiguous`` sends every assistant turn's thinking back unchanged until a compaction,
+so no turn's bytes change and each request reads the previous one back from cache; ``latest`` keeps
+only the newest turn's and costs every thinking step a second uncached send (t_d785218c, measured
+1.20% of prompt tokens missed live). The fleet default is ``prompt_caching.preserve_thinking_window``
+(``contiguous``, Ace 2026-11-13: "fully fix that cache issue"); setting it to ``latest`` returns every
+lane to the latest-only window and the #317 marker hoist in one config edit. Precedence for the
+window of an enabled route: ``providers.<name>`` key > ``prompt_caching`` key > lane profile > latest.
 
 The flag is a LANE property (Ace 2026-10-17): a registered provider profile may carry
 ``preserve_thinking = True`` (and ``preserve_thinking_window``); the fleet pin factory sets it on
@@ -59,6 +64,23 @@ def _load_providers_config() -> Dict[str, Any]:
     config = load_config_readonly()
     providers = config.get("providers") if isinstance(config, dict) else None
     return providers if isinstance(providers, dict) else {}
+
+
+def _load_window_default() -> Any:
+    """``prompt_caching.preserve_thinking_window``: the fleet-wide window (and its kill switch)."""
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
+    caching = config.get("prompt_caching") if isinstance(config, dict) else None
+    return caching.get("preserve_thinking_window") if isinstance(caching, dict) else None
+
+
+def _window_default() -> Any:
+    try:
+        return _load_window_default()
+    except Exception:  # noqa: BLE001 — unreadable config: the lane/entry decides, never a dead turn
+        logger.debug("preserve_thinking: prompt_caching config unreadable", exc_info=True)
+        return None
 
 
 def _match_identity(identity: str, providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -188,7 +210,7 @@ def resolve_preserve_thinking(provider: Optional[str], requested_provider: Optio
         enabled, window, source = False, WINDOW_LATEST, "off"
     elif "preserve_thinking" in entry:
         enabled = entry.get("preserve_thinking") is True
-        window = _window(entry.get("preserve_thinking_window")) if enabled else WINDOW_LATEST
+        window = _window(entry.get("preserve_thinking_window") or _window_default()) if enabled else WINDOW_LATEST
         source = "config"
     else:
         url_key = _base_url_identity(provider, requested_provider, base_url)
@@ -196,7 +218,7 @@ def resolve_preserve_thinking(provider: Optional[str], requested_provider: Optio
         enabled = (profile is not None and getattr(profile, "preserve_thinking", None) is True
                    and getattr(profile, "api_mode", None) == "anthropic_messages")
         if enabled:
-            window = _window(entry.get("preserve_thinking_window")
+            window = _window(entry.get("preserve_thinking_window") or _window_default()
                              or getattr(profile, "preserve_thinking_window", None))
             source = "lane"
         else:

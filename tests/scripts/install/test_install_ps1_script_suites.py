@@ -23,6 +23,7 @@ def _shell(name: str) -> str:
     return shutil.which("pwsh") or pytest.fail("native lane requires PowerShell 7")
 
 
+@pytest.mark.slow_test(300, reason="Each real installer PowerShell suite has a 300s subprocess bound")
 @pytest.mark.parametrize("shell", ["powershell", "pwsh"])
 @pytest.mark.parametrize("suite", sorted(p.name for p in SUITES.glob("test-install-ps1-*.ps1")))
 def test_suite_passes(shell, suite):

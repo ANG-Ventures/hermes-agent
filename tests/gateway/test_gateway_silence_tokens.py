@@ -11,6 +11,7 @@ import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource
+from gateway.turn_context import TurnContext
 from gateway.response_filters import (
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
@@ -190,14 +191,16 @@ async def test_scheduled_heartbeat_silence_suppresses_delivery(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
-async def test_queued_human_turn_also_gets_the_visible_fallback():
+@pytest.mark.parametrize("promoted", [False, True], ids=["human-opener", "human-steered-internal"])
+async def test_queued_human_turn_also_gets_the_visible_fallback(promoted):
     runner = gateway_run.GatewayRunner(GatewayConfig())
     runner._deliver_queued_first_response = AsyncMock()
-    turn_ctx = SimpleNamespace(
+    turn_ctx = TurnContext(
         session_key="agent:main:telegram:group:-1001:12345",
         stream_consumer_holder=[None],
         mute_notification_reply=False,
-        persist_user_display_kind=None,
+        persist_user_display_kind="internal_notification" if promoted else None,
+        human_engaged=promoted,
         reply_expected=None,
         source=_source(),
         _status_thread_metadata=None,
@@ -226,7 +229,7 @@ async def test_queued_terminal_turn_owns_the_silence_verdict(monkeypatch, tmp_pa
     runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="follow-up")
     runner._delivery_adapter_for = MagicMock(return_value=None)
     runner._refresh_agent_cache_message_count = AsyncMock()
-    turn_ctx = SimpleNamespace(
+    turn_ctx = TurnContext(
         source=_source(), session_id="sid", session_key="agent:main:telegram:group:-1001:12345",
         run_generation=1, _interrupt_depth=0, history=[], _status_thread_metadata=None,
         context_prompt=None, result_holder=[None])

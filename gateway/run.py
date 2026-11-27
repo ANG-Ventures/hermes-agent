@@ -2138,7 +2138,7 @@ from gateway.run_adapters import GatewayAdapterLifecycleMixin
 from gateway.run_topics import GatewayTopicThreadsMixin
 from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_result
 from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_verdict
-from gateway.run_busy import GatewayBusySessionMixin
+from gateway.run_busy import GatewayBusySessionMixin, _WATCH_NOTIFICATION_TYPES
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.run_startup import GatewayStartupMixin
 from gateway.run_watchers import GatewaySessionWatchersMixin
@@ -2354,6 +2354,19 @@ _DISCORD_MIGRATION_LOOKUP_CONCURRENCY = 8
 from gateway.run_turn_runner import TurnRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _describe_state_db_write_lock_holders(store: Any, window_s: float) -> str:
+    """Executor job: who held the routing store's state.db write lock in the last ``window_s``.
+
+    Resolves the DB handle here, off the event loop: ``SessionStore._routing_db`` can take the
+    store's lock (t_41843f70; tests/gateway/test_no_agent_construction_on_event_loop.py).
+    """
+    db_path = getattr(getattr(store, "_routing_db", None), "db_path", None)
+    if not db_path:
+        return "holder unknown: no routing state.db"
+    from hermes_state_lockowners import describe_write_lock_holders
+    return describe_write_lock_holders(db_path, window_s)
 
 
 def _best_effort(fn: Callable[[], Any], debug_msg: Optional[str] = None) -> Any:
@@ -3109,7 +3122,9 @@ def _channel_override_lookup_keys(
 def _get_channel_override(
     config: GatewayConfig, platform: Platform, chat_id: str, *, thread_id: Optional[str] = None,
     parent_id: Optional[str] = None) -> Optional[ChannelOverride]:
-    """Per-channel override via chat_id, then thread_id, then parent_id; None if absent."""
+    """Per-channel override via chat_id, then thread_id, then parent_id, then the platform's
+    ``'*'`` entry (per-platform default); None if absent. A persisted chat pin still wins: the
+    session tier is applied after this lookup."""
     platforms = getattr(config, "platforms", None)
     if not platforms:
         return None
@@ -3121,7 +3136,7 @@ def _get_channel_override(
         ov = overrides.get(key)
         if ov is not None:
             return ov
-    return None
+    return overrides.get("*")
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -3254,9 +3269,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         except Exception:
             break
         evt_type = evt.get("type", "completion")
-        if evt_type in {
-            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released",
-            "heartbeat"}:
+        if evt_type in _WATCH_NOTIFICATION_TYPES:
             watch_events.append(evt)
         elif evt_type in {"async_delegation", "async_delegation_restarted"}:
             requeue.append(evt)
@@ -4468,6 +4481,8 @@ class GatewayRunner(
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
         self._provider_routing = self._load_provider_routing()
+        # A read error is not "no filters": the cold boomerang parent refuses on it (t_a9bbc4ad).
+        self._provider_routing_error = self._provider_routing_read_error()
         self._fallback_model = self._load_fallback_model()
 
     def _init_session_store(self) -> None:
@@ -5539,6 +5554,32 @@ class GatewayRunner(
             getattr(source, "thread_id", None), getattr(source, "parent_chat_id", None))
         return None
 
+    def _channel_overrides_config(self, source: Optional[SessionSource] = None) -> Any:
+        """The GatewayConfig whose ``channel_overrides`` apply to this turn. Under multiplex that is the
+        RUNTIME profile's own config (``_profile_configs``), so a launch-profile ``'*'`` never leaks into a
+        secondary profile's rooms; None when that config is not loaded. Without *source* the bound
+        ``_profile_runtime_scope`` names the profile."""
+        cfg = getattr(self, "config", None)
+        if not getattr(cfg, "multiplex_profiles", False):
+            return cfg
+        name: Optional[str] = None
+        if source is None:
+            name = self._active_profile_name()
+        else:
+            from gateway.session_identity import identity_of
+            identity = identity_of(source)
+            if identity is not None:
+                name = identity.runtime_profile
+            else:
+                try:
+                    name = (getattr(source, "profile", None) or "").strip() or self._profile_name_for_source(source)
+                except Exception:
+                    name = None
+        primary = getattr(self, "_primary_profile_name", None) or "default"
+        if not name or name == primary:
+            return cfg
+        return (getattr(self, "_profile_configs", None) or {}).get(name)
+
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME serves this source: the pinned identity's runtime
         home, else ``source.profile``, then ``_profile_name_for_source`` (sources bypassing
@@ -5796,6 +5837,12 @@ class GatewayRunner(
         if getattr(self, "_async_delegation_recovery_boot_id", None) == boot_id:
             return {"claimed": 0, "queued": 0}
         self._async_delegation_recovery_boot_id = boot_id
+
+        # Before any unit relaunches: a background batch's signing grant dies with the process that ran the
+        # batch, and a relaunched generation never inherits it (t_4548202f). Never raises.
+        from tools.delegate_tool_sign_grant import sweep_orphaned_batch_grants
+
+        sweep_orphaned_batch_grants()
 
         from hermes_cli.config import load_config
         from hermes_cli.profiles import profiles_to_serve
@@ -7793,7 +7840,7 @@ class GatewayRunner(
 
         model, provider, api_mode = self._configured_route_identity(user_config)
 
-        cfg = getattr(self, "config", None)
+        cfg = self._channel_overrides_config(source) if source is not None else None
         if cfg and source is not None:
             ch = _get_channel_override(
                 cfg,
@@ -7836,7 +7883,74 @@ class GatewayRunner(
 
         return model, provider, api_mode
 
-    async def _mark_user_stopped(self, session_key: str) -> bool:
+    async def _mark_user_stopped_staged(
+        self, session_key: str, *, expected_session_id: Optional[str] = None,
+    ) -> str:
+        """Await ``_mark_user_stopped``; return its sub-stages as a ``PHASE=stop_stages`` fragment.
+
+        The marker is on disk before /stop acks (boot-gate ruling, see ``_mark_user_stopped``).
+        The write is bound to the session_id this stop saw, so a ``/new`` that lands first is
+        never marked. ``lock_s`` / ``save_lock_s`` / ``upsert_s`` / ``fallback_s`` name the wait
+        when a write is slow (t_41843f70).
+        """
+        from agent.interrupt_compat import _accepts_keyword
+        store = getattr(self, "session_store", None)
+        try:
+            session_id = expected_session_id or getattr(store._entries.get(session_key), "session_id", None)  # noqa: SLF001
+        except Exception:
+            session_id = None
+        timings: dict = {}
+        _mark = self._mark_user_stopped
+        _kwargs: dict = {}
+        if _accepts_keyword(_mark, "timings"):
+            _kwargs["timings"] = timings
+        if session_id and _accepts_keyword(_mark, "expected_session_id"):
+            _kwargs["expected_session_id"] = session_id
+        await _mark(session_key, **_kwargs)
+        return self._render_user_stop_timings(timings)
+
+    # A marker write slower than this names the state.db write-lock holder it waited behind.
+    _USER_STOP_SLOW_S = 1.0
+
+    def _log_user_stop_lock_holders(self, session_key: str, waited: float) -> None:
+        """Log who held state.db's write lock during a slow user_stopped write (t_41843f70).
+
+        A slow write may wait behind another transaction, execute slowly itself, or stall in its
+        own commit. ``describe_write_lock_holders`` (/proc/locks + the holder ledger, holds >= 2 s)
+        supplies context, not proof of a foreign holder. Runs after the write landed, so it never
+        delays the /stop ack; never raises.
+        """
+        try:
+            future = asyncio.get_running_loop().run_in_executor(
+                None, _describe_state_db_write_lock_holders, getattr(self, "session_store", None),
+                waited + 5.0)
+        except Exception:
+            return
+
+        def _done(fut: "asyncio.Future") -> None:
+            if fut.cancelled():
+                return
+            if fut.exception() is not None:
+                logger.debug("user_stopped lock-holder lookup failed for %s", session_key,
+                             exc_info=fut.exception())
+                return
+            logger.warning("PHASE=user_stopped_slow key=%s waited=%.2fs holders=%s",
+                           session_key, waited, fut.result())
+
+        future.add_done_callback(_done)
+
+    @staticmethod
+    def _render_user_stop_timings(timings: dict) -> str:
+        keys = ("rowid_s", "store_s", "lock_s", "save_lock_s", "upsert_s",
+                "wait_s", "exec_s", "commit_s", "route_check_s", "route_sql_s", "fallback_s", "other_s")
+        return " ".join(
+            f"{k}={timings[k]:.3f}" if isinstance(timings.get(k), (int, float)) else f"{k}=-"
+            for k in keys)
+
+    async def _mark_user_stopped(
+        self, session_key: str, *, generation: Optional[int] = None,
+        timings: Optional[dict] = None, expected_session_id: Optional[str] = None,
+    ) -> bool:
         """Durably record that ``session_key``'s turn was ended by ``/stop``.
 
         The rowid stamped here is the session's newest persisted message at
@@ -7852,18 +7966,27 @@ class GatewayRunner(
         """
         last_message_id: Optional[int] = None
         # Claimed before any await: a resume racing this write is compared against it.
-        generation = self._current_session_run_generation(session_key)
+        if generation is None:
+            generation = self._current_session_run_generation(session_key)
+        timings = timings if timings is not None else {}
         entry = None
         try:
             entry = self.session_store._entries.get(session_key)  # noqa: SLF001
         except Exception:
             entry = None
-        session_id = getattr(entry, "session_id", None)
+        # The write is bound to the session /stop saw (``expected_session_id``), never to
+        # whatever the key routes to by the time the write runs.
+        session_id = expected_session_id or getattr(entry, "session_id", None)
+        _t0 = time.monotonic()
         if self._session_db is not None and session_id:
             try:
+                # Newest row only (same filter, ORDER BY id DESC LIMIT 1 on the session index): the
+                # full transcript load this replaced scaled with session size on the /stop path.
                 rows = await self._session_db.get_messages(
                     session_id,
                     preserve_unparseable_tool_calls=True,
+                    latest=True,
+                    limit=1,
                 )
                 for row in reversed(rows or []):
                     if not isinstance(row, dict):
@@ -7876,24 +7999,40 @@ class GatewayRunner(
                 logger.debug(
                     "user_stopped rowid lookup failed for %s", session_key, exc_info=True
                 )
+        _t1 = time.monotonic()
         boot_id = None
         try:
             boot_id = self._current_boot_id()
         except Exception:
             boot_id = None
-        marked = await self.async_session_store.mark_user_stopped(
-            session_key,
-            boot_id=boot_id,
-            last_message_id=last_message_id,
-            generation=generation,
-        )
+        _bind = {"expected_session_id": session_id} if session_id else {}
+        try:
+            marked = await self.async_session_store.mark_user_stopped(
+                session_key,
+                boot_id=boot_id,
+                last_message_id=last_message_id,
+                generation=generation,
+                timings=timings,
+                **_bind,
+            )
+        finally:
+            # store_s = executor queue + lock_s + save_lock_s + upsert_s (+ fallback_s); other_s is
+            # the remainder (thread-pool queue and in-memory work), so the wait is attributable.
+            timings["rowid_s"] = _t1 - _t0
+            timings["store_s"] = time.monotonic() - _t1
+            timings["other_s"] = max(0.0, timings["store_s"] - sum(
+                float(timings.get(k) or 0.0) for k in ("lock_s", "save_lock_s", "upsert_s", "fallback_s")))
         logger.info(
-            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s",
+            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s %s",
             session_key,
             boot_id,
             last_message_id,
             marked,
+            self._render_user_stop_timings(timings),
         )
+        _waited = float(timings.get("store_s") or 0.0)
+        if _waited >= self._USER_STOP_SLOW_S:
+            self._log_user_stop_lock_holders(session_key, _waited)
         return bool(marked)
 
     @staticmethod
@@ -7956,6 +8095,7 @@ class GatewayRunner(
         override: Optional[dict],
         *,
         require_persistence: bool = False,
+        persist_only: bool = False,
     ) -> None:
         """Single door for setting/clearing a session-scoped /model override (P3b/RC-2).
 
@@ -7963,6 +8103,11 @@ class GatewayRunner(
         SessionEntry (config-backed-only per RC-4) AND saves. Manual /new and
         /reset copy persisted identity directly; /model reset and automatic cleanup
         use this user-action door.
+
+        ``persist_only``: the in-memory half already ran on the loop
+        (:meth:`_apply_session_model_override_in_memory`, the reply-first /model path,
+        t_2ab07928); write only the durable half and leave the in-memory map alone, so a
+        later switch's in-memory value is never overwritten from a worker thread.
         """
         if not session_key:
             return
@@ -7975,6 +8120,27 @@ class GatewayRunner(
                 if require_persistence:
                     raise
                 logger.debug("model-route clear persist skipped", exc_info=True)
+        if not persist_only:
+            self._apply_session_model_override_in_memory(session_key, override)
+        try:
+            store = getattr(self, "session_store", None)
+            entry = store.entry_for(session_key) if store is not None else None
+            if entry is not None and override is not None:
+                entry.model_override_identity = (
+                    self._model_override_is_persistable(override)
+                )
+                entry._model_override_identity_invalid = False
+                store.persist()
+        except Exception:
+            if persist_only and require_persistence:
+                raise
+            logger.debug("model-override persist skipped (non-fatal)", exc_info=True)
+
+    def _apply_session_model_override_in_memory(
+        self, session_key: str, override: Optional[dict]
+    ) -> None:
+        """In-memory half of the single door: the override map the next turn reads.
+        Sync and I/O-free, so the reply-first /model path runs it on the loop."""
         # Stamp "the user changed the override target this turn" for the NEXT
         # turn's pre-run recovery announce: the shared recovery_should_announce
         # predicate suppresses the manual /model re-target (or clear) transition
@@ -7986,23 +8152,14 @@ class GatewayRunner(
             self._override_target_just_changed = {}
         self._override_target_just_changed[session_key] = True
         if override is None:
+            # NOTE(P3b/RC-2): the in-memory half of the single door (_set_session_model_override),
+            # split out so the reply-first /model path can run it on the loop (t_2ab07928).
             self._session_model_overrides.pop(session_key, None)
         else:
             self._session_model_overrides[session_key] = dict(override)
         unavailable = getattr(self, "_session_model_override_unavailable", None)
         if unavailable is not None:
             unavailable.discard(session_key)
-        try:
-            store = getattr(self, "session_store", None)
-            entry = store.entry_for(session_key) if store is not None else None
-            if entry is not None and override is not None:
-                entry.model_override_identity = (
-                    self._model_override_is_persistable(override)
-                )
-                entry._model_override_identity_invalid = False
-                store.persist()
-        except Exception:
-            logger.debug("model-override persist skipped (non-fatal)", exc_info=True)
 
     def _sweep_restart_initiated_breadcrumbs(self) -> int:
         """Prune breadcrumb files from a prior boot or past the TTL (D-8).
@@ -8424,6 +8581,8 @@ class GatewayRunner(
                     # never replayed as a turn (spec 2026-10-12 D22/I13).
                     from gateway.fork_ext.restart_followups import acknowledge_followup
                     self._session_state(record["session_key"]).conversation.held_queue.append(event)
+                    from gateway import queue_mgmt
+                    queue_mgmt.log_items(self, "restart_restore", record["session_key"], [event], with_preview=False)
                     self._note_held_platform_message(source, source._restart_followup_message_id)
                     await asyncio.to_thread(acknowledge_followup, record["_spool_path"])
                     held_restored += 1
@@ -8756,6 +8915,7 @@ class GatewayRunner(
         override: Optional[dict],
         *,
         require_persistence: bool = False,
+        persist_only: bool = False,
     ) -> None:
         """Run :meth:`_set_session_model_override` off the loop, serialized per
         session in issue order (C5 #36, PR #970).
@@ -8777,6 +8937,7 @@ class GatewayRunner(
                 session_key,
                 override,
                 require_persistence=require_persistence,
+                **({"persist_only": True} if persist_only else {}),
             ))
             cancelled = False
             while True:
@@ -9509,6 +9670,8 @@ class GatewayRunner(
                     seen.add(id(event))
                     if await self._preserve_followup_across_restart(key, event, None, reason="queue_held"):
                         spooled += 1
+                        from gateway import queue_mgmt
+                        queue_mgmt.log_items(self, "restart_spool", key, [event], with_preview=False)
                         with suppress(ValueError):
                             events.remove(event)
         return spooled
@@ -10783,6 +10946,13 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
     planned_stop_seen = [False]
 
+    def _console_uid():
+        from gateway.shutdown_forensics import console_owner_uid
+        return console_owner_uid()
+
+    # Who owned the console when this gateway started: a SIGTERM after it changed hands is a session loss.
+    baseline_console_uid = _best_effort(_console_uid, "console owner read failed: %s")
+
     def shutdown_signal_handler(received_signal=None):
         # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
         def _takeover() -> bool:
@@ -10810,6 +10980,25 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             planned_stop = True
         _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
+        restart_how = ("--replace takeover" if planned_takeover else "planned stop" if planned_stop
+                       else f"in-band restart (requester={getattr(runner, '_restart_requester', None) or 'unknown'})"
+                       if getattr(runner, "_restart_requested", False) else None)
+        console_uid = _best_effort(_console_uid, "console owner read failed: %s")
+
+        def _session_lost() -> bool:
+            from gateway.shutdown_forensics import console_session_lost
+            return console_session_lost(baseline_console_uid, console_uid)
+
+        if restart_how is None and _best_effort(_session_lost, "console session check failed: %s"):
+            runner._console_session_lost = True
+
+            def _page() -> None:
+                from gateway.shutdown_forensics import page_console_session_lost, session_lost_page_text
+                page_console_session_lost(session_lost_page_text(sig_name or "SIGTERM", console_uid, str(_hermes_home)))
+
+            logger.warning("Console session lost (console uid %s, was %s): not a planned restart; paging",
+                           console_uid, baseline_console_uid)
+            _best_effort(_page, "console session-lost page failed: %s")
 
         if planned_takeover:
             logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
@@ -10830,7 +11019,13 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             def _diagnostic() -> None:
                 # Heavyweight (comm-only ps, pstree, dmesg), detached so it finishes even if our cgroup is torn
                 # down; bounded by an internal timeout, never blocks.
-                from gateway.shutdown_forensics import spawn_async_diagnostic
+                from gateway.shutdown_forensics import spawn_async_diagnostic, write_inprocess_diagnostic
+                # In-process block first (no fork, <=1 s): the detached ps listed nothing during the
+                # 2026-11-22 console-session teardown.
+                write_inprocess_diagnostic(
+                    _hermes_home / "logs" / "gateway-shutdown-diag.log", _shutdown_ctx["signal"],
+                    console_uid=console_uid, baseline_console_uid=baseline_console_uid,
+                    restart_requested=restart_how)
                 spawn_async_diagnostic(
                     _hermes_home / "logs" / "gateway-shutdown-diag.log", _shutdown_ctx["signal"], timeout_seconds=5.0)
 
@@ -11349,6 +11544,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # gateway.run imports from CLI code don't poison them. Shared with the cron script runner (§5.6).
     _apply_start_env()
 
+    # macOS: every subprocess launch in this process goes through one posix_spawn instead of
+    # fork()ing the multi-GB gateway under the GIL (t_aa2e2d4e). No-op elsewhere; launches it
+    # cannot express exactly keep plain Popen; HERMES_SPAWN_LEGACY=1 turns it off per spawn.
+    from tools.spawn_nofork import install_process_hook
+    install_process_hook()
+
     from hermes_cli.resource_limits import apply_nofile_soft_limit
     apply_nofile_soft_limit()
 
@@ -11400,6 +11601,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     loop.set_exception_handler(_gateway_loop_exception_handler)
 
     if threading.current_thread() is threading.main_thread():
+        # A fork-without-exec child must not deliver its signals into this loop's wakeup fd (t_5e351ab7).
+        from gateway.fork_signal_reset import install_fork_signal_reset
+        install_fork_signal_reset()
         # add_signal_handler raises NotImplementedError on Windows; SIGUSR1 is POSIX-only.
         handlers = [(sig, shutdown_signal_handler, (sig,)) for sig in (signal.SIGINT, signal.SIGTERM)]
         if hasattr(signal, "SIGUSR1"):

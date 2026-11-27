@@ -823,7 +823,7 @@ def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = Non
         return "900k" not in bare
     return bare == "gpt-daybreak-blue-latest" or any(
         bare == fam or bare.startswith(fam + "-") or bare.startswith(fam + ".")
-        for fam in ("gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"))
+        for fam in ("gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6-luna"))
 
 
 def _codex_route_bare_model(model: Optional[str], provider: Optional[str]) -> Optional[str]:
@@ -3278,7 +3278,8 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
         return None, None
     if custom_base.lower().startswith(_CODEX_AUX_BASE_URL.lower()):
         return None, None
-    model = _read_main_model_for_aux() or "gpt-4o-mini"
+    from hermes_cli.model_registry import slot_resolve
+    model = slot_resolve(_read_main_model_for_aux() or "gpt-4o-mini")[0]
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
     _clean_base, _dq = _extract_url_query_params(custom_base)
     _extra = {"default_query": _dq} if _dq else {}
@@ -3770,8 +3771,8 @@ def _relay_drain_wait_for(exc: Exception, started_at: Optional[float]) -> Tuple[
     retry above gave it 1 s + 2 s and then raised to the caller (LCM opened its
     summary circuit and truncated at L3). Same wait the main loop uses
     (t_4349cf26): ``retry_utils.relay_drain_wait`` with the
-    ``fallback.relay_drain_wait_s`` wall-clock budget (default 150 s = relay
-    drain TTL 120 s + relaunch + health gate). ``None`` = not a drain, or the
+    ``fallback.relay_drain_wait_s`` wall-clock budget (default 300 s, sized from
+    measured drains in ``retry_utils.RELAY_DRAIN_WAIT_DEFAULT_S``). ``None`` = not a drain, or the
     budget is spent.
     """
     if not _is_relay_drain(exc):
@@ -5846,7 +5847,11 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
         return _route_client(req, client, final_model)
     # Try custom first, then API-key providers (Codex excluded here:
     # falling through to Codex with no model is a stale-constant trap).
-    for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
+    from agent.auxiliary_attempt import single_attempt_config
+    resolvers = (_try_custom_endpoint,) if single_attempt_config(req.task) is not None else (
+        _try_custom_endpoint, _resolve_api_key_provider,
+    )
+    for try_fn in resolvers:
         client, default = try_fn()
         if client is not None:
             final_model = _normalize_resolved_model(model or default, provider)
@@ -6240,6 +6245,9 @@ def resolve_provider_client(
         # pre-filling it sends the image to a model that cannot accept one and the Portal 404s. Leave
         # ``model`` unset and let the Portal slot through; only an explicit caller model may override it.
         model = _get_aux_model_for_provider(provider) or _read_main_model_for_aux() or model
+    # Every aux / fallback / MoA client is built here: a slot name never reaches a branch or the wire.
+    from hermes_cli.model_registry import slot_resolve
+    model = slot_resolve(model)[0]
     req = _ResolveRequest(
         provider, original_provider, model, async_mode, raw_codex,
         explicit_base_url, explicit_api_key, api_mode, main_runtime, is_vision, task,
@@ -6419,6 +6427,9 @@ def _vision_auto_route(
         if _agg_provider and _agg_model:
             main_provider, main_model = _agg_provider, _agg_model
             runtime = dict(runtime, base_url="", api_key="", api_mode="")
+    # The capability check below must see the id, not a config slot name (``sol``).
+    from hermes_cli.model_registry import slot_resolve
+    main_model = slot_resolve(main_model)[0]
     if main_provider and main_provider not in {"auto", "", "moa"}:
         client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
         if client is not None:
@@ -6897,6 +6908,9 @@ def _resolve_task_provider_model(
             resolved_model = cfg_model
             cfg_base_url = None
             cfg_api_key = None
+    # A slot name (``sol``) in auxiliary.<task>.model or the explicit kwarg becomes its current id.
+    from hermes_cli.model_registry import slot_resolve
+    resolved_model = slot_resolve(resolved_model)[0]
     # One shared alias table with resolve_runtime_provider(): ``provider: openai`` routes the same
     # way here (compression/vision/title) and on the runtime path (background review, curator, MoA).
     from hermes_cli.runtime_provider_custom import expand_direct_api_alias
@@ -6961,6 +6975,10 @@ _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     """Config dict for auxiliary.<task>, or {} when unavailable. Plugin-registered tasks get their
     declared defaults layered under user config (user wins); built-in defaults live in DEFAULT_CONFIG."""
+    from agent.auxiliary_attempt import single_attempt_config
+    attempt_config = single_attempt_config(task)
+    if attempt_config is not None:
+        return attempt_config
     if not task:
         return {}
     try:
@@ -8146,6 +8164,9 @@ def _resolve_call_client(
             api_key=resolved_api_key, api_mode=resolved_api_mode, main_runtime=main_runtime,
             task=task)
         effective_provider = _effective_provider_for_client(client, resolved_provider)
+        from agent.auxiliary_attempt import single_attempt_config
+        if client is None and single_attempt_config(task) is not None:
+            raise AuxiliaryClientUnavailable("configured attempt has no available client")
         if client is None:
             # Explicit provider with no credentials: honor the task fallback_chain before
             # raising (fallback entries may use OAuth / credential-pool auth).
@@ -8268,7 +8289,9 @@ def _prepare_aux_request(
     # Route-scoped resilience for the COMPACTION summarizer (PRD 2026-06-25): ``_aux_task`` is added
     # ONLY for the Anthropic wrapper (its adapter threads the timeout it otherwise drops + forces
     # max_retries=0); other aux tasks keep the SDK default retries (AC-13).
-    client, _scope_kwargs = _scope_client_for_task(client, task, effective_timeout)
+    from agent.auxiliary_attempt import single_attempt_config
+    client, _scope_kwargs = _scope_client_for_task(
+        client, "compression" if single_attempt_config(task) is not None else task, effective_timeout)
     kwargs.update(_scope_kwargs)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     client_base = str(getattr(client, "base_url", "") or "")
@@ -9074,7 +9097,8 @@ def _call_llm_impl(
         return _validate_llm_response(
             _relay_sync_completion(
                 client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
-                create=lambda request: _create_with_progress(
+                create=lambda request: (
+                    _create_with_progress_once if _single_attempt else _create_with_progress)(
                     client, request, task,
                     force_stream=_provider_requires_stream(
                         request_provider, req.base_info or req.resolved_base_url),
@@ -9082,6 +9106,10 @@ def _call_llm_impl(
             ),
             task, **validate_kw,
         )
+    from agent.auxiliary_attempt import single_attempt_config
+    _single_attempt = single_attempt_config(task) is not None
+    if _single_attempt:
+        return _primary(provider=request_provider, base_url=req.base_info)
     try:
         # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
         # transient blips before escalating to fallback — a dropped connection shouldn't

@@ -396,3 +396,47 @@ class TestProfileHomeSharedRoot:
             # must not raise; must return the fallback HERMES_HOME-relative join
             out = smt._shared_skills_root()
             assert str(out).endswith("skills-shared")
+
+
+# --- t_0fc9949e: a write under skills-shared/ carries the prose lane's --check verdict -----------------------------
+
+_LANE_STUB = """\
+import sys, pathlib
+a = sys.argv[1:]
+pathlib.Path(a[a.index("--home") + 1]).joinpath("lane-calls.txt").open("a").write(" ".join(a) + "\\n")
+t = pathlib.Path(a[a.index("--check") + 1])
+if "BAD" in t.read_text():
+    print("the lane will REFUSE this: %s: secret shape in the bytes (never pushed)" % t.name)
+    sys.exit(1)
+print("ok: the lane would carry %s" % t.name)
+"""
+
+
+def test_t0fc_shared_write_attaches_the_lane_refusal(tmp_path):
+    with _fleet_home(tmp_path) as (home, _local, shared):
+        (home / "scripts" / "skills-prose-lane.py").write_text(_LANE_STUB)
+        r = _create_skill("probe-skill", VALID_CONTENT, category="general")
+        assert r["success"] and "lane_warning" not in r, r
+        r = smt._patch_skill("probe-skill", "do the thing.", "do the BAD thing.")
+        assert r["success"], r
+        assert r["lane_warning"] == "the lane will REFUSE this: SKILL.md: secret shape in the bytes (never pushed)"
+        assert "stays on this disk only" in r["lane_hint"]
+        r = smt._write_file("probe-skill", "references/x.md", "BAD\n")
+        assert r["success"] and r["lane_warning"].startswith("the lane will REFUSE this: x.md"), r
+        r = smt._edit_skill("probe-skill", VALID_CONTENT)
+        assert r["success"] and "lane_warning" not in r, r
+        calls = (home / "lane-calls.txt").read_text().splitlines()
+        assert len(calls) == 4, calls
+        assert all(c.startswith("--home %s --clone %s --check %s/general/probe-skill/" % (home, shared, shared))
+                   for c in calls), calls
+
+
+def test_t0fc_no_lane_script_or_local_write_runs_no_check(tmp_path):
+    with _fleet_home(tmp_path) as (home, local, _shared):
+        r = _create_skill("probe-skill", VALID_CONTENT, category="general")    # no script planted
+        assert r["success"] and "lane_warning" not in r, r
+        (home / "scripts" / "skills-prose-lane.py").write_text(_LANE_STUB)
+        r = _create_skill("probe-local", VALID_CONTENT.replace("probe-skill", "probe-local").replace(
+            "do the thing", "do the BAD thing"), local=True)
+        assert r["success"] and "lane_warning" not in r, r
+        assert not (home / "lane-calls.txt").exists()

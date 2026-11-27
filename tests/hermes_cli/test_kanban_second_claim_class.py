@@ -175,7 +175,7 @@ def test_operator_terminal_outcome_does_not_certify_worker_exit(conn, monkeypatc
     tid, first = _live_claim(conn, "operator release")
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 424242)
     if release == "block":
-        assert kb.block_task(conn, tid, reason="operator")
+        assert kb.block_task(conn, tid, reason="operator", kind="needs_input")
         assert kb.unblock_task(conn, tid)
     elif release == "review":
         assert kb.request_review(conn, tid, summary="operator", reviewer="worker", force=True)
@@ -207,7 +207,7 @@ def test_ended_synthetic_run_cannot_mask_older_live_owner(conn, monkeypatch):
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 424242)
     _external_release(conn, tid)
     assert kb.claim_task(conn, tid) is None
-    assert kb.block_task(conn, tid, reason="operator pause")
+    assert kb.block_task(conn, tid, reason="operator pause", kind="needs_input")
     assert kb.unblock_task(conn, tid)
     spawned, _ = _dispatch(conn)
     assert tid not in spawned
@@ -288,7 +288,7 @@ def test_real_process_survives_operator_block_without_second_spawn(conn, monkeyp
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         kbd._set_worker_pid(conn, tid, proc.pid)
-        assert kb.block_task(conn, tid, reason="operator pause")
+        assert kb.block_task(conn, tid, reason="operator pause", kind="needs_input")
         assert kb.unblock_task(conn, tid)
         spawned, _ = _dispatch(conn)
         assert proc.poll() is None
@@ -301,7 +301,7 @@ def test_real_process_survives_operator_block_without_second_spawn(conn, monkeyp
 
 def test_terminal_release_allows_proven_dead_worker(conn, monkeypatch):
     tid, _ = _live_claim(conn, "dead self-release")
-    assert kb.block_task(conn, tid, reason="operator")
+    assert kb.block_task(conn, tid, reason="operator", kind="needs_input")
     assert kb.unblock_task(conn, tid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     spawned, _ = _dispatch(conn)
@@ -694,7 +694,7 @@ def _released_with_real_holder(conn, title):
     assert first is not None
     proc = _sleeper()
     kbd._set_worker_pid(conn, tid, proc.pid)
-    assert kb.block_task(conn, tid, reason="operator pause")
+    assert kb.block_task(conn, tid, reason="operator pause", kind="needs_input")
     assert kb.unblock_task(conn, tid)
     return tid, first, proc
 
@@ -799,7 +799,7 @@ def test_lock_lagged_spawn_event_still_identifies_genuine_owner(conn, real_ident
         lag = spawned_at - psutil.Process(proc.pid).create_time()
         assert lag > 5, f"lock hold did not delay the spawned event (lag={lag:.2f}s)"
 
-        assert kb.block_task(conn, tid, reason="operator pause")
+        assert kb.block_task(conn, tid, reason="operator pause", kind="needs_input")
         assert kb.unblock_task(conn, tid)
         spawned, _ = _dispatch(conn)
         assert tid not in spawned
@@ -841,7 +841,7 @@ def test_boot_time_holder_is_not_the_owner(conn, real_identity, monkeypatch, leg
                 "UPDATE task_events SET payload = json_set(payload, "
                 "'$.start_token', ?) WHERE task_id = ? AND kind = 'spawned'",
                 (kb._pid_start_token(os.getpid()), tid))
-    assert kb.block_task(conn, tid, reason="operator")
+    assert kb.block_task(conn, tid, reason="operator", kind="needs_input")
     assert kb.unblock_task(conn, tid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == 1)
     spawned, _ = _dispatch(conn)

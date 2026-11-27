@@ -104,7 +104,7 @@ def test_worker_cli_cannot_use_foreign_task_to_drop_run_scope(tmp_path, monkeypa
     assert kb.get_task(conn, foreign).status == "running"
     attachment = tmp_path / "note.txt"
     attachment.write_text("fixture")
-    assert kb.block_task(conn, foreign, reason="fixture awaiting orchestrator")
+    assert kb.block_task(conn, foreign, reason="fixture awaiting orchestrator", kind="needs_input")
     for arguments in (["attach", foreign, str(attachment)], ["unblock", foreign]):
         proc = subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", *arguments],
                               cwd=ROOT, env=dict(os.environ), stdin=subprocess.DEVNULL,

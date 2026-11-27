@@ -278,13 +278,15 @@ CASES = {
     # conftest.py owns the _OS_MARKS skip logic, so it re-arms the
     # desktop_updater integration tests too (fail-open).
     # The shared harness can break every Python E2E suite.
+    # e2e_upgrade is main-only for the shared harness (t_4897b522): every push to main
+    # runs it, and the PR's own unit slices already load these files.
     "conftest → python + desktop_updater + python e2e": (
         ["tests/conftest.py"],
-        _lanes(os_tests=True, python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True),
+        _lanes(os_tests=True, python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True),
     ),
     "conftest fixture module → python + desktop_updater + python e2e": (
         ["tests/_fixtures/platform_gating.py"],
-        _lanes(os_tests=True, python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True),
+        _lanes(os_tests=True, python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True),
     ),
     "tests + prod source → both lanes": (
         ["tests/agent/test_foo.py", "agent/x.py"],
@@ -338,9 +340,11 @@ CASES = {
         [".prettierrc"],
         _lanes(python=True, ci_review=True),
     ),
+    # An unrelated workflow still fails open on every lane except e2e_upgrade, which
+    # runs on a PR only for the CI that selects or runs it (t_4897b522).
     "workflow yml → ci_review (also fail-open all)": (
         [".github/workflows/typecheck.yml"],
-        DEFAULT,
+        {**DEFAULT, "e2e_upgrade": False},
     ),
     # The bootstrap installer lane: shell installer, dev-checkout wrapper,
     # and the Tauri app's non-Rust sources.
@@ -356,6 +360,7 @@ CASES = {
         ["apps/bootstrap-installer/src-tauri/src/lib.rs"],
         _lanes(frontend=True, bootstrap=True, rust=True),
     ),
+    # The upgrade shards run through the retry action, so this one keeps e2e_upgrade.
     "composite action → ci_review (also fail-open all)": (
         [".github/actions/retry/action.yml"],
         DEFAULT,
@@ -804,3 +809,140 @@ def test_os_tests_lane_reaches_the_os_unit_jobs():
         ci = _yaml(rel)
         assert "os_tests" in ci["jobs"]["detect"]["outputs"]
         assert "needs.detect.outputs.os_tests" in ci["jobs"]["tests-os"]["with"]["os_tests"]
+
+
+# ── e2e_upgrade: main-only unless the PR touches the upgrade path (t_4897b522) ──
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        # the suite, its helpers and its imports
+        "tests/e2e/core/upgrade/test_upgrade_path.py",
+        "tests/e2e/core/upgrade/pm/_pm.py",
+        "tests/e2e/core/upgrade/hosts/_hosts.py",
+        "tests/e2e/core/windows_update/test_fresh_install.py",
+        "tests/e2e/core/_pending_fixes.py",
+        "tests/e2e/conftest.py",
+        "tests/e2e/environ_snapshot.py",
+        "tests/fakes/fake_llm_provider.py",
+        "tests/compat/old_updater_surface.json",
+        # the runner the shard executes
+        "scripts/run_tests.sh",
+        "scripts/run_tests_parallel.py",
+        # the code it exercises
+        "hermes_cli/update_cmd_git.py",
+        "hermes_cli/config_migrations.py",
+        "hermes_cli/main_install.py",
+        "hermes_cli/venv_sync.py",
+        "hermes_bootstrap.py",
+        "pm/environments.py",
+        "scripts/install.sh",
+        "scripts/install.ps1",
+        "setup-hermes.sh",
+        "pyproject.toml",
+        "uv.lock",
+        "setup.py",
+        "package.json",
+        # the CI that selects and runs it
+        ".github/workflows/ci.yaml",
+        ".github/workflows/ci-local.yaml",
+        ".github/workflows/tests.yml",
+        ".github/workflows/tests-os.yml",
+        ".github/workflows/windows-install-update-e2e.yml",
+        ".github/actions/detect-changes/action.yml",
+        ".github/actions/retry/action.yml",
+        ".github/actions/setup-pm/action.yml",
+        ".github/scripts/install-ci-tool.sh",
+        ".github/scripts/download-ci-asset.sh",
+        "scripts/ci/classify_changes.py",
+    ],
+)
+def test_e2e_upgrade_runs_on_a_pr_that_touches_the_upgrade_path(path):
+    assert classify([path])["e2e_upgrade"], path
+    # Mixed with an unrelated file it still runs.
+    assert classify(["gateway/run.py", path])["e2e_upgrade"], path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "gateway/run.py",
+        "hermes_cli/config.py",
+        "tests/conftest.py",
+        "tests/_fixtures/bounds.py",
+        "tests/fakes/fake_ha_server.py",
+        "tests/e2e/core/sqlite/test_torture.py",
+        ".github/workflows/lint.yml",
+        ".github/router-core/PIN.json",
+        ".github/runner/Dockerfile.ang-hermes",
+        "README.md",
+    ],
+)
+def test_e2e_upgrade_is_main_only_for_the_rest(path):
+    assert not classify([path])["e2e_upgrade"], path
+    # The run-e2e label and an empty diff still run it.
+    assert classify([path], run_e2e=True)["e2e_upgrade"]
+
+
+def test_e2e_upgrade_still_runs_on_an_empty_diff():
+    """push:main has no diff: every lane, e2e_upgrade included, stays on."""
+    assert classify([])["e2e_upgrade"]
+    assert classify(["", "  "])["e2e_upgrade"]
+
+
+def test_e2e_upgrade_pr_paths_cover_every_workflow_that_runs_the_lane():
+    """A workflow that reads the e2e_upgrade lane or runs the upgrade suite is on the PR list,
+    so editing how the lane runs always runs it on that PR."""
+    covered = []
+    for wf in sorted((_REPO / ".github" / "workflows").glob("*.y*ml")):
+        text = "\n".join(
+            line for line in wf.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("#")
+        )
+        if "e2e_upgrade" in text or "tests/e2e/core/upgrade" in text:
+            rel = wf.relative_to(_REPO).as_posix()
+            covered.append(rel)
+            if rel.split("/")[-1].startswith(("install-e2e", "fleet-ci-fail-alert")):
+                continue  # not the CI lane: standalone install journeys / alert routing
+            assert _mod._is_e2e_upgrade_pr_path(rel), rel
+    assert ".github/workflows/tests.yml" in covered
+
+
+def test_e2e_upgrade_pr_paths_match_tracked_files():
+    tracked = subprocess.run(["git", "ls-files"], cwd=_REPO, capture_output=True, text=True, check=False)
+    if tracked.returncode != 0:
+        pytest.skip("not a git checkout")
+    files = tracked.stdout.splitlines()
+    dead = [
+        p for p in (*_mod._E2E_UPGRADE_PR_SUITE, *_mod._E2E_UPGRADE_PR_CI)
+        if not any(f.startswith(p) for f in files)
+    ]
+    assert dead == []
+
+
+@pytest.mark.parametrize("orchestrator", [".github/workflows/ci.yaml", ".github/workflows/ci-local.yaml"])
+@pytest.mark.parametrize(
+    "event,toggle,classified,expected",
+    [
+        ("pull_request", "on", "false", "true"),
+        ("pull_request", "on", "true", "true"),
+        ("push", "on", "true", "true"),
+        ("merge_group", "on", "false", "true"),
+    ],
+)
+def test_gate_lanes_pr_e2e_upgrade_on_is_the_kill_switch(orchestrator, event, toggle, classified, expected, tmp_path):
+    """CI_PR_E2E_UPGRADE=on undoes the main-only narrowing: the lane runs on every PR."""
+    out = tmp_path / "out"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "RELEASE": "false",
+        "EVENT_NAME": event,
+        "DESKTOP_JOBS": "",
+        "PR_OS_TESTS": "",
+        "PR_E2E_UPGRADE": toggle,
+        "CLASSIFIED": json.dumps({"python": "true", "e2e_upgrade": classified}),
+        "GITHUB_OUTPUT": str(out),
+    }
+    subprocess.run([sys.executable, "-c", _gate_lanes_script(orchestrator)], env=env, check=True)
+    lanes = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
+    assert lanes["e2e_upgrade"] == expected

@@ -5487,7 +5487,16 @@ Write only the summary body. Do not include any preamble or prefix."""
         return self._align_boundary_forward(messages, idx + 1)
 
     def _stale_thinking_on_wire(self) -> bool:
-        """Whether the route replays stale thinking every turn; tail walks and preflight MUST agree or compaction loops."""
+        """Whether the route replays stale thinking every turn; tail walks and preflight MUST agree or compaction loops.
+
+        A compressor bound to its agent (``_route_owner``) asks the preflight's own predicate on that
+        agent, so both read the same route facts, ``requested_provider`` included (Prism e401e23b1d4b).
+        """
+        owner = getattr(self, "_route_owner", None)
+        agent = owner() if callable(owner) else None
+        if agent is not None:
+            from agent.turn_context import _agent_stale_thinking_on_wire
+            return _agent_stale_thinking_on_wire(agent)
         try:
             from agent.message_sanitization import stale_thinking_reaches_wire
             return stale_thinking_reaches_wire(

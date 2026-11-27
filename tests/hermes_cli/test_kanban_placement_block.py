@@ -7,13 +7,16 @@ t_0e9fdf38 (spilled to ci-box twice).
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_host_capabilities as khc
 from hermes_cli import kanban_placement_block as kpb
+from hermes_cli import kanban_placement_reasons as kpr
 from hermes_cli import kanban_worker_pool as kwp
 
 CI_BOX_REASON = ("Can't do the drain from here. This run was placed on ci-box (kanbanw), and the local side 6201024 "
@@ -21,6 +24,14 @@ CI_BOX_REASON = ("Can't do the drain from here. This run was placed on ci-box (k
 NAMED_AI = "Needs the qBt host: re-dispatch with host: ace-ai (the docker socket is there)."
 NAMED_UNKNOWN = "Needs host: nas-1 (the ZFS pool), which no worker reaches."
 LOCAL_REAL = "Pinning needs the Kyzcreig admin login, which this worker lacks."
+
+
+@pytest.fixture(autouse=True)
+def _legacy_reroute(monkeypatch):
+    """This suite pins the kill-switch-off path (``kanban.placement_block_no_default_studio: false``): every pool-host
+    capability block re-routes to the Studio. The default-on path is test_kanban_placement_block_no_default_studio.py
+    (t_9392860c)."""
+    monkeypatch.setattr(kpb, "strict_enabled", lambda: False)
 
 
 def _host(name, enabled=True):
@@ -127,12 +138,15 @@ def kanban_home(tmp_path: Path, monkeypatch):
 
 
 def _placed_block(conn, body, reason, host="ci-box"):
-    tid = kb.create_task(conn, title="t", assignee="alpha", body=body)
+    # Seed a legacy body: this suite exercises recovery, not mint validation.
+    tid = kb.create_task(conn, title="t", assignee="alpha")
+    conn.execute("UPDATE tasks SET body=? WHERE id=?", (body, tid))
+    conn.commit()
     assert kb.claim_task(conn, tid, claimer="alpha") is not None
     run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
     if host:
         with kb.write_txn(conn):
-            kb._append_event(conn, tid, "worker_placed", {"host": host, "reason": "band_spilling"}, run_id=run_id)
+            kb._append_event(conn, tid, "worker_allocated", {"host": host, "reason": "band_spilling"}, run_id=run_id)
     assert kb.block_task(conn, tid, reason=reason, kind="capability")
     return tid
 
@@ -200,7 +214,8 @@ def test_concurrent_body_edit_is_not_overwritten(kanban_home, monkeypatch):
         monkeypatch.setattr(kpb, "_latest_blocks", real)
         assert _tick(conn).placement_rerouted == [(tid, "studio")]       # next tick, against the edit
         body = conn.execute("SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()[0]
-        assert body == "host: studio\noperator edit"
+        assert _NOTE_RE.sub("", body.splitlines()[1]) == "requires: studio-state"   # t_388c4ab2: never a bare pin
+        assert body.splitlines()[0::2] == ["host: studio", "operator edit"]
 
 
 def test_studio_rerouted_card_blocking_again_with_generic_reason_is_recorded_unroutable(kanban_home):
@@ -328,3 +343,146 @@ def test_fresh_matrix_row_covering_the_vault_lets_that_host_take_it(tmp_path):
     pool = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), pool_hosts=(_host("ci-box"),),
                           caps=kwp.read_caps(fleet))
     assert kwp.needs_allowed_hosts(VAULT_BODY, pool) == ("ci-box",)
+
+
+# -- t_388c4ab2: the re-route's Studio pin carries the requires: line #138's drop needs -----------------
+# Live 2026-11-09 03:29-04:48 (t_a57beae6, t_3473dd0e): the tick wrote a BARE `host: studio`,
+# effective_pin() dropped it (no requires: reason), the next spawn landed on mbp-2026 again, and the
+# second capability block paged #alerts as placement_unroutable.
+
+STUDIO_CAPS = frozenset({"studio-state", "fleet-ssh", "docker", "browser-session"})
+CMAP = khc.CapabilityMap(capabilities=tuple(sorted(STUDIO_CAPS)),
+                         hosts={khc.STUDIO_ROW: STUDIO_CAPS, "ci-box": frozenset()})
+REASONS = kwp.studio_map_reasons(CMAP)
+
+
+@pytest.fixture
+def studio_map(monkeypatch):
+    monkeypatch.setattr(khc, "load_map", lambda fleet: CMAP)
+    return REASONS
+
+
+def _portable(body):
+    return kwp.portable(workspace_kind="scratch", workspace_has_content=False, assignee="alpha", body=body,
+                        pool=POOL, studio_reasons=REASONS)[:2]
+
+
+def _body(conn, tid):
+    return conn.execute("SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+
+
+def _comments(conn, tid):
+    return [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,))]
+
+
+def _pin_lines(body):
+    """The ``host:`` / ``requires:`` lines, in order (create_task adds an ``origin:`` header we ignore)."""
+    return [_NOTE_RE.sub("", ln) for ln in body.splitlines() if ln.startswith(("host:", "requires:"))]
+
+
+# The re-route's own reason on its requires: line (t_d0852f2c); test_reroute_requires_line_passes_create_refusal
+# pins the note itself, these compare the words.
+_NOTE_RE = re.compile(r" \(re-routed after capability block[^\n]*\)$")
+
+
+def test_rerouted_studio_pin_survives_the_bare_pin_drop(kanban_home, studio_map):
+    """Red on main: the re-route writes a bare `host: studio`, which effective_pin() drops."""
+    with kb.connect_closing() as conn:
+        tid = _placed_block(conn, "drain the live tree", CI_BOX_REASON, host="ace-ai")
+        assert _tick(conn).placement_rerouted == [(tid, "studio")]
+        body = _body(conn, tid)
+    assert kwp.studio_pin_justified(body, studio_map)
+    assert kwp.effective_pin(body, POOL.hosts, None, studio_map)[0] == kwp.PIN_STUDIO
+    assert _portable(body) == (False, kpr.HOST_STUDIO)
+
+
+@pytest.mark.parametrize("reason, word", [
+    ("Needs fleet SSH to the NAS, which this worker lacks. Re-run on the Studio.", "fleet-ssh"),
+    ("No ssh key for ace-ai here; re-run on the Studio.", "fleet-ssh"),
+    ("The docker socket is not reachable from this host. Re-run on the Studio.", "docker"),
+    ("The launchd job and its logs live on the Studio. Re-run on the Studio.", "studio-state"),
+    ("Restarting the relay needs the Studio. Re-run on the Studio.", "studio-state"),
+    (CI_BOX_REASON, "studio-state"),                                       # names none: the default
+])
+def test_requires_word_comes_from_the_block_reason(kanban_home, studio_map, reason, word):
+    with kb.connect_closing() as conn:
+        tid = _placed_block(conn, "do it", reason)
+        assert _tick(conn).placement_rerouted == [(tid, "studio")]
+        body = _body(conn, tid)
+        assert _pin_lines(body) == ["host: studio", f"requires: {word}"]
+        assert _pin_lines("\n".join(body.splitlines()[:2])) == ["host: studio", f"requires: {word}"]
+        assert any(f"requires: {word}" in c for c in _comments(conn, tid) if "placement re-route" in c)
+    assert _portable(body) == (False, kpr.HOST_STUDIO)
+
+
+@pytest.mark.parametrize("body, want", [
+    # the operator-edit gap of 11-09: a bare pin already in the body gets only the requires: line
+    ("host: studio\ndrain", {"host: studio", "requires: studio-state"}),
+    # a requires: word the Studio serves already justifies it: only the pin is added
+    ("requires: docker\ndrain", {"host: studio", "requires: docker"}),
+    # already pinned and justified: nothing is written twice
+    ("host: studio\nrequires: studio-state\ndrain", {"host: studio", "requires: studio-state"}),
+    # a requires: line naming no Studio reason gets the word on THAT line, never a second line
+    ("requires: none\ndrain", {"host: studio", "requires: studio-state, none"}),
+])
+def test_reroute_never_writes_a_second_host_or_requires_line(kanban_home, studio_map, body, want):
+    with kb.connect_closing() as conn:
+        tid = _placed_block(conn, body, CI_BOX_REASON)
+        before = _body(conn, tid)
+        assert _tick(conn).placement_rerouted == [(tid, "studio")]
+        got = _body(conn, tid)
+    assert len(_pin_lines(got)) == 2 and set(_pin_lines(got)) == want
+    assert [ln for ln in got.splitlines() if _NOTE_RE.sub("", ln) not in want] == \
+        [ln for ln in before.splitlines() if not ln.startswith(("host:", "requires:"))]   # the rest is untouched
+    assert kwp.studio_pin_justified(got, studio_map) and _portable(got) == (False, kpr.HOST_STUDIO)
+
+
+def test_no_capability_map_still_writes_the_default_requires_line(kanban_home, monkeypatch):
+    """With no map this tick every Studio pin holds; the line is written anyway so the pin survives once it loads."""
+    monkeypatch.setattr(khc, "load_map", lambda fleet: None)
+    with kb.connect_closing() as conn:
+        tid = _placed_block(conn, "drain", "fleet ssh is missing here; re-run on the Studio")
+        _tick(conn)
+        body = _body(conn, tid)
+    assert _pin_lines("\n".join(body.splitlines()[:2])) == ["host: studio", "requires: studio-state"]
+    assert kwp.studio_pin_justified(body, REASONS)
+
+
+def test_reroute_to_a_pool_host_writes_no_requires_line(kanban_home, studio_map):
+    with kb.connect_closing() as conn:
+        tid = _placed_block(conn, "x", NAMED_AI)
+        assert _tick(conn).placement_rerouted == [(tid, "ace-ai")]
+        assert _pin_lines(_body(conn, tid)) == ["host: ace-ai"]
+
+
+@pytest.mark.parametrize("reasons", [REASONS, None, frozenset({"browser-session"}),
+                                     frozenset({kpr.ACCESS_CONTROL_PLANE_READ})])
+@pytest.mark.parametrize("reason", [CI_BOX_REASON, "fleet ssh", "docker", "launchd", "browser", ""])
+@pytest.mark.parametrize("body", ["", "x", "host: studio\nx", "requires: none\nx", "requires: docker"])
+def test_every_studio_pin_the_dispatcher_writes_passes_the_dispatch_predicate(reasons, reason, body):
+    """One source of truth: the body pin_body() writes is judged by studio_pin_justified, the same predicate
+    effective_pin() drops a bare pin with (None = no map: judged against the full test vocabulary)."""
+    out = kpb.pin_body(body, kwp.PIN_STUDIO, reason=reason, studio_reasons=reasons, pool=POOL)
+    assert kwp.resolve_pin(out, POOL.hosts)[0] == kwp.PIN_STUDIO
+    assert kwp.studio_pin_justified(out, reasons if reasons is not None else REASONS)
+    assert out.count("host:") == 1 and sum(1 for ln in out.splitlines() if ln.startswith("requires:")) == 1
+
+
+def test_pin_body_is_the_only_dispatcher_code_that_writes_a_host_pin():
+    """A new code path that writes a `host:` line into a card body must go through pin_body() (t_388c4ab2)."""
+    import ast
+    root = Path(kpb.__file__).parent
+    writers = set()
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if isinstance(node, ast.JoinedStr) and node.values \
+                        and isinstance(node.values[0], ast.Constant) \
+                        and str(node.values[0].value).lower().startswith("host: ") \
+                        and any(isinstance(v, ast.FormattedValue) for v in node.values):
+                    writers.add((path.name, fn.name))
+    # _reason_pin builds a probe string for resolve_pin; it never reaches a body.
+    assert writers == {("kanban_placement_block.py", "pin_body"), ("kanban_placement_block.py", "_reason_pin")}

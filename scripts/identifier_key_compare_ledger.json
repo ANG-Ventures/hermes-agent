@@ -57,6 +57,16 @@
   }
  ],
  "sites": {
+  "hermes_cli/kanban_worktree_port.py::read_overrides::fold::slug::out[slug.lower()] = (val.get(\"*\"), {h.lower(): p for h, p in val.items() if h != \"*\"})": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; mirror override keys intentionally share GitHub identity semantics.",
+   "where": "hermes_cli/kanban_worktree_port.py:165 read_overrides"
+  },
+  "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::default, per_host = paths.get(slug.lower(), (None, {}))": {
+   "verdict": "kept",
+   "why": "GitHub repository names are case-insensitive; match the normalized override map.",
+   "where": "hermes_cli/kanban_worktree_port.py:185 derived_route"
+  },
   "hermes_cli/kanban.py::_cmd_set_model::fold::model::clearing = args.model is None or str(args.model).lower() in {\"none\", \"-\", \"null\", \"\"}": {
    "verdict": "kept",
    "why": "sentinel-word detection on CLI input (`none`/`null`/`-` clears the pin); the model id itself is stored unfolded.",
@@ -86,11 +96,6 @@
    "verdict": "kept",
    "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
    "where": "hermes_cli/kanban.py:320 kanban_command"
-  },
-  "hermes_cli/kanban_after_merge.py::_state::fold::repo::key = (id(query_fn), ref.repo.lower(), ref.number)": {
-   "verdict": "kept",
-   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
-   "where": "hermes_cli/kanban_after_merge.py:90 _state"
   },
   "hermes_cli/kanban_db.py::_PrStateResolver.resolve::fold::repo::key = (repo.lower(), int(number))": {
    "verdict": "kept",
@@ -372,11 +377,6 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
    "where": "hermes_cli/kanban_pr_acceptance.py:218 collect_acceptance"
   },
-  "hermes_cli/kanban_pr_freshness.py::merge_gate_profile::fold::repo::return \"v2\" if d[\"profile\"] == \"v2\" and repo.casefold() in {r.casefold() for r in repos} else \"v1\"": {
-   "verdict": "kept",
-   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
-   "where": "hermes_cli/kanban_pr_freshness.py:173 merge_gate_profile"
-  },
   "hermes_cli/kanban_pr_gate.py::_Resolver.resolve::fold::repo::key = (ref.repo.lower(), ref.number)": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
@@ -452,15 +452,20 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
    "where": "hermes_cli/kanban_pr_owner.py:92 _refs"
   },
-  "hermes_cli/kanban_pr_owner.py::pr_cards::sql::title LIKE::\"SELECT id, status, assignee FROM tasks WHERE status != 'archived' AND (\"": {
+  "hermes_cli/kanban_pr_owner.py::pr_cards::sql::title LIKE::\"SELECT id, status, assignee, created_at, rowid FROM tasks WHERE status != 'archived' AND (\"": {
    "verdict": "kept",
    "why": "title/metadata LIKE is a candidate prefilter; pr_cards keeps only rows whose exact (repo, number) is in card_pr_targets(), so the LIKE cannot admit a wrong card.",
-   "where": "hermes_cli/kanban_pr_owner.py:300 pr_cards"
+   "where": "hermes_cli/kanban_pr_owner.py:338 pr_cards"
   },
   "hermes_cli/kanban_pr_owner.py::pr_head_committed_at::fold::repo::key = (repo.lower(), int(number))": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
    "where": "hermes_cli/kanban_pr_owner.py:214 pr_head_committed_at"
+  },
+  "hermes_cli/kanban_pr_owner.py::pr_state::fold::repo::key = (repo.lower(), int(number))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_owner.py:244 pr_state"
   },
   "hermes_cli/kanban_provider_health.py::available_profile_fallback::fold::provider::if skip_providers and provider.strip().lower() in skip_providers:": {
    "verdict": "kept",
@@ -547,10 +552,25 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
    "where": "hermes_cli/kanban_worktree_port.py:146 port_for"
   },
-  "hermes_cli/kanban_worktree_port.py::read_mirrors::fold::slug::out[slug.lower()] = (mirror, hs)": {
+  "hermes_cli/kanban_worktree_port.py::mint_rewrite::fold::slug::row = read_mirrors(fleet_dir).get(slug.lower()) if slug else None": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. Same lookup as port_for (t_e604c0f9 kanban create rewrite).",
+   "where": "hermes_cli/kanban_worktree_port.py:234 mint_rewrite"
+  },
+  "hermes_cli/kanban_worktree_port.py::read_mirrors::fold::slug::out[slug.lower()] = (mirror, hs, {h.lower(): p for h, p in per_host.items()})": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
-   "where": "hermes_cli/kanban_worktree_port.py:73 read_mirrors"
+   "where": "hermes_cli/kanban_worktree_port.py:81 read_mirrors"
+  },
+  "hermes_cli/kanban_mint_scratch.py::rewrite::fold::slug::if any(n != slug.lower() for n in named):": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so a body Repo: line naming the push repo in another case names the same repo the scratch clone uses; byte-exact would keep worktrees for the same repo. Same fold as _push_repo_remotes.",
+   "where": "hermes_cli/kanban_mint_scratch.py:124 rewrite"
+  },
+  "hermes_cli/kanban_mint_scratch.py::_push_repo_remotes::fold::slug::if m and m.group(1).lower() == slug.lower():": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so a remote whose fetch URL differs from the push repo only in case is the same repo; same fold as kanban_worktree_port port_for/mint_rewrite.",
+   "where": "hermes_cli/kanban_mint_scratch.py:64 _push_repo_remotes"
   },
   "hermes_cli/kanban_db.py::complete_task::fold::repo::own_keys = {(r.repo.lower(), r.number) for r in _open_pr.split_fleet(_open_pr.extract_pr_refs(": {
    "verdict": "kept",
@@ -646,6 +666,26 @@
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, pr) tuple IS the canonical PR identity for binding; byte-exact would let one PR fail to bind its own obligation.",
    "where": "hermes_cli/kanban_work_obligations.py:580 _identity"
+  },
+  "hermes_cli/kanban_worktree_port.py::read_overrides::fold::repo::pins[row[\"repo\"].lower()] = tuple(dict.fromkeys(h.strip().lower() for h in row[\"hosts\"]))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; operator pin keys share GitHub identity semantics (a pin on Owner/Repo must hold for owner/repo), not task or session identifiers.",
+   "where": "hermes_cli/kanban_worktree_port.py:249 read_overrides"
+  },
+  "hermes_cli/kanban_worktree_port.py::repo_pin::fold::slug::return pins.get(slug.lower()) if slug else None": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; the operator pin map is keyed by the folded repo (read_overrides), so the lookup folds the same way (t_fbe8a067).",
+   "where": "hermes_cli/kanban_worktree_port.py:307 repo_pin"
+  },
+  "hermes_cli/kanban_worktree_port.py::derived_route::fold::slug::pinned = pins.get(slug.lower())": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; operator pin keys share GitHub identity semantics (a pin on Owner/Repo must hold for owner/repo), not task or session identifiers. Lookup matches the key normalized in read_overrides.",
+   "where": "hermes_cli/kanban_worktree_port.py:276 derived_route"
+  },
+  "hermes_cli/kanban_worktree_port.py::mint_rewrite::fold::slug::pinned = read_overrides(fleet_dir)[0].get(slug.lower())": {
+   "verdict": "kept",
+   "why": "GitHub owner/repository names are case-insensitive; operator pin keys share GitHub identity semantics (a pin on Owner/Repo must hold for owner/repo), not task or session identifiers. Lookup matches the key normalized in read_overrides.",
+   "where": "hermes_cli/kanban_worktree_port.py:780 mint_rewrite"
   }
  }
 }

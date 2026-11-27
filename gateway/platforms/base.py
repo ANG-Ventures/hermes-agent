@@ -829,6 +829,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway import inbound_record
 from gateway.platforms.helpers import fence_state_after
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
@@ -2176,6 +2177,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         # A photo burst always absorbs; otherwise merge only when media is involved on either
         # side. Captions merge in every absorbing case.
         if both_photo or existing.media_urls or incoming_has_media:
+            inbound_record.mark_merged(existing)   # t_118d31b1 / Prism 7fb14e749eb2
             if both_photo or incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -2195,6 +2197,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
+            inbound_record.mark_merged(existing)
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_reply_expected(event)
@@ -2266,6 +2269,27 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 
 
 _strip_media_directives = _strip_media_tag_directives
+
+
+async def call_model_selected(callback, chat_id, model_id, provider_slug, render):
+    """Invoke a /model picker callback, handing it ``render`` (the adapter's own rendering of the
+    confirmation) when it accepts one. The gateway's callback renders through it, then saves;
+    returns ``(text, rendered)`` so the adapter renders a not-yet-rendered reply itself."""
+    rendered = []
+
+    async def _render(text):
+        rendered.append(text)
+        await render(text)
+
+    try:
+        takes_render = "render" in inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        takes_render = False
+    if takes_render:
+        text = await callback(chat_id, model_id, provider_slug, render=_render)
+    else:
+        text = await callback(chat_id, model_id, provider_slug)
+    return text, bool(rendered)
 
 
 class BasePlatformAdapter(ABC):
@@ -3289,6 +3313,7 @@ class BasePlatformAdapter(ABC):
         if existing is None:
             existing = self._pending_text_batches[key] = event
         else:
+            inbound_record.mark_merged(existing)   # t_118d31b1: no longer one message
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             if event.media_urls:
@@ -4143,6 +4168,16 @@ class BasePlatformAdapter(ABC):
             cleaned = cleaned.replace(raw, '')
         return list(unique), re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
+    def _live_typing_adapter(self):
+        """Resolve this transport's slot, not a chat route that may belong to another bot."""
+        runner = self.gateway_runner
+        if self.platform != Platform.DISCORD or runner is None:
+            return self
+        profile = getattr(self, "_owner_profile", None)
+        adapters = (getattr(runner, "_profile_adapters", {}).get(profile, {})
+                    if profile else runner.adapters)
+        return adapters.get(self.platform)
+
     async def _keep_typing(
         self,
         chat_id: str,
@@ -4186,14 +4221,38 @@ class BasePlatformAdapter(ABC):
                     _send_typing_kwargs["token"] = token
             except (TypeError, ValueError):
                 pass
+        typing_adapter, typing_token = self, token
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                if chat_id not in self._typing_paused:
+                if not self._typing_token_is_current(chat_id, token):
+                    return
+                if not typing_adapter._typing_token_is_current(chat_id, typing_token):
+                    return
+                live = self._live_typing_adapter()
+                if live is not None and live is not typing_adapter and not live.has_fatal_error:
+                    # A new turn on the replacement owns its own bubble; never steal it.
+                    if token is not None and live._current_typing_token(chat_id) is not None:
+                        return
+                    if typing_adapter is not self:
+                        await typing_adapter._stop_typing_refresh(
+                            chat_id, metadata=metadata, token=typing_token)
+                    # Cleanup above yields: a stop or a new turn may have won meanwhile.
+                    if (not self._typing_token_is_current(chat_id, token)
+                            or (stop_event is not None and stop_event.is_set())
+                            or (token is not None and live._current_typing_token(chat_id) is not None)):
+                        return
+                    typing_adapter = live
+                    typing_token = live._issue_typing_token(chat_id) if token is not None else None
+                    if "token" in _send_typing_kwargs:
+                        _send_typing_kwargs["token"] = typing_token
+                if (live is typing_adapter and not live.has_fatal_error
+                        and chat_id not in self._typing_paused
+                        and chat_id not in live._typing_paused):
                     try:
                         await asyncio.wait_for(
-                            self.send_typing(chat_id, **_send_typing_kwargs),
+                            live.send_typing(chat_id, **_send_typing_kwargs),
                             timeout=_send_typing_timeout,
                         )
                     except asyncio.TimeoutError:
@@ -4215,8 +4274,13 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
+            # Tear down the rebound loop with OUR token, never a newer turn's loop.
+            if typing_adapter is not self:
+                await typing_adapter._stop_typing_refresh(
+                    chat_id, metadata=metadata, token=typing_token)
             # A send_typing after an outer stop_typing() may have recreated the platform loop.
-            await self._stop_typing_quietly(chat_id, metadata)
+            if self._typing_token_is_current(chat_id, token):
+                await self._stop_typing_quietly(chat_id, metadata)
             self._typing_paused.discard(chat_id)
             # getattr-guard: tests build adapters via object.__new__ without _status_text.
             getattr(self, "_status_text", {}).pop(str(chat_id), None)
@@ -4260,7 +4324,7 @@ class BasePlatformAdapter(ABC):
             for attempt in range(max(1, stop_attempts)):
                 if attempt:
                     await asyncio.sleep(0)
-                if metadata is None and _stop_kwargs:
+                if _stop_kwargs:
                     # Forward the ownership token to adapters whose stop_typing accepts it (Discord).
                     with contextlib.suppress(Exception):
                         await self.stop_typing(chat_id, **_stop_kwargs)
@@ -4577,14 +4641,26 @@ class BasePlatformAdapter(ABC):
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
-        if log_cmd is not None:
-            text, _ = self._unwrap_ephemeral(response)
-            if text:
-                logger.info("[%s] Sending command '/%s' response (%d chars) to %s%s", self.name, log_cmd,
-                            len(text), event.source.chat_id,
-                            " (via deferred interaction)" if getattr(event, "suppress_public_echo", False) else "")
-        await self._deliver_inline_command_reply(event, response, thread_meta=thread_meta)
+        # Work the handler wants to run after its reply is sent (a /model save, t_2bf22375). Not
+        # offered for a deferred native interaction: its reply is published by the caller only
+        # after this returns, so "after the send" would still be before the reply.
+        after_reply: list = []
+        if not getattr(event, "suppress_public_echo", False):
+            with contextlib.suppress(Exception):
+                event._inline_after_reply = after_reply
+        try:
+            response = await self._message_handler(event)
+            if log_cmd is not None:
+                text, _ = self._unwrap_ephemeral(response)
+                if text:
+                    logger.info("[%s] Sending command '/%s' response (%d chars) to %s%s", self.name, log_cmd,
+                                len(text), event.source.chat_id,
+                                " (via deferred interaction)" if getattr(event, "suppress_public_echo", False) else "")
+            await self._deliver_inline_command_reply(event, response, thread_meta=thread_meta)
+        finally:
+            # Runs even when the send failed: the hook owns resources (the /model switch lock).
+            for hook in after_reply:
+                await hook()
 
     async def _deliver_inline_command_reply(self, event: MessageEvent, response: Any, *, thread_meta: Any) -> None:
         """Publish an INLINE command-dispatch reply (not an agent turn). When the event came from a
@@ -4855,6 +4931,7 @@ class BasePlatformAdapter(ABC):
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
             store[session_key] = state
         else:
+            inbound_record.mark_merged(state.event)
             if event.text:
                 state.event.text = _append_text(state.event.text, event.text)
             state.event.absorb_reply_expected(event)
@@ -5578,6 +5655,10 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        from gateway import model_cmd_timing as _model_timing
+
+        with contextlib.suppress(Exception):
+            event._model_cmd_delivery = (self, session_key)
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -5595,6 +5676,12 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
+            selection_lock = self.__dict__.get("_model_selection_locks", {}).get(session_key)
+            if selection_lock is not None:
+                # A /model save (or a write /stop interrupted) may still be settling under the
+                # session's switch lock: no turn reads the half-saved route (t_2ab07928).
+                async with selection_lock:
+                    pass
             response = await self._message_handler(event)
             _handler_returned = time.monotonic()
             # A muted diagnostic wake ran for the session; its reply is not presented. The
@@ -5658,6 +5745,7 @@ class BasePlatformAdapter(ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+            _model_timing.delivery_finished(event, "ok" if delivery_succeeded or not delivery_attempted else "error")
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
@@ -5687,12 +5775,14 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            _model_timing.delivery_finished(event, "cancelled")
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            _model_timing.delivery_finished(event, "error")
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata

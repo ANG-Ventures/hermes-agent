@@ -53,7 +53,8 @@ def test_fresh_board_has_nullable_boomerang_wake(kanban_home):
         assert col["notnull"] == 0 and col["dflt_value"] is None
         assert "auto_handle" not in _cols(conn)
         tid = kb.create_task(conn, title="plain", assignee="peer")
-        assert kb.get_task(conn, tid).boomerang_wake is None
+        # The column stays nullable for pre-default rows; a new card is never NULL (t_c24b1cc7).
+        assert kb.get_task(conn, tid).boomerang_wake is True
 
 
 # The wake predicate of the gateway that is still RUNNING when the CLI first migrates a
@@ -154,7 +155,7 @@ def test_create_mirrors_level_into_legacy_column(kanban_home):
         on = kb.create_task(conn, title="on", assignee="peer", boomerang_wake=True)
         off = kb.create_task(conn, title="off", assignee="peer", boomerang_wake=False)
         unset = kb.create_task(conn, title="unset", assignee="peer")
-        assert (_legacy(conn, on), _legacy(conn, off), _legacy(conn, unset)) == (1, 0, None)
+        assert (_legacy(conn, on), _legacy(conn, off), _legacy(conn, unset)) == (1, 0, 1)
 
 
 def test_same_level_write_resyncs_a_stale_legacy_mirror(kanban_home):
@@ -241,7 +242,7 @@ def test_legacy_state_rename_race_resolves_to_canonical_path(kanban_home, monkey
 
 def test_set_level_lives_on_the_card_only(kanban_home):
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title="c", assignee="peer")
+        tid = kb.create_task(conn, title="c", assignee="peer", boomerang_wake=False)
         _sub(conn, tid, "c1", "notify+wake")
         assert kb.set_task_boomerang_wake(conn, tid, True)
         assert kb.get_task(conn, tid).boomerang_wake is True and _modes(conn, tid) == ["notify+wake"]
@@ -256,7 +257,7 @@ def test_set_level_lives_on_the_card_only(kanban_home):
 
 def test_subscribing_a_boomerang_mode_sets_the_card_level(kanban_home):
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title="c", assignee="peer")
+        tid = kb.create_task(conn, title="c", assignee="peer", boomerang_wake=False)
         _sub(conn, tid, "c1", "boomerang")
         assert kb.get_task(conn, tid).boomerang_wake is True and _modes(conn, tid) == ["wake"]
 
@@ -266,7 +267,7 @@ def test_boomerang_request_held_by_another_waker_leaves_the_card_level(kanban_ho
     the wake) must not switch the card to boomerang wake."""
     monkeypatch.setattr(kbn, "notify_chat_is_live", lambda *a, **k: True)
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title="c", assignee="peer")
+        tid = kb.create_task(conn, title="c", assignee="peer", boomerang_wake=False)
         _sub(conn, tid, "cA", "notify+wake")
         kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id="cB", chat_type="group",
                            delivery_mode="notify+boomerang", also=True)
@@ -286,7 +287,7 @@ def test_kanban_create_tool_accepts_boomerang_wake(kanban_home):
     assert on["ok"] and unset["ok"], (on, unset)
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, on["task_id"]).boomerang_wake is True
-        assert kb.get_task(conn, unset["task_id"]).boomerang_wake is None
+        assert kb.get_task(conn, unset["task_id"]).boomerang_wake is True   # the creation default
     shown = json.loads(kt._handle_show({"task_id": on["task_id"]}))
     assert shown["task"]["boomerang_wake"] is True
 

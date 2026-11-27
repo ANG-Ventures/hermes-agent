@@ -12,7 +12,6 @@ word matched 385 of 1392 completions in 14 days ("3 new tests fail on base").
 """
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Optional
 
@@ -22,24 +21,119 @@ _NEG_ACCEPT = (
 )
 NEG_RESULT_RE = re.compile(
     r"(?i:" + _NEG_ACCEPT + r"|\bnot\s+(?:yet\s+)?proven\b)|\bUNTRUSTED\b"
-    r"|(?i:\b(?:verdict|result|gate))\s*[:=]?\s*(?:FAIL(?:ED)?|DEFERRED)\b"
+    r"|(?<![A-Za-z0-9])(?<![A-Za-z0-9]_)(?i:verdict|result|gate)(?:\*+|__?(?!\w))?\s*[:=]?(?:\*+|__?(?!\w))?\s*(?:FAIL(?:ED)?|DEFERRED)\b"
 )
+
+
+# t_1938555e: a match counts only where the worker states a verdict, never where it describes code, a test or
+# quoted output ("Any other failure is reported as not proven" left t_c5cbe356's fixed PR a draft with no CI).
+# 14 d of review_negative_result (292): "not met" 106/106 real; "not proven" 78 real / 57 false; the FAIL arm
+# 14/15 false; "do not merge" 12/14 false. So: quoted text is blanked; "not proven" needs a verdict position;
+# merge/land only as an instruction; FAIL only as a line's own label. Every other arm is unchanged.
+_QUOTED_RE = re.compile(r'"[^"\n]*"|`[^`\n]*`|\u201c[^\u201d\n]*\u201d')
+# The worker's own verdict label before "not proven": "Result: not proven" (Prism dc37cf6bbd2e), also in Markdown
+# emphasis: "**Status:** not proven", "__Result__: not proven" (Prism 120fcd92d994).
+_VERDICT_LABEL_RE = re.compile(
+    r"(?i)[\s>*_#\-\u2022]*(?:result|status|verdict|outcome|conclusion)[*_]*\s*[:=\-]\s*[*_]*\s*$"
+)
+_PLEASE_RE = re.compile(r"(?i)\bplease\s*$")
+_NOT_PROVEN_RE = re.compile(r"(?i)\bnot\s+(?:yet\s+)?proven\b")
+_DONT_LAND_RE = re.compile(r"(?i)\b(?:do\s+not|don'?t)\s+(?:merge|land)\b")
+_FAIL_ARM_RE = re.compile(r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]_)(?i:verdict|result|gate)(?:\*+|__?(?!\w))?\s*[:=]?(?:\*+|__?(?!\w))?\s*(?:FAIL(?:ED)?|DEFERRED)\b")
+# t_647c2995: a label may carry emphasis and 1-3 capitalised words in front at a line start ("QA verdict: FAIL",
+# "__Verdict__: FAIL", "- **QA verdict**: FAIL") with a colon, or caps words before a caps label ("QA VERDICT FAIL,").
+# "Test result FAIL on base", "Prints RESULT FAIL", "Ensure verdict=FAIL" describe output (Prism 6b1d299707d7).
+_LABEL_WORDS_RE = re.compile(r"[\s>*_#\-\u2022]*(?:[A-Z][\w'\-]*\s+){0,3}[*_]*$")
+# The card's own gate named in the sentence before "not proven": "The done criterion is NOT yet proven".
+_GATE_NOUN_RE = re.compile(
+    r"(?i)\b(?:accept\w*|done|done-when|card|target|criteri\w*|condition|requirement|goal|item|close\w*|AC\d+)\b"
+)
+_LINE_LEAD_RE = re.compile(r"[\s>*#\-\u2022]*(?:\(?\w{1,3}[.)]\s*)?$")  # bullets / "1." / "(c)" before the phrase
+
+
+def _sentence_prefix(text: str, start: int) -> str:
+    """The text from the start of ``start``'s sentence (line start or after . ! ? ;) up to ``start``."""
+    line_start = text.rfind("\n", 0, start) + 1
+    prefix = text[line_start:start]
+    cut = max((m.end() for m in re.finditer(r"[.!?;](?:\s|$)", prefix)), default=0)
+    return prefix[cut:]
+
+
+def _verdict_position(text: str, m: re.Match) -> bool:
+    phrase = m.group(0)
+    prefix = _sentence_prefix(text, m.start())
+    if _FAIL_ARM_RE.fullmatch(phrase):
+        # "Verdict: FAIL" as the line's own label; "prints RESULT FAIL" / "on verdict=FAIL" describe output.
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        lead = text[line_start:m.start()]
+        if _LINE_LEAD_RE.match(lead):
+            return True
+        if not _LABEL_WORDS_RE.match(lead):
+            return False
+        if ":" in phrase:
+            return True
+        words = re.findall(r"[A-Za-z][\w'\-]*", lead)
+        return re.search(r"[A-Za-z]+", phrase).group(0).isupper() and all(w.isupper() for w in words)
+    if _DONT_LAND_RE.fullmatch(phrase):
+        # An instruction ("Do not land.", "draft, do not merge"), never a description ("I do not merge").
+        prefix = _PLEASE_RE.sub("", prefix)  # "Please do not merge" is the same instruction (Prism 01d8577b1e47)
+        return bool(re.search(r"(?:^|[,:(\-])\s*$", prefix)) or bool(_LINE_LEAD_RE.match(prefix))
+    if _NOT_PROVEN_RE.fullmatch(phrase):
+        if _LINE_LEAD_RE.match(prefix):
+            return True  # "Not proven: ...", "NOT YET PROVEN: ...", "- Not proven live"
+        if _VERDICT_LABEL_RE.match(prefix):
+            return True  # "Result: not proven", "Status: NOT proven"
+        if re.match(r"\s*(?:yet|here|live)?\s*:", text[m.end():]):
+            return True  # a heading: "What is not proven:"
+        return bool(_GATE_NOUN_RE.search(prefix))
+    return True
+
+
+def _first_verdict(text: str) -> Optional[str]:
+    blanked = _QUOTED_RE.sub(lambda q: " " * len(q.group(0)), text)
+    for m in NEG_RESULT_RE.finditer(blanked):
+        if _verdict_position(blanked, m):
+            return m.group(0)
+    return None
+
+
+def _acceptance_met_false(value: Any) -> bool:
+    if isinstance(value, dict):
+        return value.get("acceptance_met") is False or any(_acceptance_met_false(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_acceptance_met_false(v) for v in value)
+    return False
+
+
+def _meta_strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _meta_strings(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _meta_strings(v)
 
 
 def negative_result_match(summary: Optional[str], metadata: Any = None) -> Optional[str]:
     """The matched text when the handoff reports a negative result, else None.
 
-    Scans ``summary`` plus the JSON form of ``metadata`` (the merge pass reads
-    the stored ``task_runs.metadata`` text, so the two see the same bytes).
+    Scans ``summary`` and each string value of ``metadata``, counting a phrase only in a verdict position (see
+    :func:`_verdict_position`); ``"acceptance_met": false`` in the metadata always counts.
     """
-    meta_text = ""
-    if metadata:
-        try:
-            meta_text = json.dumps(metadata, ensure_ascii=False, default=str)
-        except (TypeError, ValueError):
-            meta_text = str(metadata)
-    m = NEG_RESULT_RE.search((summary or "") + "\n" + meta_text)
-    return m.group(0) if m else None
+    hit = _first_verdict(summary or "")
+    if hit is not None:
+        return hit
+    if _acceptance_met_false(metadata):
+        return '"acceptance_met": false'
+    if metadata and not isinstance(metadata, (dict, list, tuple, str)):
+        return _first_verdict(str(metadata))
+    for s in _meta_strings(metadata):
+        hit = _first_verdict(s)
+        if hit is not None:
+            return hit
+    return None
 
 
 DRAFT_NOTE_PING_MAX = 300
