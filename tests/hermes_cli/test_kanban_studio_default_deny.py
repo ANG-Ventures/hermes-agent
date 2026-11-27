@@ -482,6 +482,8 @@ def test_admit_to_the_studio_is_held_until_an_override_is_recorded(operator, mon
     from hermes_cli import kanban_admit as ka
     _cfg(operator, True, [])
     monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    from hermes_cli import kanban_studio_gap as ksg
+    monkeypatch.setattr(ksg, "pool_hosts", lambda root: ("ace-ai", "ace-media"))
     spawned = []
 
     def spawn(task, workspace, *, board=None, placement=None):
@@ -530,10 +532,12 @@ def test_a_cleared_placement_wait_ends_the_hold_episode(kanban_home):
     assert pager.sent == [], pager.sent  # the new episode began at the second wake, not two hours ago
 
 
-def test_override_warning_uses_the_live_override_match(operator, capsys):
+def test_override_warning_uses_the_live_override_match(operator, capsys, monkeypatch):
     """c-8a854f5bdb779ec7: an override naming the capability HEAD releases ``workspace_kind:x`` (live_override),
     so the command must not warn that it does not."""
     import argparse
+    from hermes_cli import kanban_studio_gap as ksg
+    monkeypatch.setattr(ksg, "pool_hosts", lambda root: ("ace-ai", "ace-media"))
     with kb.connect_closing() as conn:
         tid = _card(conn)
         with kb.write_txn(conn):

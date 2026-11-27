@@ -211,7 +211,7 @@ def _shorten(exc: GapRefused, task_id: str, root: Path, now: float) -> GapRefuse
     path = refusals_path(root)
     earlier = None
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
             try:
                 doc = json.loads(line)
             except ValueError:
