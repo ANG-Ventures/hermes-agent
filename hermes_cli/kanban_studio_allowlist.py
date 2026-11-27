@@ -474,6 +474,32 @@ def need_refusal(capability: str, need: Optional[str]) -> Optional[str]:
             f"and drop the {BROWSER_CAP} hold at its source (the card's requires: line or the attached skill)")
 
 
+def _count_comment(conn, fix: str, cap: str, task_id: str, actor: Optional[str], now: float) -> None:
+    """At most ONE count comment per gap key per day on the fix card, with the running total (operator ruling 8:
+    one comment per override would have put 138 on one card in 14 days). The events carry every run."""
+    import json as _json
+    from hermes_cli import kanban_db as _kb
+    n = 0
+    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE kind = ?", (OVERRIDE_EVENT,)).fetchall():
+        try:
+            doc = _json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(doc, dict) and doc.get("fix_card_given") == fix and doc.get("capability") == cap:
+            n += 1
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    head = f"studio-override count for gap {cap} on {day}:"
+    body = (f"{head} {n} Studio run(s) so far for this gap, latest {task_id} (by {actor or 'operator'}); "
+            f"one line per day, updated in place, the events carry each run")
+    row = conn.execute("SELECT id FROM task_comments WHERE task_id = ? AND body LIKE ? ORDER BY id DESC LIMIT 1",
+                       (fix, head + "%")).fetchone()
+    if row:  # the day's line already exists: move its running total, do not add a comment
+        with _kb.write_txn(conn):
+            conn.execute("UPDATE task_comments SET body = ? WHERE id = ?", (body, row[0]))
+        return
+    _kb.add_comment(conn, fix, "kanban", body)
+
+
 def override(conn, task_id: str, capability: str, why: str, *, once: bool = True, until: Optional[str] = None,
              actor: Optional[str] = None, now: Optional[float] = None, root: Optional[Path] = None,
              need: Optional[str] = None, elsewhere: Optional[str] = None, why_not_now: Optional[str] = None,
@@ -512,13 +538,8 @@ def override(conn, task_id: str, capability: str, why: str, *, once: bool = True
     with _kb.write_txn(conn):
         _kb._append_event(conn, task_id, OVERRIDE_EVENT, payload)
     if gap.get("fix_card_given"):  # t_9d619fbb: every Studio run for a gap is counted on the card that closes it
-        n = conn.execute("SELECT COUNT(*) FROM task_events WHERE kind = ? "
-                         "AND json_extract(payload, '$.fix_card_given') = ?",
-                         (OVERRIDE_EVENT, gap["fix_card_given"])).fetchone()[0]
         try:
-            _kb.add_comment(conn, gap["fix_card_given"], "kanban",
-                            f"studio-override #{n} for gap {cap}: {task_id} runs on the Studio until this card closes "
-                            f"the gap (by {actor or 'operator'})")
+            _count_comment(conn, gap["fix_card_given"], cap, task_id, actor, now)
         except Exception as exc:  # the event is the record; the count line is a courtesy
             payload["fix_card_comment_error"] = str(exc)
     line = {"kind": "override", "task_id": task_id, **payload}

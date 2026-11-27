@@ -43,6 +43,12 @@ def _card(conn, body="render the explainer", title="s"):
     return kb.create_task(conn, title=title, assignee="alpha", body=body)
 
 
+def _fix(conn, title="install the render toolchain on ci-box", keys=("operator_admit",), idem=None):
+    """A real gap card: the body line the printed create command writes (operator read 3)."""
+    body = "\n".join(f"capability-gap: {k}" for k in keys) + "\nInstall it on ci-box."
+    return kb.create_task(conn, title=title, assignee="alpha", body=body, idempotency_key=idem)
+
+
 def _ledger(home):
     return [json.loads(x) for x in ksa.ledger_path(home).read_text().splitlines()]
 
@@ -119,7 +125,7 @@ def test_days_passes_and_records_the_answers(operator):
 
 def test_hours_with_open_fix_card_passes_once_and_until_is_refused(operator):
     with kb.connect_closing() as conn:
-        fix = _card(conn, title="install the render toolchain on ci-box")
+        fix = _fix(conn, title="install the render toolchain on ci-box")
         tid = _card(conn)
         with pytest.raises(ksa.OverrideRefused, match="covers ONE run"):
             ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only", until="+8h",
@@ -142,7 +148,7 @@ def test_per_gap_key_first_override_needs_answers_and_an_open_fix_card(operator)
         with pytest.raises(ksa.OverrideRefused, match="name the open gap card with --fix-card"):
             ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
                          elsewhere=EW, why_not_now=WN, effort="hours")
-        fix = _card(conn, title="install the render toolchain on ci-box")
+        fix = _fix(conn, title="install the render toolchain on ci-box")
         p = ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
                          elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
     assert p["fix_card"] == fix and not p.get("counted")
@@ -151,7 +157,7 @@ def test_per_gap_key_first_override_needs_answers_and_an_open_fix_card(operator)
 def test_per_gap_key_later_overrides_on_any_card_pass_and_are_counted_on_the_fix_card(operator):
     """Case 2: while the key's fix card is open, any card's override for that key passes and is counted on it."""
     with kb.connect_closing() as conn:
-        fix = _card(conn, title="install the render toolchain on ci-box")
+        fix = _fix(conn, title="install the render toolchain on ci-box")
         first = _card(conn)
         ksa.override(conn, first, "operator_admit", "render toolchain is Studio-only",
                      elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
@@ -164,13 +170,14 @@ def test_per_gap_key_later_overrides_on_any_card_pass_and_are_counted_on_the_fix
             ksa.override(conn, _card(conn), "workspace_kind", "the worktree lives on the Studio")
         comments = [b for (b,) in conn.execute("SELECT body FROM task_comments WHERE task_id=? ORDER BY id", (fix,))]
     assert all(p["counted"] and p["fix_card"] == fix for p in got)
-    assert len(comments) == 4 and comments[-1].startswith("studio-override #4 for gap operator_admit: " + others[-1])
+    # one line per gap key per day, its running total moved in place (operator ruling 8)
+    assert len(comments) == 1 and " 4 Studio run(s) so far" in comments[0] and f"latest {others[-1]}" in comments[0]
 
 
 def test_per_gap_key_done_fix_card_refuses_every_card(operator):
     """Case 3: once the key's fix card is done, an override for the key is refused on every card, naming it."""
     with kb.connect_closing() as conn:
-        fix = _card(conn, title="install the render toolchain on ci-box")
+        fix = _fix(conn, title="install the render toolchain on ci-box")
         tid = _card(conn)
         ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
                      elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
@@ -189,11 +196,11 @@ def test_per_gap_key_done_fix_card_refuses_every_card(operator):
 def test_per_gap_key_reopened_gap_takes_a_new_fix_card(operator):
     """Case 4: the gap reopened: a NEW open fix card with the answers is accepted, and later cards count on it."""
     with kb.connect_closing() as conn:
-        old = _card(conn, title="install the render toolchain on ci-box")
+        old = _fix(conn, title="install the render toolchain on ci-box")
         ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
                      elsewhere=EW, why_not_now=WN, effort="hours", fix_card=old)
         _done(conn, old)
-        new = _card(conn, title="reinstall the render toolchain on ci-box after the rebuild")
+        new = _fix(conn, title="reinstall the render toolchain on ci-box after the rebuild")
         p = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
                          elsewhere=EW, why_not_now=WN, effort="hours", fix_card=new)
         q = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
@@ -221,7 +228,7 @@ def test_repeated_identical_refusal_within_24h_is_one_line(operator):
 def test_archived_fix_card_does_not_close_the_gap(operator):
     """Prism 7a9922be2606: an archived (abandoned) fix card is not a closed gap; an open replacement passes."""
     with kb.connect_closing() as conn:
-        fix_a = _card(conn, title="install the render toolchain on ci-box")
+        fix_a = _fix(conn, title="install the render toolchain on ci-box")
         tid = _card(conn)
         ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
                      elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix_a)
@@ -230,7 +237,7 @@ def test_archived_fix_card_does_not_close_the_gap(operator):
         with pytest.raises(ksa.OverrideRefused, match=f"--fix-card {fix_a} is archived, not open"):
             ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
                          elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix_a)
-        fix_b = _card(conn, title="install the render toolchain on ci-box, take 2")
+        fix_b = _fix(conn, title="install the render toolchain on ci-box, take 2")
         p = ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
                          elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix_b)
     assert p["fix_card"] == fix_b
@@ -239,7 +246,7 @@ def test_archived_fix_card_does_not_close_the_gap(operator):
 def test_open_fix_card_older_than_the_closing_one_does_not_count(operator):
     """Prism 434fc10f5122: fix cards A then B for one key, B done, A still open: no-answer overrides are refused."""
     with kb.connect_closing() as conn:
-        a, b = _card(conn, title="install A"), _card(conn, title="install B")
+        a, b = _fix(conn, title="install A"), _fix(conn, title="install B")
         for fix in (a, b):
             ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
                          elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
@@ -265,7 +272,7 @@ def _complete(conn, tid):
 def test_counted_run_does_not_reregister_an_older_fix_card(operator):
     """Prism be1f77072d51: A then B registered, a run counted on A explicitly, B done: A no longer counts runs."""
     with kb.connect_closing() as conn:
-        a, b = _card(conn, title="install A"), _card(conn, title="install B")
+        a, b = _fix(conn, title="install A"), _fix(conn, title="install B")
         for fix in (a, b):
             ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
                          elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
@@ -279,7 +286,7 @@ def test_counted_run_does_not_reregister_an_older_fix_card(operator):
 def test_closure_is_when_the_fix_card_became_done_not_when_it_was_named(operator):
     """Prism 434fc10f5122: A, B, then A re-registered; B done AFTER that: A's registration predates the closure."""
     with kb.connect_closing() as conn:
-        a, b = _card(conn, title="install A"), _card(conn, title="install B")
+        a, b = _fix(conn, title="install A"), _fix(conn, title="install B")
         for fix in (a, b, a):
             ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
                          elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
@@ -296,7 +303,7 @@ def test_closure_is_when_the_fix_card_became_done_not_when_it_was_named(operator
 def test_gc_kept_override_no_longer_grants_a_studio_run(operator):
     """Prism 066c453617e1: gc keeps the registration but prunes the spawn that spent it, so it must not be live."""
     with kb.connect_closing() as conn:
-        fix, a = _card(conn, title="install the render toolchain on ci-box"), _card(conn)
+        fix, a = _fix(conn, title="install the render toolchain on ci-box"), _card(conn)
         ksa.override(conn, a, "operator_admit", "render toolchain is Studio-only",
                      elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
         assert ksa.live_override(conn, a, "operator_admit") is not None
@@ -327,16 +334,57 @@ def test_readable_pool_with_no_off_studio_host_refuses_a_gap(operator, monkeypat
     assert p["class"] == "gap"
 
 
-def test_pool_hosts_unreadable_is_none(tmp_path, monkeypatch):
-    from hermes_cli import kanban_worker_pool as kwp
-    monkeypatch.setattr(kwp, "read_pool", lambda *a, **k: (_ for _ in ()).throw(OSError("gone")))
-    assert ksg.pool_hosts(tmp_path) is None
+def test_pool_hosts_absent_or_malformed_pool_file_is_none(tmp_path, monkeypatch):
+    """Operator read 2: read_pool never raises; an absent or malformed roles file is a refused/empty PoolConfig,
+    which must read as unreadable (None), not as 'no off-Studio host' (which refuses every gap override)."""
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {})
+    assert ksg.pool_hosts(tmp_path) is None                                  # no fleet dir at all
+    (tmp_path / "fleet").mkdir()
+    assert ksg.pool_hosts(tmp_path) is None                                  # fleet dir, no roles file
+    (tmp_path / "fleet" / "fleet-roles.json").write_text("{not json", encoding="utf-8")
+    assert ksg.pool_hosts(tmp_path) is None                                  # malformed roles file
+    (tmp_path / "fleet" / "fleet-roles.json").write_text('{"schema": 1, "hosts": []}', encoding="utf-8")
+    assert ksg.pool_hosts(tmp_path) is None                                  # structurally refused
+
+
+def test_malformed_pool_file_does_not_refuse_a_fully_answered_days_override(kanban_home, monkeypatch):
+    p = kb.operator_token_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("tok")
+    monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, "tok")
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {})
+    fleet = Path(kanban_home) / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / "fleet-roles.json").write_text("{not json", encoding="utf-8")
+    with kb.connect_closing() as conn:
+        p = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="days")
+    assert p["class"] == "gap" and p["effort"] == "days"
+
+
+def _write_map(fleet: Path, doc) -> None:
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / "host-capabilities.json").write_text(doc if isinstance(doc, str) else json.dumps(doc), encoding="utf-8")
+
+
+@pytest.mark.parametrize("doc", ["{not json", {"schema": 1, "hosts": {"ace-ai": ["docker"]}}],
+                         ids=["malformed", "no-studio-row"])
+def test_map_present_but_unusable_is_unreadable_not_all_gaps(tmp_path, doc):
+    """Operator read 1: a map that exists but is malformed or has no Studio row must read as None (today's
+    behaviour), not as an empty Studio-only set that turns keychain/browser-identity into gaps."""
+    _write_map(tmp_path / "fleet", doc)
+    so = ksg.studio_only_caps(tmp_path)
+    assert so is None
+    for cap in ("keychain", "browser-identity"):
+        assert ksg.classify(cap, studio_only=so) == ksg.INHERENT
 
 
 def test_gc_keeps_the_override_that_registers_a_fix_card(operator):
     """Prism 506ff9d7da6e: kanban gc past 30 days must not forget a closed gap."""
     with kb.connect_closing() as conn:
-        fix, a = _card(conn, title="install the render toolchain on ci-box"), _card(conn)
+        fix, a = _fix(conn, title="install the render toolchain on ci-box"), _card(conn)
         ksa.override(conn, a, "operator_admit", "render toolchain is Studio-only",
                      elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
         _done(conn, a)
@@ -376,6 +424,157 @@ def test_pool_hosts_are_placement_targets_without_the_studio(tmp_path, monkeypat
     # even when the Studio IS a placement target it never counts as "elsewhere"
     _studio_registered(fleet, {"mac-studio": {"class": "linux-shared", "targets": True}})
     assert ksg.pool_hosts(tmp_path) == ("ace-ai", "ace-media")
+
+
+# -- operator read 2026-11-27 (9bb399f7) ---------------------------------------------------------------------------
+
+def test_unrelated_open_card_is_not_a_fix_card_and_does_not_open_the_key(operator):
+    """Read 3: any open card used to be accepted as --fix-card and then counted every later run for the key."""
+    with kb.connect_closing() as conn:
+        unrelated = _card(conn, title="tidy the README", body="nothing to do with the Studio")
+        with pytest.raises(ksa.OverrideRefused, match=f"--fix-card {unrelated} is not a gap card for operator_admit"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=unrelated)
+        # it did not open the key: a later no-answer override is still refused
+        with pytest.raises(ksa.OverrideRefused, match="--elsewhere is required"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+        # a gap card for ANOTHER key does not serve this one either
+        other = _fix(conn, keys=("workspace_kind",))
+        with pytest.raises(ksa.OverrideRefused, match="is not a gap card for operator_admit"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=other)
+        # the idempotency key alone is enough (the printed create command writes it)
+        idem = kb.create_task(conn, title="gap", assignee="alpha", body="x", idempotency_key="studio-capgap:operator_admit")
+        p = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=idem)
+    assert p["fix_card"] == idem
+
+
+def test_registration_of_an_unrelated_card_recorded_earlier_is_ignored(operator):
+    """Read 3: an event written by the old gate naming an unrelated card never opens the key."""
+    with kb.connect_closing() as conn:
+        unrelated, work = _card(conn, title="tidy the README"), _card(conn)
+        with kb.write_txn(conn):
+            kb._append_event(conn, work, ksa.OVERRIDE_EVENT, {"capability": "operator_admit", "fix_card_given": unrelated})
+        assert ksg.key_fix_cards(conn, "operator_admit") == {}
+        with pytest.raises(ksa.OverrideRefused, match="--elsewhere is required"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+
+
+def _register_then_close(conn, old, completed_at):
+    ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                 elsewhere=EW, why_not_now=WN, effort="hours", fix_card=old)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = ? WHERE kind = ?", (completed_at - 100, ksa.OVERRIDE_EVENT))
+        conn.execute("UPDATE tasks SET status='done', completed_at=? WHERE id=?", (completed_at, old))
+
+
+def test_comment_on_an_old_done_fix_card_does_not_close_a_newer_open_one(operator):
+    """Read 4: closure is tasks.completed_at, not the done card's newest event."""
+    import time as _t
+    with kb.connect_closing() as conn:
+        old = _fix(conn, title="install A")
+        _register_then_close(conn, old, int(_t.time()) - 1000)
+        new = _fix(conn, title="install A again")
+        ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=new)
+        kb.add_comment(conn, old, "someone", "a late note on the old done card")
+        with kb.write_txn(conn):
+            kb._append_event(conn, old, "commented", {})
+        q = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert q["counted"] and q["fix_card"] == new
+
+
+def test_done_fix_card_events_deleted_keeps_the_closure_date(operator):
+    """Read 4: gc pruning the done card's own events must not move its closure."""
+    import time as _t
+    with kb.connect_closing() as conn:
+        old = _fix(conn, title="install A")
+        _register_then_close(conn, old, int(_t.time()) - 1000)
+        new = _fix(conn, title="install A again")
+        ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=new)
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM task_events WHERE task_id = ?", (old,))
+        q = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert q["counted"] and q["fix_card"] == new
+
+
+@pytest.mark.parametrize("bad", [b"[1, 2, 3]\n", b"\xff\xfe not utf-8 \x80\n", b'{"at": "soon"}\n', b"null\n"],
+                         ids=["json-list", "invalid-utf8", "bad-at", "null"])
+def test_bad_refusal_log_line_still_prints_the_refusal(operator, bad):
+    """Read 5: one bad line in gap-refusals.jsonl must not turn every later refusal into a traceback."""
+    path = ksg.refusals_path(operator)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bad)
+    with kb.connect_closing() as conn:
+        with pytest.raises(ksa.OverrideRefused, match="--elsewhere is required") as e:
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert "Pool hosts:" in str(e.value)
+
+
+def test_refusal_log_is_rotated_to_the_repeat_window(operator, monkeypatch):
+    """Ruling 9: the log is read on every refusal, so past REFUSALS_MAX_BYTES it keeps only the last 24 h."""
+    monkeypatch.setattr(ksg, "REFUSALS_MAX_BYTES", 1000)
+    path = ksg.refusals_path(operator)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = json.dumps({"at": 1, "key": "k", "problem": "p", "task_id": "t_old"})
+    path.write_text("\n".join([old] * 50) + "\n", encoding="utf-8")
+    with kb.connect_closing() as conn:
+        with pytest.raises(ksa.OverrideRefused):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and json.loads(lines[0])["key"] == "operator_admit"
+
+
+def test_create_command_is_shell_quoted_and_writes_both_markers():
+    """Ruling 9: the capability is shell-quoted; the card it creates passes is_fix_card_for."""
+    import shlex
+    cmd = ksg.create_command("ssh-root:x;rm -rf ~", "media")
+    argv = shlex.split(cmd)
+    assert argv[:5] == ["hermes", "kanban", "--board", "media", "create"]
+    assert argv[argv.index("--idempotency-key") + 1] == "studio-capgap:ssh-root:x;rm -rf ~"
+    assert argv[argv.index("--body") + 1].startswith("capability-gap: ssh-root:x;rm")
+
+
+def test_reopen_after_closure_prints_a_dated_key_that_is_accepted_end_to_end(operator):
+    """Ruling 7: after a closure the same idempotency key returns the DONE card, so the refusal prints a dated key;
+    a card created from that command is accepted as the new fix card, and later runs count on it."""
+    import shlex
+    with kb.connect_closing() as conn:
+        old = kb.create_task(conn, title="gap", assignee="alpha", body="x",
+                             idempotency_key="studio-capgap:operator_admit")
+        ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=old)
+        _done(conn, old)
+        with pytest.raises(ksa.OverrideRefused) as e:
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+        msg = str(e.value)
+        cmd = msg[msg.index("hermes kanban "):]
+        argv = shlex.split(cmd)
+        idem = argv[argv.index("--idempotency-key") + 1]
+        assert idem != "studio-capgap:operator_admit" and idem.startswith("studio-capgap:operator_admit:")
+        # the same key returns the done card; the dated one makes a new card
+        assert kb.create_task(conn, title="g", assignee="alpha", idempotency_key="studio-capgap:operator_admit") == old
+        new = kb.create_task(conn, title=argv[argv.index("create") + 1], assignee="alpha",
+                             body=argv[argv.index("--body") + 1], idempotency_key=idem)
+        assert new != old
+        p = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=new)
+        q = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert p["fix_card"] == new and q["counted"] and q["fix_card"] == new
+
+
+def test_studio_state_refusal_names_the_studio_host_route(operator):
+    """Ruling 6: work ON the Studio machine itself has its own inherent word, studio-host."""
+    with kb.connect_closing() as conn:
+        with pytest.raises(ksa.OverrideRefused) as e:
+            ksa.override(conn, _card(conn), "studio-state", "restart the Studio docker stack")
+        assert "use requires: studio-host" in str(e.value)
+        with pytest.raises(ksa.OverrideRefused) as f:
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert "studio-host" not in str(f.value)
+    assert ksg.classify("studio-host", studio_only=frozenset({"studio-host", "keychain"})) == ksg.INHERENT
 
 
 # -- 5. kill switch -----------------------------------------------------------------------------------------------
@@ -418,7 +617,8 @@ def test_replay_explainer_session_overrides(operator):
         with pytest.raises(ksa.OverrideRefused) as e:
             ksa.override(conn, first_tid, first_cap, first_why, until="+8h")
         assert "hermes kanban --board default create" in str(e.value) and "--fix-card" in str(e.value)
-        fix = _card(conn, title="install the explainer render toolchain on ci-box")
+        fix = _fix(conn, title="install the explainer render toolchain on ci-box",
+                   keys=("operator_admit", "workspace_kind"))
         seen = set()
         for tid, cap, why in seq:
             if cap in seen:  # per gap key: the open fix card already covers this gap, no answers asked again
@@ -431,4 +631,7 @@ def test_replay_explainer_session_overrides(operator):
         counts = [b for (b,) in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (fix,))]
     rows = _ledger(operator)
     assert len(rows) == 17 and {r["fix_card"] for r in rows} == {fix}
-    assert seen == {"operator_admit", "workspace_kind"} and len(counts) == 17 and "studio-override #17" in counts[-1]
+    assert seen == {"operator_admit", "workspace_kind"}
+    # one count line per gap key per day; together they total the 17 runs
+    totals = sorted(int(c.split(" Studio run(s)")[0].rsplit(" ", 1)[1]) for c in counts)
+    assert len(counts) == 2 and sum(totals) == 17

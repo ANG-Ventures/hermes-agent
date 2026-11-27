@@ -82,7 +82,10 @@ def studio_only_caps(root: Path) -> Optional[frozenset]:
         cmap = khc.load_map(Path(root) / "fleet")
         if cmap is None:
             return None
-        return frozenset(ksc.studio_only(cmap) or ())
+        # a map that exists but is malformed or has no Studio row is unreadable too: studio_only() says None, and
+        # an empty set would turn keychain/browser-identity into gaps (operator read 1, 2026-11-27)
+        so = ksc.studio_only(cmap)
+        return None if so is None else frozenset(so)
     except Exception:
         return None
 
@@ -107,7 +110,12 @@ def pool_hosts(root: Path) -> Optional[tuple]:
     try:
         from hermes_cli import kanban_db_dispatch as kbd
         from hermes_cli import kanban_worker_pool as kwp
-        cfg = kwp.read_pool(Path(root) / "fleet", kanban_cfg=kbd._root_kanban_cfg())
+        fleet = Path(root) / "fleet"
+        if not (fleet / kwp.ROLES_FILE).exists():
+            return None  # no pool file: the host check is skipped, as today (operator read 2)
+        cfg = kwp.read_pool(fleet, kanban_cfg=kbd._root_kanban_cfg())
+        if getattr(cfg, "refused", None):
+            return None  # read_pool never raises: a malformed/refused pool is an empty PoolConfig with refused set
         studio = {str(kwp.STUDIO_HOST).lower(), "studio"}
         names = [str(getattr(h, "name", "")).strip().lower() for h in (getattr(cfg, "pool_hosts", ()) or ())]
         return tuple(dict.fromkeys(n for n in names if n and n not in studio))
@@ -131,16 +139,36 @@ def _card_status(conn, card: str) -> Optional[str]:
     return row[0] if row else None
 
 
+_DATED = re.compile(r"^:\d{8}$")
+_GAP_LINE = re.compile(r"(?m)^\s*capability-gap:\s*([^\s\\]+)")
+
+
+def is_fix_card_for(conn, card: str, key: str) -> bool:
+    """A card may close gap ``key`` only when it says so (operator read 3): its idempotency key is
+    ``studio-capgap:<key>`` (or the dated reopen key ``studio-capgap:<key>:<yyyymmdd>``), or its body has the line
+    ``capability-gap: <key>``. Both are written by :func:`create_command`. Any other open card is refused."""
+    row = conn.execute("SELECT idempotency_key, body FROM tasks WHERE id = ?", (card,)).fetchone()
+    if not row:
+        return False
+    idem, body = (row[0] or "").strip(), row[1] or ""
+    base = f"studio-capgap:{key}"
+    if idem == base or (idem.startswith(base) and _DATED.match(idem[len(base):])):
+        return True
+    return any(m.group(1) == key for m in _GAP_LINE.finditer(body))
+
+
 def key_fix_cards(conn, key: str) -> dict:
     """Fix cards REGISTERED for gap ``key`` (the capability; ``studio-capgap:<key>``): ``{card: event id of its last
     registration}``, oldest first. A registration is a ``studio_override`` on ANY card that recorded
     ``fix_card_given`` for this key with the answers; a ``counted`` run only uses a registration and never moves it
-    (Prism be1f77072d51). These events survive ``kanban gc`` (``gc_events`` keeps a studio_override that names a fix
+    (Prism be1f77072d51). Values are ``(event id, created_at)``; a card that is not a fix card for ``key``
+    (:func:`is_fix_card_for`) is never a registration. These events survive ``kanban gc`` (``gc_events`` keeps a studio_override that names a fix
     card), so a closed gap stays closed past the 30-day event retention (Prism 506ff9d7da6e).
     Per GAP, not per card (operator ruling 2026-11-27): 25 cards overrode one render-toolchain gap on 11-26."""
     import json
     out: dict = {}
-    for ev_id, raw in conn.execute("SELECT id, payload FROM task_events WHERE kind = 'studio_override' ORDER BY id"):
+    rows = conn.execute("SELECT id, payload, created_at FROM task_events WHERE kind = 'studio_override' ORDER BY id")
+    for ev_id, raw, at in rows.fetchall():
         try:
             doc = json.loads(raw or "{}") or {}
         except (TypeError, ValueError):
@@ -148,18 +176,24 @@ def key_fix_cards(conn, key: str) -> dict:
         if not isinstance(doc, dict) or doc.get("capability") != key or doc.get("counted"):
             continue
         fc = doc.get("fix_card_given")
-        if fc:
+        if fc and is_fix_card_for(conn, fc, key):
             out.pop(fc, None)
-            out[fc] = ev_id
+            out[fc] = (int(ev_id), int(at or 0))
     return out
 
 
-def _closed_at(conn, card: str) -> float:
-    """Event id at which a done fix card closed its gap: its newest event (the completion or later). With none left
-    (pruned), after every registration: an unknown closure must not let an older open card count (Prism
-    434fc10f5122)."""
-    row = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (card,)).fetchone()
-    return float(row[0]) if row and row[0] is not None else float("inf")
+def _completed_at(conn, card: str) -> Optional[int]:
+    row = conn.execute("SELECT completed_at FROM tasks WHERE id = ?", (card,)).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def _after_closure(reg: tuple, done_reg: tuple, completed: Optional[int]) -> bool:
+    """Was a registration ``reg`` (event id, created_at) made after the done card closed the gap? Closure is the
+    card's ``tasks.completed_at``, never its newest event: a later comment or a gc prune of its events must not move
+    it (operator read 4). With no completion time, by registration order only."""
+    if completed is None:
+        return reg[0] > done_reg[0]
+    return reg[1] > completed or (reg[1] == completed and reg[0] > done_reg[0])
 
 
 def _body_needs(conn, task_id: str) -> str:
@@ -169,14 +203,28 @@ def _body_needs(conn, task_id: str) -> str:
     return "; ".join(lines) or "no requires: line"
 
 
-def create_command(capability: str, board: Optional[str] = None) -> str:
+def create_command(capability: str, board: Optional[str] = None, *, dated: Optional[str] = None) -> str:
     """The gap-card create command, on the override's board so the printed command runs in an unpinned shell and
-    the next override on that board finds the card (Prism 506ff9d7da6e)."""
-    b = f"--board {board} " if board else ""
-    return (f'hermes kanban {b}create "Pool hosts: install what {capability} work needs so it runs off the Studio" '
-            f'--assignee daedalus --idempotency-key studio-capgap:{capability} '
-            f'--body "capability-gap: {capability}\\nInstall <tools/models/checkout> on <pool host>; prove one card '
-            f'of this kind runs there. Skill: fleet-host-gap-handling."')
+    the next override on that board finds the card (Prism 506ff9d7da6e). After a closure the same idempotency key
+    would return the DONE card, so the reopen command carries ``dated`` (yyyymmdd): ``studio-capgap:<key>:<date>``
+    (operator ruling 7). Every argument is shell-quoted (ruling 9)."""
+    import shlex
+    b = f"--board {shlex.quote(board)} " if board else ""
+    idem = f"studio-capgap:{capability}" + (f":{dated}" if dated else "")
+    title = f"Pool hosts: install what {capability} work needs so it runs off the Studio"
+    body = (f"capability-gap: {capability}\nInstall <tools/models/checkout> on <pool host>; prove one card "
+            f"of this kind runs there. Skill: fleet-host-gap-handling.")
+    return (f"hermes kanban {b}create {shlex.quote(title)} --assignee daedalus --idempotency-key {shlex.quote(idem)} "
+            f"--body {shlex.quote(body)}")
+
+
+STUDIO_HOST_HINT = ("  If the work is ON the Studio machine itself (its disk, containers, services, GUI), use "
+                    "requires: studio-host (inherent, no fix card).\n")
+
+
+def _studio_host_hint(capability: str) -> str:
+    from hermes_cli import kanban_studio_allowlist as ksa
+    return STUDIO_HOST_HINT if any(ksa.head(p) == "studio-state" for p in ksa.parts(capability)) else ""
 
 
 class _Refusal(GapRefused):
@@ -194,6 +242,7 @@ def _refusal(conn, task_id: str, capability: str, problem: str, hosts: tuple,
         f"{problem}\n"
         f"  {task_id} wants the Studio for '{capability}', which is a host GAP (not Studio-only by nature). "
         f"The card says: {_body_needs(conn, task_id)}.\n"
+        f"{_studio_host_hint(capability)}"
         f"  Pool hosts: {_hosts_text(hosts)}.\n"
         f"  A gap override needs: --elsewhere \"<which pool host, what to install or move>\" "
         f"--why-not-now \"<why it cannot run there now>\" --effort hours|days; "
@@ -205,6 +254,7 @@ def _refusal(conn, task_id: str, capability: str, problem: str, hosts: tuple,
 
 
 REPEAT_WINDOW = 24 * 3600
+REFUSALS_MAX_BYTES = 256 * 1024   # rotated to the last REPEAT_WINDOW when larger (ruling 9): it is read on refusal
 REFUSALS_FILE = ("state", "studio-capability-gap", "gap-refusals.jsonl")
 
 
@@ -220,17 +270,29 @@ def _shorten(exc: GapRefused, task_id: str, root: Path, now: float) -> GapRefuse
         return exc
     path = refusals_path(root)
     earlier = None
+    keep: list = []
     try:
-        for line in path.read_text(encoding="utf-8-sig").splitlines():
-            try:
-                doc = json.loads(line)
-            except ValueError:
-                continue
-            if (doc.get("key") == exc.key and doc.get("problem") == exc.problem
-                    and now - float(doc.get("at") or 0) < REPEAT_WINDOW):
-                earlier = doc
+        raw = path.read_bytes()
     except OSError:
-        pass
+        raw = b""
+    for line in raw.decode("utf-8-sig", errors="replace").splitlines():
+        try:
+            doc = json.loads(line)
+            at = float(doc.get("at") or 0) if isinstance(doc, dict) else None
+        except (ValueError, TypeError, AttributeError):
+            continue  # one bad line must never turn a refusal into a traceback (operator read 5)
+        if at is None or now - at >= REPEAT_WINDOW:
+            continue
+        keep.append(line)
+        if doc.get("key") == exc.key and doc.get("problem") == exc.problem:
+            earlier = doc
+    if len(raw) > REFUSALS_MAX_BYTES:
+        try:
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text("".join(x + "\n" for x in keep), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            pass
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
@@ -265,17 +327,24 @@ def check(conn, task_id: str, capability: str, *, elsewhere: Optional[str], why_
         raise _shorten(exc, task_id, root, time.time() if now is None else now) from None
 
 
+def _reopen(key: str, board: Optional[str]) -> str:
+    import time
+    day = time.strftime("%Y%m%d", time.localtime())
+    return ("If the gap has reopened, create a new fix card (dated key: the old one returns the done card) and name "
+            f"it with --fix-card: {create_command(key, board, dated=day)}")
+
+
 def _check_gap(conn, task_id: str, key: str, *, elsewhere, why_not_now, effort, fix_card, until, root, board) -> dict:
     hosts = pool_hosts(root)
     on_pool = f"run it on a pool host: {_hosts_text(hosts)}"
     reg = key_fix_cards(conn, key)
     known = list(reg)
     status = {c: _card_status(conn, c) for c in known}
-    done_known = sorted((c for c in known if status[c] in _DONE), key=lambda c: _closed_at(conn, c))
-    # Only a fix card registered AFTER the latest closure can count a run (Prism 434fc10f5122, be1f77072d51): an
-    # older card left open when another one closed the gap predates the closure.
-    closure = _closed_at(conn, done_known[-1]) if done_known else float("-inf")
-    since = [c for c in known if reg[c] > closure]
+    completed = {c: _completed_at(conn, c) for c in known if status[c] in _DONE}
+    done_known = sorted(completed, key=lambda c: (completed[c] if completed[c] is not None else reg[c][1], reg[c][0]))
+    # Only a fix card registered AFTER every closure can count a run (Prism 434fc10f5122, be1f77072d51): an older
+    # card left open when another one closed the gap predates the closure.
+    since = [c for c in known if all(_after_closure(reg[c], reg[d], completed[d]) for d in done_known)]
     open_known = [c for c in since if status[c] not in _CLOSED and c != task_id]
     ew, wn, eff = (elsewhere or "").strip(), (why_not_now or "").strip(), (effort or "").strip().lower()
     fc = (fix_card or "").strip() or None
@@ -286,10 +355,14 @@ def _check_gap(conn, task_id: str, key: str, *, elsewhere, why_not_now, effort, 
         if fc == task_id:
             raise _refusal(conn, task_id, key, "--fix-card must be the card that closes the gap, not this card",
                            hosts, board)
+        if not is_fix_card_for(conn, fc, key):
+            raise _refusal(conn, task_id, key, f"--fix-card {fc} is not a gap card for {key}: its idempotency key "
+                           f"must be studio-capgap:{key} or its body must carry the line 'capability-gap: {key}'",
+                           hosts, board)
         if st in _DONE:
             p = f"--fix-card {fc} is done: the gap {key} is closed"
-            raise _Refusal(f"{p}, {on_pool}. If the gap has reopened, create a new fix card and name it with "
-                           f"--fix-card.", key=key, problem=p, fix_card=fc, short=f"({on_pool})")
+            raise _Refusal(f"{p}, {on_pool}. {_reopen(key, board)}", key=key, problem=p, fix_card=fc,
+                           short=f"({on_pool})")
         if st in _CLOSED:
             raise _refusal(conn, task_id, key, f"--fix-card {fc} is {st}, not open: name an open gap card",
                            hosts, board)
@@ -303,8 +376,8 @@ def _check_gap(conn, task_id: str, key: str, *, elsewhere, why_not_now, effort, 
                 "fix_card_given": counted, "counted": True}
     if not fc and done_known:
         p = f"the gap card {done_known[-1]} for {key} is done: the gap is closed"
-        raise _Refusal(f"{p}, {on_pool}. If the gap has reopened, create a new fix card and name it with --fix-card.",
-                       key=key, problem=p, fix_card=done_known[-1], short=f"({on_pool})")
+        raise _Refusal(f"{p}, {on_pool}. {_reopen(key, board)}", key=key, problem=p, fix_card=done_known[-1],
+                       short=f"({on_pool})")
     if len(ew) < MIN_TEXT:
         raise _refusal(conn, task_id, key, f"--elsewhere is required ({MIN_TEXT}+ characters)", hosts, board)
     if hosts == ():
