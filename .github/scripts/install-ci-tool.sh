@@ -40,10 +40,25 @@ esac
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 # Switch transport after a failed release GET, retaining the same integrity pin.
-bash "$(dirname "${BASH_SOURCE[0]}")/download-ci-asset.sh" \
+if ! bash "$(dirname "${BASH_SOURCE[0]}")/download-ci-asset.sh" \
   "https://github.com/$release/$asset" \
   "https://api.github.com/repos/${release%%/releases/*}/releases/assets/$asset_id" \
-  "$sha" "$scratch/$asset"
+  "$sha" "$scratch/$asset"; then
+  # Both GitHub sources can refuse a shared runner IP at once (HTTP 403 x6, job 140396763701),
+  # which skipped a whole test slice. ripgrep only: fall back to the distro's signed package,
+  # never to unverified bytes. CI_TOOL_DISTRO_FALLBACK=0 keeps the pinned-only behaviour.
+  if [[ "$tool" != ripgrep || "${CI_TOOL_DISTRO_FALLBACK:-1}" == 0 ]]; then
+    exit 1
+  fi
+  if ! command -v rg >/dev/null; then
+    sudo -n apt-get install -y -qq --no-install-recommends ripgrep >&2 \
+      || { sudo -n apt-get update -qq >&2 && sudo -n apt-get install -y -qq --no-install-recommends ripgrep >&2; } \
+      || { printf 'ripgrep: pinned download and distro package both failed\n' >&2; exit 1; }
+  fi
+  printf 'ripgrep: pinned release unavailable; using distro rg at %s\n' "$(command -v rg)" >&2
+  rg --version
+  exit 0
+fi
 case "$tool" in
   ripgrep) tar -xzf "$scratch/$asset" -C "$scratch" --strip-components=1 "${asset%.tar.gz}/rg" ;;
   gitleaks) tar -xzf "$scratch/$asset" -C "$scratch" gitleaks ;;

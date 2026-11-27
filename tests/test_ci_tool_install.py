@@ -100,7 +100,8 @@ def test_corrupt_release_rejected_before_install(tmp_path, arch, suffix, tool, f
     path_file = tmp_path / "github-path"
     url_log = tmp_path / "url"
     env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
-           "GITHUB_PATH": str(path_file), "URL_LOG": str(url_log), "FALLBACK": str(int(fallback))}
+           "GITHUB_PATH": str(path_file), "URL_LOG": str(url_log), "FALLBACK": str(int(fallback)),
+           "CI_TOOL_DISTRO_FALLBACK": "0"}
     result = subprocess.run(["bash", str(INSTALLER), tool, str(destination)],
                             env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
@@ -142,7 +143,8 @@ def _flaky_curl_env(tmp_path, failures):
     for executable in shim.iterdir():
         executable.chmod(0o755)
     calls = tmp_path / "calls"
-    return {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}", "CALLS": str(calls)}, calls
+    return {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}", "CALLS": str(calls),
+            "CI_TOOL_DISTRO_FALLBACK": "0"}, calls
 
 
 @pytest.mark.skipif(not shutil.which("bash") or not shutil.which("sha256sum"), reason="Linux installer tools required")
@@ -165,6 +167,65 @@ def test_persistent_download_failure_gives_up(tmp_path):
     assert len(calls.read_text().splitlines()) == 6
     assert "download failed after 6 attempts" in result.stderr
     assert not destination.exists()
+
+
+def _distro_fallback(tmp_path, tool, *, have_rg, apt_ok=True):
+    """Every GitHub GET fails (403); rg/sudo are shims so the host's own rg never answers."""
+    env, calls = _flaky_curl_env(tmp_path, failures=99)
+    env.pop("CI_TOOL_DISTRO_FALLBACK")
+    shim = tmp_path / "shim"
+    rg_script = '#!/bin/sh\nprintf "ripgrep 14.1.0\\n"\n'
+    (tmp_path / "rg.template").write_text(rg_script)
+    (shim / "sudo").write_text(
+        '#!/bin/sh\necho "$*" >> "$SUDO_LOG"\n'
+        + ('cat "$SHIM/../rg.template" > "$SHIM/rg"; chmod +x "$SHIM/rg"\n' if apt_ok else "exit 100\n"))
+    if have_rg:
+        (shim / "rg").write_text(rg_script)
+    for executable in shim.iterdir():
+        executable.chmod(0o755)
+    # PATH = shim + a toolbox of the utilities the scripts call, so no host rg can answer.
+    toolbox = tmp_path / "toolbox"
+    toolbox.mkdir()
+    for name in ("bash", "sh", "mktemp", "rm", "dirname", "sha256sum", "wc", "chmod", "cat", "tar",
+                 "mkdir", "install"):
+        found = shutil.which(name)
+        if found:
+            (toolbox / name).symlink_to(found)
+    env.update(PATH=f"{shim}:{toolbox}", SUDO_LOG=str(tmp_path / "sudo"), SHIM=str(shim))
+    destination = tmp_path / "installed"
+    result = subprocess.run(["bash", str(INSTALLER), tool, str(destination)],
+                            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    sudo_log = tmp_path / "sudo"
+    return result, destination, sudo_log.read_text().splitlines() if sudo_log.exists() else []
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="bash required")
+def test_ripgrep_uses_present_rg_when_github_refuses(tmp_path):
+    result, destination, sudo = _distro_fallback(tmp_path, "ripgrep", have_rg=True)
+    assert result.returncode == 0, result.stderr
+    assert "using distro rg" in result.stderr and "ripgrep 14.1.0" in result.stdout
+    assert sudo == [] and not destination.exists()  # no unverified bytes installed
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="bash required")
+def test_ripgrep_installs_distro_package_when_github_refuses(tmp_path):
+    result, _, sudo = _distro_fallback(tmp_path, "ripgrep", have_rg=False)
+    assert result.returncode == 0, result.stderr
+    assert sudo == ["-n apt-get install -y -qq --no-install-recommends ripgrep"]
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="bash required")
+def test_ripgrep_fails_when_distro_package_also_fails(tmp_path):
+    result, _, sudo = _distro_fallback(tmp_path, "ripgrep", have_rg=False, apt_ok=False)
+    assert result.returncode == 1
+    assert "pinned download and distro package both failed" in result.stderr
+    assert len(sudo) == 2  # install, then update (+ install skipped because update failed)
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="bash required")
+def test_other_tools_never_take_the_distro_fallback(tmp_path):
+    result, _, sudo = _distro_fallback(tmp_path, "gitleaks", have_rg=True)
+    assert result.returncode == 1 and sudo == []
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="bash required")
