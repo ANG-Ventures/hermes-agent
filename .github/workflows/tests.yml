@@ -72,7 +72,7 @@ jobs:
         run: echo "::notice title=ci-executed-sha::${GITHUB_SHA}"
 
       - name: Restore duration cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: test_durations.json
           # Per-run primary key so it can NEVER exact-hit. A legacy 3.5 KB entry
@@ -497,7 +497,7 @@ jobs:
         # concurrent main run may have saved between a slice's restore and
         # this one, so this restore is the output base, never the diff base.
         # Same path as the save so the cache version matches.
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: test_durations.json
           key: test-durations-restore-${{ github.run_id }}
