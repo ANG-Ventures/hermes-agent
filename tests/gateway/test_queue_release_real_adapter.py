@@ -565,3 +565,33 @@ async def test_busy_queue_run_during_first_reply_send_runs_each_item_once(monkey
     assert rig.calls == ["ping", "a", "b"]
     assert _held(rig) == []
     assert rig.max_live == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,cap", [("merged", None), ("per_item", None), ("merged", 0)])
+async def test_reclaimed_item_released_again_with_a_later_prompt_runs(monkeypatch, tmp_path, mode, cap):
+    """Apollo send-back on 54715102: `a` is reclaimed into held (flag set); a later completed turn
+    releases it together with `/queue b`. The merged copy must not inherit `_queue_reclaimed`, or
+    claim_inflight refuses it and it is in no store. cap=0 pops the batch at the recursion cap."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.runner._queue_release_mode = mode
+    gate, _task = await _queue_a_then_block_drain(rig, monkeypatch)
+    gate.set()
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert _held(rig) == ["a"]
+    if cap is not None:
+        rig.runner._MAX_INTERRUPT_DEPTH = cap
+    rig.gates["pong"] = threading.Event()
+    rig.gate_completes.add("pong")
+    rig.first_started.clear()
+    await rig.adapter.handle_message(_msg("pong"))
+    await _wait(rig.first_started)
+    await rig.adapter.handle_message(_msg("/queue b"))
+    rig.gates["pong"].set()
+    await rig.settle(expect=3)
+    await asyncio.sleep(0.5)
+    expected = ["ping", "pong", "a\n\nb"] if mode == "merged" else ["ping", "pong", "a", "b"]
+    assert rig.calls == expected
+    assert _held(rig) == []
+    assert rig.max_live == 1

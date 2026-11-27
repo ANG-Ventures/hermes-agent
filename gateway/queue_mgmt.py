@@ -431,6 +431,10 @@ def merge_user_events(events: List[Any]) -> Any:
     # so the merged turn re-derives from every item (same rule as the adapter merge in base.py).
     for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
         head.__dict__.pop(attr, None)
+    # Queue marks describe the head's own history, not the new batch: an inherited reclaim flag
+    # makes claim_inflight refuse the merged turn and it is in no store (Apollo send-back on 54715102).
+    for attr in ("_queue_reclaimed", "_queue_merged_from", "_queue_released"):
+        head.__dict__.pop(attr, None)
     texts = [str(getattr(e, "text", "") or "").strip() for e in events]
     head.text = MERGE_SEPARATOR.join(t for t in texts if t)
     if len(events) > 1:
