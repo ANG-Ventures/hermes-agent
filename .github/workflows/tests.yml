@@ -188,7 +188,7 @@ jobs:
         id: request
         # A failed upload only means no plan: test/e2e fall back to the static split.
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-overflow-request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-overflow/request.json
@@ -204,7 +204,7 @@ jobs:
         # downloads it to `.` and finds ci-overflow/ and scripts/ where they were.
         if: github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-overflow-local-matrix-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -410,7 +410,7 @@ jobs:
         # a "re-run failed jobs" attempt never overwrites attempt 1.
         if: ${{ !cancelled() }}
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-slice-result-${{ matrix.slice.index }}-a${{ github.run_attempt }}
           path: ci-junit/
@@ -458,7 +458,7 @@ jobs:
         # slices red, so the cache was never written (t_153af496).
         if: ${{ !cancelled() }}
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-durations-slice-${{ matrix.slice.index }}
           path: |
