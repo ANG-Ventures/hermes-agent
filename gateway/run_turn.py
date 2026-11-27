@@ -4317,11 +4317,16 @@ class GatewayTurnMixin:
                 _pending_text = pending_event.text or ""
                 if self._pending_event_audio_paths(pending_event):
                     # Dequeued already: a /stop during this STT must persist the note, not drop it.
+                    # The STT hand-off owns it meanwhile, so it is unmarked (one disposition, Apollo
+                    # read of 036bbae1); re-marked after STT only if no reclaim took it first.
+                    owned = queue_mgmt.claim_inflight(self, session_key, pending_event)
                     pending, _ = await self._transcribe_and_echo_pending_voice(
                         pending_event, adapter, source, _pending_text, log_context="Voice-drain",
                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
                         persist_session_id=session_id, persist_owner_key=session_key,
                     )
+                    if owned:
+                        queue_mgmt.mark_inflight(self, session_key, pending_event)
                     pending = pending or _build_media_placeholder(pending_event)
                 else:
                     pending = _pending_text or _build_media_placeholder(pending_event)

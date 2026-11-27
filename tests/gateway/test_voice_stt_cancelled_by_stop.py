@@ -329,6 +329,30 @@ async def test_stop_during_queued_voice_drain_stt_persists_note(tmp_path):
     assert len(rows) == 1 and '"queued words"' in rows[0]["content"]
 
 
+@pytest.mark.asyncio
+async def test_stop_during_queued_voice_drain_stt_holds_nothing(tmp_path):
+    """Apollo read of PR 573 at 036bbae1: one disposition per window. While the drain's STT runs,
+    the STT hand-off owns the popped note: /stop (generation invalidation, then the cancel, as the
+    real /stop orders them) writes the note row once and puts nothing in held."""
+    runner = _runner(tmp_path)
+    started = asyncio.Event()
+    pending = _pending_adapter(runner.key, _voice())
+    runner._overflow_queue = lambda key: []
+    runner._draining = False
+    with patch(_STT, side_effect=_slow_stt(started, {"/cache/audio/long.ogg": "queued words"})):
+        drain = asyncio.ensure_future(runner._run_agent_drain_pending(
+            {"final_response": "done"}, pending, _source(), runner.key, runner.sid,
+        ))
+        await asyncio.wait_for(started.wait(), 5)
+        runner._invalidate_session_run_generation(runner.key, reason="stop_command")
+        await _cancel_once_started(drain, started, runner)
+    conversation = runner._session_state(runner.key).conversation
+    assert list(conversation.held_queue) == []
+    assert conversation.inflight_followup is None
+    rows = _rows(runner)
+    assert len(rows) == 1 and '"queued words"' in rows[0]["content"]
+
+
 def test_post_stop_note_row_keeps_the_stop_marker():
     """Apollo round 2 (C): the note row lands after ``user_stopped.last_message_id``; it must not
     count as the user speaking after /stop, or a restart auto-resumes (and replies to) the turn."""

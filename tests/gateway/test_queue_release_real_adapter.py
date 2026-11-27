@@ -616,3 +616,71 @@ async def test_reclaimed_event_at_the_recursion_cap_is_not_put_back(monkeypatch,
     assert rig.calls == ["ping"]
     assert _held(rig) == ["a"]
     assert rig.adapter._pending_messages.get(KEY) is None
+
+
+def _voice_rig(monkeypatch, tmp_path):
+    """ping runs; a queued voice note waits in the slot. STT and the post-stop hand-off are the
+    runner's own seams (``_enrich_message_with_transcription``, ``_hand_off_voice_after_stop``)."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.pause_on_stop = True
+    rig.gates = {"ping": threading.Event()}
+    rig.gate_completes.add("ping")
+    rig.stt_entered, rig.stt_gate, rig.handoffs = asyncio.Event(), asyncio.Event(), []
+
+    async def enrich(text, audio_paths, *, notes_out=None):
+        rig.stt_entered.set()
+        await rig.stt_gate.wait()
+        return "voice words", ["voice words"]
+
+    async def hand_off(event, *args, **kwargs):
+        rig.handoffs.append(event)
+
+    rig.runner._enrich_message_with_transcription = enrich
+    rig.runner._hand_off_voice_after_stop = hand_off
+    rig.voice = MessageEvent(text="", message_type=MessageType.VOICE, source=_source(), message_id="v1",
+                             media_urls=["/cache/audio/v1.ogg"], media_types=["audio/ogg"])
+    return rig
+
+
+async def _start_ping_with_queued_voice(rig):
+    rig.adapter._start_session_processing(_msg("ping"), KEY)
+    await _wait(rig.first_started)
+    rig.adapter._pending_messages[KEY] = rig.voice
+    rig.gates["ping"].set()
+
+
+@pytest.mark.asyncio
+async def test_stop_during_queued_voice_stt_hands_off_once_and_holds_nothing(monkeypatch, tmp_path):
+    """Apollo read of PR 573 at 036bbae1 (1): /stop while the drain's STT of a queued voice note is
+    blocked. The STT hand-off owns it: one hand-off, held empty, nothing runs."""
+    rig = _voice_rig(monkeypatch, tmp_path)
+    await _start_ping_with_queued_voice(rig)
+    await _wait(rig.stt_entered)
+    await rig.adapter.handle_message(_msg("/stop"))
+    rig.stt_gate.set()
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping"]
+    assert _held(rig) == []
+    assert rig.handoffs == [rig.voice]
+    assert rig.runner._session_state(KEY).conversation.inflight_followup is None
+
+
+@pytest.mark.asyncio
+async def test_stop_after_queued_voice_stt_during_reply_send_holds_it_once(monkeypatch, tmp_path):
+    """(2) STT finished, /stop during ping's reply send: the mark owns it again, so held is exactly
+    the voice note once and the STT hand-off never ran."""
+    rig = _voice_rig(monkeypatch, tmp_path)
+    rig.stt_gate.set()
+    rig.adapter.block_text, rig.adapter.send_entered = "answer ping", asyncio.Event()
+    rig.adapter.send_gate = asyncio.Event()
+    await _start_ping_with_queued_voice(rig)
+    await _wait(rig.adapter.send_entered)
+    await rig.adapter.handle_message(_msg("/stop"))
+    rig.adapter.send_gate.set()
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping"]
+    held = rig.runner._session_state(KEY).conversation.held_queue
+    assert len(held) == 1 and held[0] is rig.voice
+    assert rig.handoffs == []
