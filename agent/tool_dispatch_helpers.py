@@ -557,6 +557,12 @@ def make_tool_result_message(
     trust_name = _trust_name(name, call_args, content)
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
+    # t_90c8b36c: payment card numbers are masked to their last four before the result enters the
+    # transcript, the session stores or the next request (security.mask_card_numbers_tool_results).
+    from agent.redact_cards import mask_tool_result_content
+    content = mask_tool_result_content(content)
+    if isinstance(multimodal_text_summary, str):
+        multimodal_text_summary = mask_tool_result_content(multimodal_text_summary)
     # E11: remote tool output never carries the harness's route-note marker. Local output
     # (read_file, terminal, ...) stays byte-identical so the model edits what is on disk.
     if tool_output_relabels_route_notes(trust_name):

@@ -1,0 +1,236 @@
+"""Payment card masking (t_90c8b36c): tool results, inbound user text, browser_vision screenshots.
+
+Every card number here is MADE UP: Luhn-valid with a real network prefix, last fours 0366 / 2226 / 2347,
+none shared with a real card.
+"""
+from __future__ import annotations
+
+import json
+from unittest.mock import patch
+
+import pytest
+
+from agent import redact_cards
+from agent.redact_cards import (
+    CARD_IMAGE_REFUSAL,
+    count_card_numbers,
+    luhn,
+    mask_card_numbers,
+)
+from agent.tool_dispatch_helpers import make_tool_result_message
+
+VISA = "4532015112830366"
+MC = "5555444433332226"
+AMEX = "341256789012347"
+
+
+def _cfg(**security):
+    return patch("hermes_cli.config.load_config_readonly", return_value={"security": security})
+
+
+def test_fixture_numbers_are_luhn_valid_and_not_samples():
+    for n in (VISA, MC, AMEX):
+        assert luhn(n) and n not in redact_cards.PLACEHOLDERS
+        assert not n.endswith("1120")
+
+
+@pytest.mark.parametrize("raw, masked", [
+    (f"{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}", "XXXX XXXX XXXX 0366"),
+    (f"{VISA[:4]}-{VISA[4:8]}-{VISA[8:12]}-{VISA[12:]}", "XXXX-XXXX-XXXX-0366"),
+    (VISA, "XXXXXXXXXXXX0366"),
+    (MC, "XXXXXXXXXXXX2226"),
+    (f"{AMEX[:4]} {AMEX[4:10]} {AMEX[10:]}", "XXXX XXXXXX X2347"),
+    (AMEX, "XXXXXXXXXXX2347"),
+])
+def test_card_groupings_mask_to_last_four(raw, masked):
+    assert mask_card_numbers(f"card: {raw}.") == f"card: {masked}."
+
+
+@pytest.mark.parametrize("text", [
+    "order 112-1234567-1234567 shipped",                      # Amazon 3-7-7 order number
+    "order 112 1234567 1234567 shipped",
+    "ticket 4532015112830367",                                # 16 digits, Luhn fails
+    "ticket 4532 0151 1283 0367",
+    "sha 9f2c4532015112830366ab",                             # hex hash with a Luhn-valid digit run inside
+    "deadbeef4532015112830366 and 4532015112830366cafe",
+    "commit 4532015112830366a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "ts=1795828039000000",                                    # microsecond epoch: no network prefix
+    "4111 1111 1111 1111 cvc 123",                            # published sample number
+    "card 4242424242424242 exp 12/30",
+    "id 45320151128303661",                                   # 17 digits: not a card length
+])
+def test_false_positives_pass_untouched(text):
+    assert mask_card_numbers(text) == text
+
+
+def test_cvc_and_expiry_masked_on_same_and_next_two_lines():
+    text = f"card {VISA} cvc: 417\nExpiry: 08/29\nCVV2 = 417\nexp 09/30\nzip 93401"
+    assert mask_card_numbers(text) == (
+        "card XXXXXXXXXXXX0366 cvc: XXX\nExpiry: XX/XX\nCVV2 = XXX\nexp 09/30\nzip 93401")
+
+
+def test_cvc_needs_its_label_and_a_masked_number():
+    assert mask_card_numbers(f"card {VISA}\nqty 417") == "card XXXXXXXXXXXX0366\nqty 417"
+    assert mask_card_numbers("cvc: 417 exp 08/29") == "cvc: 417 exp 08/29"
+    assert mask_card_numbers("ticket 4532015112830367 cvc 417") == "ticket 4532015112830367 cvc 417"
+
+
+def test_json_encoded_form_fill_output():
+    """Route 1 shape: terminal output inside a JSON tool result, lines joined by the \\n escape."""
+    out = json.dumps({"output": f"filled #cardNumber={VISA}\ncardCvc=417\ncardExpiry=0829\nok", "exit_code": 0})
+    masked = mask_card_numbers(out)
+    assert VISA not in masked and "417" not in masked and "0829" not in masked
+    assert json.loads(masked)["output"] == "filled #cardNumber=XXXXXXXXXXXX0366\ncardCvc=XXX\ncardExpiry=XXXX\nok"
+
+
+def test_count_card_numbers_matches_the_hook_gate():
+    assert count_card_numbers(f"{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}") == 1
+    assert count_card_numbers("4111 1111 1111 1111") == 0
+    assert count_card_numbers("112-1234567-1234567") == 0
+    assert count_card_numbers("****  ****  ****  0366") == 0
+
+
+# ── route 1: terminal tool result ─────────────────────────────────────────────
+
+def test_terminal_result_is_masked_in_the_transcript_message():
+    content = json.dumps({"output": f"Card number: {VISA}\nCVC: 417", "exit_code": 0})
+    with _cfg():
+        msg = make_tool_result_message("terminal", content, "call_1")
+    assert VISA not in msg["content"] and "XXXXXXXXXXXX0366" in msg["content"]
+    assert "CVC: XXX" in msg["content"]
+
+
+def test_terminal_result_untouched_when_knob_off():
+    content = json.dumps({"output": f"Card number: {VISA}"})
+    with _cfg(mask_card_numbers_tool_results=False):
+        msg = make_tool_result_message("terminal", content, "call_1")
+    assert VISA in msg["content"]
+
+
+def test_result_without_card_is_byte_identical():
+    content = json.dumps({"output": "order 112-1234567-1234567\nsha 4532015112830366ab"})
+    with _cfg():
+        assert make_tool_result_message("terminal", content, "call_1")["content"] == content
+
+
+# ── route 2: image-read result (model wrote the number out of a screenshot) ───
+
+def test_image_read_result_is_masked():
+    content = json.dumps({"success": True, "analysis": f"The card reads {MC}, exp 11/28, CVC 913."})
+    with _cfg():
+        msg = make_tool_result_message("vision_analyze", content, "call_2")
+    assert MC not in msg["content"] and "XXXXXXXXXXXX2226" in msg["content"]
+    assert "exp XX/XX" in msg["content"] and "CVC XXX" in msg["content"]
+
+
+def test_multimodal_text_parts_and_summary_are_masked():
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    content = [{"type": "text", "text": f"Amex {AMEX}"}, image]
+    with _cfg():
+        msg = make_tool_result_message("browser_vision", content, "call_3",
+                                       multimodal_text_summary=f"summary {AMEX}")
+    flat = json.dumps(msg)
+    assert AMEX not in flat and "XXXXXXXXXXX2347" in flat
+    assert msg["content"] == [{"type": "text", "text": "Amex XXXXXXXXXXX2347"}, image]
+    assert msg["_multimodal_text_summary"] == "summary XXXXXXXXXXX2347"
+
+
+# ── route 3: inbound user message (separate switch, default off) ──────────────
+
+def _turn(user_message, **cfg):
+    from tests.agent.test_turn_context import _FakeAgent, _build
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+        if cfg:
+            with _cfg(**cfg):
+                return _build(_FakeAgent(), user_message=user_message)
+        return _build(_FakeAgent(), user_message=user_message)
+
+
+def test_user_message_unmasked_by_default():
+    assert redact_cards._KNOB_DEFAULTS["mask_card_numbers_user_messages"] is False
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["security"]["mask_card_numbers_user_messages"] is False
+    ctx = _turn(f"my cards: {VISA} and {MC}")
+    assert ctx.messages[-1]["content"] == f"my cards: {VISA} and {MC}"
+
+
+def test_user_message_masked_when_switched_on():
+    ctx = _turn(f"my cards: {VISA} and {MC}", mask_card_numbers_user_messages=True)
+    assert ctx.messages[-1]["content"] == "my cards: XXXXXXXXXXXX0366 and XXXXXXXXXXXX2226"
+
+
+def test_config_defaults_carry_all_three_knobs():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    sec = DEFAULT_CONFIG["security"]
+    assert sec["mask_card_numbers_tool_results"] is True
+    assert sec["browser_vision_card_ocr"] is True
+    for name, default in redact_cards._KNOB_DEFAULTS.items():
+        assert sec[name] is default
+
+
+# ── browser_vision screenshot OCR ─────────────────────────────────────────────
+
+def test_screenshot_refusal_uses_the_hook_gate_wording(tmp_path):
+    shot = tmp_path / "s.png"
+    shot.write_bytes(b"png")
+    with _cfg(), patch.object(redact_cards, "_ocr", return_value=(f"Card\n{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}", None)):
+        assert redact_cards.screenshot_card_refusal(shot) == CARD_IMAGE_REFUSAL
+    with _cfg(), patch.object(redact_cards, "_ocr", return_value=("Order 112-1234567-1234567", None)):
+        assert redact_cards.screenshot_card_refusal(shot) is None
+
+
+def test_screenshot_ocr_fails_open_and_obeys_its_knob(tmp_path, caplog):
+    shot = tmp_path / "s.png"
+    shot.write_bytes(b"png")
+    with _cfg(), patch.object(redact_cards, "_ocr", return_value=(None, "tesseract not installed")):
+        assert redact_cards.screenshot_card_refusal(shot) is None
+    assert "UNCHECKED" in caplog.text
+    with _cfg(browser_vision_card_ocr=False), patch.object(redact_cards, "_ocr") as ocr:
+        assert redact_cards.screenshot_card_refusal(shot) is None
+    ocr.assert_not_called()
+
+
+def test_screenshot_ocr_runs_the_real_subprocess_path(tmp_path):
+    """_ocr through a stand-in tesseract that echoes its stdin: a card in the 'image' refuses."""
+    fake = tmp_path / "tesseract"
+    fake.write_text("#!/bin/sh\ncat\n")
+    fake.chmod(0o755)
+    shot = tmp_path / "s.png"
+    shot.write_text(f"Card number\n{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}\n")
+    with _cfg(), patch.object(redact_cards, "TESSERACT", (str(fake),)):
+        assert redact_cards.screenshot_card_refusal(shot) == CARD_IMAGE_REFUSAL
+        shot.write_text("Order 112-1234567-1234567\n")
+        assert redact_cards.screenshot_card_refusal(shot) is None
+
+
+def _browser_vision(tmp_path, ocr_text):
+    from tools.browser_tool import browser_vision
+    shots_dir = tmp_path / "browser_screenshots"
+    shots_dir.mkdir()
+    shot = shots_dir / "shot.png"
+    shot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+    with (
+        patch("hermes_constants.get_hermes_dir", return_value=shots_dir),
+        patch("tools.browser_tool_lifecycle._cleanup_old_screenshots"),
+        patch("tools.browser_tool_session._run_browser_command",
+              return_value={"success": True, "data": {"path": str(shot)}}),
+        patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=False),
+        patch.object(redact_cards, "_ocr", return_value=(ocr_text, None)),
+        patch("tools.browser_tool_vision._analyze_screenshot_with_aux_llm", return_value="a checkout page") as aux,
+    ):
+        result = json.loads(browser_vision("what is on the page?", task_id="test"))
+    return result, aux
+
+
+def test_browser_vision_refuses_a_screenshot_with_a_card_before_any_model(tmp_path):
+    result, aux = _browser_vision(tmp_path, f"Pay with\n{MC[:4]} {MC[4:8]} {MC[8:12]} {MC[12:]}\n08/29")
+    aux.assert_not_called()
+    assert result.get("success") is not True
+    assert CARD_IMAGE_REFUSAL in json.dumps(result)
+    assert MC not in json.dumps(result)
+
+
+def test_browser_vision_without_a_card_reaches_the_model(tmp_path):
+    result, aux = _browser_vision(tmp_path, "Order 112-1234567-1234567 total $41.00")
+    aux.assert_called_once()
+    assert result["success"] is True and result["analysis"] == "a checkout page"

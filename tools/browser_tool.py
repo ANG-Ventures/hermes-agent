@@ -1287,6 +1287,12 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             effective_task_id, annotate, screenshot_path, _lp_prerouted)
         if error is not None:
             return error
+        # t_90c8b36c: the screenshot is taken here, after every pre-tool hook, so the image-read card gate
+        # cannot see it. OCR it locally and refuse before any model reads a full card number.
+        from agent.redact_cards import screenshot_card_refusal
+        refusal = screenshot_card_refusal(screenshot_path)
+        if refusal is not None:
+            return _dumps(_err(refusal))
         # Native image routing: attach the screenshot directly instead of describing it
         # through an aux vision LLM (no information loss).
         from tools.vision_tools import _should_use_native_vision_fast_path

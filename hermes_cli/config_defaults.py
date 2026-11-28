@@ -2078,6 +2078,13 @@ DEFAULT_CONFIG = {
         # dials them instead of rejecting them as private. Empty = normal private-address verdict.
         "fake_ip_ranges": [],
         "redact_secrets": True,
+        # Payment card numbers (t_90c8b36c, agent/redact_cards.py). Tool results: mask all but the last four
+        # before the result is stored or sent. User messages: the same mask on inbound text; off by default
+        # (it changes what the owner typed). browser_vision: OCR the screenshot locally and refuse one that
+        # shows a full card number. Set any of these false to turn that part off.
+        "mask_card_numbers_tool_results": True,
+        "mask_card_numbers_user_messages": False,
+        "browser_vision_card_ocr": True,
         # Persisted acknowledgement for unattended model overrides whose tier lets the vendor train
         # on prompts. The startup guard still warns every run; cost guards are unaffected.
         "allow_data_training_tiers_noninteractive": False,
