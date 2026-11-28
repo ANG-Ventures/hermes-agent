@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from agent.redact_cards import mask_card_numbers
+from agent.redact_cards import mask_reply_text
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.config import (
@@ -841,7 +841,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         True when the turn finished here (the run loop returns)."""
         # A card straddling a split is too short to match in either half: mask the whole buffer first.
         # Accepted limit (no hold-back buffer): a number still arriving at the split can leave 8 + 8 digits.
-        self._accumulated = mask_card_numbers(self._accumulated, json_quoting=False)
+        self._accumulated = mask_reply_text(self._accumulated)
         chunks = self._truncate_for_stream(self._accumulated, self._safe_limit, self._len_fn)
         if len(chunks) <= 1:
             # Malformed/legacy adapter result must still be splittable.
@@ -895,7 +895,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Existing message overflowing: seal it with the head, start a new message for the rest."""
         # A card straddling a split is too short to match in either half: mask the whole buffer first.
         # Accepted limit (no hold-back buffer): a number still arriving at the split can leave 8 + 8 digits.
-        self._accumulated = mask_card_numbers(self._accumulated, json_quoting=False)
+        self._accumulated = mask_reply_text(self._accumulated)
         while self._overflows() and self._message_id is not None and self._edit_supported:
             cp_budget = _custom_unit_to_cp(self._accumulated, self._safe_limit, self._len_fn)
             split_at = self._accumulated.rfind("\n", 0, cp_budget)
@@ -1095,7 +1095,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         t_abd83687) unless *mask* is False: every streamed edit and fallback send passes through it.
         """
         text = _BasePlatformAdapter.strip_media_directives_for_display(text)
-        return mask_card_numbers(text, json_quoting=False) if mask else text
+        return mask_reply_text(text) if mask else text
 
     def _silence_predicate(self):
         if not self.cfg.internal_event:

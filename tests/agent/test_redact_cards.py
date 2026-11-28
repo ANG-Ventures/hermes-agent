@@ -1274,6 +1274,29 @@ def test_final_reply_is_masked_at_the_send_boundary():
     assert all("XXXXXXXXXXXX0993" in s for s in sent)
 
 
+@pytest.mark.parametrize("security, masked", [({}, True), ({"mask_card_numbers_replies": False}, False)])
+def test_reply_mask_switch_mask_card_numbers_replies(security, masked):
+    """security.mask_card_numbers_replies: unset masks the final reply and streamed frames; false sends them
+    unchanged, with every other card switch left as it is."""
+    import asyncio
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    assert redact_cards._KNOB_DEFAULTS["mask_card_numbers_replies"] is True
+    sent = []
+    adapter = _final_adapter(sent)
+    event = MessageEvent(text="hi", message_type=MessageType.TEXT, message_id="in-1",
+                         source=adapter.build_source(chat_id="8", user_id="u1"))
+    with _cfg(**security):
+        asyncio.run(adapter.send_final_ledgered(event, "k", f"Your card is {DISC}.", {}, reply_to=None))
+        consumer = GatewayStreamConsumer(adapter, "8", StreamConsumerConfig(cursor=""))
+        asyncio.run(consumer._send_or_edit(f"streamed: {DISC}"))
+    assert len(sent) == 2
+    if masked:
+        assert sent[0] == f"Your card is {'X' * 12}{DISC[-4:]}." and DISC not in sent[1]
+    else:
+        assert sent[0] == f"Your card is {DISC}." and DISC in sent[1]
+
+
 def test_unlimited_tool_preview_is_uncut_and_masked_whole():
     """Path 3: tool_preview_length 0 stays unlimited (no cap): the whole 100 KB preview is masked, nothing
     is cut. Prism 2d50f75829e9: a long link keeps its full target."""

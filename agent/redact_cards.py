@@ -14,6 +14,8 @@ read from ``security.*`` in config.yaml:
 - ``security.mask_card_numbers_memory_capture`` (default true): the same mask on the turn's user text and
   reply as handed to external memory (``AIAgent._sync_external_memory_for_turn``), t_0171c33b. The stored
   transcript is not changed.
+- ``security.mask_card_numbers_replies`` (default true): ``mask_reply_text`` on the assistant's chat reply at
+  the send boundary (final send, reconciliation edit, streamed edits and overflow splits), t_abd83687.
 - ``security.browser_vision_card_ocr`` (default true): ``browser_vision`` OCRs its own screenshot locally and
   refuses with ``CARD_IMAGE_REFUSAL`` before any model sees a full card number. Same check and wording as the
   home repo's hook gate (``hooks/gate_card_image.py``), which covers local-file image reads.
@@ -341,6 +343,7 @@ _KNOB_DEFAULTS = {
     "mask_card_numbers_tool_results": True,
     "mask_card_numbers_user_messages": False,
     "mask_card_numbers_memory_capture": True,
+    "mask_card_numbers_replies": True,
     "browser_vision_card_ocr": True,
     "image_read_card_ocr": True,
 }
@@ -366,6 +369,13 @@ def mask_tool_result_content(content: Any) -> Any:
     if not card_knob("mask_card_numbers_tool_results"):
         return content
     return mask_card_numbers_in_content(content)
+
+
+def mask_reply_text(text: Any) -> Any:
+    """Chat-reply entry point (``security.mask_card_numbers_replies``): length-preserving, adds no characters."""
+    if not card_knob("mask_card_numbers_replies"):
+        return text
+    return mask_card_numbers(text, json_quoting=False)
 
 
 def mask_tool_display_value(value: Any) -> Any:

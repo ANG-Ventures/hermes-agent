@@ -5468,8 +5468,8 @@ class BasePlatformAdapter(ABC):
         delivery_adapter = self._final_delivery_adapter(event.source)
         # t_abd83687: the reply leaves the machine (and is ledgered for redelivery): mask card numbers
         # here, the last line of defence after the tool-result mask.
-        from agent.redact_cards import mask_card_numbers
-        text_content = mask_card_numbers(text_content, json_quoting=False)
+        from agent.redact_cards import mask_reply_text
+        text_content = mask_reply_text(text_content)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(

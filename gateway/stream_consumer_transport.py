@@ -11,7 +11,7 @@ import logging
 import time
 from typing import Any, Optional
 
-from agent.redact_cards import mask_card_numbers
+from agent.redact_cards import mask_reply_text
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from hermes_cli.observability.shared_metrics_gateway import stops_reply_clock
@@ -321,6 +321,7 @@ class StreamTransportMixin:
         send; a transport returns None to fall through to the next."""
         # Native and draft frames are append-only streams (Slack refuses a frame that rewrites sent
         # text): they go out unmasked; the edit and first-send paths below are masked (t_abd83687).
+        # Known limit (accepted 2026-11-28): a streamed Slack reply holding a card keeps the whole number here.
         text = self._clean_for_display(text, mask=False)
         # Stream-is-the-message draft frames must stay prefix-stable: a closing ```
         # on a mid-code-block frame makes frame N not a prefix of N+1 and the
@@ -361,7 +362,7 @@ class StreamTransportMixin:
                                         is_turn_final=is_turn_final)
             if ok is not None:
                 return ok
-        text = mask_card_numbers(text, json_quoting=False)
+        text = mask_reply_text(text)
         self._last_edit_overflowed = False
         try:
             if self._message_id is None:
