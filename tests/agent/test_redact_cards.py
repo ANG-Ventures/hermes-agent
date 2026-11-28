@@ -617,12 +617,29 @@ def test_mask_is_linear_and_matches_the_old_windowing():
     with patch.object(redact_cards, "_window", lambda text, s, e, breaks=None: _old_window(text, s, e)):
         old = mask_card_numbers(sample)
     assert old != sample and mask_card_numbers(sample) == old
-    big = _card_rows(20000, seed=8)
-    t0 = time.perf_counter()
-    out = mask_card_numbers(big)
-    elapsed = time.perf_counter() - t0
-    assert out.count("XXXXXXXXXXXX") == 20000
-    assert elapsed < 2.0, "20,000 card rows took %.1f s" % elapsed
+    assert mask_card_numbers(_card_rows(20000, seed=8)).count("XXXXXXXXXXXX") == 20000
+
+
+def _best_of_3(fn, arg):
+    import time
+    best = None
+    for _ in range(3):
+        t0 = time.perf_counter()
+        fn(arg)
+        took = time.perf_counter() - t0
+        best = took if best is None else min(best, took)
+    return best
+
+
+def _assert_scales_linearly(fn, small, big, what):
+    """Best of 3 at 4x the input under 10x the best of 3 at 1x (linear ~4x; the old quadratic code ~16x).
+    A ratio, not seconds: a loaded runner slows both sides (t_110f649d item 7)."""
+    t1, t4 = _best_of_3(fn, small), _best_of_3(fn, big)
+    assert t4 < 10 * t1, "%s: 4x input took %.1fx the time (%.3f s vs %.3f s)" % (what, t4 / t1, t4, t1)
+
+
+def test_card_rows_mask_scales_linearly():
+    _assert_scales_linearly(mask_card_numbers, _card_rows(5000, seed=8), _card_rows(20000, seed=8), "card rows")
 
 
 def test_masked_bare_json_numbers_in_arrays_and_at_the_root_stay_valid_json():
@@ -694,8 +711,8 @@ def test_array_quotes_only_for_number_tokens_outside_every_string():
     # Not JSON: no quotes (prose with a bracketed list, a bare number on a line of prose).
     assert mask_card_numbers("cards seen: [%s, %s]" % (VISA, VISA)) == "cards seen: [%s, %s]" % (m, m)
     assert mask_card_numbers("%s\nnext line" % VISA) == m + "\nnext line"
-    # A number token that is more than the card (a negative or a fraction) is left unquoted.
-    assert mask_card_numbers("[-%s]" % VISA) == "[-%s]" % m
+    # A number token that is more than the card (a negative or a fraction): the whole token is quoted.
+    assert json.loads(mask_card_numbers("[-%s]" % VISA)) == ["-" + m]
 
 
 def test_many_cards_on_one_line_mask_in_linear_time():
@@ -714,12 +731,22 @@ def test_many_cards_on_one_line_mask_in_linear_time():
     with patch.object(redact_cards, "_merge", lambda windows: windows):
         per_card = mask_card_numbers(sample)
     assert per_card != sample and mask_card_numbers(sample) == per_card
-    big = json.dumps(cards(20000))
-    t0 = time.perf_counter()
-    out = mask_card_numbers(big)
-    elapsed = time.perf_counter() - t0
+    out = mask_card_numbers(json.dumps(cards(20000)))
     assert len(json.loads(out)) == 20000 and out.count("XXXXXXXXXXXX") == 20000
-    assert elapsed < 3.0, "20,000 cards on one line took %.1f s" % elapsed
+
+
+def test_one_line_cards_mask_scales_linearly():
+    import random
+    rng = random.Random(11)
+
+    def cards(n):
+        out = []
+        while len(out) < n:
+            body = "4" + "".join(rng.choice("0123456789") for _ in range(14))
+            out.append(int(next(body + d for d in "0123456789" if luhn(body + d))))
+        return out
+    _assert_scales_linearly(mask_card_numbers, json.dumps(cards(5000)), json.dumps(cards(20000)),
+                            "cards on one line")
 
 
 # ── t_110f649d: the six paths PR 596 did not cover ───────────────────────────
@@ -1041,7 +1068,8 @@ def test_rejected_tool_name_in_a_synthetic_row_is_masked():
     rows = []
     with _cfg():
         _append_tool_error_results(rows, [call], lambda tc: "Error: unknown tool")
-    assert rows[0]["name"] == "XXXXXXXXXXXX0993"
+    # The whole name is a JSON number token, so the masker quotes it (PR 604); either way no digits remain.
+    assert DISC not in rows[0]["name"] and rows[0]["name"].strip('"') == "XXXXXXXXXXXX0993"
 
 
 def test_terminal_outer_loop_error_reply_is_masked():
@@ -1056,3 +1084,127 @@ def test_terminal_outer_loop_error_reply_is_masked():
             messages=messages, conversation_history=[], _turn_exit_reason=None, failed=False, final_response=None)
     text = json.dumps(out, default=str) + json.dumps(messages)
     assert DISC not in text and "XXXXXXXXXXXX0993" in text
+
+
+# ── t_110f649d operator send-back (#602 @aef821979e83) ──────────────────────
+
+
+def _split_disc(sep="\n"):
+    return sep.join((DISC[:4], DISC[4:8], DISC[8:12], DISC[12:]))
+
+
+_PROSE = "the order page shows a shipping form and a billing form with several fields to fill in. " * 27
+
+
+@pytest.mark.parametrize("prefix", ["\n" * 2048, "\n" * 4096, _PROSE], ids=["2048nl", "4096nl", "2.3KB-prose"])
+@pytest.mark.parametrize("mode", ["all", "verbose"])
+def test_split_card_anywhere_in_an_arg_is_masked_in_progress(prefix, mode):
+    """Prism 172d24d70731: the split-card check stopped at 2,048 characters; the compact preview collapses
+    whitespace and verbose progress dumps the args with escaped line breaks, both rejoining the card."""
+    import re
+    assert len(_PROSE) > 2300
+    tr, ctx = _runner()
+    ctx.tool_progress_enabled, ctx.progress_mode = True, mode
+    args = {"ref": "@e3", "text": prefix + _split_disc()}
+    with _cfg():
+        from agent.display import build_tool_preview
+        tr.progress_callback("tool.started", "browser_type", build_tool_preview("browser_type", args, max_len=0), args)
+    sent = _drain(ctx)
+    assert sent and DISC not in re.sub(r"\\\\[nrt]|\\[nrt]|\s", "", sent)
+    masked = redact_cards.mask_tool_display_value(args)
+    assert DISC not in re.sub(r"\s", "", json.dumps(masked)) and "XXXX XXXX XXXX 0993" in masked["text"]
+    assert args["text"].endswith(_split_disc()), "the dispatched args are never touched"
+
+
+def test_multi_line_command_without_a_card_keeps_its_line_breaks():
+    cmd = "\n".join("echo step %d done" % i for i in range(30))
+    with _cfg():
+        assert redact_cards.mask_tool_display_value({"command": cmd})["command"].count("\n") == 29
+
+
+def test_display_mask_scales_linearly_on_a_numeric_column():
+    """A 100 KB argument (a column of 4-digit numbers) against 25 KB: linear, not quadratic."""
+    import random
+    rng = random.Random(5)
+
+    def column(kb):
+        return {"content": "\n".join("%04d" % rng.randrange(10000) for _ in range(kb * 1024 // 5))}
+    with _cfg():
+        _assert_scales_linearly(redact_cards.mask_tool_display_value, column(25), column(100), "display column")
+
+
+def test_display_walker_masks_a_whole_number_float():
+    """Prism e5227933383e: an argument decoded from <card>.0 is a float; ints were masked, floats not."""
+    with _cfg():
+        out = redact_cards.mask_tool_display_value({"card": float(DISC), "price": 1234567890123456.0, "x": 1.5})
+    dumped = json.dumps(out)
+    assert DISC not in dumped and "XXXXXXXXXXXX0993" in dumped
+    assert out["price"] == 1234567890123456.0 and out["x"] == 1.5
+
+
+def test_terminal_error_reply_masks_before_the_clip():
+    """Prism 6c34937e0f11: short_detail clipped to 199 characters, then the mask missed a card cut at its
+    last digit and the chat reply kept 15 clear digits."""
+    from agent import turn_loop_errors
+    agent = SimpleNamespace(suppress_status_output=True, max_iterations=10, _safe_print=lambda *a, **k: None)
+    messages = [{"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]}]
+    exc = RuntimeError("a " * 92 + DISC + " declined")
+    assert len(str(exc)[:199]) == 199 and DISC[:15] in str(exc)[:199]
+    with _cfg(), patch("agent.conversation_loop._ra", return_value=SimpleNamespace(AIAgent=SimpleNamespace(
+            _get_tool_call_name_static=lambda tc: "web_search"))):
+        out = turn_loop_errors.handle_outer_loop_error(
+            agent, e=exc, _outer_error_count=0, api_call_count=9,
+            messages=messages, conversation_history=[], _turn_exit_reason=None, failed=False, final_response=None)
+    text = json.dumps(out, default=str) + json.dumps(messages)
+    assert DISC[:15] not in text and "XXXXXXXXXXXX" in text
+
+
+def test_codex_mcp_native_vision_meta_is_masked():
+    """Prism c5d4f1214b21: meta carries annotation labels (page text) and the caller's image_url."""
+    import sys
+    import types
+    from agent.transports import hermes_tools_mcp_server as srv
+    from tools.vision_tools import _build_native_vision_tool_result
+    handlers = {}
+
+    class _FakeMCP:
+        def __init__(self, *a, **k):
+            pass
+
+        def add_tool(self, fn, name=None, description=None):
+            handlers[name] = fn
+
+    defs = [{"type": "function", "function": {"name": "browser_vision", "parameters": {"type": "object",
+             "properties": {"question": {"type": "string"}}}}}]
+    fake_server = types.ModuleType("mcp.server")
+    fake_server.MCPServer = _FakeMCP
+    envelope = _build_native_vision_tool_result("https://shop.test/c/%s.png" % DISC, "what is on the page?",
+                                                "data:image/png;base64,AA", 2)
+    envelope["meta"]["annotations"] = [{"id": 1, "label": "Card %s" % DISC}]
+    with patch.dict(sys.modules, {"mcp": types.ModuleType("mcp"), "mcp.server": fake_server}), \
+            patch("model_tools.get_tool_definitions", return_value=defs), \
+            patch("model_tools.handle_function_call", return_value=envelope), _cfg():
+        srv._build_server()
+        out = handlers["browser_vision"](question="what is on the page?")
+    sent = json.dumps(out)
+    assert DISC not in sent and out["meta"]["annotations"][0]["label"] == "Card XXXXXXXXXXXX0993"
+    assert out["meta"]["size_bytes"] == 2 and out["content"][1] == envelope["content"][1]
+
+
+def test_colon_first_string_value_stays_valid_json():
+    """Prism 1aa4cb0d2a7a: '":<card>,' inside a top-level string looked like a key and got RAW quotes."""
+    doc = '{"output":":%s,approved","exit_code":0}' % DISC
+    assert json.loads(mask_card_numbers(doc)) == {"output": ":XXXXXXXXXXXX0993,approved", "exit_code": 0}
+    # A real key outside every string is still quoted.
+    assert json.loads(mask_card_numbers('{"card":%s,"ok":1}' % DISC)) == {"card": "XXXXXXXXXXXX0993", "ok": 1}
+
+
+@pytest.mark.parametrize("shape", ["[%s.0]", '{"n": %s.0}', "[-%s]"])
+def test_sign_and_fraction_on_a_bare_number_stay_valid_json(shape):
+    """Item 8: the quotes go around the whole number token (minus, fraction), card digits masked inside."""
+    doc = shape % DISC
+    json.loads(doc)
+    out = mask_card_numbers(doc)
+    assert DISC not in out
+    assert "XXXXXXXXXXXX0993" in json.dumps(json.loads(out))
+    assert mask_card_numbers("[%se5]" % DISC[:15]) == "[%se5]" % DISC[:15]  # exponent form: out of scope

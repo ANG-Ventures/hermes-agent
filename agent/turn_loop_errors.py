@@ -160,7 +160,8 @@ def handle_outer_loop_error(
         # card stops reading these as "unknown"/retryable. The deterministic local bug keeps
         # ``failed`` as it was (an incomplete, not failed, turn): flipping it made every such
         # child run a strike against the kanban dispatcher breaker.
-        detail = mask_tool_result_content(short_detail(e))
+        # Mask, then clip (Prism 6c34937e0f11): a clip first can cut a card's last digit and leave 15 clear.
+        detail = short_detail(mask_tool_result_content(str(e)).strip() or type(e).__name__)
         if _is_local_processing_error:
             _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
             final_response = site_copy("local_processing_error", detail=detail)
