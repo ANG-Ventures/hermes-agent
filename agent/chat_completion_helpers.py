@@ -28,7 +28,7 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
     FailoverReason, PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE, PROVIDER_STREAM_NON_JSON_ERROR_CODE,
-    _extract_status_code)
+    _extract_status_code, is_read_phase_stall)
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError, ProviderStreamParseError
 from agent.confab_notice import (
@@ -88,8 +88,8 @@ _CAPACITY_STATUS_CODES = frozenset({429, 503, 529})
 
 def _relay_or_capacity_5xx(e: Exception, status: int) -> bool:
     """True when a pre-delta 5xx is a stated capacity / relay answer, not an opaque crash:
-    a capacity status, any relay error class or hop (headers or body), or the relay's 504
-    ``upstream attempt timed out``. The non-streaming unmask re-send has nothing to surface
+    a capacity status, any relay error class or hop (headers or body keys), or a 504 read-phase
+    stall as the error classifier defines it. The non-streaming unmask re-send has nothing to surface
     there (t_17b7602b: 0 of 117 re-sends found a 4xx; one hid a 503 for 120 s). Never raises."""
     if status in _CAPACITY_STATUS_CODES:
         return True
@@ -98,12 +98,17 @@ def _relay_or_capacity_5xx(e: Exception, status: int) -> bool:
         hdrs = {str(k).lower(): v for k, v in dict(hdrs).items()}
         if any(str(hdrs.get(k) or "").strip() for k in ("x-relay-error-class", "x-relay-error-hop")):
             return True
-        # The openai SDK keeps only body["error"] when that key exists, so the full relay
-        # body survives only in the exception text: read both.
-        text = f"{e} {getattr(e, 'body', '')}".lower()
-        if "relay_error_class" in text or "relay_error_hop" in text:
+        # The openai SDK keeps only body["error"] when that key exists, so read the real keys of
+        # both the full response JSON and the SDK body; never a substring of the values.
+        bodies = [getattr(e, "body", None)]
+        try:
+            bodies.append(e.response.json())
+        except Exception:  # noqa: BLE001
+            pass
+        if any(isinstance(b, dict) and (b.get("relay_error_class") or b.get("relay_error_hop"))
+               for b in bodies):
             return True
-        return status == 504 and "upstream attempt timed out" in text
+        return status == 504 and is_read_phase_stall(e)
     except Exception:  # noqa: BLE001
         return False
 
