@@ -680,7 +680,9 @@ class GatewayBusySessionMixin:
 
     def _steer_running_agent(self, running_agent: Any, text: str, *, event: Any, internal: bool = False) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
-        :meth:`_steer_active_subagents`); True when the parent or any child queued it.
+        :meth:`_steer_active_subagents`); True when the parent queued it. A parent that refused (its turn
+        made its last drain, t_2b16f0e6) gets no fan-out and returns False, so the caller queues the text
+        as the next turn: a child still attached then belongs to an abandoned delegation (t_3ae2c201).
 
         Every accepted steer is recorded ON THE AGENT as a buffer entry with its provenance, so it
         follows the text to whichever turn drains it (see :func:`leftover_steer_is_internal`), never to
@@ -688,7 +690,9 @@ class GatewayBusySessionMixin:
         message being steered (its inbound record rides the entry to the steer row, t_b8fbfc54); pass
         ``event=None`` only for a steer no platform message produced."""
         accepted = steer_with_provenance(running_agent, running_agent.steer, text, internal=internal, event=event)
-        return bool(self._steer_active_subagents(running_agent, text)) or accepted
+        if accepted:
+            self._steer_active_subagents(running_agent, text)
+        return accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
         """True when a compression lock is held for this session's id (callers demote interrupt →
