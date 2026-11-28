@@ -1249,6 +1249,7 @@ def stash_api_error(agent: Any, api_error: BaseException,
             "text": msg[:2000],
             "headers": {k: v for k, v in headers.items()
                         if k in ("x-relay-error-class", "x-relay-error-hop",
+                                 "x-relay-error-cause",
                                  "x-relay-quota-window",
                                  "x-relay-seat", "x-pool-served-by",
                                  "x-pool-unreachable",

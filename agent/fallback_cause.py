@@ -239,9 +239,37 @@ def cause_text(agent: Any, cause: "FailoverCause") -> str:
     if cause.seat:
         text += f" on {cause.seat}"
     if cause.http_status:
-        text += f" (Anthropic {cause.http_status})" if str(cause.lane or "").startswith("claude-") \
-            else f" (HTTP {cause.http_status})"
+        ours = _our_hop_status(ev, cause.http_status)
+        if ours:
+            text += f", {ours}"
+        else:
+            text += f" (Anthropic {cause.http_status})" if str(cause.lane or "").startswith("claude-") \
+                else f" (HTTP {cause.http_status})"
     return text
+
+
+# Hops whose status is the provider's own answer; every other stated hop is ours.
+_UPSTREAM_HOPS = frozenset({"bridge->upstream", "bridge→anthropic", "proxy→anthropic",
+                            "cli→anthropic"})
+_OUR_HOP_NAMES = {"front": "lane door"}
+
+
+def _our_hop_status(ev: Dict[str, Any], status: Any) -> Optional[str]:
+    """``lane door 503 (local_unavailable)`` when the relay states the status came
+    from one of OUR hops (front, relay, bridge, ...), else None (t_c5cddd09: the
+    lane door's canned 503 rendered "(Anthropic 503)" though Anthropic never answered)."""
+    h = ev.get("headers") if isinstance(ev.get("headers"), dict) else {}
+    body = ev.get("body") if isinstance(ev.get("body"), dict) else {}
+    inner = body.get("error") if isinstance(body.get("error"), dict) else {}
+    hop = str(h.get("x-relay-error-hop") or body.get("relay_error_hop")
+              or inner.get("relay_error_hop") or "").strip()
+    if not hop or hop.lower() in _UPSTREAM_HOPS:
+        return None
+    why = (h.get("x-relay-error-cause") or body.get("relay_error_cause")
+           or inner.get("relay_error_cause")
+           or (body.get("error") if isinstance(body.get("error"), str) else None))
+    name = _OUR_HOP_NAMES.get(hop.lower(), hop.replace("->", "→"))
+    return f"{name} {status}" + (f" ({str(why).strip()})" if why and str(why).strip() else "")
 
 
 def wait_notice(agent: Any, now_mono: Optional[float] = None) -> Optional[str]:
