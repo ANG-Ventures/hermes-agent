@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import shlex
+
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -615,12 +617,29 @@ def test_mask_is_linear_and_matches_the_old_windowing():
     with patch.object(redact_cards, "_window", lambda text, s, e, breaks=None: _old_window(text, s, e)):
         old = mask_card_numbers(sample)
     assert old != sample and mask_card_numbers(sample) == old
-    big = _card_rows(20000, seed=8)
-    t0 = time.perf_counter()
-    out = mask_card_numbers(big)
-    elapsed = time.perf_counter() - t0
-    assert out.count("XXXXXXXXXXXX") == 20000
-    assert elapsed < 2.0, "20,000 card rows took %.1f s" % elapsed
+    assert mask_card_numbers(_card_rows(20000, seed=8)).count("XXXXXXXXXXXX") == 20000
+
+
+def _best_of_3(fn, arg):
+    import time
+    best = None
+    for _ in range(3):
+        t0 = time.perf_counter()
+        fn(arg)
+        took = time.perf_counter() - t0
+        best = took if best is None else min(best, took)
+    return best
+
+
+def _assert_scales_linearly(fn, small, big, what):
+    """Best of 3 at 4x the input under 10x the best of 3 at 1x (linear ~4x; the old quadratic code ~16x).
+    A ratio, not seconds: a loaded runner slows both sides (t_110f649d item 7)."""
+    t1, t4 = _best_of_3(fn, small), _best_of_3(fn, big)
+    assert t4 < 10 * t1, "%s: 4x input took %.1fx the time (%.3f s vs %.3f s)" % (what, t4 / t1, t4, t1)
+
+
+def test_card_rows_mask_scales_linearly():
+    _assert_scales_linearly(mask_card_numbers, _card_rows(5000, seed=8), _card_rows(20000, seed=8), "card rows")
 
 
 def test_masked_bare_json_numbers_in_arrays_and_at_the_root_stay_valid_json():
@@ -692,8 +711,8 @@ def test_array_quotes_only_for_number_tokens_outside_every_string():
     # Not JSON: no quotes (prose with a bracketed list, a bare number on a line of prose).
     assert mask_card_numbers("cards seen: [%s, %s]" % (VISA, VISA)) == "cards seen: [%s, %s]" % (m, m)
     assert mask_card_numbers("%s\nnext line" % VISA) == m + "\nnext line"
-    # A number token that is more than the card (a negative or a fraction) is left unquoted.
-    assert mask_card_numbers("[-%s]" % VISA) == "[-%s]" % m
+    # A number token that is more than the card (a negative or a fraction): the whole token is quoted.
+    assert json.loads(mask_card_numbers("[-%s]" % VISA)) == ["-" + m]
 
 
 def test_many_cards_on_one_line_mask_in_linear_time():
@@ -712,9 +731,480 @@ def test_many_cards_on_one_line_mask_in_linear_time():
     with patch.object(redact_cards, "_merge", lambda windows: windows):
         per_card = mask_card_numbers(sample)
     assert per_card != sample and mask_card_numbers(sample) == per_card
-    big = json.dumps(cards(20000))
-    t0 = time.perf_counter()
-    out = mask_card_numbers(big)
-    elapsed = time.perf_counter() - t0
+    out = mask_card_numbers(json.dumps(cards(20000)))
     assert len(json.loads(out)) == 20000 and out.count("XXXXXXXXXXXX") == 20000
-    assert elapsed < 3.0, "20,000 cards on one line took %.1f s" % elapsed
+
+
+def test_one_line_cards_mask_scales_linearly():
+    import random
+    rng = random.Random(11)
+
+    def cards(n):
+        out = []
+        while len(out) < n:
+            body = "4" + "".join(rng.choice("0123456789") for _ in range(14))
+            out.append(int(next(body + d for d in "0123456789" if luhn(body + d))))
+        return out
+    _assert_scales_linearly(mask_card_numbers, json.dumps(cards(5000)), json.dumps(cards(20000)),
+                            "cards on one line")
+
+
+# ── t_110f649d: the six paths PR 596 did not cover ───────────────────────────
+# Made-up Luhn-valid Discover number for this block (last four 0993, not 1120).
+DISC = "6011000990130993"
+
+
+def test_disc_fixture_is_luhn_valid_and_masked():
+    assert luhn(DISC) and DISC not in redact_cards.PLACEHOLDERS and not DISC.endswith("1120")
+    assert mask_card_numbers(f"card {DISC}") == "card XXXXXXXXXXXX0993"
+
+
+def _camofox_vision(tmp_path, ocr_text):
+    from tools import browser_camofox
+    shot = tmp_path / "camofox.png"
+    llm = []
+    with (
+        _cfg(),
+        patch.object(browser_camofox, "_require_tab", return_value=({"tab_id": "t", "user_id": "u"}, None)),
+        patch.object(browser_camofox, "_get_raw", return_value=SimpleNamespace(content=b"\x89PNG")),
+        patch.object(browser_camofox, "_save_screenshot", side_effect=lambda c: (shot.write_bytes(c), str(shot))[1]),
+        patch.object(redact_cards, "_ocr", return_value=(ocr_text, None)),
+        patch("agent.auxiliary_client.call_llm", side_effect=lambda **kw: llm.append(kw) or SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="a checkout page"))])),
+    ):
+        result = json.loads(browser_camofox.camofox_vision("what is on the page?", task_id="test"))
+    return result, llm
+
+
+def test_camofox_vision_refuses_a_card_screenshot_before_any_model(tmp_path):
+    """Path 1: browser_vision in camofox mode returns before browser_tool's OCR; camofox_vision checks itself."""
+    result, llm = _camofox_vision(tmp_path, f"Pay with\n{DISC[:4]} {DISC[4:8]} {DISC[8:12]} {DISC[12:]}")
+    assert llm == []
+    assert result.get("success") is False and CARD_IMAGE_REFUSAL in json.dumps(result)
+    result, llm = _camofox_vision(tmp_path, "Order 112-1234567-1234567")
+    assert len(llm) == 1 and result["success"] is True
+
+
+def test_gateway_progress_preview_and_args_are_masked():
+    """Path 2: tool.started preview/args become a chat message on a third-party service."""
+    import queue
+    from gateway.config import Platform
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+    ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform=Platform.DISCORD), progress_queue=queue.Queue(),
+                      _run_still_current=lambda: True)
+    ctx.tool_progress_enabled, ctx.progress_mode = True, "verbose"
+    tr = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda source: None, _session_initiated_restart={}), ctx)
+    with _cfg():
+        tr.progress_callback("tool.started", "browser_type", f"type {DISC}", {"ref": "@e3", "text": DISC})
+        tr.progress_callback("tool.started", "web_search", f"q {DISC}", None)
+    sent = []
+    while not ctx.progress_queue.empty():
+        sent.append(str(ctx.progress_queue.get()))
+    assert sent and DISC not in "".join(sent)
+    assert "XXXXXXXXXXXX0993" in "".join(sent)
+
+
+def test_synthetic_error_tool_rows_are_masked():
+    """Path 3: the validation/mixed-batch rows (one helper) and the outer-loop error rows."""
+    from agent.turn_tool_validation import _append_tool_error_results
+    call = SimpleNamespace(id="call-1", type="function", function=SimpleNamespace(name="web_search", arguments="{}"))
+    rows = []
+    with _cfg():
+        _append_tool_error_results(rows, [call], lambda tc: f"Error: bad args {DISC}")
+    assert rows[0]["content"] == "Error: bad args XXXXXXXXXXXX0993"
+
+    from agent import turn_loop_errors
+    agent = SimpleNamespace(suppress_status_output=True, max_iterations=10, _safe_print=lambda *a, **k: None)
+    messages = [{"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]}]
+    with _cfg():
+        try:
+            turn_loop_errors.handle_outer_loop_error(
+                agent, e=RuntimeError(f"provider echoed {DISC}"), _outer_error_count=0, api_call_count=1,
+                messages=messages, conversation_history=[], _turn_exit_reason=None, failed=False, final_response=None)
+        except Exception:
+            pass  # only the synthetic row matters here; the rest of the handler needs a real agent
+    tool_rows = [m for m in messages if m.get("role") == "tool"]
+    assert tool_rows and DISC not in tool_rows[0]["content"] and "XXXXXXXXXXXX0993" in tool_rows[0]["content"]
+
+
+def test_multimodal_text_part_is_masked_before_it_spills():
+    """Path 4: _persist_multimodal_text_parts writes text parts to disk; the mask runs first."""
+    from agent.tool_executor import _persist_multimodal_text_parts
+    spilled = []
+
+    def persist(**kw):
+        spilled.append(kw["content"])
+        return "<spilled to /tmp/x>"
+
+    envelope = {"content": [{"type": "text", "text": f"stdout card {DISC}"}, {"type": "image_url", "image_url": {}}]}
+    budget = SimpleNamespace(resolve_threshold=lambda name: 10)
+    with _cfg(), patch("agent.tool_executor.maybe_persist_tool_result", side_effect=persist):
+        out = _persist_multimodal_text_parts(envelope, "browser_exec", "call-1", None, budget)
+    assert spilled == ["stdout card XXXXXXXXXXXX0993"]
+    assert out["content"][0]["text"] == "<spilled to /tmp/x>"
+    # Masked but under the threshold (no spill): the part still carries the masked text.
+    with _cfg(), patch("agent.tool_executor.maybe_persist_tool_result", side_effect=lambda **kw: kw["content"]):
+        out = _persist_multimodal_text_parts(envelope, "browser_exec", "call-1", None, budget)
+    assert out["content"][0]["text"] == "stdout card XXXXXXXXXXXX0993"
+
+
+def test_submit_row_adoption_does_not_rewrite_the_card_back(tmp_path):
+    """Path 5 (Prism e847bb92b9cf): the row written masked must not be rewritten unmasked at adoption."""
+    from contextlib import contextmanager
+    from tui_gateway import session_workdir
+    rewrites = []
+
+    class _DB:
+        def append_message(self, target, role, content=None, **kw):
+            return 7
+
+        def set_user_message_content(self, key, row_id, content):
+            rewrites.append(content)
+
+    @contextmanager
+    def _db(_session):
+        yield _DB()
+
+    agent = SimpleNamespace(_pending_cli_user_message=None)
+    raw = f"card {DISC}"
+    with patch.object(session_workdir, "_session_db", _db), \
+            patch.object(session_workdir, "_submit_row_target_key", lambda s: "k"), \
+            _cfg(mask_card_numbers_user_messages=True):
+        session = {"session_key": "k"}
+        session_workdir._persist_submit_user_row(session, raw, None)
+        session_workdir._adopt_submit_user_row(session, agent, raw, raw)
+        session_workdir._persist_submit_user_row(session, raw, None)
+        session_workdir._adopt_submit_user_row(session, agent, f"@file expanded\n{raw}", raw)
+    assert rewrites == ["@file expanded\ncard XXXXXXXXXXXX0993"]
+    assert agent._pending_cli_user_message["content"] == "@file expanded\ncard XXXXXXXXXXXX0993"
+
+
+def test_codex_mcp_tool_results_are_masked():
+    """Path 6 (Prism 875afa3a8d9a): hermes-tools MCP results reach Codex without make_tool_result_message."""
+    import sys
+    import types
+    from agent.transports import hermes_tools_mcp_server as srv
+    handlers = {}
+
+    class _FakeMCP:
+        def __init__(self, *a, **k):
+            pass
+
+        def add_tool(self, fn, name=None, description=None):
+            handlers[name] = fn
+
+    defs = [{"type": "function", "function": {"name": "vision_analyze", "parameters": {"type": "object", "properties": {
+        "question": {"type": "string"}}}}}]
+    fake_server = types.ModuleType("mcp.server")
+    fake_server.MCPServer = _FakeMCP
+    with patch.dict(sys.modules, {"mcp": types.ModuleType("mcp"), "mcp.server": fake_server}), \
+            patch("model_tools.get_tool_definitions", return_value=defs), \
+            patch("model_tools.handle_function_call", return_value=json.dumps({"analysis": f"card {DISC}"})), _cfg():
+        srv._build_server()
+        out = handlers["vision_analyze"](question="what card?")
+    assert DISC not in out and "XXXXXXXXXXXX0993" in out
+
+
+# ── t_110f649d Prism round 1 (#602 @862329a1d80d) ────────────────────────────
+
+
+def _runner(platform_name="DISCORD"):
+    import queue
+    from gateway.config import Platform
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+    ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform=getattr(Platform, platform_name)),
+                      progress_queue=queue.Queue(), _run_still_current=lambda: True)
+    runner = SimpleNamespace(_delivery_adapter_for=lambda source: None, _session_initiated_restart={},
+                             _deliver_platform_notice=lambda source, line: line)
+    return TurnRunner(runner, ctx), ctx
+
+
+def _drain(ctx):
+    sent = []
+    while not ctx.progress_queue.empty():
+        sent.append(json.dumps(ctx.progress_queue.get(), default=str))
+    return "".join(sent)
+
+
+def test_slack_native_task_card_title_is_masked():
+    """Prism 119a6de996ea: native task cards build their title from args in tool_start_callback."""
+    tr, ctx = _runner("SLACK")
+    with _cfg():
+        tr.native_tool_start_callback("call-1", "browser_type", {"ref": "@e3", "text": DISC})
+    sent = _drain(ctx)
+    assert sent and DISC not in sent and "XXXXXXXXXXXX0993" in sent
+
+
+def test_compact_progress_does_not_rejoin_a_line_split_card():
+    """Prism edad8432494d: the preview collapses newlines, which rejoins a card the per-line mask missed."""
+    split = "\n".join((DISC[:4], DISC[4:8], DISC[8:12], DISC[12:]))
+    joined = " ".join((DISC[:4], DISC[4:8], DISC[8:12], DISC[12:]))
+    tr, ctx = _runner()
+    ctx.tool_progress_enabled, ctx.progress_mode = True, "all"
+    with _cfg():
+        args = {"ref": "@e3", "text": split}
+        from agent.display import build_tool_preview
+        tr.progress_callback("tool.started", "browser_type", build_tool_preview("browser_type", args), args)
+    sent = _drain(ctx)
+    assert sent and joined not in sent and "XXXX XXXX XXXX 0993" in sent
+
+
+def test_subagent_failure_notice_masks_goal_and_summary():
+    """Prism 3313bd690cea: the failure notice prefers kwargs summary over preview and renders the goal."""
+    tr, ctx = _runner()
+    notices = []
+    tr._schedule = lambda line, _msg: notices.append(line)
+    with _cfg(), patch("gateway.warning_notifications.warning_notifications_enabled", return_value=True):
+        tr.progress_callback("subagent.complete", preview=f"card {DISC}", status="failed",
+                             summary=f"card {DISC}", goal=f"pay with {DISC}")
+    assert notices and DISC not in "".join(notices) and "XXXXXXXXXXXX0993" in "".join(notices)
+
+
+def test_codex_mcp_exception_response_is_masked():
+    """Prism c5d4f1214b21: the except branch serializes str(exc) without the result mask."""
+    import sys
+    import types
+    from agent.transports import hermes_tools_mcp_server as srv
+    handlers = {}
+
+    class _FakeMCP:
+        def __init__(self, *a, **k):
+            pass
+
+        def add_tool(self, fn, name=None, description=None):
+            handlers[name] = fn
+
+    defs = [{"type": "function", "function": {"name": "vision_analyze", "parameters": {"type": "object", "properties": {
+        "question": {"type": "string"}}}}}]
+    fake_server = types.ModuleType("mcp.server")
+    fake_server.MCPServer = _FakeMCP
+    with patch.dict(sys.modules, {"mcp": types.ModuleType("mcp"), "mcp.server": fake_server}), \
+            patch("model_tools.get_tool_definitions", return_value=defs), \
+            patch("model_tools.handle_function_call", side_effect=RuntimeError(f"vision echoed card {DISC}")), _cfg():
+        srv._build_server()
+        out = handlers["vision_analyze"](question="what card?")
+    assert DISC not in out and "XXXXXXXXXXXX0993" in out
+
+
+def test_camofox_annotated_vision_masks_the_accessibility_tree(tmp_path):
+    """Prism ee28670894fb: annotate=True sends the page's accessibility text along with the screenshot."""
+    from tools import browser_camofox
+    shot = tmp_path / "camofox.png"
+    llm = []
+    with (
+        _cfg(),
+        patch.object(browser_camofox, "_require_tab", return_value=({"tab_id": "t", "user_id": "u"}, None)),
+        patch.object(browser_camofox, "_get_raw", return_value=SimpleNamespace(content=b"\x89PNG")),
+        patch.object(browser_camofox, "_save_screenshot", side_effect=lambda c: (shot.write_bytes(c), str(shot))[1]),
+        patch.object(browser_camofox, "_snapshot_data", return_value={"snapshot": f'textbox "Payment number": {DISC}'}),
+        patch.object(redact_cards, "_ocr", return_value=("Checkout", None)),
+        patch("agent.auxiliary_client.call_llm", side_effect=lambda **kw: llm.append(kw) or SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="a checkout page"))])),
+    ):
+        browser_camofox.camofox_vision("What is on this page?", annotate=True, task_id="test")
+    sent = json.dumps(llm)
+    assert len(llm) == 1 and DISC not in sent and "XXXXXXXXXXXX0993" in sent
+
+
+# ── t_110f649d Prism round 2 (#602 @cd0fa7c7f80a) ────────────────────────────
+
+
+def test_progress_callback_never_scans_a_completed_tool_result():
+    """Prism edad8432494d: tool.completed carries the raw result, which no progress path renders."""
+    tr, ctx = _runner()
+    scanned = []
+    real = redact_cards.mask_card_numbers
+    with _cfg(), patch.object(redact_cards, "mask_card_numbers", side_effect=lambda t: scanned.append(t) or real(t)):
+        tr.progress_callback("tool.completed", "terminal", None, None, duration=1.0, is_error=False,
+                             result=f"stdout card {DISC}")
+    assert not any(DISC in t for t in scanned)
+
+
+def test_verbose_progress_masks_a_card_given_as_a_json_integer():
+    """Prism 172d24d70731: the display walker skipped ints; verbose progress prints the args JSON."""
+    tr, ctx = _runner()
+    ctx.tool_progress_enabled, ctx.progress_mode = True, "verbose"
+    with _cfg():
+        tr.progress_callback("tool.started", "mcp_checkout_pay", "pay", {"card": int(DISC), "qty": 1234567890123456})
+    sent = _drain(ctx)
+    assert sent and DISC not in sent and "XXXXXXXXXXXX0993" in sent and "1234567890123456" in sent
+
+
+def test_codex_mcp_native_vision_envelope_is_masked():
+    """Prism c5d4f1214b21: native vision_analyze returns a dict envelope whose text part echoes the question."""
+    import sys
+    import types
+    from agent.transports import hermes_tools_mcp_server as srv
+    from tools.vision_tools import _build_native_vision_tool_result
+    handlers = {}
+
+    class _FakeMCP:
+        def __init__(self, *a, **k):
+            pass
+
+        def add_tool(self, fn, name=None, description=None):
+            handlers[name] = fn
+
+    defs = [{"type": "function", "function": {"name": "vision_analyze", "parameters": {"type": "object", "properties": {
+        "question": {"type": "string"}}}}}]
+    fake_server = types.ModuleType("mcp.server")
+    fake_server.MCPServer = _FakeMCP
+    envelope = _build_native_vision_tool_result("x.png", f"is {DISC} on it?", "data:image/png;base64,AA", 2)
+    with patch.dict(sys.modules, {"mcp": types.ModuleType("mcp"), "mcp.server": fake_server}), \
+            patch("model_tools.get_tool_definitions", return_value=defs), \
+            patch("model_tools.handle_function_call", return_value=envelope), _cfg():
+        srv._build_server()
+        out = handlers["vision_analyze"](question="what card?")
+    sent = json.dumps(out)
+    assert DISC not in sent and "XXXXXXXXXXXX0993" in sent and out["_multimodal"] is True
+
+
+def test_rejected_tool_name_in_a_synthetic_row_is_masked():
+    """Prism 771038845f0e: the error row copied the model-supplied (invalid) tool name verbatim."""
+    from agent.turn_tool_validation import _append_tool_error_results
+    call = SimpleNamespace(id="call-1", type="function", function=SimpleNamespace(name=DISC, arguments="{}"))
+    rows = []
+    with _cfg():
+        _append_tool_error_results(rows, [call], lambda tc: "Error: unknown tool")
+    # The whole name is a JSON number token, so the masker quotes it (PR 604); either way no digits remain.
+    assert DISC not in rows[0]["name"] and rows[0]["name"].strip('"') == "XXXXXXXXXXXX0993"
+
+
+def test_terminal_outer_loop_error_reply_is_masked():
+    """Prism f50f62a3c37b: the terminal branch's chat reply and exit reason came from the raw exception."""
+    from agent import turn_loop_errors
+    agent = SimpleNamespace(suppress_status_output=True, max_iterations=10, _safe_print=lambda *a, **k: None)
+    messages = [{"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]}]
+    with _cfg(), patch("agent.conversation_loop._ra", return_value=SimpleNamespace(AIAgent=SimpleNamespace(
+            _get_tool_call_name_static=lambda tc: "web_search"))):
+        out = turn_loop_errors.handle_outer_loop_error(
+            agent, e=RuntimeError(f"provider echoed {DISC}"), _outer_error_count=0, api_call_count=9,
+            messages=messages, conversation_history=[], _turn_exit_reason=None, failed=False, final_response=None)
+    text = json.dumps(out, default=str) + json.dumps(messages)
+    assert DISC not in text and "XXXXXXXXXXXX0993" in text
+
+
+# ── t_110f649d operator send-back (#602 @aef821979e83) ──────────────────────
+
+
+def _split_disc(sep="\n"):
+    return sep.join((DISC[:4], DISC[4:8], DISC[8:12], DISC[12:]))
+
+
+_PROSE = "the order page shows a shipping form and a billing form with several fields to fill in. " * 27
+
+
+@pytest.mark.parametrize("prefix", ["\n" * 2048, "\n" * 4096, _PROSE], ids=["2048nl", "4096nl", "2.3KB-prose"])
+@pytest.mark.parametrize("mode", ["all", "verbose"])
+def test_split_card_anywhere_in_an_arg_is_masked_in_progress(prefix, mode):
+    """Prism 172d24d70731: the split-card check stopped at 2,048 characters; the compact preview collapses
+    whitespace and verbose progress dumps the args with escaped line breaks, both rejoining the card."""
+    import re
+    assert len(_PROSE) > 2300
+    tr, ctx = _runner()
+    ctx.tool_progress_enabled, ctx.progress_mode = True, mode
+    args = {"ref": "@e3", "text": prefix + _split_disc()}
+    with _cfg():
+        from agent.display import build_tool_preview
+        tr.progress_callback("tool.started", "browser_type", build_tool_preview("browser_type", args, max_len=0), args)
+    sent = _drain(ctx)
+    assert sent and DISC not in re.sub(r"\\\\[nrt]|\\[nrt]|\s", "", sent)
+    masked = redact_cards.mask_tool_display_value(args)
+    assert DISC not in re.sub(r"\s", "", json.dumps(masked)) and "XXXX XXXX XXXX 0993" in masked["text"]
+    assert args["text"].endswith(_split_disc()), "the dispatched args are never touched"
+
+
+def test_multi_line_command_without_a_card_keeps_its_line_breaks():
+    cmd = "\n".join("echo step %d done" % i for i in range(30))
+    with _cfg():
+        assert redact_cards.mask_tool_display_value({"command": cmd})["command"].count("\n") == 29
+
+
+def test_display_mask_scales_linearly_on_a_numeric_column():
+    """A 100 KB argument (a column of 4-digit numbers) against 25 KB: linear, not quadratic."""
+    import random
+    rng = random.Random(5)
+
+    def column(kb):
+        return {"content": "\n".join("%04d" % rng.randrange(10000) for _ in range(kb * 1024 // 5))}
+    with _cfg():
+        _assert_scales_linearly(redact_cards.mask_tool_display_value, column(25), column(100), "display column")
+
+
+def test_display_walker_masks_a_whole_number_float():
+    """Prism e5227933383e: an argument decoded from <card>.0 is a float; ints were masked, floats not."""
+    with _cfg():
+        out = redact_cards.mask_tool_display_value({"card": float(DISC), "price": 1234567890123456.0, "x": 1.5})
+    dumped = json.dumps(out)
+    assert DISC not in dumped and "XXXXXXXXXXXX0993" in dumped
+    assert out["price"] == 1234567890123456.0 and out["x"] == 1.5
+
+
+def test_terminal_error_reply_masks_before_the_clip():
+    """Prism 6c34937e0f11: short_detail clipped to 199 characters, then the mask missed a card cut at its
+    last digit and the chat reply kept 15 clear digits."""
+    from agent import turn_loop_errors
+    agent = SimpleNamespace(suppress_status_output=True, max_iterations=10, _safe_print=lambda *a, **k: None)
+    messages = [{"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]}]
+    exc = RuntimeError("a " * 92 + DISC + " declined")
+    assert len(str(exc)[:199]) == 199 and DISC[:15] in str(exc)[:199]
+    with _cfg(), patch("agent.conversation_loop._ra", return_value=SimpleNamespace(AIAgent=SimpleNamespace(
+            _get_tool_call_name_static=lambda tc: "web_search"))):
+        out = turn_loop_errors.handle_outer_loop_error(
+            agent, e=exc, _outer_error_count=0, api_call_count=9,
+            messages=messages, conversation_history=[], _turn_exit_reason=None, failed=False, final_response=None)
+    text = json.dumps(out, default=str) + json.dumps(messages)
+    assert DISC[:15] not in text and "XXXXXXXXXXXX" in text
+
+
+def test_codex_mcp_native_vision_meta_is_masked():
+    """Prism c5d4f1214b21: meta carries annotation labels (page text) and the caller's image_url."""
+    import sys
+    import types
+    from agent.transports import hermes_tools_mcp_server as srv
+    from tools.vision_tools import _build_native_vision_tool_result
+    handlers = {}
+
+    class _FakeMCP:
+        def __init__(self, *a, **k):
+            pass
+
+        def add_tool(self, fn, name=None, description=None):
+            handlers[name] = fn
+
+    defs = [{"type": "function", "function": {"name": "browser_vision", "parameters": {"type": "object",
+             "properties": {"question": {"type": "string"}}}}}]
+    fake_server = types.ModuleType("mcp.server")
+    fake_server.MCPServer = _FakeMCP
+    envelope = _build_native_vision_tool_result("https://shop.test/c/%s.png" % DISC, "what is on the page?",
+                                                "data:image/png;base64,AA", 2)
+    envelope["meta"]["annotations"] = [{"id": 1, "label": "Card %s" % DISC}]
+    with patch.dict(sys.modules, {"mcp": types.ModuleType("mcp"), "mcp.server": fake_server}), \
+            patch("model_tools.get_tool_definitions", return_value=defs), \
+            patch("model_tools.handle_function_call", return_value=envelope), _cfg():
+        srv._build_server()
+        out = handlers["browser_vision"](question="what is on the page?")
+    sent = json.dumps(out)
+    assert DISC not in sent and out["meta"]["annotations"][0]["label"] == "Card XXXXXXXXXXXX0993"
+    assert out["meta"]["size_bytes"] == 2 and out["content"][1] == envelope["content"][1]
+
+
+def test_colon_first_string_value_stays_valid_json():
+    """Prism 1aa4cb0d2a7a: '":<card>,' inside a top-level string looked like a key and got RAW quotes."""
+    doc = '{"output":":%s,approved","exit_code":0}' % DISC
+    assert json.loads(mask_card_numbers(doc)) == {"output": ":XXXXXXXXXXXX0993,approved", "exit_code": 0}
+    # A real key outside every string is still quoted.
+    assert json.loads(mask_card_numbers('{"card":%s,"ok":1}' % DISC)) == {"card": "XXXXXXXXXXXX0993", "ok": 1}
+
+
+@pytest.mark.parametrize("shape", ["[%s.0]", '{"n": %s.0}', "[-%s]"])
+def test_sign_and_fraction_on_a_bare_number_stay_valid_json(shape):
+    """Item 8: the quotes go around the whole number token (minus, fraction), card digits masked inside."""
+    doc = shape % DISC
+    json.loads(doc)
+    out = mask_card_numbers(doc)
+    assert DISC not in out
+    assert "XXXXXXXXXXXX0993" in json.dumps(json.loads(out))
+    assert mask_card_numbers("[%se5]" % DISC[:15]) == "[%se5]" % DISC[:15]  # exponent form: out of scope

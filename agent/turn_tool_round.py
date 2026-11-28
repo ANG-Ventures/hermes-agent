@@ -13,9 +13,8 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
-from agent.message_sanitization import coalesce_tool_call_id
 from agent.turn_preflight import compress_after_tool_results
-from agent.turn_tool_validation import validate_tool_calls
+from agent.turn_tool_validation import _append_tool_error_results, validate_tool_calls
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -102,15 +101,10 @@ def run_tool_round(
 
     # Mixed batch: error-result invalid calls and drop them from execution.
     if _invalid_batch_calls:
-        for tc in _invalid_batch_calls:
-            append_message(messages, {
-                "role": "tool",
-                "name": tc.function.name,
-                "tool_call_id": coalesce_tool_call_id(tc),
-                "content": _invalid_tool_name_error_content(
-                    tc.function.name, agent.valid_tool_names
-                ),
-            })
+        _append_tool_error_results(  # card-masked synthetic rows (t_110f649d)
+            messages, _invalid_batch_calls,
+            lambda tc: _invalid_tool_name_error_content(tc.function.name, agent.valid_tool_names),
+        )
         assistant_message.tool_calls = [
             tc for tc in assistant_message.tool_calls if tc.function.name in agent.valid_tool_names
         ]

@@ -104,11 +104,30 @@ def _build_server() -> Any:
             try:
                 # Drop None so unset optionals aren't forwarded to the handler.
                 # handle_function_call returns through the E11 boundary (model_tools), so its result is final.
-                return handle_function_call(tool_name, {k: v for k, v in kwargs.items() if v is not None})
+                # t_110f649d (Prism 875afa3a8d9a): this result reaches Codex (and its projected transcript) without
+                # make_tool_result_message, so the card mask runs here; read_file/search_files stay exempt.
+                from agent.tool_dispatch_helpers import mask_cards_for_tool
+                result = handle_function_call(tool_name, {k: v for k, v in kwargs.items() if v is not None})
+                if isinstance(result, dict) and result.get("_multimodal"):
+                    # Native vision envelope: its text part and summary echo the question, and meta carries
+                    # page text (annotation labels) and the caller's image_url (Prism c5d4f1214b21).
+                    def _meta(v):
+                        if isinstance(v, str):
+                            return mask_cards_for_tool(tool_name, v)
+                        if isinstance(v, dict):
+                            return {k: _meta(x) for k, x in v.items()}
+                        if isinstance(v, list):
+                            return [_meta(x) for x in v]
+                        return v
+                    return {**result, **{k: mask_cards_for_tool(tool_name, result[k])
+                                         for k in ("content", "text_summary") if k in result},
+                            **({"meta": _meta(result["meta"])} if "meta" in result else {})}
+                return mask_cards_for_tool(tool_name, result)
             except Exception as exc:
                 logger.exception("tool %s raised", tool_name)
                 # An exception message is harness/handler text, never file content: relabel always.
-                return json.dumps({"error": relabel_route_note_text(str(exc)), "tool": tool_name})
+                from agent.redact_cards import mask_tool_result_content
+                return json.dumps({"error": mask_tool_result_content(relabel_route_note_text(str(exc))), "tool": tool_name})
 
         _dispatch.__name__ = tool_name
         _dispatch.__doc__ = description

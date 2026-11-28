@@ -218,22 +218,58 @@ def mask_card_numbers(text: str) -> str:
     # JSON-encoded string (``\\"key\\":4000...``) gets ``\\"`` and the outer JSON stays valid too.
     quote_at = {}
     rest = []
+    raw_keyed = []
     for vs, ve in values:
         if vs > 0 and text[vs - 1] == '"':
             continue
         lo = max(0, vs - 16)
         key = _JSON_KEY_BEFORE.search(text, lo, vs)
         if key and _JSON_VALUE_AFTER.match(text, ve):
-            quote_at[vs] = quote_at[ve] = "\\" * _quote_share(text, key.start()) + '"'
+            share = _quote_share(text, key.start())
+            if share:
+                quote_at[vs] = quote_at[ve] = "\\" * share + '"'
+            else:
+                raw_keyed.append((vs, ve))
         else:
             rest.append((vs, ve))
-    # A masked bare number in an array or at the root: quoted only when *text* is valid JSON and the number is
-    # a whole number token outside every string of it. Inside a string nothing is added (t_c497904d).
-    if rest and _parses(text):
-        bare = {m.span() for m in _JSON_TOKEN.finditer(text) if text[m.start()] != '"'}
-        for vs, ve in rest:
-            if (vs, ve) in bare:
-                quote_at[vs] = quote_at[ve] = '"'
+    if not (rest or raw_keyed):
+        return _render(text, masked, quote_at)
+    if not _parses(text):
+        # Not one JSON document (prose, JSON lines, a cut-off payload): a raw-keyed value is quoted as before.
+        for vs, ve in raw_keyed:
+            quote_at[vs] = quote_at[ve] = '"'
+        return _render(text, masked, quote_at)
+    # Valid JSON: one scan finds every string and every number token outside them (t_c497904d). A RAW quote
+    # goes in only outside every string (Prism 1aa4cb0d2a7a: '":<card>,' inside a string value looked like a
+    # key). Accepted (main's behaviour, the outer result stays valid): the same text inside a NESTED JSON
+    # document still gets the escaped form, so the inner document can come out invalid, and text that only
+    # looks like a key inside a string gains two escaped quotes.
+    strings: List[Tuple[int, int]] = []
+    numbers = {}
+    for m in _JSON_TOKEN.finditer(text):
+        s, e = m.span()
+        if text[s] == '"':
+            strings.append((s, e))
+            continue
+        tok = m.group()
+        if "e" in tok or "E" in tok:
+            continue  # exponent form: the digit run is not a card
+        # The integer digits of the token, mapped to the whole token (leading minus, fraction part), so the
+        # quotes go around all of it (item 8, t_110f649d).
+        ds = s + (tok[0] == "-")
+        dot = tok.find(".")
+        numbers[(ds, s + dot if dot >= 0 else e)] = (s, e)
+    starts = [s for s, _ in strings]
+    for vs, ve in raw_keyed:
+        i = bisect.bisect_right(starts, vs) - 1
+        if i < 0 or strings[i][1] <= vs:
+            quote_at[vs] = quote_at[ve] = '"'
+    # A masked bare number in an array or at the root: quoted only when it is a whole number token outside
+    # every string. Inside a string nothing is added.
+    for vs, ve in rest:
+        tok = numbers.get((vs, ve))
+        if tok is not None:
+            quote_at[tok[0]] = quote_at[tok[1]] = '"'
     return _render(text, masked, quote_at)
 
 
@@ -327,6 +363,43 @@ def mask_tool_result_content(content: Any) -> Any:
     if not card_knob("mask_card_numbers_tool_results"):
         return content
     return mask_card_numbers_in_content(content)
+
+
+def mask_tool_display_value(value: Any) -> Any:
+    """Tool-progress display entry point (``security.mask_card_numbers_tool_results``): a preview string, or
+    a tool's args dict/list with every string inside masked. Display copies only; never the dispatched args.
+
+    Previews collapse whitespace (agent.display._oneline), which can join a card split across lines back into
+    one number, and verbose progress json.dumps the args with the line breaks escaped. So every string, whole
+    length, is collapsed when (and only when) its collapsed copy shows a card the uncollapsed copy does not;
+    otherwise it keeps its line breaks. Accepted side effect: a column of 4-digit numbers whose joined groups
+    pass the card check is collapsed and masked in the DISPLAY copy only; the tool still gets its real args.
+    Callers mask before they clip (t_110f649d)."""
+    if not card_knob("mask_card_numbers_tool_results"):
+        return value
+
+    def walk(v: Any) -> Any:
+        if isinstance(v, str):
+            masked = mask_card_numbers(v)
+            collapsed = " ".join(masked.split())
+            if collapsed == masked:
+                return masked
+            recollapsed = mask_card_numbers(collapsed)
+            return masked if recollapsed == collapsed else recollapsed
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        # A card supplied as a JSON number renders as its digits (verbose progress json.dumps the args); a
+        # whole-number float (``<card>.0``) renders with all of them too.
+        if isinstance(v, float) and v.is_integer():
+            masked = mask_card_numbers(repr(v))
+            return masked if masked != repr(v) else v
+        if isinstance(v, int) and not isinstance(v, bool):
+            masked = mask_card_numbers(str(v))
+            return masked if masked != str(v) else v
+        return v
+    return walk(value)
 
 
 def mask_user_message_content(content: Any) -> Any:

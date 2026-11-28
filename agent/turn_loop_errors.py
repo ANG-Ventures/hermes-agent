@@ -104,6 +104,10 @@ def handle_outer_loop_error(
         error_msg = f"Error during local message processing after API call #{api_call_count}: {str(e)}"
     else:
         error_msg = f"Error during API call #{api_call_count}: {str(e)}"
+    # t_110f649d: an exception message can echo request or tool text; every copy below (tool row, exit
+    # reason, chat reply) is card-masked. The traceback in agent.log stays raw.
+    from agent.redact_cards import mask_tool_result_content
+    error_msg = mask_tool_result_content(error_msg)
     # Honor the _vprint contract: suppress_status_output silences hard failures;
     # quiet_mode -q still shows them. Traceback is logged below.
     if getattr(agent, "suppress_status_output", False):
@@ -156,7 +160,8 @@ def handle_outer_loop_error(
         # card stops reading these as "unknown"/retryable. The deterministic local bug keeps
         # ``failed`` as it was (an incomplete, not failed, turn): flipping it made every such
         # child run a strike against the kanban dispatcher breaker.
-        detail = short_detail(e)
+        # Mask, then clip (Prism 6c34937e0f11): a clip first can cut a card's last digit and leave 15 clear.
+        detail = short_detail(mask_tool_result_content(str(e)).strip() or type(e).__name__)
         if _is_local_processing_error:
             _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
             final_response = site_copy("local_processing_error", detail=detail)

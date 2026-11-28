@@ -571,11 +571,17 @@ def camofox_vision(question: str, annotate: bool = False, task_id: Optional[str]
     def body(session):
         resp = _get_raw(_tab_path(session, "screenshot"), params=_user_params(session))
         screenshot_path = _save_screenshot(resp.content)
+        # t_110f649d: same local OCR card check as browser_vision's own screenshot, before any model sees it.
+        from agent.redact_cards import screenshot_card_refusal
+        refusal = screenshot_card_refusal(screenshot_path)
+        if refusal is not None:
+            return tool_error(refusal, success=False)
         img_b64 = base64.b64encode(resp.content).decode("utf-8")
         annotation_context = ""
         if annotate:
             try:
-                snapshot = _snapshot_data(session).get("snapshot", "")
+                from agent.redact_cards import mask_tool_result_content
+                snapshot = mask_tool_result_content(_snapshot_data(session).get("snapshot", ""))
                 annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snapshot[:3000]}"
             except Exception:
                 pass
