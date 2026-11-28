@@ -501,3 +501,53 @@ def test_vision_analyze_real_ocr_on_a_rendered_card_image(tmp_path):
     out, llm = _vision_analyze(tmp_path, url, None)
     llm.assert_not_called()
     assert CARD_IMAGE_REFUSAL in out
+
+
+def _rgba_card_url(alpha: int, size=(1800, 200)):
+    """A PNG whose RGB shows the card; ``alpha`` 0 hides it from a white-composited view (Prism 77de86bbc303)."""
+    import base64
+    import io
+    pil = pytest.importorskip("PIL.Image")
+    from PIL import ImageDraw, ImageFont
+    try:
+        font = ImageFont.load_default(size=60)
+    except TypeError:
+        pytest.skip("Pillow too old for a sized default font")
+    im = pil.new("RGB", size, "white")
+    ImageDraw.Draw(im).text((40, 60), f"{VISA[:4]}   {VISA[4:8]}   {VISA[8:12]}   {VISA[12:]}", fill="black", font=font)
+    im = im.convert("RGBA")
+    im.putalpha(alpha)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def test_vision_analyze_ocrs_the_alpha_dropped_view_of_a_transparent_image(tmp_path):
+    """The JPEG resize drops alpha (convert("RGB")): OCR clean on the composited view, card under the alpha."""
+    seen = []
+
+    def ocr(path):
+        seen.append(path)
+        return ("", None) if len(seen) % 2 else _CARD_OCR
+    for native in (False, True):
+        with patch.object(redact_cards, "_ocr", side_effect=ocr):
+            out, llm = _vision_analyze(tmp_path, _rgba_card_url(0), None, native=native)
+        llm.assert_not_called()
+        assert CARD_IMAGE_REFUSAL in out and '"_multimodal"' not in out
+    assert len(seen) == 4 and seen[1].endswith(".rgb.png") and seen[3].endswith(".rgb.png")
+    assert not list(tmp_path.glob("*.rgb.png"))
+
+
+def test_vision_analyze_opaque_image_is_ocred_once(tmp_path):
+    with patch.object(redact_cards, "_ocr", return_value=("receipt", None)) as ocr:
+        out, llm = _vision_analyze(tmp_path, _rgba_card_url(255, (400, 100)), None, native=True)
+    assert ocr.call_count == 1 and out["_multimodal"] is True
+
+
+def test_vision_analyze_real_ocr_refuses_a_card_hidden_under_transparency(tmp_path):
+    """Prism repro with real tesseract: 1800x200 RGBA, alpha 0, native path (it resizes to JPEG)."""
+    import os
+    if not any(os.access(b, os.X_OK) for b in redact_cards.TESSERACT):
+        pytest.skip("tesseract not installed")
+    out, llm = _vision_analyze(tmp_path, _rgba_card_url(0), None, native=True)
+    assert CARD_IMAGE_REFUSAL in out and '"_multimodal"' not in out

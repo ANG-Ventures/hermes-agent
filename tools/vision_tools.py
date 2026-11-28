@@ -531,6 +531,27 @@ class _CardImageRefused(_ImagePrepError):
     """The image shows a full payment card number (``agent.redact_cards.CARD_IMAGE_REFUSAL``)."""
 
 
+def _alpha_dropped_copy(path: Path) -> Optional[Path]:
+    """PNG copy of *path* with transparency dropped exactly as the JPEG resize does (``convert("RGB")``),
+    or None when the image has no non-opaque pixels (or Pillow cannot read it). Caller deletes the copy."""
+    Image = _import_pillow_for_resize()
+    if Image is None:
+        return None
+    try:
+        with Image.open(path) as img:
+            if img.mode in ("RGBA", "LA", "PA"):
+                if img.getchannel("A").getextrema()[0] == 255:
+                    return None
+            elif "transparency" not in img.info:
+                return None
+            out = path.with_name(path.name + ".rgb.png")
+            img.convert("RGB").save(out, format="PNG")
+            return out
+    except Exception as exc:
+        logger.debug("alpha-dropped OCR copy failed: %s", exc)
+        return None
+
+
 class _PreparedImage(NamedTuple):
     """Temp image ready to encode; ``path`` is owned by the caller (delete it)."""
     path: Path
@@ -582,6 +603,16 @@ async def _prepare_image(
         from agent.redact_cards import screenshot_card_refusal
         refusal = await asyncio.to_thread(
             screenshot_card_refusal, path, knob="image_read_card_ocr", what="image read")
+        if refusal is None:
+            # Tesseract composites transparency on white, but the JPEG resize (convert("RGB")) and providers
+            # that ignore alpha show the RGB under it: OCR that alpha-dropped view too.
+            flat = await asyncio.to_thread(_alpha_dropped_copy, path)
+            if flat is not None:
+                try:
+                    refusal = await asyncio.to_thread(
+                        screenshot_card_refusal, flat, knob="image_read_card_ocr", what="image read")
+                finally:
+                    _unlink_quietly(flat)
         if refusal is not None:
             raise _CardImageRefused(refusal)
     except BaseException:
