@@ -1068,6 +1068,13 @@ def _memory_turn_start_and_prefetch(
     if not agent._memory_manager:
         return ""
     _query = _memory_query_text(original_user_message)
+    # t_0171c33b: the turn-start recall query is masked for card numbers too; on a mask error send nothing.
+    try:
+        from agent.redact_cards import card_knob, mask_card_numbers
+        if _query and card_knob("mask_card_numbers_memory_capture"):
+            _query = mask_card_numbers(_query)
+    except Exception:
+        _query = ""
     # The author rides along so a provider can attribute THIS turn, not whoever opened the session.
     _author = turn_author if isinstance(turn_author, dict) else {}
     with suppress(Exception):

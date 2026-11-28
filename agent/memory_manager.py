@@ -33,6 +33,19 @@ _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
 
+
+def _note_card_masked(result: Any) -> Any:
+    """A memory tool result with a plain note that card numbers in the call were masked (t_0171c33b)."""
+    note = "A card number in this call was masked to its last four digits before it reached memory; anything this call saved holds the masked number."
+    try:
+        data = json.loads(result) if isinstance(result, str) else None
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        return json.dumps({**data, "card_number_masked": note})
+    return f"{result}\n[{note}]" if isinstance(result, str) else result
+
+
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
 
 def _signature_params(fn: Callable[..., Any]):
@@ -749,6 +762,19 @@ class MemoryManager:
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
         from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
+        # t_0171c33b: card numbers in a memory tool call (a saved fact, a search) are masked before any provider.
+        # Only free text (a value with whitespace) is masked: a one-token value is a selector (a URI, an id) that
+        # must reach the provider exactly, or a delete/update could land on a different record.
+        try:
+            from agent.redact_cards import card_knob, mask_card_numbers
+            card_masked = False
+            if isinstance(args, dict) and card_knob("mask_card_numbers_memory_capture"):
+                masked_args = {k: mask_card_numbers(v) if isinstance(v, str) and len(v.split()) > 1 else v
+                               for k, v in args.items()}
+                card_masked = masked_args != args
+                args = masked_args
+        except Exception as e:
+            return tool_error(f"Memory tool '{tool_name}' refused: card-number mask failed ({e})")
         try:
             result = provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
@@ -756,6 +782,8 @@ class MemoryManager:
             record_provider_memory_call(provider.name, tool_name, args, raised=True)
             return tool_error(f"Memory tool '{tool_name}' failed: {e}")
         record_provider_memory_call(provider.name, tool_name, args, result)
+        if card_masked:
+            result = _note_card_masked(result)
         return result
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
