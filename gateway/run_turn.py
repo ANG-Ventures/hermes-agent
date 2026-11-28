@@ -4751,9 +4751,11 @@ class GatewayTurnMixin:
         ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
         ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
         ``already_sent`` stays unset so the normal final send delivers the content."""
+        from agent.redact_cards import mask_reply_text  # bypasses send_final_ledgered's mask (t_abd83687)
         try:
             _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
+                chat_id=source.chat_id, message_id=_sc.message_id, content=mask_reply_text(content),
+                finalize=True,
             )
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)

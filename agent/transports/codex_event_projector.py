@@ -41,6 +41,11 @@ class ProjectionResult:
     final_text: Optional[str] = None  # Set when an agentMessage completes
 
 
+def _mask_cards(name: str, content: str) -> str:
+    from agent.tool_dispatch_helpers import mask_cards_for_tool
+    return mask_cards_for_tool(name, content)
+
+
 class CodexEventProjector:
     """Stateful projector; stashes codex's separate reasoning items onto the next assistant message."""
 
@@ -107,7 +112,9 @@ class CodexEventProjector:
         # here. hermes-tools results were already relabelled at the MCP server (remote tools only);
         # a foreign MCP server or Codex-native result reached Codex raw, so it is persisted raw, with
         # the server in the row's tool name (``mcp.<server>.<tool>``) as its provenance.
-        tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
+        # t_abd83687: these rows skip make_tool_result_message, so card numbers are masked here before
+        # the transcript/session store; the Codex model itself already read the raw output.
+        tool_msg = {"role": "tool", "tool_call_id": call_id, "content": _mask_cards(name, content)}
         return ProjectionResult(messages=[assistant_msg, tool_msg], is_tool_iteration=True)
 
     @staticmethod
@@ -136,20 +143,23 @@ class CodexEventProjector:
     def _mcp_tool_call_spec(item: dict) -> tuple[str, str, dict, str]:
         server = item.get("server") or "mcp"
         tool = item.get("tool") or "unknown"
+        name = f"mcp.{server}.{tool}"
         result, error = item.get("result"), item.get("error")
+        # Mask before the clip: a card cut at the clip is too short to match afterwards (t_abd83687).
         if error:
-            content = f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
+            content = f"[error] {_mask_cards(name, json.dumps(error, ensure_ascii=False))[:1000]}"
         else:
-            content = json.dumps(result, ensure_ascii=False)[:4000] if result is not None else ""
+            content = _mask_cards(name, json.dumps(result, ensure_ascii=False))[:4000] if result is not None else ""
         # Call id mirrors the native MCP name convention (mcp__server__tool).
-        return f"mcp__{server}__{tool}", f"mcp.{server}.{tool}", _dict_args(item.get("arguments")), content
+        return f"mcp__{server}__{tool}", name, _dict_args(item.get("arguments")), content
 
     @staticmethod
     def _dynamic_tool_call_spec(item: dict) -> tuple[str, str, dict, str]:
         tool = item.get("tool") or "unknown"
         content_items = item.get("contentItems") or []
         content = (
-            json.dumps(content_items, ensure_ascii=False)[:4000] if isinstance(content_items, list) and content_items
+            _mask_cards(tool, json.dumps(content_items, ensure_ascii=False))[:4000]
+            if isinstance(content_items, list) and content_items
             else f"success={item.get('success')}"
         )
         return f"dyn_{tool}", tool, _dict_args(item.get("arguments")), content

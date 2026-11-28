@@ -1016,7 +1016,7 @@ def test_progress_callback_never_scans_a_completed_tool_result():
     tr, ctx = _runner()
     scanned = []
     real = redact_cards.mask_card_numbers
-    with _cfg(), patch.object(redact_cards, "mask_card_numbers", side_effect=lambda t: scanned.append(t) or real(t)):
+    with _cfg(), patch.object(redact_cards, "mask_card_numbers", side_effect=lambda t, **kw: scanned.append(t) or real(t, **kw)):
         tr.progress_callback("tool.completed", "terminal", None, None, duration=1.0, is_error=False,
                              result=f"stdout card {DISC}")
     assert not any(DISC in t for t in scanned)
@@ -1208,3 +1208,237 @@ def test_sign_and_fraction_on_a_bare_number_stay_valid_json(shape):
     assert DISC not in out
     assert "XXXXXXXXXXXX0993" in json.dumps(json.loads(out))
     assert mask_card_numbers("[%se5]" % DISC[:15]) == "[%se5]" % DISC[:15]  # exponent form: out of scope
+
+
+# ── t_abd83687: four paths outside the six ───────────────────────────────────
+
+
+@pytest.mark.parametrize("item, name", [
+    ({"type": "commandExecution", "id": "i1", "command": "cat order.txt", "cwd": "/w",
+      "aggregatedOutput": f"card {DISC}\n", "exitCode": 0}, "exec_command"),
+    ({"type": "mcpToolCall", "id": "i2", "server": "stripe", "tool": "get_card",
+      "arguments": {}, "result": {"content": [{"type": "text", "text": f"card {DISC}"}]}}, "mcp.stripe.get_card"),
+])
+def test_codex_native_tool_outputs_are_masked_in_the_projected_transcript(item, name):
+    """Path 1: Codex-native exec_command / mcpToolCall rows skip make_tool_result_message."""
+    from agent.transports.codex_event_projector import CodexEventProjector
+    with _cfg():
+        out = CodexEventProjector().project({"method": "item/completed", "params": {"item": item}})
+    call, row = out.messages
+    assert call["tool_calls"][0]["function"]["name"] == name
+    assert DISC not in row["content"] and "XXXXXXXXXXXX0993" in row["content"]
+    json.loads(row["content"])  # the exec/MCP envelope stays valid JSON
+
+
+def _final_adapter(sent):
+    from gateway.platforms.base import BasePlatformAdapter, Platform, PlatformConfig, SendResult
+
+    class _A(BasePlatformAdapter):
+        def __init__(self):
+            super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            pass
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            sent.append(content)
+            return SendResult(success=True, message_id="m1")
+
+        async def edit_message(self, chat_id, message_id, content, **kw):
+            sent.append(content)
+            return SendResult(success=True, message_id=message_id)
+
+        async def get_chat_info(self, chat_id):
+            return {"id": chat_id, "type": "dm"}
+    return _A()
+
+
+def test_final_reply_is_masked_at_the_send_boundary():
+    """Path 2: the final reply (ledgered send) and the streamed frames leave the machine masked."""
+    import asyncio
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    sent = []
+    adapter = _final_adapter(sent)
+    event = MessageEvent(text="hi", message_type=MessageType.TEXT, message_id="in-1",
+                         source=adapter.build_source(chat_id="8", user_id="u1"))
+    asyncio.run(adapter.send_final_ledgered(event, "k", f"Your card is {DISC}.", {}, reply_to=None))
+    consumer = GatewayStreamConsumer(adapter, "8", StreamConsumerConfig(cursor=""))
+    asyncio.run(consumer._send_or_edit(f"streamed: {DISC}"))
+    asyncio.run(consumer._send_or_edit(f"streamed: {DISC} and more"))
+    assert len(sent) == 3 and not any(DISC in s for s in sent)
+    assert sent[0] == "Your card is XXXXXXXXXXXX0993."
+    assert all("XXXXXXXXXXXX0993" in s for s in sent)
+
+
+@pytest.mark.parametrize("security, masked", [({}, True), ({"mask_card_numbers_replies": False}, False)])
+def test_reply_mask_switch_mask_card_numbers_replies(security, masked):
+    """security.mask_card_numbers_replies: unset masks the final reply and streamed frames; false sends them
+    unchanged, with every other card switch left as it is."""
+    import asyncio
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    assert redact_cards._KNOB_DEFAULTS["mask_card_numbers_replies"] is True
+    sent = []
+    adapter = _final_adapter(sent)
+    event = MessageEvent(text="hi", message_type=MessageType.TEXT, message_id="in-1",
+                         source=adapter.build_source(chat_id="8", user_id="u1"))
+    with _cfg(**security):
+        asyncio.run(adapter.send_final_ledgered(event, "k", f"Your card is {DISC}.", {}, reply_to=None))
+        consumer = GatewayStreamConsumer(adapter, "8", StreamConsumerConfig(cursor=""))
+        asyncio.run(consumer._send_or_edit(f"streamed: {DISC}"))
+    assert len(sent) == 2
+    if masked:
+        assert sent[0] == f"Your card is {'X' * 12}{DISC[-4:]}." and DISC not in sent[1]
+    else:
+        assert sent[0] == f"Your card is {DISC}." and DISC in sent[1]
+
+
+def test_unlimited_tool_preview_is_uncut_and_masked_whole():
+    """Path 3: tool_preview_length 0 stays unlimited (no cap): the whole 100 KB preview is masked, nothing
+    is cut. Prism 2d50f75829e9: a long link keeps its full target."""
+    from agent import display
+    command = "echo " + "x" * 100_000 + f" {DISC}"
+    with patch.object(display, "_tool_preview_max_len", 0), _cfg():
+        preview = display.build_tool_preview("terminal", {"command": command})
+        assert preview == command
+        masked = redact_cards.mask_tool_display_value(preview)
+        assert len(masked) == len(preview) and DISC not in masked and masked.endswith("XXXXXXXXXXXX0993")
+        url = "https://shop.test/signed?sig=" + "a" * 3000
+        tp = display.prepare_tool_preview("browser_navigate", {"url": url}, fallback="", max_len=80)
+        assert tp.truncated and tp.url == url
+
+
+def test_display_walker_masks_tuple_values_and_dict_keys():
+    """Path 4: mask_tool_display_value walks tuples and dict keys (verbose progress json.dumps keys too)."""
+    with _cfg():
+        out = redact_cards.mask_tool_display_value({DISC: ("a", DISC), "n": [(1, DISC)]})
+    (key, val), (_, n) = out.items()
+    assert isinstance(val, tuple) and isinstance(n[0], tuple) and DISC not in json.dumps(out)
+    # Display copies add no characters (operator B, 00:05): a value that is only the number stays 16 long.
+    assert key == val[1] == n[0][1] == "XXXXXXXXXXXX0993"
+    with _cfg():
+        for v in (DISC, int(DISC), float(DISC)):
+            assert redact_cards.mask_tool_display_value({"text": v})["text"] in ("XXXXXXXXXXXX0993", "XXXXXXXXXXXX0993.0")
+
+
+def test_codex_mcp_numeric_card_in_array_stays_valid_json():
+    """Prism 6702d657689f: a numeric card inside an MCP result array is masked and the envelope stays JSON."""
+    from agent.transports.codex_event_projector import CodexEventProjector
+    item = {"type": "mcpToolCall", "id": "i3", "server": "stripe", "tool": "get_cards", "arguments": {},
+            "result": {"structuredContent": {"cards": [int(DISC)]}}}
+    with _cfg():
+        out = CodexEventProjector().project({"method": "item/completed", "params": {"item": item}})
+    row = out.messages[1]["content"]
+    assert DISC not in row and "XXXXXXXXXXXX0993" in row
+    json.loads(row)
+
+
+def test_streaming_overflow_split_masks_the_whole_card_before_sealing():
+    """Prism 545bfaf1096c: a card straddling the overflow split is masked with the whole buffer in view."""
+    import asyncio
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    sent = []
+    consumer = GatewayStreamConsumer(_final_adapter(sent), "8", StreamConsumerConfig(cursor=""))
+    consumer._len_fn, consumer._safe_limit = consumer._resolve_length_budget()
+    asyncio.run(consumer._send_or_edit("preview"))
+    limit = consumer._safe_limit
+    consumer._accumulated = "a" * (limit - 9) + " " + DISC + "."
+    asyncio.run(consumer._seal_overflow_heads())
+    asyncio.run(consumer._send_or_edit(consumer._accumulated))
+    out = "".join(sent[1:])
+    assert len(sent) == 3 and "".join(c for c in out if c.isdigit()) == DISC[-4:]
+
+
+def test_final_reconciliation_edit_is_masked():
+    """Prism 688fd1611a31: run_turn's in-place reconciliation edit goes out masked."""
+    import asyncio
+    from types import SimpleNamespace as NS
+    from gateway.run_turn import GatewayTurnMixin
+    sent = []
+    sc = NS(adapter=_final_adapter(sent), message_id="m1")
+    response = {}
+    asyncio.run(GatewayTurnMixin._run_agent_edit_streamed_message(
+        None, sc, NS(chat_id="8"), response, f"Your card: {DISC} (verified)", _sk="k",
+        ok=("ok",), fail_result="%s %s", fail_exc="%s %s"))
+    assert response.get("already_sent") and sent == ["Your card: XXXXXXXXXXXX0993 (verified)"]
+
+
+# ── t_abd83687 operator send-back (22:40 + 22:29 rulings + 00:05 additions) ──
+
+
+def test_reply_that_is_only_a_card_number_keeps_its_length():
+    """Ruling 3: chat replies add no characters; the JSON root quoting stays on for tool results only."""
+    import asyncio
+    from gateway.platforms.event import MessageEvent, MessageType
+    sent = []
+    adapter = _final_adapter(sent)
+    event = MessageEvent(text="hi", message_type=MessageType.TEXT, message_id="in-1",
+                         source=adapter.build_source(chat_id="8", user_id="u1"))
+    asyncio.run(adapter.send_final_ledgered(event, "k", DISC, {}, reply_to=None))
+    assert sent == ["XXXXXXXXXXXX0993"]
+    assert mask_card_numbers(DISC) == '"XXXXXXXXXXXX0993"'  # tool-result default unchanged
+
+
+def test_append_only_draft_stream_with_a_card_has_no_failed_frame():
+    """Ruling 2 / Prism 688fd1611a31: on an append-only draft transport (Slack) the mask never rewrites
+    sent text, so no frame fails with a prefix mismatch; the edit/first-send paths stay masked."""
+    import asyncio
+    from gateway.platforms.base import SendResult
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    sent, frames, failed = [], [], []
+    adapter = _final_adapter(sent)
+
+    async def send_draft(chat_id, draft_id, content, metadata=None):
+        if frames and not content.startswith(frames[-1]):
+            failed.append(content)
+            return SendResult(success=False, error="stream prefix mismatch")
+        frames.append(content)
+        return SendResult(success=True, message_id="ts1")
+    adapter.send_draft = send_draft
+    consumer = GatewayStreamConsumer(adapter, "8", StreamConsumerConfig(cursor=""))
+    consumer._use_draft_streaming, consumer._draft_id = True, 1
+    for text in ("Card: " + DISC[:12], "Card: " + DISC + ". More to follow"):
+        assert asyncio.run(consumer._send_or_edit(text, is_turn_final=False))
+    assert not failed and len(frames) == 2 and sent == []
+    consumer._use_draft_streaming = False  # drafts off: the first send masks
+    asyncio.run(consumer._send_or_edit("Card: " + DISC + ". Done"))
+    assert sent == ["Card: XXXXXXXXXXXX0993. Done"]
+
+
+def test_codex_mcp_whole_number_fraction_card_stays_valid_json():
+    """Prism 9ca6a5372475 (fixed by the rebase on merged PR 602): <card>.0 in an MCP result stays JSON."""
+    from agent.transports.codex_event_projector import CodexEventProjector
+    item = {"type": "mcpToolCall", "id": "i4", "server": "stripe", "tool": "get_card", "arguments": {},
+            "result": {"structuredContent": {"pan": float(DISC)}}}
+    with _cfg():
+        out = CodexEventProjector().project({"method": "item/completed", "params": {"item": item}})
+    row = out.messages[1]["content"]
+    assert DISC not in row and "XXXXXXXXXXXX0993" in json.dumps(json.loads(row))
+
+
+def test_codex_mcp_result_is_masked_before_the_4000_clip():
+    """Ruling 5: a card cut at the 4000-character clip keeps no clear digit run of 12+."""
+    import re
+    from agent.transports.codex_event_projector import CodexEventProjector
+    text = "a" * (4000 - len('{"content": [{"type": "text", "text": "') - 8) + " " + DISC
+    item = {"type": "mcpToolCall", "id": "i5", "server": "stripe", "tool": "get_card", "arguments": {},
+            "result": {"content": [{"type": "text", "text": text}]}}
+    with _cfg():
+        out = CodexEventProjector().project({"method": "item/completed", "params": {"item": item}})
+    row = out.messages[1]["content"]
+    assert len(row) == 4000 and not re.search(r"\d{5,}", row) and "XXXX" in row
+
+
+def test_native_vision_meta_image_url_is_masked_before_the_clip():
+    """Operator C: image_url was clipped to 200 characters before any mask (up to 15 clear digits)."""
+    import re
+    from tools.vision_tools import _build_native_vision_tool_result
+    url = "https://shop.test/" + "a" * (200 - len("https://shop.test/") - 9) + "/" + DISC
+    with _cfg():
+        env = _build_native_vision_tool_result(url, "q", "data:image/png;base64,AA", 2)
+    meta_url = env["meta"]["image_url"]
+    assert len(meta_url) == 200 and not re.search(r"\d{5,}", meta_url)

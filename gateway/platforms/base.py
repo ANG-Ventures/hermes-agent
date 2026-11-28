@@ -5466,6 +5466,10 @@ class BasePlatformAdapter(ABC):
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
         delivery_adapter = self._final_delivery_adapter(event.source)
+        # t_abd83687: the reply leaves the machine (and is ledgered for redelivery): mask card numbers
+        # here, the last line of defence after the tool-result mask.
+        from agent.redact_cards import mask_reply_text
+        text_content = mask_reply_text(text_content)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(

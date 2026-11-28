@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from agent.redact_cards import mask_reply_text
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.config import (
@@ -838,6 +839,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """No message to edit yet and the buffer overflows: seal only the head chunks; the
         tail stays in _accumulated as the active preview later deltas edit in place.
         True when the turn finished here (the run loop returns)."""
+        # A card straddling a split is too short to match in either half: mask the whole buffer first.
+        # Accepted limit (no hold-back buffer): a number still arriving at the split can leave 8 + 8 digits.
+        self._accumulated = mask_reply_text(self._accumulated)
         chunks = self._truncate_for_stream(self._accumulated, self._safe_limit, self._len_fn)
         if len(chunks) <= 1:
             # Malformed/legacy adapter result must still be splittable.
@@ -889,6 +893,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     async def _seal_overflow_heads(self) -> None:
         """Existing message overflowing: seal it with the head, start a new message for the rest."""
+        # A card straddling a split is too short to match in either half: mask the whole buffer first.
+        # Accepted limit (no hold-back buffer): a number still arriving at the split can leave 8 + 8 digits.
+        self._accumulated = mask_reply_text(self._accumulated)
         while self._overflows() and self._message_id is not None and self._edit_supported:
             cp_budget = _custom_unit_to_cp(self._accumulated, self._safe_limit, self._len_fn)
             split_at = self._accumulated.rfind("\n", 0, cp_budget)
@@ -1079,14 +1086,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     # unknown-extension path stays visible instead of being silently dropped (issue #34517). Streaming and
     # non-streaming paths share the same regex, so a tag is treated identically whichever path delivered the
     # text.
-    def _clean_for_display(text: str) -> str:
+    def _clean_for_display(text: str, *, mask: bool = True) -> str:
         """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream.
 
         Media-only on purpose: this runs on every chunk, including sealed non-final overflow
         chunks, so it must never remove text.  The trailing silence-marker strip is a turn-final
-        decision (:meth:`_strip_turn_final_marker`).
+        decision (:meth:`_strip_turn_final_marker`).  Card numbers are masked here (length-preserving,
+        t_abd83687) unless *mask* is False: every streamed edit and fallback send passes through it.
         """
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        text = _BasePlatformAdapter.strip_media_directives_for_display(text)
+        return mask_reply_text(text) if mask else text
 
     def _silence_predicate(self):
         if not self.cfg.internal_event:

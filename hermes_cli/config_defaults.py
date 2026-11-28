@@ -2087,6 +2087,8 @@ DEFAULT_CONFIG = {
         # The turn text handed to external memory providers and the capture queue (t_0171c33b); the stored
         # transcript is not changed.
         "mask_card_numbers_memory_capture": True,
+        # The assistant's chat reply at the send boundary (t_abd83687): last line of defence.
+        "mask_card_numbers_replies": True,
         "browser_vision_card_ocr": True,
         # vision_analyze: the same OCR check on the image bytes before any model call (t_56a9d083).
         "image_read_card_ocr": True,
