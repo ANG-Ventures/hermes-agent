@@ -167,7 +167,7 @@ def note_error(agent: Any, pending: Dict[str, Any], api_error: Any, raw_headers:
         note_upstream_failure(agent, status=pending.get("status"),
                               socket=pending.get("socket_cause"), exc_name=exc,
                               box=seat or attribution(raw_headers, body)["seat"], hop=hop,
-                              relay_class=(pending.get("headers") or {}).get("x-relay-error-class"),
+                              relay_class=_stated_class(pending.get("headers"), body),
                               relay_error=relay_synthetic_error(body, pending.get("text")),
                               text=pending.get("text"))
         if isinstance(getattr(agent, "_failover_cause", None), FailoverCause) \
@@ -254,6 +254,23 @@ _UPSTREAM_HOPS = frozenset({"bridge->upstream", "bridge→anthropic", "proxy→a
 _OUR_HOP_NAMES = {"front": "lane door"}
 
 
+def _stated_class(headers: Any, body: Any) -> Optional[str]:
+    """The relay's stated error class: the header, else ``relay_error_class`` in the body
+    (top level or inside ``error``). t_d1de29dd: the wait notice decides quota on it."""
+    h = headers if isinstance(headers, dict) else {}
+    b = body if isinstance(body, dict) else {}
+    inner = b.get("error") if isinstance(b.get("error"), dict) else {}
+    rc = h.get("x-relay-error-class") or b.get("relay_error_class") or inner.get("relay_error_class")
+    return rc if isinstance(rc, str) and rc.strip() else None
+
+
+def _bounded(value: Any, cap: int) -> str:
+    """One printable line of at most ``cap`` chars (t_d1de29dd, Prism #600 d4e148ca1690):
+    relay-sent hop/cause text is printed in a banner, never verbatim."""
+    text = " ".join("".join(c if c.isprintable() else " " for c in str(value)).split())
+    return text if len(text) <= cap else text[:cap - 1].rstrip() + "…"
+
+
 def _our_hop_status(ev: Dict[str, Any], status: Any) -> Optional[str]:
     """``lane door 503 (local_unavailable)`` when the relay states the status came
     from one of OUR hops (front, relay, bridge, ...), else None (t_c5cddd09: the
@@ -268,8 +285,9 @@ def _our_hop_status(ev: Dict[str, Any], status: Any) -> Optional[str]:
     why = (h.get("x-relay-error-cause") or body.get("relay_error_cause")
            or inner.get("relay_error_cause")
            or (body.get("error") if isinstance(body.get("error"), str) else None))
-    name = _OUR_HOP_NAMES.get(hop.lower(), hop.replace("->", "→"))
-    return f"{name} {status}" + (f" ({str(why).strip()})" if why and str(why).strip() else "")
+    name = _OUR_HOP_NAMES.get(hop.lower(), _bounded(hop.replace("->", "→"), 30))
+    why = _bounded(why, 60) if why else ""
+    return f"{name} {status}" + (f" ({why})" if why else "")
 
 
 def wait_notice(agent: Any, now_mono: Optional[float] = None) -> Optional[str]:

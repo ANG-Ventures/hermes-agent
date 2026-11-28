@@ -493,3 +493,37 @@ def test_inflight_probe_that_raises_releases_waiters(monkeypatch):
         rc.model_capacity(DTLR, FABLE)
     assert rc._INFLIGHT == {}
     assert rc.model_capacity(DTLR, FABLE) is None   # cached unknown, no stuck waiter
+
+
+@pytest.mark.parametrize("relay_class,text", [
+    ("rate_upstream", "Error code: 429 - rate limit exceeded"),
+    (None, "Error code: 429 - Too Many Requests"),
+    # Prism #603 b9591dd20ab5: bare "reached your" must not read as quota.
+    (None, "Error code: 429 - You've reached your rate limit"),
+])
+def test_plain_rate_limit_429_does_not_blame_the_allowance(monkeypatch, relay_class, text):
+    """Prism #600 4dab164d36f9 (t_d1de29dd): a 429 the relay classes as a rate limit (or
+    unclassed with no quota words) is not a quota refusal, even with Fable used up on
+    19/26 seats elsewhere in the pool."""
+    _relay(monkeypatch, exhausted=19, of=26, eligible=8, inflight=RETRYING)
+    a = _agent()
+    wb.arm(a, now=0.0)
+    wb.note_upstream_failure(a, status=429, relay_class=relay_class, text=text)
+    line = wb.notice_due(a, now=120.0)
+    print(line)
+    assert "allowance" not in line
+
+
+@pytest.mark.parametrize("relay_class,text", [
+    ("quota_model", "Error code: 429"),
+    (None, "Error code: 429 - You've hit your weekly limit"),
+    (None, "Error code: 429 - You've reached your Fable limit"),
+])
+def test_quota_429_still_names_the_allowance(monkeypatch, relay_class, text):
+    _relay(monkeypatch, exhausted=19, of=26, eligible=8, inflight=RETRYING)
+    a = _agent()
+    wb.arm(a, now=0.0)
+    wb.note_upstream_failure(a, status=429, relay_class=relay_class, text=text)
+    line = wb.notice_due(a, now=120.0)
+    print(line)
+    assert "Fable allowance used up on 19/26 seats" in line
