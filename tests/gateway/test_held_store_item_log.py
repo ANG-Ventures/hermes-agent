@@ -84,3 +84,34 @@ def test_the_store_ends_up_the_same_with_the_audit_switched_off(rig, monkeypatch
     qm.rewrite_active(runner, KEY, adapter, [])
     monkeypatch.setattr(qm, "held_audit", lambda *a, **k: None)
     assert _sequence(runner, adapter) == with_audit == (["prompt 41", "prompt 43"], 2, ["prompt 41", "prompt 43"], [])
+
+
+def test_a_merged_held_release_logs_every_absorbed_message(rig, caplog):
+    """Prism da666476e0b3: under ``queue_release_mode: merged`` the one turn carries the head's id
+    only, so each absorbed message gets its own ``merged-into-head`` line naming the head."""
+    caplog.set_level(logging.INFO, logger="gateway.inbox_log")
+    runner, adapter = rig
+    runner._queue_release_mode = "merged"
+    _seed_ids(runner, adapter, "41", "42", "43")
+    qm.hold_user_items(runner, KEY, adapter)
+    assert qm.restage_held(runner, KEY, adapter) == 3
+    lines = [r.getMessage() for r in caplog.records if r.name == "gateway.inbox_log"]
+    got = [dict(p.split("=", 1) for p in m.split()[1:]) for m in lines]
+    assert [(g["disposition"], g["msg_id"], g["path"], g["into"]) for g in got] == [
+        ("merged-into-head", "42", "held_release_merged", "41"),
+        ("merged-into-head", "43", "held_release_merged", "41")]
+    assert all("prompt" not in m for m in lines)
+
+
+def test_a_held_audit_that_raises_changes_no_outcome(rig):
+    """Its depth record broken (``.get`` and ``.pop`` both fail): the store still ends up the same."""
+    runner, adapter = rig
+    with_audit = _sequence(runner, adapter)
+    qm.rewrite_active(runner, KEY, adapter, [])
+    runner.__dict__["_held_depth_seen"] = object()
+    assert _sequence(runner, adapter) == with_audit
+    # An automatic reset still carries the held items (a raise there would clear without carry).
+    _seed_ids(runner, adapter, "51", "52")
+    qm.hold_user_items(runner, KEY, adapter)
+    carried = qm.before_scope_clear(runner, KEY, "auto_reset")
+    assert [e.message_id for e in carried or ()] == ["51", "52"]

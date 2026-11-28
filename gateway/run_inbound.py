@@ -669,7 +669,8 @@ class GatewayInboundMixin:
             _had_head = adapter._pending_messages.get(_quick_key) is not None
             merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
             inbox_log.log_disposition("merged-into-head" if _had_head else "queued", _quick_key, event,
-                                      depth=self._queue_depth(_quick_key, adapter=adapter), path="pending_slot")
+                                      depth=lambda: self._queue_depth(_quick_key, adapter=adapter),
+                                      path="pending_slot")
         else:
             inbox_log.log_disposition("refused", _quick_key, event, path="no_adapter")
 
@@ -758,12 +759,14 @@ class GatewayInboundMixin:
         # runtime supports it; media/voice and older runtimes use the interrupt path below.
         _can_redirect = getattr(running_agent, "_supports_active_turn_redirect", False) is True
         _redirectable = self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect")
+        _queue_tried = False
         if _redirectable and self._has_queued_human_followup(_quick_key, self._delivery_adapter_for(source)):
             # t_086da8be: a redirect would overtake the earlier queued message. Queue this one
             # behind it, then interrupt: with a pending event the turn runner drains the queue
             # and ignores the bare interrupt text, so queueing is what keeps the text.
             self._log_busy_followup_held(_quick_key, "redirect")
             inbox_log.log_disposition("held", _quick_key, event, path="redirect_behind_queued")
+            _queue_tried = True
             self._queue_or_replace_pending_event(_quick_key, event)
         elif _redirectable and self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):
             logger.debug("PRIORITY redirect for session %s", _quick_key)
@@ -772,6 +775,7 @@ class GatewayInboundMixin:
             # The turn runner reads the bare interrupt text only when nothing is pending
             # (run_turn ``not pending_event and interrupt_message``); with anything queued it would
             # be dropped, so queue the event itself (its STT result is cached on it below).
+            _queue_tried = True
             self._queue_or_replace_pending_event(_quick_key, event)
         logger.debug("PRIORITY interrupt for session %s", _quick_key)
         _interrupt_text = event.text
@@ -782,10 +786,10 @@ class GatewayInboundMixin:
             )
         elif not _interrupt_text and getattr(event, "media_urls", None):
             _interrupt_text = _build_media_placeholder(event)
-        if getattr(event, "_gateway_accepted", False) is not True:
-            # Not queued above: the bare interrupt text is what the turn runner reads as the next turn.
-            inbox_log.log_disposition("became-next-turn", _quick_key, event, path="interrupt_text", runner=self,
-                                      session_id=getattr(running_agent, "session_id", None))
+        if not _queue_tried:
+            # Nothing queued: the bare interrupt text is what the turn runner reads as the next turn. A
+            # queue attempt above logged its own outcome; a refused one must not read as delivered here.
+            inbox_log.log_disposition("became-next-turn", _quick_key, event, path="interrupt_text")
         # Delivered via adapter._pending_messages (read by _run_agent); never also buffered on self
         # — that copy was never consumed and grew unbounded.
         running_agent.interrupt(_interrupt_text)

@@ -36,7 +36,7 @@ import logging
 from typing import Any, List, Optional, Tuple
 
 from agent.i18n import t
-from gateway import inbound_record
+from gateway import inbound_record, inbox_log
 from hermes_cli.queue_verbs import QueueOp, parse_queue_payload
 
 logger = logging.getLogger(__name__)
@@ -93,16 +93,28 @@ def held_audit(runner: Any, key: str, *, before: bool) -> None:
     """Bracket every logged change of the held store: ``before=True`` just ahead of it, ``before=False``
     right after. A held list shorter than the last bracket left it means items went without an item
     line (review F5): one WARNING, with both depths. Reads lengths only; changes nothing."""
-    held = held_list(runner, key)
-    depth = len(held) if isinstance(held, list) else 0
-    seen = runner.__dict__.setdefault("_held_depth_seen", {})
-    if before and depth < seen.get(key, 0):
-        logger.warning("queue_mgmt op=unexplained_shrink session=%s expected=%d found=%d",
-                       key, seen.get(key, 0), depth)
-    if depth:
-        seen[key] = depth
-    else:
-        seen.pop(key, None)
+    try:
+        held = held_list(runner, key)
+        depth = len(held) if isinstance(held, list) else 0
+        expected = runner.__dict__.setdefault("_held_depth_seen", {}).get(key, 0)
+        if before and depth < expected:
+            logger.warning("queue_mgmt op=unexplained_shrink session=%s expected=%d found=%d",
+                           key, expected, depth)
+    except Exception:
+        return   # logging only: never reaches the held store's own change
+    _note_held_depth(runner, key, depth)
+
+
+def _note_held_depth(runner: Any, key: str, depth: int) -> None:
+    """The depth :func:`held_audit` compares against next time. Logging state only; never raises."""
+    try:
+        seen = runner.__dict__.setdefault("_held_depth_seen", {})
+        if depth:
+            seen[key] = depth
+        else:
+            seen.pop(key, None)
+    except Exception:
+        pass
 
 
 def held_list(runner: Any, key: str) -> Optional[List[Any]]:
@@ -505,6 +517,7 @@ def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_r
         return 0
     released = len(users) + len(system)
     merged = release_mode(runner) == "merged" and len(users) > 1
+    originals = list(users)
     if merged:
         users = [merge_user_events(users)]
     for e in users:
@@ -527,6 +540,11 @@ def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_r
                 release_mode(runner), len(system) + len(users), trigger)
     log_items(runner, "release", key, [e for e in combined if is_system_event(runner, e)]
               + [e for e in combined if not is_system_event(runner, e)])
+    if merged:
+        # Prism da666476e0b3: the merged turn carries only the head's id; one line per absorbed message.
+        for e in originals[1:]:
+            inbox_log.log_disposition("merged-into-head", key, e, path="held_release_merged",
+                                      into=getattr(originals[0], "message_id", None))
     return released
 
 
@@ -643,11 +661,10 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
         overflow = list(overflow_raw) if isinstance(overflow_raw, list) else []
         users_overflow = [e for e in overflow if not is_system_event(runner, e)]
         held_audit(runner, key, before=True)
-        seen = runner.__dict__.setdefault("_held_depth_seen", {})
         if reason in USER_RESET_REASONS:
             note_reset_drop(runner, key, len(held) + len(users_overflow))
             log_items(runner, "reset_drop", key, held + users_overflow)
-            seen.pop(key, None)   # the caller's clear empties held; these items have their lines
+            _note_held_depth(runner, key, 0)   # the caller's clear empties held; these items have their lines
             return None
         # Automatic resets have no reply target, so they must not drop anything (D5/D21): carry the
         # held items AND any active user items into the held store. An unknown reason is treated
@@ -660,10 +677,7 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
             logger.info("queue_mgmt op=auto_reset session=%s carried %d active item(s) into held",
                         key, len(users_overflow))
         log_items(runner, "auto_reset", key, carried)
-        if carried:
-            seen[key] = len(carried)   # what the caller's clear-then-carry leaves in held
-        else:
-            seen.pop(key, None)
+        _note_held_depth(runner, key, len(carried))   # what the caller's clear-then-carry leaves in held
         return carried or None
     except Exception:
         logger.warning("queue_mgmt before_scope_clear failed for %s (%s); clearing without carry",

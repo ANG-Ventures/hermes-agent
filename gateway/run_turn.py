@@ -2661,8 +2661,7 @@ class GatewayTurnMixin:
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
             event._goal_execution_started = True
-            inbox_log.log_disposition("became-next-turn", session_key, event, path="turn_start",
-                                      runner=self, session_id=_run_start_session_id)
+            inbox_log.log_disposition("became-next-turn", session_key, event, path="turn_start")
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -4646,8 +4645,7 @@ class GatewayTurnMixin:
                 await _run_followup_processing_hook(
                     _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
                 return result
-            inbox_log.log_disposition("became-next-turn", next_session_key, pending_event, path="followup",
-                                      runner=self, session_id=session_id)
+            inbox_log.log_disposition("became-next-turn", next_session_key, pending_event, path="followup")
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,
