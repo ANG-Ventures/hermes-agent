@@ -1290,5 +1290,49 @@ def test_display_walker_masks_tuple_values_and_dict_keys():
     """Path 4: mask_tool_display_value walks tuples and dict keys (verbose progress json.dumps keys too)."""
     with _cfg():
         out = redact_cards.mask_tool_display_value({DISC: ("a", DISC), "n": [(1, DISC)]})
-    assert DISC not in json.dumps(out)
-    assert out == {"XXXXXXXXXXXX0993": ("a", "XXXXXXXXXXXX0993"), "n": [(1, "XXXXXXXXXXXX0993")]}
+    # Shape only: whether a bare masked number is quoted is mask_card_numbers' call (#602), not the walker's.
+    (key, val), (_, n) = out.items()
+    assert isinstance(val, tuple) and isinstance(n[0], tuple) and DISC not in json.dumps(out)
+    assert all("XXXXXXXXXXXX0993" in s for s in (key, val[1], n[0][1]))
+
+
+def test_codex_mcp_numeric_card_in_array_stays_valid_json():
+    """Prism 6702d657689f: a numeric card inside an MCP result array is masked and the envelope stays JSON."""
+    from agent.transports.codex_event_projector import CodexEventProjector
+    item = {"type": "mcpToolCall", "id": "i3", "server": "stripe", "tool": "get_cards", "arguments": {},
+            "result": {"structuredContent": {"cards": [int(DISC)]}}}
+    with _cfg():
+        out = CodexEventProjector().project({"method": "item/completed", "params": {"item": item}})
+    row = out.messages[1]["content"]
+    assert DISC not in row and "XXXXXXXXXXXX0993" in row
+    json.loads(row)
+
+
+def test_streaming_overflow_split_masks_the_whole_card_before_sealing():
+    """Prism 545bfaf1096c: a card straddling the overflow split is masked with the whole buffer in view."""
+    import asyncio
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    sent = []
+    consumer = GatewayStreamConsumer(_final_adapter(sent), "8", StreamConsumerConfig(cursor=""))
+    consumer._len_fn, consumer._safe_limit = consumer._resolve_length_budget()
+    asyncio.run(consumer._send_or_edit("preview"))
+    limit = consumer._safe_limit
+    consumer._accumulated = "a" * (limit - 9) + " " + DISC + "."
+    asyncio.run(consumer._seal_overflow_heads())
+    asyncio.run(consumer._send_or_edit(consumer._accumulated))
+    out = "".join(sent[1:])
+    assert len(sent) == 3 and "".join(c for c in out if c.isdigit()) == DISC[-4:]
+
+
+def test_final_reconciliation_edit_is_masked():
+    """Prism 688fd1611a31: run_turn's in-place reconciliation edit goes out masked."""
+    import asyncio
+    from types import SimpleNamespace as NS
+    from gateway.run_turn import GatewayTurnMixin
+    sent = []
+    sc = NS(adapter=_final_adapter(sent), message_id="m1")
+    response = {}
+    asyncio.run(GatewayTurnMixin._run_agent_edit_streamed_message(
+        None, sc, NS(chat_id="8"), response, f"Your card: {DISC} (verified)", _sk="k",
+        ok=("ok",), fail_result="%s %s", fail_exc="%s %s"))
+    assert response.get("already_sent") and sent == ["Your card: XXXXXXXXXXXX0993 (verified)"]
