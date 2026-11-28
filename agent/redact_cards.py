@@ -25,6 +25,8 @@ the next two lines.
 """
 from __future__ import annotations
 
+import bisect
+import json
 import logging
 import os
 import re
@@ -138,30 +140,53 @@ _EXP_RE = re.compile(
     + r"(?P<v>\d{1,2}[ \t]?[/-][ \t]?(?:\d{4}|\d{2})|\d{4}|\d{2})(?![\d/-])")
 
 
-def _window(text: str, start: int, end: int) -> Tuple[int, int]:
-    """From the start of the line holding [start, end) to the end of the second line after it."""
-    line_start = 0
-    for m in _LINE_BREAK.finditer(text, 0, start):
-        line_start = m.end()
-    stop, breaks = len(text), 0
-    for m in _LINE_BREAK.finditer(text, end):
-        breaks += 1
-        if breaks == 3:
-            stop = m.start()
-            break
+class _LineBreaks:
+    """Every ``_LINE_BREAK`` match in *text*, found once per result, so each card's window is a bisect
+    instead of a rescan from the start of the text (20,000 card rows took 60 s, t_c497904d)."""
+
+    def __init__(self, text: str):
+        spans = [m.span() for m in _LINE_BREAK.finditer(text)]
+        self.starts = [s for s, _ in spans]
+        self.ends = [e for _, e in spans]
+        self.size = len(text)
+
+
+def _window(text: str, start: int, end: int, breaks: Optional[_LineBreaks] = None) -> Tuple[int, int]:
+    """From the start of the line holding [start, end) to the end of the second line after it.
+    A card's first and last characters are digits, so no line break straddles ``start`` or ``end``."""
+    if breaks is None:
+        breaks = _LineBreaks(text)
+    i = bisect.bisect_right(breaks.ends, start)
+    line_start = breaks.ends[i - 1] if i else 0
+    j = bisect.bisect_left(breaks.starts, end) + 2
+    stop = breaks.starts[j] if j < len(breaks.starts) else breaks.size
     return line_start, stop
 
 
 # A bare JSON value: right after ``"key":`` and right before ``,`` ``}`` ``]`` or the end of the text.
 _JSON_KEY_BEFORE = re.compile(r'"[ \t]*:[ \t]*$')
 _JSON_VALUE_AFTER = re.compile(r"[ \t]*(?:[,}\]]|$)")
+# One pass over a valid JSON document: each string (skipped whole) or each number outside every string.
+_JSON_TOKEN = re.compile(r'"(?:[^"\\]+|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?')
+
+
+def _quote_share(text: str, q: int) -> int:
+    """How many backslashes escape the quote at *q*: n backslashes before it = (2**d - 1) for the quote at
+    depth d, plus whole escaped backslashes of the string it ends (2**(d+1) each); the trailing run of
+    1-bits of n is the quote's share."""
+    b = q
+    while b > 0 and text[b - 1] == "\\":
+        b -= 1
+    n = q - b
+    return n & ~(n + 1)
 
 
 def mask_card_numbers(text: str) -> str:
     """*text* with every card number masked to its last four, plus labelled CVC/expiry near one.
 
     Digits become ``X`` and separators are kept. Numbers that share a group are masked together. A masked
-    bare JSON number (``"cvv":123``) is quoted so a valid JSON payload stays valid."""
+    bare JSON number (``"cvv":123``, ``[4000...]``, or the whole text) is quoted so a valid JSON payload
+    stays valid; array/root quotes only for number tokens outside every string of a valid JSON *text*."""
     if not isinstance(text, str) or len(text) < 15:
         return text
     cards = list(_card_spans(text, strict=True))
@@ -169,12 +194,18 @@ def mask_card_numbers(text: str) -> str:
         return text
     masked: set = set()
     values: List[Tuple[int, int]] = []
+    breaks = _LineBreaks(text)
+    windows = []
     for groups in cards:
         digit_pos = [i for s, e in groups for i in range(s, e)]
         masked.update(digit_pos[:-4])
         start, end = groups[0][0], groups[-1][1]
         values.append((start, end))
-        lo, hi = _window(text, start, end)
+        windows.append(_window(text, start, end, breaks))
+    # CVC/expiry: scan the union of the cards' windows once (many cards on one long line share one window,
+    # t_c497904d). Windows are whole lines and no label match crosses a line break, so the union finds the
+    # same matches as scanning each card's window.
+    for lo, hi in _merge(windows):
         for rx in (_CVC_RE, _EXP_RE):
             for m in rx.finditer(text, lo, hi):
                 vs, ve = m.span("v")
@@ -183,18 +214,46 @@ def mask_card_numbers(text: str) -> str:
     # The inserted quote copies the key's closing quote with its backslashes, so a bare value inside a
     # JSON-encoded string (``\\"key\\":4000...``) gets ``\\"`` and the outer JSON stays valid too.
     quote_at = {}
+    rest = []
     for vs, ve in values:
+        if vs > 0 and text[vs - 1] == '"':
+            continue
         lo = max(0, vs - 16)
         key = _JSON_KEY_BEFORE.search(text, lo, vs)
-        if vs > 0 and text[vs - 1] != '"' and key and _JSON_VALUE_AFTER.match(text, ve):
-            q = key.start()
-            b = q
-            while b > 0 and text[b - 1] == "\\":
-                b -= 1
-            # n backslashes before the quote = (2**d - 1) for the quote at depth d, plus whole escaped
-            # backslashes of the key itself (2**(d+1) each); the trailing run of 1-bits of n is the quote's share.
-            n = q - b
-            quote_at[vs] = quote_at[ve] = "\\" * (n & ~(n + 1)) + '"'
+        if key and _JSON_VALUE_AFTER.match(text, ve):
+            quote_at[vs] = quote_at[ve] = "\\" * _quote_share(text, key.start()) + '"'
+        else:
+            rest.append((vs, ve))
+    # A masked bare number in an array or at the root: quoted only when *text* is valid JSON and the number is
+    # a whole number token outside every string of it. Inside a string nothing is added (t_c497904d).
+    if rest and _parses(text):
+        bare = {m.span() for m in _JSON_TOKEN.finditer(text) if text[m.start()] != '"'}
+        for vs, ve in rest:
+            if (vs, ve) in bare:
+                quote_at[vs] = quote_at[ve] = '"'
+    return _render(text, masked, quote_at)
+
+
+def _merge(windows: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    merged: List[Tuple[int, int]] = []
+    for lo, hi in sorted(windows):
+        if merged and lo <= merged[-1][1]:
+            if hi > merged[-1][1]:
+                merged[-1] = (merged[-1][0], hi)
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _parses(text: str) -> bool:
+    try:
+        json.loads(text)
+    except (ValueError, RecursionError):
+        return False
+    return True
+
+
+def _render(text: str, masked: set, quote_at: dict) -> str:
     out = []
     for i, ch in enumerate(text):
         if i in quote_at:

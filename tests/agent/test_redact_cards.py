@@ -577,3 +577,144 @@ def test_alpha_dropped_copy_drops_a_trns_colour_key(tmp_path):
     with Image.open(out) as im:
         assert im.mode == "RGB" and "transparency" not in im.info
 
+
+
+# ── t_c497904d: linear time, JSON arrays/root, flattened copy lifetime ───────
+
+def _old_window(text, start, end):
+    """``_window`` as it was before t_c497904d (rescans from the start of the text per card)."""
+    line_start = 0
+    for m in redact_cards._LINE_BREAK.finditer(text, 0, start):
+        line_start = m.end()
+    stop, breaks = len(text), 0
+    for m in redact_cards._LINE_BREAK.finditer(text, end):
+        breaks += 1
+        if breaks == 3:
+            stop = m.start()
+            break
+    return line_start, stop
+
+
+def _card_rows(n, seed=7):
+    """n rows, each with a made-up Luhn-valid Visa number: plain table rows (CRLF) and JSON-escaped rows."""
+    import random
+    rng = random.Random(seed)
+
+    def card():
+        body = "4" + "".join(rng.choice("0123456789") for _ in range(14))
+        return next(body + d for d in "0123456789" if luhn(body + d))
+    return "".join(
+        "order %06d  customer name here  card %s  cvv %03d  exp 08/29  ok\r\n" % (i, card(), rng.randrange(1000))
+        if i % 3 else '{\\"order\\": %d, \\"card\\": %s}\\n  cvc: %03d\n' % (i, card(), rng.randrange(1000))
+        for i in range(n))
+
+
+def test_mask_is_linear_and_matches_the_old_windowing():
+    import time
+    sample = _card_rows(500)
+    with patch.object(redact_cards, "_window", lambda text, s, e, breaks=None: _old_window(text, s, e)):
+        old = mask_card_numbers(sample)
+    assert old != sample and mask_card_numbers(sample) == old
+    big = _card_rows(20000, seed=8)
+    t0 = time.perf_counter()
+    out = mask_card_numbers(big)
+    elapsed = time.perf_counter() - t0
+    assert out.count("XXXXXXXXXXXX") == 20000
+    assert elapsed < 2.0, "20,000 card rows took %.1f s" % elapsed
+
+
+def test_masked_bare_json_numbers_in_arrays_and_at_the_root_stay_valid_json():
+    m = "XXXXXXXXXXXX0366"
+    assert json.loads(mask_card_numbers('{"cards":[%s]}' % VISA)) == {"cards": [m]}
+    assert json.loads(mask_card_numbers('{"cards":[1, %s, 5]}' % VISA)) == {"cards": [1, m, 5]}
+    assert json.loads(mask_card_numbers(json.dumps({"cards": [int(VISA)] * 2}, indent=2))) == {"cards": [m, m]}
+    assert json.loads(mask_card_numbers(VISA)) == m
+    assert json.loads(mask_card_numbers(VISA + "\n")) == m
+    assert json.loads(mask_card_numbers(json.dumps(["say \"hi\"", int(VISA)]))) == ["say \"hi\"", m]
+    # Inside a JSON-encoded string nothing is added: the array item is only X'd, one and two levels deep.
+    for inner in ('{"cards":[%s]}' % VISA, "[%s]" % VISA, json.dumps([int(VISA)], indent=2)):
+        out = json.loads(mask_card_numbers(json.dumps({"output": inner})))["output"]
+        assert out == inner.replace(VISA, m)
+    twice = mask_card_numbers(json.dumps({"o": json.dumps({"x": "[%s]" % VISA})}))
+    assert json.loads(json.loads(twice)["o"])["x"] == "[%s]" % m
+    # Not a JSON number: a spaced card at the root stays unquoted.
+    assert mask_card_numbers(f"{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}") == "XXXX XXXX XXXX 0366"
+
+
+def test_cancelled_image_read_leaves_no_flattened_copy(tmp_path):
+    """The alpha-dropped ``.rgb.png`` copy shows the unmasked card: a read cancelled while the copy exists
+    must still delete it."""
+    import asyncio
+    import threading
+    from tools import vision_tools
+    url = _rgba_card_url(0, (400, 100))
+    made, release = threading.Event(), threading.Event()
+    real = vision_tools._alpha_dropped_copy
+
+    def copy_then_wait(path):
+        out = real(path)
+        made.set()
+        release.wait(10)
+        return out
+
+    async def run():
+        task = asyncio.create_task(vision_tools._prepare_image(url, "t", None, validate_decode=False))
+        assert await asyncio.to_thread(made.wait, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert list(tmp_path.glob("*.rgb.png")), "the copy was not made before the cancel"
+        release.set()
+        # asyncio.run joins the worker thread on exit, so the copy's fate is settled when it returns.
+
+    with _cfg(), patch("tools.vision_tools.get_hermes_dir", return_value=tmp_path), \
+            patch.object(vision_tools, "_alpha_dropped_copy", copy_then_wait), \
+            patch.object(redact_cards, "_ocr", return_value=("", None)):
+        asyncio.run(run())
+    assert not list(tmp_path.glob("*.rgb.png"))
+
+
+def test_array_quotes_only_for_number_tokens_outside_every_string():
+    """Prism f224ce988f0c / 800ec6141d53: text inside a JSON string gets X's and nothing else; a bare number
+    is quoted only when it is a token of a valid JSON document, outside every string."""
+    m = "XXXXXXXXXXXX0366"
+    # CSV rows inside a terminal result decode to the text with only the digits X'd.
+    for output in (",%s,approved" % VISA, "id,card\n7,%s,ok\n" % VISA, "a,%s,b" % VISA, "[x,%s,y" % VISA,
+                   "cards seen: [%s, %s]" % (VISA, VISA)):
+        got = json.loads(mask_card_numbers(json.dumps({"output": output, "exit_code": 0})))
+        assert got == {"output": output.replace(VISA, m), "exit_code": 0}
+    # One document with a comma-first CSV string AND a bare number array: valid, array item quoted.
+    doc = '{"output":",%s,approved","cards":[%s]}' % (VISA, VISA)
+    assert json.loads(mask_card_numbers(doc)) == {"output": ",%s,approved" % m, "cards": [m]}
+    # A top-level array and a lone root number are quoted.
+    assert json.loads(mask_card_numbers(json.dumps([int(VISA), int(MC)]))) == [m, "XXXXXXXXXXXX2226"]
+    assert json.loads(mask_card_numbers(" %s\n" % VISA)) == m
+    # Not JSON: no quotes (prose with a bracketed list, a bare number on a line of prose).
+    assert mask_card_numbers("cards seen: [%s, %s]" % (VISA, VISA)) == "cards seen: [%s, %s]" % (m, m)
+    assert mask_card_numbers("%s\nnext line" % VISA) == m + "\nnext line"
+    # A number token that is more than the card (a negative or a fraction) is left unquoted.
+    assert mask_card_numbers("[-%s]" % VISA) == "[-%s]" % m
+
+
+def test_many_cards_on_one_line_mask_in_linear_time():
+    """Prism b327b5c2835b: every card on one line shared the whole line as its window."""
+    import random
+    import time
+    rng = random.Random(11)
+
+    def cards(n):
+        out = []
+        while len(out) < n:
+            body = "4" + "".join(rng.choice("0123456789") for _ in range(14))
+            out.append(int(next(body + d for d in "0123456789" if luhn(body + d))))
+        return out
+    sample = json.dumps({"ids": cards(300), "cvc": 123, "exp": "08/29"})
+    with patch.object(redact_cards, "_merge", lambda windows: windows):
+        per_card = mask_card_numbers(sample)
+    assert per_card != sample and mask_card_numbers(sample) == per_card
+    big = json.dumps(cards(20000))
+    t0 = time.perf_counter()
+    out = mask_card_numbers(big)
+    elapsed = time.perf_counter() - t0
+    assert len(json.loads(out)) == 20000 and out.count("XXXXXXXXXXXX") == 20000
+    assert elapsed < 3.0, "20,000 cards on one line took %.1f s" % elapsed

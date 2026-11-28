@@ -533,7 +533,8 @@ class _CardImageRefused(_ImagePrepError):
 
 def _alpha_dropped_copy(path: Path) -> Optional[Path]:
     """PNG copy of *path* with transparency dropped exactly as the JPEG resize does (``convert("RGB")``),
-    or None when the image has no non-opaque pixels (or Pillow cannot read it). Caller deletes the copy."""
+    or None when the image has no non-opaque pixels (or Pillow cannot read it). ``_alpha_dropped_card_refusal``
+    deletes the copy."""
     Image = _import_pillow_for_resize()
     if Image is None:
         return None
@@ -553,6 +554,20 @@ def _alpha_dropped_copy(path: Path) -> Optional[Path]:
     except Exception as exc:
         logger.debug("alpha-dropped OCR copy failed: %s", exc)
         return None
+
+
+def _alpha_dropped_card_refusal(path: Path) -> Optional[str]:
+    """``screenshot_card_refusal`` on the alpha-dropped copy of *path* (None when the image is opaque).
+    The copy is created, OCRed and deleted in this one worker call: a cancelled caller cannot strand the
+    unmasked copy in the vision temp dir (t_c497904d)."""
+    from agent.redact_cards import screenshot_card_refusal
+    flat = _alpha_dropped_copy(path)
+    if flat is None:
+        return None
+    try:
+        return screenshot_card_refusal(flat, knob="image_read_card_ocr", what="image read")
+    finally:
+        _unlink_quietly(flat)
 
 
 class _PreparedImage(NamedTuple):
@@ -609,13 +624,7 @@ async def _prepare_image(
         if refusal is None:
             # Tesseract composites transparency on white, but the JPEG resize (convert("RGB")) and providers
             # that ignore alpha show the RGB under it: OCR that alpha-dropped view too.
-            flat = await asyncio.to_thread(_alpha_dropped_copy, path)
-            if flat is not None:
-                try:
-                    refusal = await asyncio.to_thread(
-                        screenshot_card_refusal, flat, knob="image_read_card_ocr", what="image read")
-                finally:
-                    _unlink_quietly(flat)
+            refusal = await asyncio.to_thread(_alpha_dropped_card_refusal, path)
         if refusal is not None:
             raise _CardImageRefused(refusal)
     except BaseException:
