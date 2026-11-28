@@ -1731,21 +1731,16 @@ def implementer_not_owner_enabled() -> bool:
     return os.environ.get("BOOMERANG_IMPLEMENTER_NOT_OWNER") != "0"
 
 
-def _row_implementer(conn: Any, task_id: str, event_id: Any) -> Optional[str]:
+def _row_implementer(kb: Any, conn: Any, task_id: str, event_id: Any) -> Optional[str]:
     """The implementer the send-back event ``event_id`` handed the card to: its payload's ``implementer``, else the
-    one recorded by the newest ``review_requested`` at or before it. None when neither names one."""
-    for sql in ("SELECT payload FROM task_events WHERE task_id = ? AND id = ?",
-                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' AND id <= ? "
-                "ORDER BY id DESC LIMIT 1"):
-        row = conn.execute(sql, (task_id, event_id)).fetchone()
-        try:
-            payload = json.loads((row["payload"] if row else None) or "{}")
-        except ValueError:
-            payload = {}
-        name = str((payload if isinstance(payload, dict) else {}).get("implementer") or "").strip()
-        if name:
-            return name
-    return None
+    one recorded by the newest ``review_requested``. None when neither names one."""
+    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND id = ?", (task_id, event_id)).fetchone()
+    try:
+        payload = json.loads((row["payload"] if row else None) or "{}")
+    except ValueError:
+        payload = {}
+    name = str((payload if isinstance(payload, dict) else {}).get("implementer") or "").strip()
+    return name or kb._review_handoff_implementer(conn, task_id)  # noqa: SLF001 -- the board's own reader
 
 
 #: t_53549b28 R4: a surface refused as "owner comment newer than handback" is written to the card as ONE comment, with
@@ -1804,10 +1799,12 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False, surfaced: bool
                   (owner, str(_field(task, "assignee") or "")) if name}
         owners |= {f"human:{name}" for name in owners}
         if sendback and implementer_not_owner_enabled():
-            implementer = _row_implementer(conn, entry["task_id"], event_id)
+            implementer = _row_implementer(kb, conn, entry["task_id"], event_id)
             if implementer:
                 bare = implementer.removeprefix("human:")
-                owners -= {bare, f"human:{bare}"}
+                # An explicit human lane of the same name (``human:<bare>``) stays an owner: only the worker is out.
+                explicit = {name for name in (owner, str(_field(task, "assignee") or "")) if name.startswith("human:")}
+                owners -= {bare, f"human:{bare}"} - explicit
         comments = [c for c in kb.list_comments(conn, entry["task_id"])
                     if str(c.author) not in {"boomerang-wake", "kanban-dispatcher"}
                     and not str(c.author).startswith("unverified:")
@@ -2529,6 +2526,7 @@ def record_surface(entry: dict, summary: str) -> bool:
 _MERGED_REFUSAL = "summarized PR merged"
 _DONE_REFUSAL = " after send-back"   # stale_surface_reason rule (a): "card <status> after send-back"
 _STALE_READ_HEAD = f"{MARKER} stale surface refused"
+_STALE_READ_SAID_MAX = 1500
 _PATH_RE = re.compile(r"[\w~./-]+\.(?:md|txt)\b")
 
 
@@ -2577,8 +2575,12 @@ def record_stale_read(entry: dict, result: dict) -> bool:
     wake = f"(wake {str(entry['key']).split('#restart', 1)[0]}) (delegation "
     tag = f"{wake}{entry['delegation_id']})"
     staged = _staged_read(entry, [result.get("detail"), *(result.get("evidence") or []), result.get("summary")])
+    # ONE line, bounded: a quoted record (``review_coverage:``, ``ruling:``) in a rendered turn must not start a line
+    # of a board comment, where line-anchored parsers would read it as the reviewer's own.
+    said = " ".join(str(result.get("summary") or "").split())
+    said = (said[:_STALE_READ_SAID_MAX] + "…") if len(said) > _STALE_READ_SAID_MAX else said
     body = (f"{_STALE_READ_HEAD} ({reason}); the child's read was not delivered. "
-            f"Staged read: {staged or 'none found'}. Child said: {result.get('summary') or 'no summary'} {tag}")
+            f"Staged read: {staged or 'none found'}. Child said: {said or 'no summary'} {tag}")
     conn = kb.connect(board=entry.get("board"))
     try:
         if any(c.author == AUTHOR and c.body.startswith(_STALE_READ_HEAD) and wake in c.body
