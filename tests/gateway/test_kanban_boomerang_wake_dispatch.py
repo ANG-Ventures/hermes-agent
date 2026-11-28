@@ -539,13 +539,131 @@ def test_acknowledge_on_a_merged_pr_card_open_on_a_human_keeps_todays_behaviour(
 
 
 def test_refused_acknowledge_or_other_reason_leaves_no_stale_read_comment(env):
-    """t_e86eeab2: only a surface refused for a merged PR is recorded; an acknowledge or another refusal is not."""
+    """t_e86eeab2: only a surface refused for a merged PR is recorded; an acknowledge or another refusal is not.
+    (t_53549b28 R4 records an owner-comment refusal too: see test_owner_comment_refusal_*.)"""
     tid = _card(env)
     _handback(tid, 71)
     entry = _claimed_entry(env, tid, row="completed", kind="review_requested")
     assert ah.record_stale_read(entry, {"action": "acknowledge", "reason": f"summarized PR merged: {REPO}#71"}) is False
-    assert ah.record_stale_read(entry, {"action": "surface", "reason": "owner comment newer than handback"}) is False
+    assert ah.record_stale_read(entry, {"action": "acknowledge", "reason": "owner comment newer than handback"}) is False
+    assert ah.record_stale_read(entry, {"action": "surface", "reason": "owner release/hold line"}) is False
     assert _stale_read_comments(tid) == []
+
+
+# --- t_53549b28: owner-comment refusals (ruling:t_53549b28-owner-comment-rule, R1 + R4) ------------------------
+
+def _owner_comment_card(env, *, author="apollo") -> tuple:
+    """A handback, then an owner comment newer than it; the claim is a human review read of that handback."""
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, author, "Landed #71", 1793844766))
+    env["health"][(REPO, 71)] = {"state": "open"}
+    return tid, _claimed_entry(env, tid, row="own_repo_review_human", kind="review_requested")
+
+
+@pytest.mark.parametrize("switch", ["on", "off"])
+def test_owner_comment_refusal_writes_one_card_comment_no_turn(env, switch):
+    """R4 (t_53549b28, 11-23..11-28: 100 reads dropped as "owner comment newer than handback", 94 left nothing on the
+    card): the refused surface is written to the card as ONE comment, with no chat turn. RED on 8d138b30 for "on"."""
+    if switch == "off":
+        env["monkeypatch"].setenv("BOOMERANG_OWNER_COMMENT_CARD_READ", "0")
+    tid, entry = _owner_comment_card(env)
+    _run(env, entry, "completed", _verdict(entry, "surface", summary="the guard still reads the old key"))
+    assert env["adapter"].handled == [] and env["adapter"].sent == []
+    assert _claims()[entry["key"]]["outcome"] == "stale"
+    comments = _stale_read_comments(tid)
+    if switch == "off":
+        assert comments == []
+        return
+    assert len(comments) == 1, comments
+    assert "(owner comment newer than handback)" in comments[0]
+    assert "the guard still reads the old key" in comments[0]
+    assert comments[0].endswith(f"(wake {entry['key']}) (delegation {entry['delegation_id']})")
+    # replay of the same wake adds nothing
+    assert ah.record_stale_read(entry, {"action": "surface", "reason": "owner comment newer than handback"}) is False
+    assert len(_stale_read_comments(tid)) == 1
+
+
+@pytest.mark.parametrize("surfaced", [False, True])
+def test_owner_comment_refusal_at_delivery_writes_the_read_once(env, surfaced):
+    """R4 at the deliver stage (2 of the 100): the pending surface row is dropped, its read goes to the card unless
+    this delegation's ``surfaced:`` comment already holds it. RED on 8d138b30 for surfaced=False."""
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+    env["health"][(REPO, 71)] = {"state": "open"}
+    entry = _claimed_entry(env, tid, row="review_requested", kind="review_requested")
+    state = ah.BoomerangWakeState()
+    if surfaced:
+        assert ah.record_surface(entry, "child surfaced it")
+    ah.enqueue_handback(entry, {"summary": "ready", "action": "surface"}, state=state,
+                        turn_text="the read: guard reads the old key")
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, "apollo", "owner acted", 1793844766))
+    assert asyncio.run(ah.deliver_handbacks(env["runner"], state)) == 0
+    assert env["adapter"].handled == [] and state.handbacks() == {}
+    comments = _stale_read_comments(tid)
+    if surfaced:
+        assert comments == []
+    else:
+        assert len(comments) == 1 and "the read: guard reads the old key" in comments[0], comments
+
+
+def _implementer_sendback(env, *, payload_implementer=True) -> tuple:
+    """The worker hands back, the reviewer sends it back (card assigned to the worker), the worker comments."""
+    tid = _card(env)
+    _handback(tid, 71)
+    payload = {"reason": "fix the key", "implementer": "worker", "reviewer": "human:apollo"}
+    if not payload_implementer:
+        payload.pop("implementer")
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "changes_requested", json.dumps(payload), 1793845000))
+        conn.execute("UPDATE tasks SET assignee = 'worker' WHERE id = ?", (tid,))
+    entry = _claimed_entry(env, tid, row="changes_requested", kind="changes_requested")
+    return tid, entry
+
+
+def _comment(tid, author, body, at=1793846000):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                     (tid, author, body, at))
+
+
+@pytest.mark.parametrize("arm,stale", [
+    ("implementer", None),                                            # R1: the worker's own comment, delivered
+    ("implementer_from_handback", None),                              # payload names no implementer: the handback's
+    ("implementer_release", None),                                    # a release line by the worker is not an act
+    ("switch_off", "owner comment newer than handback"),              # BOOMERANG_IMPLEMENTER_NOT_OWNER=0
+    ("owner_assignee", "owner comment newer than handback"),          # card back on a human owner who commented
+])
+def test_sendback_implementer_comment_is_not_an_owner_act(env, arm, stale):
+    """R1 (t_53549b28: 28 of the 100 drops): on a changes_requested row the card is assigned back to the implementer,
+    and its "prism-verdict ... fixed" line was read as "the owner already acted". Decided by the author's role on
+    the row, not by the comment's words. RED on 8d138b30 for the three delivered arms."""
+    tid, entry = _implementer_sendback(env, payload_implementer=arm != "implementer_from_handback")
+    if arm == "switch_off":
+        env["monkeypatch"].setenv("BOOMERANG_IMPLEMENTER_NOT_OWNER", "0")
+    if arm == "owner_assignee":
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        _comment(tid, "apollo", "Landed the fix")
+    elif arm == "implementer_release":
+        _comment(tid, "worker", "release: fixed in a3f2")
+    else:
+        _comment(tid, "worker", f"prism-verdict 0123456789ab fixed {'a' * 40}")
+    if arm == "implementer_from_handback":
+        with kb.connect_closing() as conn:
+            assert kb._review_handoff_implementer(conn, tid) == "worker"   # noqa: SLF001
+    assert ah.stale_surface_reason(entry) == stale
 
 
 def _sendback_card(env) -> tuple:

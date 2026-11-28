@@ -1723,6 +1723,38 @@ def merged_open_deliver_enabled() -> bool:
     return os.environ.get("BOOMERANG_MERGED_OPEN_DELIVER") != "0"
 
 
+#: t_53549b28 R1 (ruling:t_53549b28-owner-comment-rule): on a changes_requested row the board hands the card back to
+#: the implementer, so the card's assignee is the worker. Its own comments ("prism-verdict ... fixed", a scope split)
+#: are not an owner act on the read: decided by the author's role on the row, never by comment text. 11-23..11-28:
+#: 28 of 100 "owner comment newer" drops. Kill switch: BOOMERANG_IMPLEMENTER_NOT_OWNER=0.
+def implementer_not_owner_enabled() -> bool:
+    return os.environ.get("BOOMERANG_IMPLEMENTER_NOT_OWNER") != "0"
+
+
+def _row_implementer(conn: Any, task_id: str, event_id: Any) -> Optional[str]:
+    """The implementer the send-back event ``event_id`` handed the card to: its payload's ``implementer``, else the
+    one recorded by the newest ``review_requested`` at or before it. None when neither names one."""
+    for sql in ("SELECT payload FROM task_events WHERE task_id = ? AND id = ?",
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' AND id <= ? "
+                "ORDER BY id DESC LIMIT 1"):
+        row = conn.execute(sql, (task_id, event_id)).fetchone()
+        try:
+            payload = json.loads((row["payload"] if row else None) or "{}")
+        except ValueError:
+            payload = {}
+        name = str((payload if isinstance(payload, dict) else {}).get("implementer") or "").strip()
+        if name:
+            return name
+    return None
+
+
+#: t_53549b28 R4: a surface refused as "owner comment newer than handback" is written to the card as ONE comment, with
+#: no chat turn, so the read is not lost (94 of 100 such drops left nothing on the card). Kill switch:
+#: BOOMERANG_OWNER_COMMENT_CARD_READ=0 (the read is dropped with no trace, as before).
+def owner_comment_card_read_enabled() -> bool:
+    return os.environ.get("BOOMERANG_OWNER_COMMENT_CARD_READ") != "0"
+
+
 def stale_surface_reason(entry: dict, *, fork_died: bool = False, surfaced: bool = False) -> Optional[str]:
     """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
 
@@ -1771,6 +1803,11 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False, surfaced: bool
         owners = {name.removeprefix("human:") for name in
                   (owner, str(_field(task, "assignee") or "")) if name}
         owners |= {f"human:{name}" for name in owners}
+        if sendback and implementer_not_owner_enabled():
+            implementer = _row_implementer(conn, entry["task_id"], event_id)
+            if implementer:
+                bare = implementer.removeprefix("human:")
+                owners -= {bare, f"human:{bare}"}
         comments = [c for c in kb.list_comments(conn, entry["task_id"])
                     if str(c.author) not in {"boomerang-wake", "kanban-dispatcher"}
                     and not str(c.author).startswith("unverified:")
@@ -2212,6 +2249,15 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
             why = await asyncio.to_thread(_stale_refusal, guard_entry, "deliver_one",
                                           fork_died=bool(row.get("fork_died")), surfaced=bool(row.get("merged_open")))
             if why:
+                if why == _OWNER_COMMENT_NEWER:
+                    # t_53549b28 R4: the read goes to the card (no chat turn) before its row is dropped.
+                    try:
+                        await asyncio.to_thread(record_stale_read, {
+                            **guard_entry, "key": guard_entry.get("key") or row.get("claim_key") or delegation_id},
+                            {"action": "surface", "reason": why, "summary": row.get("turn") or row.get("line")})
+                    except Exception as exc:
+                        logger.warning("kanban boomerang-wake: stale-read comment on %s not written: %s",
+                                       row.get("task_id"), exc)
                 await asyncio.to_thread(state.drop_handback, delegation_id)
                 return sent
         fail: dict = {}
@@ -2516,10 +2562,15 @@ def record_stale_read(entry: dict, result: dict) -> bool:
     and the refusal otherwise leaves no trace on the card. Names the staged read file and the refusal reason. Ends
     ``(wake <key>) (delegation <id>)``: deduped on the WAKE (claim key without its ``#restartN`` suffix), since a
     restart redispatch of the same wake mints a new delegation id; the delegation id stays as the pointer to the
-    child's folder and transcript. Any other refusal or action writes nothing."""
+    child's folder and transcript. Any other refusal or action writes nothing.
+
+    t_53549b28 R4: a surface refused as "owner comment newer than handback" is recorded the same way (kill switch
+    BOOMERANG_OWNER_COMMENT_CARD_READ=0), unless this delegation's ``surfaced:`` comment already holds the read."""
     reason = str(result.get("reason") or "")
+    owner_newer = reason == _OWNER_COMMENT_NEWER and owner_comment_card_read_enabled()
     if result.get("action") != "surface" or not (
-            reason.startswith(_MERGED_REFUSAL) or (reason.startswith("card ") and reason.endswith(_DONE_REFUSAL))):
+            owner_newer or reason.startswith(_MERGED_REFUSAL)
+            or (reason.startswith("card ") and reason.endswith(_DONE_REFUSAL))):
         return False
     from hermes_cli import kanban_db as kb
 
@@ -2532,6 +2583,8 @@ def record_stale_read(entry: dict, result: dict) -> bool:
     try:
         if any(c.author == AUTHOR and c.body.startswith(_STALE_READ_HEAD) and wake in c.body
                for c in kb.list_comments(conn, entry["task_id"])):
+            return False
+        if owner_newer and _surfaced_summary(kb, conn, entry["task_id"], entry["delegation_id"]) is not None:
             return False
         with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
             kb.add_comment(conn, entry["task_id"], AUTHOR, body)
