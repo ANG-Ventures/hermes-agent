@@ -156,6 +156,9 @@ def board(kanban_home, monkeypatch, anchor):
 
 
 def _tick_counted(conn, monkeypatch, n_ready: int, *, sleep: float = 0.0, **kw):
+    # the counter fails every ssh, so a tick's pool clones fail and mark (host, repo) cooling down (t_4d8fb733);
+    # each measured tick starts with none, so N=2 and N=12 route their worktree cards the same way
+    kwt._port_faults.clear()
     counter = SpawnCounter(sleep=sleep).install(monkeypatch)
     t0 = time.monotonic()
     res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=n_ready, **kw)

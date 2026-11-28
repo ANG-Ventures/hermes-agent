@@ -1576,6 +1576,21 @@ def run_clone(key: tuple, job: Callable[[], None], lock_path: Path) -> None:
         _unlock(fd)
 
 
+def run_port_clone(key: tuple, job: Callable[[], None], lock_path: Path, host: str, slug: str) -> None:
+    """:func:`run_clone` at the dispatcher's claim. A failed clone on the pool host (:data:`CLONE_FAILED_PREFIX`) is a
+    HOST fault (t_4d8fb733): the (host, repo) pair is marked (:func:`mark_port_fault`) and the failure is raised as
+    ``WorkspaceUnavailable``, which releases the claim uncharged with the reason named. A pending clone or a failed
+    push of the card branch raises unchanged."""
+    try:
+        run_clone(key, job, lock_path)
+    except RuntimeError as exc:
+        if not str(exc).startswith(CLONE_FAILED_PREFIX):
+            raise
+        from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+        mark_port_fault(host, slug, str(exc))
+        raise WorkspaceUnavailable(f"{WHY_CLONE_FAILED}:{host}: {exc}") from exc
+
+
 def convert(conn, task, workspace: str, branch: str, *, host: str, slug: str,
             mirror: str) -> None:
     """Persist the port: the card is now a scratch card at ``workspace``."""

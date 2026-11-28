@@ -1018,6 +1018,10 @@ def test_failed_background_clone_is_a_host_fault_never_charged(kanban_home, anch
     assert (run["error"] or "").startswith(f"{kwt.WHY_CLONE_FAILED}:ace-ai")
     assert (other, "ace-ai") in spawned3
     assert all(tid != wt for tid, _ in res3.placed) and row3["consecutive_failures"] == 0
+    # Prism 00573c799797: the card is held NAMED while the pair cools down (a clone outage is not a Studio
+    # capability, so the Studio last-resort policy does not take it), never charged, never silently dropped
+    route3 = next(r for r in res3.routes if r["task_id"] == wt)
+    assert kwt.WHY_CLONE_FAILED in f"{route3.get('code')} {route3.get('detail')} {res3.placement_waits.get(wt)}", route3
     assert kwt.port_fault("ace-ai", SLUG) is not None
 
 
