@@ -1723,6 +1723,13 @@ def merged_open_deliver_enabled() -> bool:
     return os.environ.get("BOOMERANG_MERGED_OPEN_DELIVER") != "0"
 
 
+#: t_53549b28 R4: a surface refused as "owner comment newer than handback" is written to the card as ONE comment, with
+#: no chat turn, so the read is not lost (94 of 100 such drops left nothing on the card). Kill switch:
+#: BOOMERANG_OWNER_COMMENT_CARD_READ=0 (the read is dropped with no trace, as before).
+def owner_comment_card_read_enabled() -> bool:
+    return os.environ.get("BOOMERANG_OWNER_COMMENT_CARD_READ") != "0"
+
+
 def stale_surface_reason(entry: dict, *, fork_died: bool = False, surfaced: bool = False) -> Optional[str]:
     """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
 
@@ -2212,6 +2219,15 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
             why = await asyncio.to_thread(_stale_refusal, guard_entry, "deliver_one",
                                           fork_died=bool(row.get("fork_died")), surfaced=bool(row.get("merged_open")))
             if why:
+                if why == _OWNER_COMMENT_NEWER:
+                    # t_53549b28 R4: the read goes to the card (no chat turn) before its row is dropped.
+                    try:   # none of the turn's text goes to the card
+                        await asyncio.to_thread(record_stale_read, {
+                            **guard_entry, "key": guard_entry.get("key") or row.get("claim_key") or delegation_id},
+                            {"action": "surface", "reason": why})
+                    except Exception as exc:
+                        logger.warning("kanban boomerang-wake: stale-read comment on %s not written: %s",
+                                       row.get("task_id"), exc)
                 await asyncio.to_thread(state.drop_handback, delegation_id)
                 return sent
         fail: dict = {}
@@ -2484,6 +2500,20 @@ _MERGED_REFUSAL = "summarized PR merged"
 _DONE_REFUSAL = " after send-back"   # stale_surface_reason rule (a): "card <status> after send-back"
 _STALE_READ_HEAD = f"{MARKER} stale surface refused"
 _PATH_RE = re.compile(r"[\w~./-]+\.(?:md|txt)\b")
+# t_53549b28 (Apollo send-backs on #614 r2, r3): the stale-read comment is fixed words plus the wake and delegation
+# ids, never child text and never a file path (a legal path can spell a PR URL the closer reads): unanchored,
+# author-blind readers (unblock sweep, archive CLOSED:, closer-echo review_coverage, the ruling citation check) act on
+# quoted text anywhere in a comment. Every interpolated field has its own allowlist and the final body is checked
+# against this grammar before the write.
+_STALE_READ_KEY = r"[A-Za-z0-9_.:|#-]{1,200}"   # '#': gateway-minted <key>#deferred claims (Prism 07c006b857b0)
+_STALE_READ_DID = r"[A-Za-z0-9_.-]{1,80}"
+_STALE_READ_REASONS = (_OWNER_COMMENT_NEWER, _MERGED_REFUSAL, f"card done{_DONE_REFUSAL}",
+                       f"card archived{_DONE_REFUSAL}")
+_STALE_READ_BODY_RE = re.compile(
+    rf"{re.escape(_STALE_READ_HEAD)} \((?:{'|'.join(map(re.escape, _STALE_READ_REASONS))})\); "
+    rf"the child's read was not delivered\. "
+    rf"\(wake {_STALE_READ_KEY}\) \(delegation {_STALE_READ_DID}\)")
+_STALE_READ_TAG_RE = re.compile(rf"\(wake ({_STALE_READ_KEY})\) \(delegation {_STALE_READ_DID}\)\Z")
 
 
 def _staged_read(entry: dict, texts: list) -> Optional[str]:
@@ -2510,29 +2540,43 @@ def _staged_read(entry: dict, texts: list) -> Optional[str]:
     return str(max(found, key=lambda p: (p.suffix == ".md", p.stat().st_mtime))) if found else None
 
 
+def _stale_read_reason(reason: str) -> Optional[str]:
+    """The refusal reason as its constant (a merged refusal drops the PR names), None for a reason not recorded."""
+    if reason == _OWNER_COMMENT_NEWER:
+        return _OWNER_COMMENT_NEWER if owner_comment_card_read_enabled() else None
+    if reason.startswith(_MERGED_REFUSAL):
+        return _MERGED_REFUSAL
+    return reason if reason in _STALE_READ_REASONS else None
+
+
 def record_stale_read(entry: dict, result: dict) -> bool:
     """t_e86eeab2: ONE card comment when a child's ``surface`` was refused because the PR merged, or (round 3) because
-    the card was done/archived after a send-back (no chat wake): the read can still hold a finding about what merged,
-    and the refusal otherwise leaves no trace on the card. Names the staged read file and the refusal reason. Ends
-    ``(wake <key>) (delegation <id>)``: deduped on the WAKE (claim key without its ``#restartN`` suffix), since a
-    restart redispatch of the same wake mints a new delegation id; the delegation id stays as the pointer to the
-    child's folder and transcript. Any other refusal or action writes nothing."""
-    reason = str(result.get("reason") or "")
-    if result.get("action") != "surface" or not (
-            reason.startswith(_MERGED_REFUSAL) or (reason.startswith("card ") and reason.endswith(_DONE_REFUSAL))):
+    the card was done/archived after a send-back, or (t_53549b28 R4, kill switch BOOMERANG_OWNER_COMMENT_CARD_READ=0)
+    because an owner comment is newer than the handback. No chat wake; the refusal otherwise leaves no trace.
+
+    The body is fixed words and the ids only (t_53549b28 r2, r3): the reason constant, then ``(wake <key>)
+    (delegation <id>)``. The delegation id is the pointer: the child's read is in that delegation's folder and
+    transcript. Deduped on the WAKE (claim key without its ``#restartN`` suffix) read from the exact trailing tag of
+    this author's comments, since a restart redispatch of the same wake mints a new delegation id. Any other refusal or action, or a body outside the grammar, writes nothing."""
+    reason = _stale_read_reason(str(result.get("reason") or ""))
+    if result.get("action") != "surface" or reason is None:
         return False
     from hermes_cli import kanban_db as kb
 
-    wake = f"(wake {str(entry['key']).split('#restart', 1)[0]}) (delegation "
-    tag = f"{wake}{entry['delegation_id']})"
-    staged = _staged_read(entry, [result.get("detail"), *(result.get("evidence") or []), result.get("summary")])
+    wake_key = str(entry["key"]).split("#restart", 1)[0]
     body = (f"{_STALE_READ_HEAD} ({reason}); the child's read was not delivered. "
-            f"Staged read: {staged or 'none found'}. Child said: {result.get('summary') or 'no summary'} {tag}")
+            f"(wake {wake_key}) (delegation {entry['delegation_id']})")
+    if not _STALE_READ_BODY_RE.fullmatch(body):
+        logger.warning("kanban boomerang-wake: stale-read comment on %s not written: body outside the grammar",
+                       entry.get("task_id"))
+        return False
     conn = kb.connect(board=entry.get("board"))
     try:
-        if any(c.author == AUTHOR and c.body.startswith(_STALE_READ_HEAD) and wake in c.body
-               for c in kb.list_comments(conn, entry["task_id"])):
-            return False
+        for c in kb.list_comments(conn, entry["task_id"]):
+            tag = _STALE_READ_TAG_RE.search(c.body) if (
+                c.author == AUTHOR and c.body.startswith(_STALE_READ_HEAD)) else None
+            if tag and tag.group(1) == wake_key:
+                return False
         with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
             kb.add_comment(conn, entry["task_id"], AUTHOR, body)
         return True
