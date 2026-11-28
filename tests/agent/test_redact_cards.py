@@ -6,6 +6,7 @@ none shared with a real card.
 from __future__ import annotations
 
 import json
+import shlex
 from unittest.mock import patch
 
 import pytest
@@ -471,7 +472,7 @@ def test_vision_analyze_ocr_runs_the_real_subprocess_on_the_sent_bytes(tmp_path)
     the bytes OCRed are exactly the PNG the tool would have sent."""
     seen = tmp_path / "seen.bin"
     fake = tmp_path / "tesseract"
-    fake.write_text(f"#!/bin/sh\ncat > {seen}\nprintf 'Card\\n{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}\\n'\n")
+    fake.write_text(f"#!/bin/sh\ncat > {shlex.quote(str(seen))}\nprintf 'Card\\n{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}\\n'\n")
     fake.chmod(0o755)
     with patch.object(redact_cards, "TESSERACT", (str(fake),)):
         out, llm = _vision_analyze(tmp_path, _data_url(), None)
@@ -551,3 +552,28 @@ def test_vision_analyze_real_ocr_refuses_a_card_hidden_under_transparency(tmp_pa
         pytest.skip("tesseract not installed")
     out, llm = _vision_analyze(tmp_path, _rgba_card_url(0), None, native=True)
     assert CARD_IMAGE_REFUSAL in out and '"_multimodal"' not in out
+
+
+def _trns_card_png(path):
+    """RGB PNG: black made-up card digits on white, with black marked transparent (a tRNS colour key)."""
+    from PIL import Image, ImageDraw, ImageFont
+    im = Image.new("RGB", (1800, 200), "white")
+    try:
+        font = ImageFont.load_default(size=60)
+    except TypeError:
+        pytest.skip("Pillow too old for a sized default font")
+    ImageDraw.Draw(im).text((40, 60), f"{VISA[:4]}   {VISA[4:8]}   {VISA[8:12]}   {VISA[12:]}", fill="black", font=font)
+    im.save(path, format="PNG", transparency=(0, 0, 0))
+
+
+def test_alpha_dropped_copy_drops_a_trns_colour_key(tmp_path):
+    pytest.importorskip("PIL.Image")
+    from PIL import Image
+    from tools.vision_tools import _alpha_dropped_copy
+    src = tmp_path / "trns.png"
+    _trns_card_png(src)
+    out = _alpha_dropped_copy(src)
+    assert out is not None
+    with Image.open(out) as im:
+        assert im.mode == "RGB" and "transparency" not in im.info
+

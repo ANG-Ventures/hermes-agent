@@ -545,7 +545,10 @@ def _alpha_dropped_copy(path: Path) -> Optional[Path]:
             elif "transparency" not in img.info:
                 return None
             out = path.with_name(path.name + ".rgb.png")
-            img.convert("RGB").save(out, format="PNG")
+            flat = img.convert("RGB")
+            # convert("RGB") keeps a tRNS colour key in .info and save() writes it back: drop it.
+            flat.info.pop("transparency", None)
+            flat.save(out, format="PNG")
             return out
     except Exception as exc:
         logger.debug("alpha-dropped OCR copy failed: %s", exc)
