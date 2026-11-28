@@ -99,7 +99,7 @@ def test_became_next_turn_line_and_its_two_call_sites(caplog):
         "disposition": "became-next-turn", "session": SK, "platform": "discord", "msg_id": "6001",
         "depth": "-", "path": "turn_start", "held_release": "False", "reorder_check": "ordered"}
     # Both turn starts (a fresh inbound turn, a queued follow-up) log it right before the turn runs.
-    src = (REPO / "gateway" / "run_turn.py").read_text(encoding="utf-8")
+    src = (REPO / "gateway" / "run_turn.py").read_text(encoding="utf-8-sig")
     for path in ("turn_start", "followup"):
         at = src.index(f'path="{path}"')
         assert "await self._run_agent(" in src[at:at + 260], path
@@ -108,7 +108,7 @@ def test_became_next_turn_line_and_its_two_call_sites(caplog):
 def test_every_adapter_slot_write_has_its_line():
     """The adapter's own queue writes (default path, photo burst, text debounce) are checked in the
     source, not driven: each direct write of the pending slot is followed by its disposition line."""
-    src = (REPO / "gateway" / "platforms" / "base.py").read_text(encoding="utf-8")
+    src = (REPO / "gateway" / "platforms" / "base.py").read_text(encoding="utf-8-sig")
     sites = [i for i in range(len(src)) if src.startswith("merge_pending_message_event(self._pending_messages", i)]
     assert len(sites) == 4
     for at in sites:

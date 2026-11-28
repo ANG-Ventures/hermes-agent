@@ -48,7 +48,7 @@ def read_lines(logs_dir: str, since: datetime, until: datetime) -> Iterable[Tupl
     for pattern in ("gateway.log*", "agent.log*"):
         for path in sorted(glob.glob(os.path.join(logs_dir, pattern))):
             try:
-                handle = open(path, "r", encoding="utf-8", errors="replace")
+                handle = open(path, "r", encoding="utf-8-sig", errors="replace")
             except OSError:
                 continue
             with handle:
