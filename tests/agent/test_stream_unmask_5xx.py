@@ -252,3 +252,15 @@ def test_relay_fields_as_top_level_keys_without_headers_skip_resend(monkeypatch,
     err = _sdk_status_error(status, body)
     n, call = _resend_count(monkeypatch, err)
     assert n == 0 and call.result["error"] is err
+
+
+# --- t_104882b4: relay tags nested under error{} in a buffered SSE error envelope ----------------
+
+def test_sse_error_event_with_relay_class_under_error_goes_to_loop_without_resend(monkeypatch):
+    text = ('event: error\n'
+            'data: {"error": {"code": 502, "message": "bad gateway", "relay_error_class": "conn"}}\n\n')
+    err = h._provider_stream_error_from_text(text, "error")
+    assert isinstance(err, h.ProviderStreamError) and err.status_code == 502
+    assert not hasattr(err.response, "json")  # the full envelope is the only body
+    n, call = _resend_count(monkeypatch, err)
+    assert n == 0 and call.result["error"] is err and call.result["response"] is None

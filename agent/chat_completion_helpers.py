@@ -99,12 +99,14 @@ def _relay_or_capacity_5xx(e: Exception, status: int) -> bool:
         if any(str(hdrs.get(k) or "").strip() for k in ("x-relay-error-class", "x-relay-error-hop")):
             return True
         # The openai SDK keeps only body["error"] when that key exists, so read the real keys of
-        # both the full response JSON and the SDK body; never a substring of the values.
+        # both the full response JSON and the SDK body; never a substring of the values. A buffered
+        # SSE error keeps the full envelope as its body, so also read the keys of body["error"].
         bodies = [getattr(e, "body", None)]
         try:
             bodies.append(e.response.json())
         except Exception:  # noqa: BLE001
             pass
+        bodies += [b.get("error") for b in bodies if isinstance(b, dict)]
         if any(isinstance(b, dict) and (b.get("relay_error_class") or b.get("relay_error_hop"))
                for b in bodies):
             return True
