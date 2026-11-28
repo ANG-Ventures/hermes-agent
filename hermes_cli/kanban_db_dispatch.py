@@ -8899,6 +8899,13 @@ def _dispatch_once_locked(
                 try:
                     # A finished background clone (gateway tick) is collected; a failed one raises here.
                     _kwt.run_clone(_ckey, _cjob, _clock)
+                except RuntimeError as exc:
+                    if not str(exc).startswith(_kwt.CLONE_FAILED_PREFIX):
+                        raise   # a pending clone, a push of the card branch: unchanged
+                    # t_4d8fb733: a host fault, never the card's. The pair is skipped by placement for a while and
+                    # the claim goes back uncharged (WorkspaceUnavailable), named; the next tick picks another host.
+                    _kwt.mark_port_fault(placed_host.name, _wt_port[0], str(exc))
+                    raise WorkspaceUnavailable(f"{_kwt.WHY_CLONE_FAILED}:{placed_host.name}: {exc}") from exc
                 finally:
                     result.clone_ms += (time.monotonic() - _ct0) * 1000.0
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,

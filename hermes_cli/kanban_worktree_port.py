@@ -92,6 +92,7 @@ WHY_NOT_CHECKOUT = "own_tree_not_a_checkout"
 WHY_PROBE_FAILED = "own_tree_probe_failed"
 WHY_REPO_MISMATCH = "own_tree_repo_mismatch"
 WHY_DERIVED_OFF = "derived_mode_off"
+WHY_CLONE_FAILED = "port_clone_failed"   # every candidate host's clone of the repo failed within PORT_FAULT_SECONDS
 # A dirty own tree is carried to the clone (t_894be273) except in these cases, where the card stays local:
 WHY_NESTED_REPO = "dirty_submodule_or_nested_repo"   # a modified submodule or an embedded repository
 WHY_CARRY_SIZE = "dirty_tree_over_cap"               # more than DIRTY_CARRY_MAX_BYTES of changed files
@@ -133,6 +134,8 @@ LOCAL_ONLY_REASONS: Dict[str, str] = {
                "the tree failed: uncommitted work in the Studio tree",
     WHY_UNPUSHED: "hand-list mode only (derived: false): committed work origin lacks",
     WHY_DERIVED_OFF: "hand-list mode (derived: false / KANBAN_MIRROR_DERIVED=0) and the repo has no row",
+    WHY_CLONE_FAILED: "the clone of the repo failed on every candidate pool host in the last PORT_FAULT_SECONDS "
+                      "(a host fault: no credential, no network); the card is not charged for it (t_4d8fb733)",
     WHY_UNENUMERATED: "a code bug: a path named a reason that is not in this table; _why records this instead and "
                       "logs the offending string, so no unlisted reason reaches the dispatcher",
 }
@@ -416,8 +419,38 @@ def derived_route(slug: str, fleet_dir: Path, pool_hosts, why: Optional[List[str
         if not hosts:
             _why(why, WHY_PINNED)  # pinned to hosts outside the pool: local only when the pin names the Studio
             return None
+    # t_4d8fb733: a host whose clone of this repo just failed is skipped until PORT_FAULT_SECONDS pass
+    hosts = tuple(h for h in hosts if port_fault(h, slug) is None)
+    if not hosts:
+        _why(why, WHY_CLONE_FAILED)
+        return None
     default, per_host = paths.get(slug.lower(), (None, {}))
     return (default or f"{DERIVED_MIRROR_ROOT}/{slug}.git"), hosts, dict(per_host)
+
+
+# A failed port clone is a HOST fault, not the card's (t_4d8fb733: 3 identical 0 s rc=128 clones on ci-box and a
+# give-up, 11-23..11-27). The (host, repo) pair is skipped by derived_route for PORT_FAULT_SECONDS, so the next tick
+# places the card on another pool host, or keeps it on the Studio named WHY_CLONE_FAILED. In-process, like
+# kanban_worker_pool._board_faults: the gateway's dispatcher is long-lived.
+PORT_FAULT_SECONDS = 1800
+_port_faults: Dict[Tuple[str, str], Tuple[float, str]] = {}
+
+
+def mark_port_fault(host: str, slug: str, why: str, *, now: Optional[float] = None) -> None:
+    now = time.time() if now is None else now
+    _port_faults[(str(host).lower(), str(slug).lower())] = (now + PORT_FAULT_SECONDS, str(why)[:200])
+
+
+def port_fault(host: str, slug: str, *, now: Optional[float] = None) -> Optional[str]:
+    """Why ``host`` cannot clone ``slug`` right now, or None."""
+    key = (str(host).lower(), str(slug).lower())
+    got = _port_faults.get(key)
+    if got is None:
+        return None
+    if (time.time() if now is None else now) >= got[0]:
+        _port_faults.pop(key, None)
+        return None
+    return got[1]
 
 
 def _why(why: Optional[List[str]], reason: str) -> None:
@@ -1219,7 +1252,12 @@ def port_for(task_id: str, workspace_path: Optional[str], board_default: Optiona
     row = mirrors.get(slug.lower()) if slug else None
     if row is None:
         _why(why, WHY_DERIVED_OFF)
-    return (slug, row[0], row[1], row[2], None) if row else None
+        return None
+    hosts = tuple(h for h in row[1] if port_fault(h, slug) is None)   # t_4d8fb733, as derived_route
+    if not hosts:
+        _why(why, WHY_CLONE_FAILED)
+        return None
+    return (slug, row[0], hosts, row[2], None)
 
 
 def _origin_url(repo: Path, runner: Callable) -> str:
@@ -1382,7 +1420,10 @@ def clone_on_host(host, workspace: str, slug: str, mirror: str, branch: str,
     if rc != 0:
         err = getattr(proc, "stderr", "") or ""
         err = err.decode("utf-8", "replace") if isinstance(err, bytes) else err
-        raise RuntimeError(f"worktree clone of {slug} on {host.name} failed rc={rc}: {err.strip()[:200]}")
+        raise RuntimeError(f"{CLONE_FAILED_PREFIX}{slug} on {host.name} failed rc={rc}: {err.strip()[:200]}")
+
+
+CLONE_FAILED_PREFIX = "worktree clone of "   # clone_on_host's failure; the dispatcher reads it as a host fault
 
 
 # Pool-host clone off the dispatcher tick (t_915b8d2d). A gateway tick measured 5 of 6 py-spy samples in
