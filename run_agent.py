@@ -1047,6 +1047,13 @@ class AIAgent(
         response_text = _summarize_user_message_for_log(final_response, sep="\n")
         if not (user_text and response_text):
             return
+        # t_0171c33b: card numbers never reach a memory provider, its capture queue or the prefetch search.
+        try:
+            from agent.redact_cards import card_knob, mask_card_numbers
+            if card_knob("mask_card_numbers_memory_capture"):
+                user_text, response_text = mask_card_numbers(user_text), mask_card_numbers(response_text)
+        except Exception:
+            return
         try:
             sync_kwargs = {"session_id": self.session_id or "", **({"messages": messages} if messages is not None else {})}
             # Stashed by build_turn_context() for this turn, None on a human turn.
