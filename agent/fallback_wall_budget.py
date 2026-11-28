@@ -495,19 +495,26 @@ def note_upstream_failure(agent: Any, *, status: Any = None, socket: Optional[st
 
 _QUOTA_CLASSES = ("quota_model", "quota_seat")
 
+# Ledger text-table needles too generic to prove quota on their own: "You've reached
+# your rate limit" is a rate limit (Prism #603 b9591dd20ab5).
+_WEAK_QUOTA_NEEDLES = ("reached your",)
+
 
 def _is_quota_refusal(code: Optional[int], relay_class: Optional[str], text: Any) -> bool:
     """The relay's stated class decides (t_d1de29dd, Prism #600 4dab164d36f9): a plain
     rate-limit 429 is not a quota refusal. An unclassed 429 counts only when its text
-    reads as quota (the same text table the ledger uses)."""
+    carries an actual quota phrase from the ledger's text table ("weekly limit",
+    "Fable limit", ...); the bare "reached your" alone does not count."""
     rc = (relay_class or "").strip().lower()
     if rc:
         return rc in _QUOTA_CLASSES
     if code != 429:
         return False
     try:
-        from agent.fallback_events import classify_text
-        return classify_text(str(text or ""), http_status=code) in _QUOTA_CLASSES
+        from agent.fallback_events import _TEXT_TABLE
+        t = str(text or "").lower()
+        return any(n in t for cls, needles in _TEXT_TABLE if cls in _QUOTA_CLASSES
+                   for n in needles if n not in _WEAK_QUOTA_NEEDLES)
     except Exception:
         return False
 
