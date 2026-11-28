@@ -42,13 +42,15 @@ def _preview_name(name: str) -> str:
 
 
 def _append_tool_error_results(messages, tool_calls, content_for) -> None:
-    """One tool-role result per call so every tool_call keeps a matching result."""
+    """One tool-role result per call so every tool_call keeps a matching result. Built outside
+    make_tool_result_message, so the card mask runs here (t_110f649d): the content echoes model text."""
+    from agent.redact_cards import mask_tool_result_content
     for tc in tool_calls:
         append_message(messages, {
             "role": "tool",
-            "name": tc.function.name,
+            "name": mask_tool_result_content(tc.function.name),  # a rejected name is model text too
             "tool_call_id": coalesce_tool_call_id(tc),
-            "content": content_for(tc),
+            "content": mask_tool_result_content(content_for(tc)),
         })
 
 

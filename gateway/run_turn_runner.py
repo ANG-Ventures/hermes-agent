@@ -130,9 +130,16 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        # t_110f649d: everything below renders preview/args into a chat message on a third-party service
+        # (progress bubble, live status, log channel, failure notice): mask card numbers first. A "_thinking"
+        # event carries its text in tool_name.
+        from agent.redact_cards import mask_tool_display_value
+        tool_name, preview, args = (mask_tool_display_value(v) for v in (tool_name, preview, args))
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
+            # The notice renders goal, summary and failure_reason; the other kwargs (tool.completed's result) are never shown.
+            kwargs = {**kwargs, **{k: mask_tool_display_value(kwargs[k]) for k in ("goal", "summary", "failure_reason") if k in kwargs}}
             self._progress_subagent_notice(preview, kwargs)
             return
         self._progress_live_status(event_type, tool_name, args)
@@ -978,7 +985,9 @@ class TurnRunner:
         if not self._native_card_gate():
             return
         from agent.display import build_tool_preview
+        from agent.redact_cards import mask_tool_display_value
         name = str(tool_name or "tool")
+        args = mask_tool_display_value(args)  # the task title is a Slack message
         self._ctx.progress_queue.put({
             "type": "tool.started", "tool_call_id": str(call_id or ""), "tool_name": name,
             "preview": build_tool_preview(name, args or {}, max_len=64) or "",

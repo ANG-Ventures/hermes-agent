@@ -651,6 +651,10 @@ def _adopt_submit_user_row(session: dict, agent, persist_user_message: Any, text
     # The turn matches this dict on the raw text it receives, never the relabelled content.
     staged[STAGED_TURN_RAW_KEY] = persist_user_message
     persist_user_message = relabel_route_note_content(persist_user_message)
+    # t_110f649d (Prism e847bb92b9cf): the row was written masked; compare and rewrite in the same masked
+    # form, or a prompt the prologue rewrote puts the full card number back in the row.
+    from agent.redact_cards import mask_user_message_content
+    persist_user_message = mask_user_message_content(persist_user_message)
     if staged["content"] != persist_user_message:
         from agent.session_persistence import _durable_content
         with _session_db(session) as db:

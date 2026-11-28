@@ -311,6 +311,37 @@ def mask_tool_result_content(content: Any) -> Any:
     return mask_card_numbers_in_content(content)
 
 
+_COLLAPSE_CHECK_CHARS = 2048
+
+
+def mask_tool_display_value(value: Any) -> Any:
+    """Tool-progress display entry point (``security.mask_card_numbers_tool_results``): a preview string, or
+    a tool's args dict/list with every string inside masked. Display copies only; never the dispatched args."""
+    if not card_knob("mask_card_numbers_tool_results"):
+        return value
+
+    def walk(v: Any) -> Any:
+        if isinstance(v, str):
+            masked = mask_card_numbers(v)
+            # Previews collapse whitespace (agent.display._oneline), which can join a card split across lines
+            # back into one number: when the collapsed text shows a card, the display copy is the collapsed one.
+            # Only the head is checked: the full-length collapse cost ~20 s on 117 KB of numeric text.
+            head = " ".join(masked[:_COLLAPSE_CHECK_CHARS].split())
+            if mask_card_numbers(head) == head:
+                return masked
+            return mask_card_numbers(" ".join(masked.split()))
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, int) and not isinstance(v, bool):
+            # A card supplied as a JSON number renders as its digits (verbose progress json.dumps the args).
+            masked = mask_card_numbers(str(v))
+            return masked if masked != str(v) else v
+        return v
+    return walk(value)
+
+
 def mask_user_message_content(content: Any) -> Any:
     """Inbound user-message entry point (``security.mask_card_numbers_user_messages``, default off)."""
     if content is None or not card_knob("mask_card_numbers_user_messages"):

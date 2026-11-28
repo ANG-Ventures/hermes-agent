@@ -1330,23 +1330,27 @@ def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: s
     entirely and ride every later request inline. Image parts are left untouched (their size is
     governed by the vision embed budget); a fresh dict is returned so history is never mutated."""
     parts = result.get("content") or []
-    bounded_parts, first_replacement = [], None
+    bounded_parts, first_replacement, changed = [], None, False
     for part in parts:
         text = part.get("text") if isinstance(part, dict) and part.get("type") == "text" else None
         if isinstance(text, str):
-            replaced = maybe_persist_tool_result(content=text, tool_name=tool_name, tool_use_id=tool_call_id,
+            # t_110f649d: mask before the spill write, or the file (read back by exempt read_file) holds
+            # the full card number.
+            masked = mask_cards_for_tool(tool_name, text)
+            replaced = maybe_persist_tool_result(content=masked, tool_name=tool_name, tool_use_id=tool_call_id,
                                                  env=env, config=budget)
-            if replaced != text:
-                part = {**part, "text": replaced}
+            if replaced != masked:
                 first_replacement = first_replacement or replaced
+            if replaced != text:
+                part, changed = {**part, "text": replaced}, True
         bounded_parts.append(part)
-    if first_replacement is None:
+    if not changed:
         return result
     bounded = {**result, "content": bounded_parts}
     summary = bounded.get("text_summary")
     # The summary is a subset of the (already spilled) part text: reuse that bounded reference instead
     # of a second persist under the same id, which would overwrite the spill file with the summary.
-    if isinstance(summary, str) and len(summary) > budget.resolve_threshold(tool_name):
+    if first_replacement is not None and isinstance(summary, str) and len(summary) > budget.resolve_threshold(tool_name):
         bounded["text_summary"] = first_replacement
     return bounded
 
