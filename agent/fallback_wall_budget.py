@@ -498,17 +498,18 @@ _QUOTA_CLASSES = ("quota_model", "quota_seat")
 
 def _is_quota_refusal(code: Optional[int], relay_class: Optional[str], text: Any) -> bool:
     """The relay's stated class decides (t_d1de29dd, Prism #600 4dab164d36f9): a plain
-    rate-limit 429 is not a quota refusal. An unclassed 429 counts only when its text
-    carries an actual quota phrase (``fallback_events.text_names_quota``, the same rule
-    the cause label uses): "You've reached your rate limit" does not count."""
+    rate-limit 429 is not a quota refusal. An unclassed 429 counts only when the ordered
+    text classifier the cause label uses (``fallback_events.classify_text``) calls it
+    quota: "You've reached your rate limit" does not, and neither does a capacity 429
+    that quotes a seat's cap sentence (t_48bb0de3, Prism #606 0aa4ea16a348)."""
     rc = (relay_class or "").strip().lower()
     if rc:
         return rc in _QUOTA_CLASSES
     if code != 429:
         return False
     try:
-        from agent.fallback_events import text_names_quota
-        return text_names_quota(text)
+        from agent.fallback_events import classify_text
+        return classify_text(str(text or ""), http_status=code) in _QUOTA_CLASSES
     except Exception:
         return False
 
