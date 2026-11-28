@@ -332,3 +332,21 @@ def test_next_call_cold_backfilled(_home, monkeypatch):
         attribution="inferred", http_status=200)
     r = _rows(_home)[0]
     assert r["next_call_cold"] == 1 and r["next_call_cache_write"] == 40000
+
+
+# ── Prism 1d16abfcfca0 round 2 (t_67969ec8): an unencodable seat keeps the row ──
+
+def test_lone_surrogate_seat_still_writes_the_row(_home, monkeypatch):
+    """JSON accepts an escaped lone surrogate; SQLite cannot bind it as TEXT.
+    The row must land (seat escaped), not vanish in write_row's except."""
+    _fail_over(monkeypatch, _Err("You've hit your weekly limit", 429,
+                                 body={"relay_seat": "sub-" + chr(0xD800)}))
+    rows = _rows(_home)
+    assert len(rows) == 1
+    assert rows[0]["seat"] == "sub-\\ud800"
+
+
+def test_valid_seat_is_stored_verbatim(_home, monkeypatch):
+    _fail_over(monkeypatch, _Err("You've hit your weekly limit", 429,
+                                 body={"relay_seat": "sub-vps-production-east-pool-east"}))
+    assert _rows(_home)[0]["seat"] == "sub-vps-production-east-pool-east"
