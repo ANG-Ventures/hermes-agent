@@ -122,6 +122,8 @@ def attribution(headers: Any, body: Any = None) -> Dict[str, Optional[str]]:
         v = str(body.get("relay_seat") or inner.get("relay_seat") or "").strip()
         if v.lower() not in _SEAT_UNSTATED:
             seat = v
+    if seat is not None:
+        seat = bounded_seat(seat)
     route = next((h[k].strip() for k in _ROUTE_HEADERS if (h.get(k) or "").strip()), None)
     answered = any(k.startswith(("x-relay-", "x-pool-")) for k in h)
     return {"seat": seat, "route_id": route, "quota_window": quota_window(headers, body),
@@ -269,6 +271,12 @@ def _bounded(value: Any, cap: int) -> str:
     relay-sent hop/cause text is printed in a banner, never verbatim."""
     text = " ".join("".join(c if c.isprintable() else " " for c in str(value)).split())
     return text if len(text) <= cap else text[:cap - 1].rstrip() + "…"
+
+
+def bounded_seat(value: Any) -> str:
+    """A relay-sent seat name as printed in a banner: one printable line, at most 30
+    chars (t_67969ec8, Prism #603 686796853b7c). ``sub-vps-12`` / ``local`` unchanged."""
+    return _bounded(value, 30)
 
 
 def _our_hop_status(ev: Dict[str, Any], status: Any) -> Optional[str]:
