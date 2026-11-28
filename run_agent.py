@@ -1049,9 +1049,12 @@ class AIAgent(
             return
         # t_0171c33b: card numbers never reach a memory provider, its capture queue or the prefetch search.
         try:
-            from agent.redact_cards import card_knob, mask_card_numbers
+            from agent.redact_cards import card_knob, mask_card_numbers, mask_card_numbers_deep
             if card_knob("mask_card_numbers_memory_capture"):
                 user_text, response_text = mask_card_numbers(user_text), mask_card_numbers(response_text)
+                # Providers get a masked copy of the transcript; the stored rows stay as they are. The texts and the
+                # rows are masked alike, so a provider that finds the turn by matching the reply still finds it.
+                messages = mask_card_numbers_deep(messages)
         except Exception:
             return
         try:

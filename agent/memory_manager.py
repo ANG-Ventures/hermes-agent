@@ -36,7 +36,7 @@ _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
 def _note_card_masked(result: Any) -> Any:
     """A memory tool result with a plain note that card numbers in the call were masked (t_0171c33b)."""
-    note = "A card number in this call was masked to its last four digits before it reached memory; what was saved holds the masked number."
+    note = "A card number in this call was masked to its last four digits before it reached memory; anything this call saved holds the masked number."
     try:
         data = json.loads(result) if isinstance(result, str) else None
     except ValueError:
@@ -763,11 +763,14 @@ class MemoryManager:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
         from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
         # t_0171c33b: card numbers in a memory tool call (a saved fact, a search) are masked before any provider.
+        # Only free text (a value with whitespace) is masked: a one-token value is a selector (a URI, an id) that
+        # must reach the provider exactly, or a delete/update could land on a different record.
         try:
             from agent.redact_cards import card_knob, mask_card_numbers
             card_masked = False
             if isinstance(args, dict) and card_knob("mask_card_numbers_memory_capture"):
-                masked_args = {k: mask_card_numbers(v) if isinstance(v, str) else v for k, v in args.items()}
+                masked_args = {k: mask_card_numbers(v) if isinstance(v, str) and len(v.split()) > 1 else v
+                               for k, v in args.items()}
                 card_masked = masked_args != args
                 args = masked_args
         except Exception as e:

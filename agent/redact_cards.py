@@ -284,6 +284,20 @@ def mask_card_numbers_in_content(content: Any) -> Any:
     return content
 
 
+def mask_card_numbers_deep(obj: Any) -> Any:
+    """``mask_card_numbers`` over every string in nested dicts/lists (a provider-only copy of a transcript).
+    Unchanged containers are returned as the same object, so the input is never mutated."""
+    if isinstance(obj, str):
+        return mask_card_numbers(obj)
+    if isinstance(obj, dict):
+        out = {k: mask_card_numbers_deep(v) for k, v in obj.items()}
+        return out if any(out[k] is not obj[k] for k in obj) else obj
+    if isinstance(obj, list):
+        items = [mask_card_numbers_deep(v) for v in obj]
+        return items if any(a is not b for a, b in zip(items, obj)) else obj
+    return obj
+
+
 _KNOB_DEFAULTS = {
     "mask_card_numbers_tool_results": True,
     "mask_card_numbers_user_messages": False,
