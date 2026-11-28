@@ -557,6 +557,13 @@ def make_tool_result_message(
     trust_name = _trust_name(name, call_args, content)
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
+    # t_90c8b36c: payment card numbers are masked to their last four before the result enters the
+    # transcript, the session stores or the next request (security.mask_card_numbers_tool_results).
+    # read_file/search_files are exempt: their text must match the disk, or an edit built from it writes
+    # the X's back over a payment test fixture.
+    content = mask_cards_for_tool(name, content)
+    if isinstance(multimodal_text_summary, str):
+        multimodal_text_summary = mask_cards_for_tool(name, multimodal_text_summary)
     # E11: remote tool output never carries the harness's route-note marker. Local output
     # (read_file, terminal, ...) stays byte-identical so the model edits what is on disk.
     if tool_output_relabels_route_notes(trust_name):
@@ -585,6 +592,18 @@ def make_tool_result_message(
     if isinstance(multimodal_text_summary, str) and multimodal_text_summary:
         message[_MULTIMODAL_TEXT_SUMMARY_KEY] = multimodal_text_summary
     return message
+
+
+# Local file reads whose text must stay byte-identical to the disk (t_90c8b36c card mask exemption).
+_CARD_MASK_EXEMPT_TOOLS = frozenset({"read_file", "search_files"})
+
+
+def mask_cards_for_tool(name: str, content):
+    """Card-number mask for a *name* tool's result; read_file/search_files pass through (disk byte-identity)."""
+    if name and _own_mcp_tool_name(name) in _CARD_MASK_EXEMPT_TOOLS:
+        return content
+    from agent.redact_cards import mask_tool_result_content
+    return mask_tool_result_content(content)
 
 
 # Tools whose results carry attacker-controllable content (other people's pages, messages, posts,

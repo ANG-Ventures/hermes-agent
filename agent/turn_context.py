@@ -1241,6 +1241,13 @@ def build_turn_context(
     raw_persist_content = persist_user_message if persist_user_message is not None else user_message
     user_message = relabel_route_note_content(user_message)
     persist_user_message = relabel_route_note_content(persist_user_message)
+    # t_90c8b36c: card numbers in inbound user text, only when security.mask_card_numbers_user_messages
+    # is on (default off: it changes what the owner typed). After the raw capture, like the relabel.
+    from agent.redact_cards import mask_user_message_content
+    user_message = mask_user_message_content(user_message)
+    persist_user_message = mask_user_message_content(persist_user_message)
+    if isinstance(title_user_message, str):
+        title_user_message = mask_user_message_content(title_user_message)
 
     # Turn identity is bound BEFORE the primary restore: its recovery /
     # restore_refused ledger rows belong to THIS turn (C7 k73).

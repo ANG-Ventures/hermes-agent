@@ -184,7 +184,9 @@ def _redact_spill_file(path, total_chars, command) -> list[tuple[str, Any]]:
         raw_spill = Path(path).read_text(encoding="utf-8-sig", errors="replace")
         # lstat-checked unlink + exclusive create: the redacted copy can't
         # be diverted through a symlink planted since the collector's write.
-        write_text_exclusive(Path(path), redact_terminal_output(strip_ansi(raw_spill), command),
+        from agent.redact_cards import mask_tool_result_content
+        spill = mask_tool_result_content(redact_terminal_output(strip_ansi(raw_spill), command))
+        write_text_exclusive(Path(path), spill,
                              private=True, overwrite=True, errors="replace")
     except Exception:
         logger.debug("spill redaction failed; dropping spill handle", exc_info=True)

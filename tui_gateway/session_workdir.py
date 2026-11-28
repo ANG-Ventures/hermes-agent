@@ -591,6 +591,9 @@ def _write_submit_user_row(session: dict, text: Any, display_kind: str | None,
     from agent.message_metadata import stamp_message_timestamp, stamp_message_uid
     from agent.route_note_ingest import relabel_route_note_text
     raw_text, text = text, relabel_route_note_text(text)  # E11: never store the harness marker
+    # t_90c8b36c: when security.mask_card_numbers_user_messages is on, the row is never written unmasked.
+    from agent.redact_cards import mask_user_message_content
+    text = mask_user_message_content(text)
     staged = stamp_message_timestamp({"role": "user", "content": text})
     # Adoption matches on the RAW submit: two different submits can relabel to the same text.
     staged[_SUBMIT_ROW_RAW_KEY] = raw_text
