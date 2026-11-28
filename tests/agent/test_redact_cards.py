@@ -672,3 +672,43 @@ def test_cancelled_image_read_leaves_no_flattened_copy(tmp_path):
             patch.object(redact_cards, "_ocr", return_value=("", None)):
         asyncio.run(run())
     assert not list(tmp_path.glob("*.rgb.png"))
+
+
+def test_array_quotes_only_for_valid_json_and_only_when_the_result_parses():
+    """Prism f224ce988f0c: a CSV field inside a JSON string is not an array item."""
+    m = "XXXXXXXXXXXX0366"
+    for output in (",%s,approved" % VISA, "id,card\n1,%s,ok\n" % VISA, "[x,%s,y" % VISA):
+        envelope = json.dumps({"output": output, "exit_code": 0})
+        got = json.loads(mask_card_numbers(envelope))
+        assert m in got["output"] and VISA not in got["output"] and got["exit_code"] == 0
+    assert json.loads(mask_card_numbers(json.dumps({"output": ",%s,approved" % VISA, "exit_code": 0}))) == {
+        "output": ",%s,approved" % m, "exit_code": 0}
+    # A valid JSON array of bare card numbers is still quoted.
+    assert json.loads(mask_card_numbers(json.dumps([int(VISA), int(MC)]))) == [m, "XXXXXXXXXXXX2226"]
+    # Not JSON: no array or root quotes (prose with a bracketed list, a bare number on a line of prose).
+    assert mask_card_numbers("cards: [%s, %s]" % (VISA, VISA)) == "cards: [%s, %s]" % (m, m)
+    assert mask_card_numbers("%s\nnext line" % VISA) == m + "\nnext line"
+
+
+def test_many_cards_on_one_line_mask_in_linear_time():
+    """Prism b327b5c2835b: every card on one line shared the whole line as its window."""
+    import random
+    import time
+    rng = random.Random(11)
+
+    def cards(n):
+        out = []
+        while len(out) < n:
+            body = "4" + "".join(rng.choice("0123456789") for _ in range(14))
+            out.append(int(next(body + d for d in "0123456789" if luhn(body + d))))
+        return out
+    sample = json.dumps({"ids": cards(300), "cvc": 123, "exp": "08/29"})
+    with patch.object(redact_cards, "_merge", lambda windows: windows):
+        per_card = mask_card_numbers(sample)
+    assert per_card != sample and mask_card_numbers(sample) == per_card
+    big = json.dumps(cards(20000))
+    t0 = time.perf_counter()
+    out = mask_card_numbers(big)
+    elapsed = time.perf_counter() - t0
+    assert len(json.loads(out)) == 20000 and out.count("XXXXXXXXXXXX") == 20000
+    assert elapsed < 3.0, "20,000 cards on one line took %.1f s" % elapsed
