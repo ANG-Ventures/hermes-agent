@@ -1246,6 +1246,8 @@ def build_turn_context(
     from agent.redact_cards import mask_user_message_content
     user_message = mask_user_message_content(user_message)
     persist_user_message = mask_user_message_content(persist_user_message)
+    if isinstance(title_user_message, str):
+        title_user_message = mask_user_message_content(title_user_message)
 
     # Turn identity is bound BEFORE the primary restore: its recovery /
     # restore_refused ledger rows belong to THIS turn (C7 k73).

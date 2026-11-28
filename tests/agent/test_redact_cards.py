@@ -254,6 +254,27 @@ def test_masked_bare_json_numbers_stay_valid_json():
     assert json.loads(quoted) == {"cardNumber": "XXXXXXXXXXXX0366", "cvv": "XXX"}
 
 
+def test_bare_number_inside_a_json_encoded_string_keeps_both_levels_valid():
+    inner = '{"cardNumber":%s}' % VISA
+    out = mask_card_numbers(json.dumps({"output": inner}))
+    assert json.loads(json.loads(out)["output"]) == {"cardNumber": "XXXXXXXXXXXX0366"}
+    twice = mask_card_numbers(json.dumps({"o": json.dumps({"x": inner})}))
+    assert json.loads(json.loads(json.loads(twice)["o"])["x"]) == {"cardNumber": "XXXXXXXXXXXX0366"}
+
+
+def test_session_title_input_is_masked_with_the_user_message_switch():
+    from tests.agent.test_turn_context import _FakeAgent, _build
+    seen = []
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
+            patch("agent.turn_context._maybe_title_session_at_turn_start",
+                  lambda agent, messages, title=None: seen.append(title)):
+        with _cfg(mask_card_numbers_user_messages=True):
+            _build(_FakeAgent(), user_message=f"card {VISA}", title_user_message=f"card {VISA}")
+        with _cfg():
+            _build(_FakeAgent(), user_message=f"card {VISA}", title_user_message=f"card {VISA}")
+    assert seen == ["card XXXXXXXXXXXX0366", f"card {VISA}"]
+
+
 def test_numbers_sharing_a_group_are_both_masked():
     a, b = "4000 0000 0004 4000", "4000 0000 0000 0366"  # both Luhn-valid; a's last group is b's first
     assert luhn(a.replace(" ", "")) and luhn(b.replace(" ", ""))

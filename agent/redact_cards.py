@@ -178,18 +178,25 @@ def mask_card_numbers(text: str) -> str:
                 vs, ve = m.span("v")
                 masked.update(i for i in range(vs, ve) if text[i].isdigit())
                 values.append((vs, ve))
-    quote_at = set()
+    # The inserted quote copies the key's closing quote with its backslashes, so a bare value inside a
+    # JSON-encoded string (``\\"key\\":4000...``) gets ``\\"`` and the outer JSON stays valid too.
+    quote_at = {}
     for vs, ve in values:
-        if (vs > 0 and text[vs - 1] != '"' and _JSON_KEY_BEFORE.search(text[max(0, vs - 16):vs])
-                and _JSON_VALUE_AFTER.match(text, ve)):
-            quote_at.update((vs, ve))
+        lo = max(0, vs - 16)
+        key = _JSON_KEY_BEFORE.search(text, lo, vs)
+        if vs > 0 and text[vs - 1] != '"' and key and _JSON_VALUE_AFTER.match(text, ve):
+            q = key.start()
+            b = q
+            while b > 0 and text[b - 1] == "\\":
+                b -= 1
+            quote_at[vs] = quote_at[ve] = text[b:q + 1]
     out = []
     for i, ch in enumerate(text):
         if i in quote_at:
-            out.append('"')
+            out.append(quote_at[i])
         out.append("X" if i in masked else ch)
     if len(text) in quote_at:
-        out.append('"')
+        out.append(quote_at[len(text)])
     return "".join(out)
 
 
