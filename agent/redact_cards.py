@@ -387,7 +387,8 @@ def mask_tool_display_value(value: Any) -> Any:
             recollapsed = mask_card_numbers(collapsed)
             return masked if recollapsed == collapsed else recollapsed
         if isinstance(v, dict):
-            return {k: walk(x) for k, x in v.items()}
+            # Keys too: verbose progress json.dumps the args, keys included (t_abd83687).
+            return {walk(k): walk(x) for k, x in v.items()}
         if isinstance(v, list):
             return [walk(x) for x in v]
         # A card supplied as a JSON number renders as its digits (verbose progress json.dumps the args); a
@@ -395,6 +396,8 @@ def mask_tool_display_value(value: Any) -> Any:
         if isinstance(v, float) and v.is_integer():
             masked = mask_card_numbers(repr(v))
             return masked if masked != repr(v) else v
+        if isinstance(v, tuple):
+            return tuple(walk(x) for x in v)
         if isinstance(v, int) and not isinstance(v, bool):
             masked = mask_card_numbers(str(v))
             return masked if masked != str(v) else v

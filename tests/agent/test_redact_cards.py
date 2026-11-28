@@ -1208,3 +1208,87 @@ def test_sign_and_fraction_on_a_bare_number_stay_valid_json(shape):
     assert DISC not in out
     assert "XXXXXXXXXXXX0993" in json.dumps(json.loads(out))
     assert mask_card_numbers("[%se5]" % DISC[:15]) == "[%se5]" % DISC[:15]  # exponent form: out of scope
+
+
+# ── t_abd83687: four paths outside the six ───────────────────────────────────
+
+
+@pytest.mark.parametrize("item, name", [
+    ({"type": "commandExecution", "id": "i1", "command": "cat order.txt", "cwd": "/w",
+      "aggregatedOutput": f"card {DISC}\n", "exitCode": 0}, "exec_command"),
+    ({"type": "mcpToolCall", "id": "i2", "server": "stripe", "tool": "get_card",
+      "arguments": {}, "result": {"content": [{"type": "text", "text": f"card {DISC}"}]}}, "mcp.stripe.get_card"),
+])
+def test_codex_native_tool_outputs_are_masked_in_the_projected_transcript(item, name):
+    """Path 1: Codex-native exec_command / mcpToolCall rows skip make_tool_result_message."""
+    from agent.transports.codex_event_projector import CodexEventProjector
+    with _cfg():
+        out = CodexEventProjector().project({"method": "item/completed", "params": {"item": item}})
+    call, row = out.messages
+    assert call["tool_calls"][0]["function"]["name"] == name
+    assert DISC not in row["content"] and "XXXXXXXXXXXX0993" in row["content"]
+    json.loads(row["content"])  # the exec/MCP envelope stays valid JSON
+
+
+def _final_adapter(sent):
+    from gateway.platforms.base import BasePlatformAdapter, Platform, PlatformConfig, SendResult
+
+    class _A(BasePlatformAdapter):
+        def __init__(self):
+            super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            pass
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            sent.append(content)
+            return SendResult(success=True, message_id="m1")
+
+        async def edit_message(self, chat_id, message_id, content, **kw):
+            sent.append(content)
+            return SendResult(success=True, message_id=message_id)
+
+        async def get_chat_info(self, chat_id):
+            return {"id": chat_id, "type": "dm"}
+    return _A()
+
+
+def test_final_reply_is_masked_at_the_send_boundary():
+    """Path 2: the final reply (ledgered send) and the streamed frames leave the machine masked."""
+    import asyncio
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    sent = []
+    adapter = _final_adapter(sent)
+    event = MessageEvent(text="hi", message_type=MessageType.TEXT, message_id="in-1",
+                         source=adapter.build_source(chat_id="8", user_id="u1"))
+    asyncio.run(adapter.send_final_ledgered(event, "k", f"Your card is {DISC}.", {}, reply_to=None))
+    consumer = GatewayStreamConsumer(adapter, "8", StreamConsumerConfig(cursor=""))
+    asyncio.run(consumer._send_or_edit(f"streamed: {DISC}"))
+    asyncio.run(consumer._send_or_edit(f"streamed: {DISC} and more"))
+    assert len(sent) == 3 and not any(DISC in s for s in sent)
+    assert sent[0] == "Your card is XXXXXXXXXXXX0993."
+    assert all("XXXXXXXXXXXX0993" in s for s in sent)
+
+
+def test_unlimited_tool_preview_is_capped():
+    """Path 3: tool_preview_length 0 ("unlimited") no longer hands a 100 KB preview to the api_server label."""
+    from agent import display
+    command = "echo " + "x" * 100_000 + f" {DISC}"
+    with patch.object(display, "_tool_preview_max_len", 0):
+        preview = display.build_tool_preview("terminal", {"command": command})
+        assert len(preview) <= display._TOOL_PREVIEW_CEILING
+        assert DISC not in preview
+        assert display.build_tool_preview("terminal", {"command": "ls -la"}) == "ls -la"
+        assert len(display.build_tool_preview("terminal", {"command": command}, max_len=0)) <= 2000
+
+
+def test_display_walker_masks_tuple_values_and_dict_keys():
+    """Path 4: mask_tool_display_value walks tuples and dict keys (verbose progress json.dumps keys too)."""
+    with _cfg():
+        out = redact_cards.mask_tool_display_value({DISC: ("a", DISC), "n": [(1, DISC)]})
+    assert DISC not in json.dumps(out)
+    assert out == {"XXXXXXXXXXXX0993": ("a", "XXXXXXXXXXXX0993"), "n": [(1, "XXXXXXXXXXXX0993")]}

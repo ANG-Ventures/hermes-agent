@@ -107,7 +107,10 @@ class CodexEventProjector:
         # here. hermes-tools results were already relabelled at the MCP server (remote tools only);
         # a foreign MCP server or Codex-native result reached Codex raw, so it is persisted raw, with
         # the server in the row's tool name (``mcp.<server>.<tool>``) as its provenance.
-        tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
+        # t_abd83687: these rows skip make_tool_result_message, so card numbers are masked here before
+        # the transcript/session store; the Codex model itself already read the raw output.
+        from agent.tool_dispatch_helpers import mask_cards_for_tool
+        tool_msg = {"role": "tool", "tool_call_id": call_id, "content": mask_cards_for_tool(name, content)}
         return ProjectionResult(messages=[assistant_msg, tool_msg], is_tool_iteration=True)
 
     @staticmethod

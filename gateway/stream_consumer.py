@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from agent.redact_cards import mask_card_numbers
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.config import (
@@ -547,7 +548,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     async def _finalize_boundary_stream(self, _reason: str) -> bool:
         """Close the open native stream at a boundary; send() the pre-prompt text if that
         fails.  False only when both finalize and the fallback send failed."""
-        finalize_text = self._accumulated or self._boundary_placeholder
+        finalize_text = mask_card_numbers(self._accumulated) or self._boundary_placeholder
         try:
             if await self._send_frame(finalize_text, finalize=True):
                 logger.debug("%s boundary: finalized stream (chat=%s, turn=%s)",
@@ -1084,9 +1085,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
         Media-only on purpose: this runs on every chunk, including sealed non-final overflow
         chunks, so it must never remove text.  The trailing silence-marker strip is a turn-final
-        decision (:meth:`_strip_turn_final_marker`).
+        decision (:meth:`_strip_turn_final_marker`).  Card numbers are masked here (length-preserving,
+        t_abd83687): every streamed frame, edit and fallback send passes through this method.
         """
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        return mask_card_numbers(_BasePlatformAdapter.strip_media_directives_for_display(text))
 
     def _silence_predicate(self):
         if not self.cfg.internal_event:

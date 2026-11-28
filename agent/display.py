@@ -113,6 +113,10 @@ class LocalEditSnapshot:
 
 # Configurable tool preview length; set once at startup from display.tool_preview_length.
 _tool_preview_max_len: int = 0  # 0 = unlimited
+# t_abd83687: "unlimited" previews are still capped here. A 100 KB terminal command became a 100 KB
+# preview (the api_server stream label carries it uncut) and the card mask on it took ~10 s per tool
+# call on numeric text. 2000 = Discord's message limit, the smallest common chat cap.
+_TOOL_PREVIEW_CEILING = 2000
 _friendly_tool_labels: bool = True
 
 
@@ -478,10 +482,13 @@ _PREVIEW_BUILDERS = {
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
-    *max_len* ``None`` defers to the global ``_tool_preview_max_len``; ``0`` means unlimited.
+    *max_len* ``None`` defers to the global ``_tool_preview_max_len``; ``0`` ("unlimited") means
+    ``_TOOL_PREVIEW_CEILING``.
     """
     if max_len is None:
         max_len = _tool_preview_max_len
+    if not max_len or max_len < 0:
+        max_len = _TOOL_PREVIEW_CEILING
     if not args:
         return None
     args = redact_tool_args_for_display(tool_name, args) or args
