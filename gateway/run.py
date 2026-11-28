@@ -8580,8 +8580,10 @@ class GatewayRunner(
                     # A /queue item held by /stop before the restart: back into the held store,
                     # never replayed as a turn (spec 2026-10-12 D22/I13).
                     from gateway.fork_ext.restart_followups import acknowledge_followup
-                    self._session_state(record["session_key"]).conversation.held_queue.append(event)
                     from gateway import queue_mgmt
+                    queue_mgmt.held_audit(self, record["session_key"], before=True)
+                    self._session_state(record["session_key"]).conversation.held_queue.append(event)
+                    queue_mgmt.held_audit(self, record["session_key"], before=False)
                     queue_mgmt.log_items(self, "restart_restore", record["session_key"], [event], with_preview=False)
                     self._note_held_platform_message(source, source._restart_followup_message_id)
                     await asyncio.to_thread(acknowledge_followup, record["_spool_path"])
@@ -9672,8 +9674,10 @@ class GatewayRunner(
                         spooled += 1
                         from gateway import queue_mgmt
                         queue_mgmt.log_items(self, "restart_spool", key, [event], with_preview=False)
+                        queue_mgmt.held_audit(self, key, before=True)
                         with suppress(ValueError):
                             events.remove(event)
+                        queue_mgmt.held_audit(self, key, before=False)
         return spooled
 
     async def _send_startup_restore_ack(

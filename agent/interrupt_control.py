@@ -280,10 +280,13 @@ class InterruptControlMixin:
         turn's last drain has closed steering (t_2b16f0e6) until the next turn opens it: the caller then
         queues the text as the next turn. Only :func:`late_result_nudge` is buffered while closed."""
         if not text or not text.strip():
+            logger.info("steer_refused reason=empty session=%s", getattr(self, "session_id", None))
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
             if getattr(self, "_steer_closed", False) and not getattr(_CLOSED_STEER_BYPASS, "on", False):
+                logger.info("steer_refused reason=turn_closed session=%s len=%d",
+                            getattr(self, "session_id", None), len(cleaned))
                 return False  # the turn has returned; the surface queues it as the next turn
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned

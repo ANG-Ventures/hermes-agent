@@ -65,6 +65,7 @@ def log_items(runner: Any, op: str, key: str, items: Any, *, with_preview: bool 
     """One line per item, so gateway.log alone answers what was held and where it went. Never raises.
     ``with_preview=False`` for the restart sweeps: they log under the launch profile's home, so a
     secondary profile's prompt text stays out of it (its hold line already carries the preview)."""
+    global _LOG_ITEMS_WARNED
     try:
         for pos, e in enumerate(list(items or ()), 1):
             kind = "system" if is_system_event(runner, e) else "user"
@@ -79,7 +80,29 @@ def log_items(runner: Any, op: str, key: str, items: Any, *, with_preview: bool 
             logger.info("queue_mgmt item op=%s session=%s pos=%d msg_id=%s kind=%s preview=%s",
                         op, key, pos, getattr(e, "message_id", None), kind, text)
     except Exception:
-        logger.debug("queue_mgmt item log failed for %s (%s)", key, op, exc_info=True)
+        # A failure here hides where held items went (review F5): say so once per process at WARNING.
+        level = logging.DEBUG if _LOG_ITEMS_WARNED else logging.WARNING
+        _LOG_ITEMS_WARNED = True
+        logger.log(level, "queue_mgmt item log failed for %s (%s)", key, op, exc_info=True)
+
+
+_LOG_ITEMS_WARNED = False
+
+
+def held_audit(runner: Any, key: str, *, before: bool) -> None:
+    """Bracket every logged change of the held store: ``before=True`` just ahead of it, ``before=False``
+    right after. A held list shorter than the last bracket left it means items went without an item
+    line (review F5): one WARNING, with both depths. Reads lengths only; changes nothing."""
+    held = held_list(runner, key)
+    depth = len(held) if isinstance(held, list) else 0
+    seen = runner.__dict__.setdefault("_held_depth_seen", {})
+    if before and depth < seen.get(key, 0):
+        logger.warning("queue_mgmt op=unexplained_shrink session=%s expected=%d found=%d",
+                       key, seen.get(key, 0), depth)
+    if depth:
+        seen[key] = depth
+    else:
+        seen.pop(key, None)
 
 
 def held_list(runner: Any, key: str) -> Optional[List[Any]]:
@@ -137,10 +160,13 @@ def hold_user_items(runner: Any, key: str, adapter: Any) -> int:
         if users:
             held_store = runner._session_state(key).conversation.held_queue
             before = len(held_store)
+            held_audit(runner, key, before=True)
             held_store.extend(users)
             if not rewrite_active(runner, key, adapter, [e for e in active if not paused and is_system_event(runner, e)]):
                 del held_store[before:]
+                held_audit(runner, key, before=False)
                 return before
+            held_audit(runner, key, before=False)
             logger.info("queue_mgmt op=hold session=%s moved=%d held=%d", key, len(users), len(held_store))
             log_items(runner, "hold", key, users)
         return len(held_list(runner, key) or [])
@@ -162,7 +188,9 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
     if state.automatic_turns_paused is not True:
         return False
     if is_system_event(runner, event):
+        held_audit(runner, key, before=True)
         state.held_queue.append(event)
+        held_audit(runner, key, before=False)
         logger.info("queue_mgmt op=hold_wake session=%s held=%d", key, len(state.held_queue))
         log_items(runner, "hold_wake", key, [event])
         return True
@@ -174,7 +202,9 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
     # /new|/reset drops and counts it (D21). The caller's turn must then end: its session_entry
     # predates the invalidation and must never reach the model.
     generation = runner._session_state(key).persistent.run_generation
+    held_audit(runner, key, before=True)
     state.held_queue.append(event)
+    held_audit(runner, key, before=False)
     try:
         await runner.async_session_store.clear_user_stopped(key, generation=generation)
     except BaseException:
@@ -185,6 +215,8 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
         raise
     if runner._session_state(key).persistent.run_generation != generation:
         logger.info("queue_mgmt op=resume_invalidated session=%s", key)
+        if any(e is event for e in held_list(runner, key) or ()):
+            log_items(runner, "hold", key, [event])   # still held (a /queue verb that moved it logs its own line)
         return True
     if not _unpark(runner, key, event):
         return True  # a /queue verb removed or rewrote it meanwhile; that verb owns it now
@@ -192,7 +224,10 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
     wakes = [e for e in state.held_queue if is_system_event(runner, e)]
     if wakes and not rewrite_active(runner, key, adapter, active_items(runner, key, adapter) + wakes):
         raise RuntimeError("Cannot resume held notifications: adapter queue unavailable")
+    held_audit(runner, key, before=True)
     state.held_queue[:] = [e for e in state.held_queue if not is_system_event(runner, e)]
+    held_audit(runner, key, before=False)
+    log_items(runner, "resume_wake", key, wakes)
     state.automatic_turns_paused = False
     return False
 
@@ -202,7 +237,9 @@ def _unpark(runner: Any, key: str, event: Any) -> bool:
     held = runner._session_state(key).conversation.held_queue
     for i, e in enumerate(held):
         if e is event:
+            held_audit(runner, key, before=True)
             del held[i]
+            held_audit(runner, key, before=False)
             return True
     return False
 
@@ -249,7 +286,9 @@ def reclaim_inflight(runner: Any, key: str, *, only: Any = None) -> int:
         if any(h is event for h in held):
             return 0
         event._queue_released = False
+        held_audit(runner, key, before=True)
         held.insert(0, event)
+        held_audit(runner, key, before=False)
         logger.info("queue_mgmt op=hold session=%s moved=1 held=%d from=inflight", key, len(held))
         log_items(runner, "hold", key, [event])
         return 1
@@ -270,8 +309,10 @@ def _store_for_verbs(runner: Any, key: str, adapter: Any) -> Tuple[str, List[Any
 def _write_store(runner: Any, key: str, adapter: Any, which: str, items: List[Any]) -> bool:
     if which == "held":
         held = runner._session_state(key).conversation.held_queue
+        held_audit(runner, key, before=True)
         del held[:]
         held.extend(items)
+        held_audit(runner, key, before=False)
         return True
     return rewrite_active(runner, key, adapter, items, arm=None)
 
@@ -479,7 +520,9 @@ def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_r
                 pass
         return None
     if held:
+        held_audit(runner, key, before=True)
         del held[:]
+        held_audit(runner, key, before=False)
     logger.info("queue_mgmt op=release session=%s released=%d mode=%s armed=%d trigger=%s", key, released,
                 release_mode(runner), len(system) + len(users), trigger)
     log_items(runner, "release", key, [e for e in combined if is_system_event(runner, e)]
@@ -599,9 +642,12 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
         overflow_raw = getattr(state.conversation, "queued_events", None)
         overflow = list(overflow_raw) if isinstance(overflow_raw, list) else []
         users_overflow = [e for e in overflow if not is_system_event(runner, e)]
+        held_audit(runner, key, before=True)
+        seen = runner.__dict__.setdefault("_held_depth_seen", {})
         if reason in USER_RESET_REASONS:
             note_reset_drop(runner, key, len(held) + len(users_overflow))
             log_items(runner, "reset_drop", key, held + users_overflow)
+            seen.pop(key, None)   # the caller's clear empties held; these items have their lines
             return None
         # Automatic resets have no reply target, so they must not drop anything (D5/D21): carry the
         # held items AND any active user items into the held store. An unknown reason is treated
@@ -614,6 +660,10 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
             logger.info("queue_mgmt op=auto_reset session=%s carried %d active item(s) into held",
                         key, len(users_overflow))
         log_items(runner, "auto_reset", key, carried)
+        if carried:
+            seen[key] = len(carried)   # what the caller's clear-then-carry leaves in held
+        else:
+            seen.pop(key, None)
         return carried or None
     except Exception:
         logger.warning("queue_mgmt before_scope_clear failed for %s (%s); clearing without carry",

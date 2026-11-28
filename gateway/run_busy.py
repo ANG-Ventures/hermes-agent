@@ -17,6 +17,7 @@ import threading
 import time
 from agent.i18n import DEFAULT_LANGUAGE, t
 from agent.session_activity import format_iteration_progress
+from gateway import inbox_log
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
@@ -83,6 +84,8 @@ _BUSY_STEER_IMAGE_DEADLINE_S = 45.0
 # The agent-side hook ``steer_user_row`` calls with the drained text (t_b8fbfc54); keep the name in step with
 # ``agent.prompt_builder.STEER_ROW_DISPLAY_METADATA_ATTR``.
 STEER_ROW_DISPLAY_METADATA_ATTR = "_steer_row_display_metadata"
+# Same contract for the row's ``platform_message_id`` (card t_1eb0a176): ``agent.prompt_builder.STEER_ROW_PLATFORM_ID_ATTR``.
+STEER_ROW_PLATFORM_ID_ATTR = "_steer_row_platform_message_id"
 _STEER_INSTALL_LOCK = threading.Lock()
 # Set while steer_with_provenance runs its verb: the wrapped ``steer`` then records nothing itself.
 _RECORDING = threading.local()
@@ -172,6 +175,8 @@ def _provenance_lock(agent: Any) -> Optional[threading.Lock]:
             return _drained_display_metadata(_attrs, _lock, text)
 
         attrs[STEER_ROW_DISPLAY_METADATA_ATTR] = _row_display_metadata
+        attrs[STEER_ROW_PLATFORM_ID_ATTR] = lambda text, _attrs=attrs, _lock=lock: _drained_platform_message_id(
+            _attrs, _lock, text)
         return lock
 
 
@@ -180,6 +185,7 @@ def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool, e
     inbound record (``None`` for a steer with no platform message), which the steer row then carries."""
     from gateway import inbound_record
     record = inbound_record.display_metadata(event).get(inbound_record.KEY) if event is not None else None
+    msg_id = getattr(event, "message_id", None) if not internal else None
     lock = _provenance_lock(agent) if agent is not None else None
     with lock if lock is not None else contextlib.nullcontext():
         fresh = _steer_buffer_empty(agent)
@@ -189,8 +195,21 @@ def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool, e
         finally:
             _RECORDING.active = False
         if accepted and lock is not None:
-            _record_steer_entry(agent, text, internal=internal, fresh=fresh, record=record)
+            _record_steer_entry(agent, text, internal=internal, fresh=fresh, record=record, msg_id=msg_id)
     return accepted
+
+
+def _drained_platform_message_id(attrs: dict, lock: Any, text: Any) -> Optional[str]:
+    """The platform message id of the ONE person's message a drained steer row is (newest snapshot whose
+    text is *text*); None when the row merged several messages, is internal, or carries no id."""
+    with lock:
+        for drained_text, entries in reversed(list(attrs.get(_STEER_DRAINED_ATTR) or ())):
+            if drained_text == text:
+                if len(entries) != 1 or len(entries[0]) < 4 or entries[0][1] or not entries[0][3]:
+                    return None
+                whole = str(entries[0][0]).strip() == str(drained_text or "").strip()
+                return str(entries[0][3]) if whole else None
+    return None
 
 
 def _drained_display_metadata(attrs: dict, lock: Any, text: Any) -> dict:
@@ -213,7 +232,8 @@ def leftover_steer_display_metadata(agent: Any, leftover: Optional[str]) -> dict
     return _drained_display_metadata(agent.__dict__, lock, leftover)
 
 
-def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool, record: Any = None) -> None:
+def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool, record: Any = None,
+                        msg_id: Any = None) -> None:
     cleaned = (text or "").strip()
     if not cleaned:
         return
@@ -221,7 +241,7 @@ def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool, r
     if fresh or not isinstance(attrs.get(_STEER_ENTRIES_ATTR), list):
         attrs[_STEER_ENTRIES_ATTR] = []  # a buffer wiped without a drain (hard cancel) leaves stale entries
     ledger = attrs[_STEER_ENTRIES_ATTR]
-    ledger.append((cleaned, bool(internal), record if isinstance(record, dict) else None))
+    ledger.append((cleaned, bool(internal), record if isinstance(record, dict) else None, msg_id))
     del ledger[:-_STEER_ENTRIES_MAX]
 
 
@@ -314,6 +334,7 @@ class GatewayBusySessionMixin:
         """Append a /queue event to the FIFO chain for a session."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
+            inbox_log.log_disposition("refused", session_key, queued_event, path="no_slot")
             return
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
@@ -327,6 +348,8 @@ class GatewayBusySessionMixin:
             else:
                 pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
+        inbox_log.log_disposition("queued", session_key, queued_event,
+                                  depth=self._queue_depth(session_key, adapter=adapter), path="fifo")
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
@@ -756,6 +779,7 @@ class GatewayBusySessionMixin:
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
+            inbox_log.log_disposition("refused", session_key, event, path="no_adapter")
             return
         # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
         # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
@@ -803,6 +827,8 @@ class GatewayBusySessionMixin:
                 merge_text=event.message_type == MessageType.TEXT,
             )
             event._gateway_accepted = True
+            inbox_log.log_disposition("merged-into-head", session_key, event,
+                                      depth=self._queue_depth(session_key, adapter=adapter), path="photo_burst")
             return
 
         if self._coalesce_card_wake(session_key, event, adapter):
@@ -822,6 +848,7 @@ class GatewayBusySessionMixin:
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
+            inbox_log.log_disposition("refused", session_key, event, depth=depth, path="cap")
             # A refused wake raises WakeNotAccepted at its sender; file it ONCE per episode so a
             # session that cannot take wakes shows as that, not as a failing cron (t_4a891379).
             if getattr(event, "internal", False) and session_key not in refused:
@@ -1060,6 +1087,7 @@ class GatewayBusySessionMixin:
                 if self._has_queued_human_followup(session_key, self._delivery_adapter_for(event.source)):
                     # Checked first: a held voice note or image is prepared when its own turn runs.
                     self._log_busy_followup_held(session_key, "steer")
+                    inbox_log.log_disposition("held", session_key, event, path="steer_behind_queued")
                     return "held"
                 awaited = awaited or bool(self._busy_steer_image_paths(event))
                 steer_text = await self._prepare_busy_steer_payload(event, session_key)
@@ -1077,6 +1105,8 @@ class GatewayBusySessionMixin:
                 )
                 if steered:
                     self._fold_into_running_turn(running_agent, session_key, event)
+                    inbox_log.log_disposition("steered", session_key, event, path="steer", runner=self,
+                                              session_id=getattr(running_agent, "session_id", None))
                     return "steered"
                 if self._busy_steer_image_paths(event):
                     logger.info(
@@ -1286,6 +1316,7 @@ class GatewayBusySessionMixin:
             if self._has_queued_human_followup(session_key, self._delivery_adapter_for(event.source)):
                 # Not redirected: the caller queues this event behind the earlier one and interrupts.
                 self._log_busy_followup_held(session_key, "redirect")
+                inbox_log.log_disposition("held", session_key, event, path="redirect_behind_queued")
             else:
                 redirected = self._redirect_active_turn(
                     running_agent, (event.text or "").strip(), session_key, event
@@ -1329,6 +1360,8 @@ class GatewayBusySessionMixin:
         if not self._try_agent_verb(running_agent, "redirect", text, session_key, event=event):
             return False
         turn = self._fold_into_running_turn(running_agent, session_key, event)
+        inbox_log.log_disposition("steered", session_key, event, path="redirect", runner=self,
+                                  session_id=getattr(running_agent, "session_id", None))
         if turn is None:
             return True  # a newer turn already owns the slot; never re-anchor it
         anchor = self._reply_anchor_for_event(event)

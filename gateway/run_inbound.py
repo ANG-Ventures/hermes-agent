@@ -27,6 +27,7 @@ from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
 from gateway import inbound_record
+from gateway import inbox_log
 from gateway.run_common import _UNSET
 from gateway.run_inbound_unauthorized import (
     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
@@ -665,7 +666,12 @@ class GatewayInboundMixin:
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
+            _had_head = adapter._pending_messages.get(_quick_key) is not None
             merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+            inbox_log.log_disposition("merged-into-head" if _had_head else "queued", _quick_key, event,
+                                      depth=self._queue_depth(_quick_key, adapter=adapter), path="pending_slot")
+        else:
+            inbox_log.log_disposition("refused", _quick_key, event, path="no_adapter")
 
     async def _hm_busy_slash_or_photo(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -757,6 +763,7 @@ class GatewayInboundMixin:
             # behind it, then interrupt: with a pending event the turn runner drains the queue
             # and ignores the bare interrupt text, so queueing is what keeps the text.
             self._log_busy_followup_held(_quick_key, "redirect")
+            inbox_log.log_disposition("held", _quick_key, event, path="redirect_behind_queued")
             self._queue_or_replace_pending_event(_quick_key, event)
         elif _redirectable and self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):
             logger.debug("PRIORITY redirect for session %s", _quick_key)
@@ -892,6 +899,8 @@ class GatewayInboundMixin:
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
             if queue_during_drain:
                 self._queue_or_replace_pending_event(_quick_key, event)
+            else:
+                inbox_log.log_disposition("refused", _quick_key, event, path="drain")
             return (
                 t("gateway.busy.drain_queued", action=self._status_action_gerund())
                 if queue_during_drain

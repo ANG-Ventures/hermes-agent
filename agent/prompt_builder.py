@@ -595,6 +595,7 @@ STEER_DISPLAY_KIND = "steer"
 # Instance attribute the gateway installs on an agent it steers (gateway.run_busy): called with the drained
 # steer text, it returns that row's ``display_metadata`` (the platform message's inbound record, t_b8fbfc54).
 STEER_ROW_DISPLAY_METADATA_ATTR = "_steer_row_display_metadata"
+STEER_ROW_PLATFORM_ID_ATTR = "_steer_row_platform_message_id"  # gateway hook: text -> platform message id or None
 
 
 def steer_user_row(steer_text: str, *, agent: Any) -> Dict[str, Any]:
@@ -620,6 +621,12 @@ def steer_user_row(steer_text: str, *, agent: Any) -> Dict[str, Any]:
             meta = None
         if isinstance(meta, dict) and meta:
             row["display_metadata"] = dict(meta)
+    # Gateway-steered agents only: the id of the one platform message this row is (t_1eb0a176), into
+    # the session store's existing ``platform_message_id`` column. No hook (CLI, kanban, TUI): unchanged.
+    id_hook = getattr(agent, "__dict__", {}).get(STEER_ROW_PLATFORM_ID_ATTR) if agent is not None else None
+    platform_id = id_hook(steer_text) if callable(id_hook) else None
+    if platform_id:
+        row["platform_message_id"] = str(platform_id)
     return row
 
 
