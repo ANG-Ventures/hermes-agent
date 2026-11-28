@@ -340,15 +340,18 @@ def check(conn, task_id: str, capability: str, *, elsewhere: Optional[str], why_
 
 
 def _reopen_day(conn, key: str) -> str:
-    """``yyyymmdd`` for the reopen key, or ``yyyymmdd-N`` when a live card already holds that day's key: the gap
-    closed twice in one day, and the first dated key would return that day's DONE card (t_dfb01891)."""
+    """``yyyymmdd`` for the reopen key, or ``yyyymmdd-N`` when a DONE card already holds that day's key: the gap
+    closed twice in one day, and the first dated key would return that day's DONE card (t_dfb01891). A key held by
+    an open card is reused, so a repeated refusal names that card instead of minting a duplicate (Prism c10a5eb0769c)."""
     import time
     day = time.strftime("%Y%m%d", time.localtime())
     base = f"studio-capgap:{key}:{day}"
-    taken = {r[0] for r in conn.execute("SELECT idempotency_key FROM tasks WHERE substr(idempotency_key, 1, ?) = ? "
-                                        "AND status != 'archived'", (len(base), base)).fetchall()}
+    done = {}
+    for idem, status in conn.execute("SELECT idempotency_key, status FROM tasks WHERE substr(idempotency_key, 1, ?) = ? "
+                                     "AND status != 'archived'", (len(base), base)).fetchall():
+        done[idem] = done.get(idem, True) and status == "done"
     n = 1
-    while (base if n == 1 else f"{base}-{n}") in taken:
+    while done.get(base if n == 1 else f"{base}-{n}"):
         n += 1
     return day if n == 1 else f"{day}-{n}"
 

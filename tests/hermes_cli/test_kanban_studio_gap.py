@@ -687,6 +687,28 @@ def test_second_closure_on_the_same_day_prints_a_distinct_reopen_key(operator):
     assert len(set(keys)) == 2
 
 
+def test_repeated_refusal_reuses_the_dated_key_of_an_open_reopen_card(operator):
+    """Prism c10a5eb0769c: after the reopen command made an OPEN card (not yet registered), a second refusal for
+    the same closure must print the same key, so following it returns that card instead of a duplicate."""
+    with kb.connect_closing() as conn:
+        old = kb.create_task(conn, title="gap", assignee="alpha", body="x", idempotency_key="studio-capgap:operator_admit")
+        ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=old)
+        _done(conn, old)
+        with pytest.raises(ksa.OverrideRefused) as e:
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+        argv, idem = _reopen_idem(str(e.value))
+        new = kb.create_task(conn, title=argv[argv.index("create") + 1], assignee="alpha", body="x",
+                             idempotency_key=idem)
+        with pytest.raises(ksa.OverrideRefused) as e2:
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only", fix_card=old)
+        argv2, idem2 = _reopen_idem(str(e2.value))
+        assert idem2 == idem
+        again = kb.create_task(conn, title=argv2[argv2.index("create") + 1], assignee="alpha", body="x",
+                               idempotency_key=idem2)
+    assert again == new
+
+
 def test_open_card_registered_in_the_closing_second_before_the_closure_does_not_count(operator):
     """B registered, then A registered, then B completed, all in the same second: A predates the closure (event
     order is the tie-break, against B's COMPLETION, not B's registration). A card registered after the completion
