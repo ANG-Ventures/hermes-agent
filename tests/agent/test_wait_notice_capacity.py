@@ -52,7 +52,12 @@ RETRYING = {"stage": "upstream_ttfb", "seat": "sub-vps-3", "since_ms": 4000,
             "attempt_ms": 4000, "request_ms": 62000}
 
 
-def test_shared_notice_names_the_exhausted_allowance_not_a_queue(monkeypatch):
+def _quota_refused(agent):
+    """This wait saw a Fable quota refusal from the relay (t_c5cddd09)."""
+    wb.note_upstream_failure(agent, status=503, relay_class="quota_model")
+
+
+def test_shared_notice_names_the_allowance_when_the_wait_is_on_quota(monkeypatch):
     _relay(monkeypatch, inflight=RETRYING)
     agents = [_agent(f"s{i}") for i in range(12)]
     wb.arm(agents[0], now=-2309.0)
@@ -60,6 +65,7 @@ def test_shared_notice_names_the_exhausted_allowance_not_a_queue(monkeypatch):
         wb.arm(a, now=0.0)
     for a in agents:
         wb.note_quiet(a, 300, now=0.0)
+    _quota_refused(agents[-1])
     text = wb.notice_due(agents[-1], now=120.0)
     print(text)
     assert text == ("⏳ 12 sessions waiting on claude-dtlr/claude-fable-5-2 (oldest 2429s): "
@@ -67,24 +73,57 @@ def test_shared_notice_names_the_exhausted_allowance_not_a_queue(monkeypatch):
                     "resets Sun 10:59); this turn 120s, cut at 600s")
 
 
-def test_solo_notice_names_the_allowance(monkeypatch):
+def test_solo_notice_names_the_allowance_when_refused_for_quota(monkeypatch):
     _relay(monkeypatch, inflight=RETRYING)
+    a = _agent()
+    wb.arm(a, now=0.0)
+    _quota_refused(a)
+    text = wb.notice_due(a, now=120.0)
+    print(text)
+    assert text.startswith("⏳ waiting on claude-dtlr/claude-fable-5-2: relay retrying seats (Fable "
+                           "allowance used up on 23/25 seats, 2 eligible, resets Sun 10:59); 120s "
+                           "elapsed")
+
+
+def test_slow_call_with_fable_left_does_not_blame_the_allowance(monkeypatch):
+    """2026-11-27 19:06 PT: call #27 ran 239.8 s and returned 200, no refusal; 8 of 26
+    seats had Fable left. The wait line read "Fable allowance used up on 19/26 seats"."""
+    _relay(monkeypatch, exhausted=19, of=26, eligible=8, inflight=RETRYING)
     a = _agent()
     wb.arm(a, now=0.0)
     text = wb.notice_due(a, now=120.0)
     print(text)
-    assert text == ("⏳ waiting on claude-dtlr/claude-fable-5-2: relay retrying seats (Fable "
-                    "allowance used up on 23/25 seats, 2 eligible, resets Sun 10:59); 120s "
-                    "elapsed; cut to next lane at 600s")
+    assert "allowance" not in text
+    assert text == ("⏳ sub-vps-3 connected, provider has not sent a first token for 4s: "
+                    "120s elapsed; cut at 600s")
+    wb.clear_registry()
+    _relay(monkeypatch, exhausted=19, of=26, eligible=8, inflight=None)
+    b = _agent("s9")
+    wb.arm(b, now=0.0)
+    text = wb.notice_due(b, now=120.0)
+    print(text)
+    assert "allowance" not in text and "120s elapsed" in text
 
 
-def test_solo_notice_without_retry_evidence_still_names_the_allowance(monkeypatch):
-    _relay(monkeypatch, inflight=None)
-    a = _agent()
+def test_quota_refusal_on_the_old_lane_does_not_blame_the_new_lane(monkeypatch):
+    """Prism #600 e77e9819a17a: a 429 on claude-alr, then a fallback to claude-dtlr that
+    never refused. The clock carries over; the refusal does not."""
+    _relay(monkeypatch, inflight=RETRYING)
+    a = _agent(provider="claude-alr")
     wb.arm(a, now=0.0)
-    assert wb.notice_due(a, now=120.0) == (
-        "⏳ waiting on claude-dtlr/claude-fable-5-2: Fable allowance used up on 23/25 seats, "
-        "2 eligible, resets Sun 10:59; 120s elapsed; cut to next lane at 600s")
+    wb.note_upstream_failure(a, status=429)
+    a.provider = "claude-dtlr"
+    wb.note_lane_switch(a)
+    text = wb.notice_due(a, now=120.0)
+    print(text)
+    assert "allowance" not in text
+    assert text == ("⏳ still waiting for a first reply: 120s on claude-dtlr/claude-fable-5-2, "
+                    "2 lanes tried; last failure: HTTP 429 rate limited, retrying")
+    # The same lane refusing again names the allowance.
+    wb.note_upstream_failure(a, status=503, relay_class="quota_model")
+    text = wb.notice_due(a, now=240.0)
+    print(text)
+    assert "Fable allowance used up on 23/25 seats" in text
 
 
 def test_normal_queue_keeps_todays_wording(monkeypatch):

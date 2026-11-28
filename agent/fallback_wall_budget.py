@@ -479,6 +479,10 @@ def note_upstream_failure(agent: Any, *, status: Any = None, socket: Optional[st
         code = None
     if code is not None and code < 400:
         code = None   # a 200 head that then dropped is a drop, not a status
+    if code == 429 or (relay_class or "").lower() in ("quota_model", "quota_seat"):
+        # t_c5cddd09: this wait IS on quota, on THIS route. The clock survives a
+        # fallback; the refusal does not speak for the next lane.
+        st.setdefault("quota_refused", set()).add(_route_key(agent))
     phrase = _failure_phrase(code, socket, exc_name, hop, relay_class, relay_error,
                              str(text or ""), str(getattr(agent, "provider", "") or ""))
     if not phrase:
@@ -487,6 +491,12 @@ def note_upstream_failure(agent: Any, *, status: Any = None, socket: Optional[st
     counts[phrase] = int(counts.get(phrase, 0)) + 1
     st["last_failure"] = phrase
     st["last_box"] = (str(box).strip() or None) if box else None
+
+
+def _route_key(agent: Any) -> tuple[str, str]:
+    """The lane and model a refusal belongs to."""
+    return (str(getattr(agent, "provider", "") or "").strip().lower(),
+            str(getattr(agent, "model", "") or "").strip().lower())
 
 
 def _failure_text(st: dict) -> str:
@@ -727,9 +737,16 @@ def _capacity_stage(agent: Any) -> Optional[str]:
     """``relay retrying seats (Fable allowance used up on 23/25 seats, 2 eligible, resets
     Sun 10:59)`` when the relay states capacity pressure on the lane's model, else None.
     A producer-stamped per-seat allowance on ``/inflight`` keeps its own wording."""
-    from agent.fork_ext.relay_capacity import capacity_phrase
-    text = capacity_phrase(_capacity(agent))
+    from agent.fork_ext.relay_capacity import capacity_phrase, exhausted
+    cap = _capacity(agent)
+    text = capacity_phrase(cap)
     if not text:
+        return None
+    # t_c5cddd09: seats used up elsewhere in the pool are a pool fact, not why THIS
+    # call waits. Name the allowance only when no seat can serve the model or this
+    # wait saw a quota refusal; otherwise the notice says the stage it is on.
+    refused = (_state(agent) or {}).get("quota_refused") or ()
+    if not (exhausted(cap) or _route_key(agent) in refused):
         return None
     info = _inflight(agent)
     if isinstance(info, dict) and _allowance_phrase(info, shared=False):
