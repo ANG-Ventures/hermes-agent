@@ -1076,6 +1076,17 @@ def _is_read_phase_stall(c: _Ctx) -> bool:
     return any(p in c.msg for p in _POOL_STALLED_PATTERNS)
 
 
+def is_read_phase_stall(error: Exception) -> bool:
+    """:func:`_is_read_phase_stall` for a raw exception (the stream 5xx unmask guard reads it,
+    so both sides share one list of stall signals). Never raises."""
+    try:
+        body = _extract_error_body(error)
+        c = _Ctx(error, _extract_status_code(error), body, _build_error_msg(error, body), "", "", 0, 0, 0)
+        return _is_read_phase_stall(c)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _no_auth_available_verdict(msg: str) -> Verdict:
     """cpa ``auth_unavailable``: bare = no credential loaded (auth_permanent); with a capacity
     ``last upstream error:`` / cooldown = the relay capacity verdict for that class (t_03fb601f).

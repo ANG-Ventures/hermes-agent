@@ -202,3 +202,53 @@ def test_opaque_sdk_500_still_gets_the_one_resend(monkeypatch):
 
     assert _run_handle_stream_error(call, err) is False
     assert len(sent) == 1 and call.result["response"] is not None and call.result["error"] is None
+
+
+# --- t_41183e3a: untagged relay stalls; relay field names only as real keys ----------------------
+
+def _resend_count(monkeypatch, err):
+    call = _make_call({"model": "m", "stream": True, "messages": []})
+    sent = []
+
+    def fake_probe(agent, kwargs, **_kw):
+        sent.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", reasoning_content=None))])
+
+    monkeypatch.setattr(h, "interruptible_api_call", fake_probe)
+    assert _run_handle_stream_error(call, err) is False
+    return len(sent), call
+
+
+@pytest.mark.parametrize("body", [
+    {"error": "pool deadline exceeded"},
+    {"error": {"message": "interactive turn timed out", "code": "tui_turn_timeout"}},
+], ids=["pool-deadline-exceeded", "tui_turn_timeout"])
+def test_untagged_relay_stall_504_goes_to_loop_without_resend(monkeypatch, body):
+    err = _sdk_status_error(504, body)
+    n, call = _resend_count(monkeypatch, err)
+    assert n == 0 and call.result["error"] is err and call.result["response"] is None
+
+
+def test_unrelated_504_still_gets_the_one_resend(monkeypatch):
+    n, call = _resend_count(monkeypatch, _sdk_status_error(504, {"error": {"message": "gateway timeout"}}))
+    assert n == 1 and call.result["response"] is not None
+
+
+def test_relay_field_name_only_inside_a_value_still_gets_the_one_resend(monkeypatch):
+    body = {"error": {"message": "something went wrong", "request_id": "relay_error_hop-42"}}
+    n, call = _resend_count(monkeypatch, _sdk_status_error(500, body))
+    assert n == 1 and call.result["response"] is not None
+
+
+@pytest.mark.parametrize("status,body", [
+    (503, {"error": "local_unavailable", "relay_error_class": "pool_pressure", "relay_error_hop": "front"}),
+    (503, {"error": {"message": "local_unavailable"}, "relay_error_class": "pool_pressure",
+           "relay_error_hop": "front"}),
+    (500, {"error": {"message": "local_unavailable"}, "relay_error_class": "pool_pressure",
+           "relay_error_hop": "front"}),
+    (502, {"error": "bad gateway", "relay_error_hop": "relay->bridge"}),
+], ids=["503-flat", "503-nested-top-level-fields", "500-nested-top-level-fields", "502-flat-hop"])
+def test_relay_fields_as_top_level_keys_without_headers_skip_resend(monkeypatch, status, body):
+    err = _sdk_status_error(status, body)
+    n, call = _resend_count(monkeypatch, err)
+    assert n == 0 and call.result["error"] is err
