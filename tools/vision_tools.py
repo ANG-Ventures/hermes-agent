@@ -527,6 +527,10 @@ class _ImagePrepError(ValueError):
     """Raised by :func:`_prepare_image`; the message is user-facing."""
 
 
+class _CardImageRefused(_ImagePrepError):
+    """The image shows a full payment card number (``agent.redact_cards.CARD_IMAGE_REFUSAL``)."""
+
+
 class _PreparedImage(NamedTuple):
     """Temp image ready to encode; ``path`` is owned by the caller (delete it)."""
     path: Path
@@ -573,6 +577,13 @@ async def _prepare_image(
                 raise _ImagePrepError(crop_err or "Region crop failed.")
             _unlink_quietly(path)
             path, mime, size_bytes = cropped_path, cropped_mime, cropped_path.stat().st_size
+        # t_56a9d083: OCR the exact bytes about to be sent, wherever they came from (a worker's remote
+        # terminal host, a data: URL, http). The pre-tool hook gate only sees files on the agent's host.
+        from agent.redact_cards import screenshot_card_refusal
+        refusal = await asyncio.to_thread(
+            screenshot_card_refusal, path, knob="image_read_card_ocr", what="image read")
+        if refusal is not None:
+            raise _CardImageRefused(refusal)
     except BaseException:
         _unlink_quietly(path)
         raise
@@ -766,6 +777,9 @@ async def _run_analysis(
             result["scale_note"] = scale_note
         debug_call_data.update(success=True, analysis_length=analysis_length)
         return finish(result)
+    except _CardImageRefused as e:
+        debug_call_data["error"] = "card image refused"
+        return finish({"success": False, "error": str(e)})
     except Exception as e:
         error_msg = f"Error analyzing {kind}: {str(e)}"
         logger.error("%s", error_msg, exc_info=True)

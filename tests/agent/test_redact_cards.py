@@ -355,3 +355,149 @@ def test_executor_masks_a_result_before_it_spills():
             patch("agent.tool_executor.maybe_persist_tool_result", side_effect=persist):
         agent._execute_tool_calls_sequential(SimpleNamespace(content="", tool_calls=[call]), [], "task-1")
     assert spilled == ["card XXXXXXXXXXXX0366"]
+
+
+# ── vision_analyze: OCR the bytes it is about to send (t_56a9d083) ────────────
+
+def _png_bytes() -> bytes:
+    import struct
+    import zlib
+    w, h = 8, 4
+    rows = b"".join(b"\x00" + b"\xff\xff\xff" * w for _ in range(h))
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def _data_url() -> str:
+    import base64
+    return "data:image/png;base64," + base64.b64encode(_png_bytes()).decode()
+
+
+class _RemoteEnv:
+    """A worker's terminal backend on another host: the file exists only there."""
+    def __init__(self):
+        self.commands = []
+
+    def execute(self, cmd):
+        import base64
+        self.commands.append(cmd)
+        return {"returncode": 0, "output": base64.b64encode(_png_bytes()).decode()}
+
+
+def _vision_analyze(tmp_path, image_url, ocr, *, native=False, env=None, **security):
+    """Run the vision_analyze handler with the model calls stubbed; ``ocr`` is _ocr's return value."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from tools import vision_tools
+    patches = [
+        _cfg(**security),
+        patch("tools.vision_tools.get_hermes_dir", return_value=tmp_path),
+        patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=native),
+        patch("tools.vision_tools._validate_raster_image_decodable", return_value=None),
+        patch("tools.vision_tools.async_call_llm", new=AsyncMock(return_value=object())),
+        patch("tools.vision_tools.extract_content_or_reasoning", return_value="a receipt"),
+        patch("tools.vision_tools._load_auxiliary_client"),
+        patch.object(redact_cards, "_ocr", return_value=ocr) if ocr is not None else patch.object(redact_cards, "luhn", redact_cards.luhn),
+    ]
+    if env is not None:
+        patches += [patch("tools.image_source._is_local_terminal_backend", return_value=False),
+                    patch("tools.image_source._ensure_container_env"),
+                    patch("tools.image_source._get_active_env", return_value=env)]
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        mocks = [stack.enter_context(p) for p in patches]
+        out = asyncio.run(vision_tools._handle_vision_analyze(
+            {"image_url": image_url, "question": "what does it say?"}, task_id="t"))
+        llm = mocks[4]
+    return out, llm
+
+
+_CARD_OCR = (f"Card number\n{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}\nExp 08/29", None)
+
+
+def test_vision_analyze_refuses_a_data_url_image_with_a_card_before_any_model(tmp_path):
+    out, llm = _vision_analyze(tmp_path, _data_url(), _CARD_OCR)
+    llm.assert_not_called()
+    result = json.loads(out)
+    assert result["success"] is False and result["error"] == CARD_IMAGE_REFUSAL
+    assert VISA not in out
+
+
+def test_vision_analyze_refuses_a_remote_terminal_host_image_with_a_card(tmp_path):
+    """The path exists only on the worker's terminal host; the bytes come back through env.execute."""
+    env = _RemoteEnv()
+    for native in (False, True):
+        out, llm = _vision_analyze(tmp_path, "/srv/ci/scratch/t_x/shot.png", _CARD_OCR, native=native, env=env)
+        llm.assert_not_called()
+        assert CARD_IMAGE_REFUSAL in out and VISA not in out
+        assert '"_multimodal"' not in out
+    assert env.commands and "/srv/ci/scratch/t_x/shot.png" in env.commands[0]
+
+
+@pytest.mark.parametrize("text", ["Card ending XXXX XXXX XXXX 0366", "Order 112-1234567-1234567 total $41.00"])
+def test_vision_analyze_passes_masked_numbers_and_order_numbers(tmp_path, text):
+    out, llm = _vision_analyze(tmp_path, _data_url(), (text, None))
+    llm.assert_called()
+    assert json.loads(out) == {"success": True, "analysis": "a receipt"}
+    out, _ = _vision_analyze(tmp_path, _data_url(), (text, None), native=True)
+    assert isinstance(out, dict) and out["_multimodal"] is True
+
+
+def test_vision_analyze_ocr_missing_allows_with_one_warning(tmp_path, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="agent.redact_cards"):
+        out, llm = _vision_analyze(tmp_path, _data_url(), (None, "tesseract not installed"))
+    llm.assert_called()
+    assert json.loads(out)["success"] is True
+    lines = [r.getMessage() for r in caplog.records if "UNCHECKED" in r.getMessage()]
+    assert len(lines) == 1 and "image read sent UNCHECKED" in lines[0] and "tesseract not installed" in lines[0]
+
+
+def test_vision_analyze_card_ocr_obeys_its_own_knob(tmp_path):
+    with patch.object(redact_cards, "_ocr") as ocr:
+        out, llm = _vision_analyze(tmp_path, _data_url(), None, image_read_card_ocr=False)
+    ocr.assert_not_called()
+    llm.assert_called()
+    # browser_vision's knob does not turn this one off.
+    out, llm = _vision_analyze(tmp_path, _data_url(), _CARD_OCR, browser_vision_card_ocr=False)
+    assert CARD_IMAGE_REFUSAL in out
+
+
+def test_vision_analyze_ocr_runs_the_real_subprocess_on_the_sent_bytes(tmp_path):
+    """A stand-in tesseract records the bytes it was given and prints a card: the image is refused, and
+    the bytes OCRed are exactly the PNG the tool would have sent."""
+    seen = tmp_path / "seen.bin"
+    fake = tmp_path / "tesseract"
+    fake.write_text(f"#!/bin/sh\ncat > {seen}\nprintf 'Card\\n{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}\\n'\n")
+    fake.chmod(0o755)
+    with patch.object(redact_cards, "TESSERACT", (str(fake),)):
+        out, llm = _vision_analyze(tmp_path, _data_url(), None)
+    llm.assert_not_called()
+    assert CARD_IMAGE_REFUSAL in out
+    assert seen.read_bytes() == _png_bytes()
+
+
+def test_vision_analyze_real_ocr_on_a_rendered_card_image(tmp_path):
+    """Real tesseract on a rendered image of a made-up Luhn-valid number (skipped where OCR is absent)."""
+    import os
+    pil = pytest.importorskip("PIL.Image")
+    from PIL import ImageDraw, ImageFont
+    if not any(os.access(b, os.X_OK) for b in redact_cards.TESSERACT):
+        pytest.skip("tesseract not installed")
+    import base64
+    import io
+    im = pil.new("RGB", (900, 160), "white")
+    try:
+        font = ImageFont.load_default(size=48)
+    except TypeError:
+        pytest.skip("Pillow too old for a sized default font")
+    ImageDraw.Draw(im).text((20, 50), f"{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}", fill="black", font=font)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    out, llm = _vision_analyze(tmp_path, url, None)
+    llm.assert_not_called()
+    assert CARD_IMAGE_REFUSAL in out
