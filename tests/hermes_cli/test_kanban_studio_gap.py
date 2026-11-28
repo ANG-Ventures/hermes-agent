@@ -635,3 +635,165 @@ def test_replay_explainer_session_overrides(operator):
     # one count line per gap key per day; together they total the 17 runs
     totals = sorted(int(c.split(" Studio run(s)")[0].rsplit(" ", 1)[1]) for c in counts)
     assert len(counts) == 2 and sum(totals) == 17
+
+
+# -- 7. t_dfb01891: follow-ups from the independent read ---------------------------------------------------------
+
+@pytest.mark.parametrize("bad_at", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_refusal_log_line_with_a_non_finite_at_is_skipped(operator, bad_at):
+    """A hand-edited gap-refusals.jsonl line whose `at` is NaN/Infinity/1e999 with a MATCHING key and problem
+    must not turn the refusal into a ValueError/OverflowError: the line is skipped, the full refusal prints."""
+    path = ksg.refusals_path(operator)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    problem = f"--elsewhere is required ({ksg.MIN_TEXT}+ characters)"
+    path.write_text('{"at": %s, "key": "studio-state", "problem": %s, "task_id": "t_hand"}\n'
+                    % (bad_at, json.dumps(problem)), encoding="utf-8")
+    with kb.connect_closing() as conn:
+        with pytest.raises(ksa.OverrideRefused) as e:
+            ksa.override(conn, _card(conn), "studio-state", "reads the live board db", now=1_000_000.0)
+    assert "Pool hosts:" in str(e.value) and "[repeat;" not in str(e.value)
+
+
+def _reopen_idem(msg):
+    import shlex
+    argv = shlex.split(msg[msg.index("hermes kanban "):])
+    return argv, argv[argv.index("--idempotency-key") + 1]
+
+
+def test_second_closure_on_the_same_day_prints_a_distinct_reopen_key(operator):
+    """The gap closes twice in one day: the second refusal must not print the first dated key (it would return that
+    day's DONE card); its key is distinct, makes a new card, and that card is accepted as the fix card."""
+    base = "studio-capgap:operator_admit"
+    with kb.connect_closing() as conn:
+        old = kb.create_task(conn, title="gap", assignee="alpha", body="x", idempotency_key=base)
+        ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=old)
+        _done(conn, old)
+        keys, cards = [], [old]
+        for _ in range(2):  # two more closures the same day
+            with pytest.raises(ksa.OverrideRefused) as e:
+                ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+            argv, idem = _reopen_idem(str(e.value))
+            assert idem.startswith(base + ":") and idem not in keys
+            keys.append(idem)
+            new = kb.create_task(conn, title=argv[argv.index("create") + 1], assignee="alpha",
+                                 body="no marker", idempotency_key=idem)
+            assert new not in cards
+            cards.append(new)
+            p = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                             elsewhere=EW, why_not_now=WN, effort="hours", fix_card=new)
+            assert p["fix_card"] == new and not p.get("counted")
+            _done(conn, new)
+    assert len(set(keys)) == 2
+
+
+def test_repeated_refusal_reuses_the_dated_key_of_an_open_reopen_card(operator):
+    """Prism c10a5eb0769c: after the reopen command made an OPEN card (not yet registered), a second refusal for
+    the same closure must print the same key, so following it returns that card instead of a duplicate."""
+    with kb.connect_closing() as conn:
+        old = kb.create_task(conn, title="gap", assignee="alpha", body="x", idempotency_key="studio-capgap:operator_admit")
+        ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=old)
+        _done(conn, old)
+        with pytest.raises(ksa.OverrideRefused) as e:
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+        argv, idem = _reopen_idem(str(e.value))
+        new = kb.create_task(conn, title=argv[argv.index("create") + 1], assignee="alpha", body="x",
+                             idempotency_key=idem)
+        with pytest.raises(ksa.OverrideRefused) as e2:
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only", fix_card=old)
+        argv2, idem2 = _reopen_idem(str(e2.value))
+        assert idem2 == idem
+        again = kb.create_task(conn, title=argv2[argv2.index("create") + 1], assignee="alpha", body="x",
+                               idempotency_key=idem2)
+    assert again == new
+
+
+def test_open_card_registered_in_the_closing_second_before_the_closure_does_not_count(operator):
+    """B registered, then A registered, then B completed, all in the same second: A predates the closure (event
+    order is the tie-break, against B's COMPLETION, not B's registration). A card registered after the completion
+    in that same second does count."""
+    t = 1_900_000_000
+    with kb.connect_closing() as conn:
+        a, b = _fix(conn, title="install A"), _fix(conn, title="install B")
+        for fix in (b, a):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done', completed_at=? WHERE id=?", (t, b))
+            kb._append_event(conn, b, "completed", {})
+            conn.execute("UPDATE task_events SET created_at=? WHERE kind IN ('studio_override', 'completed')", (t,))
+        with pytest.raises(ksa.OverrideRefused, match=f"the gap card {b} for operator_admit is done"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+        c = _fix(conn, title="install C")
+        ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=c)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET created_at=? WHERE kind='studio_override'", (t,))
+        q = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert q["counted"] and q["fix_card"] == c
+
+
+def test_cli_studio_override_end_to_end_on_a_scratch_board(kanban_home, monkeypatch, capsys):
+    """Through the real `hermes kanban studio-override` entry (parser + kanban_command), no module stubs: refused
+    without answers; the printed create command makes the fix card; accepted with both answers plus that card;
+    later runs count on it, one count line per day."""
+    import argparse
+    import shlex
+    from hermes_cli import kanban as kcli
+    from hermes_cli import kanban_parser
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_CRON_JOB_ID"):
+        monkeypatch.delenv(var, raising=False)
+    tok = kb.operator_token_path()
+    tok.parent.mkdir(parents=True, exist_ok=True)
+    tok.write_text("tok", encoding="utf-8")
+    monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, "tok")
+
+    def run(argv):
+        top = argparse.ArgumentParser()
+        kanban_parser.build_parser(top.add_subparsers(dest="cmd"))
+        rc = kcli.kanban_command(top.parse_args(argv))
+        out = capsys.readouterr()
+        return rc, out.out, out.err
+
+    with kb.connect_closing() as conn:
+        cards = [_card(conn) for _ in range(3)]
+    why = ["--capability", "operator_admit", "--why", "render toolchain is Studio-only"]
+    rc, _, err = run(["kanban", "--board", "default", "studio-override", cards[0], *why])
+    assert rc == 1 and "REFUSED" in err and "--elsewhere is required" in err
+    rc, out, err = run(shlex.split(err[err.index("hermes kanban "):])[1:] + ["--json"])
+    assert rc == 0, err
+    fix = json.loads(out)["id"] if out.strip().startswith("{") else out.split()[-1]
+    with kb.connect_closing() as conn:
+        assert ksg.is_fix_card_for(conn, fix, "operator_admit")
+    answers = ["--elsewhere", EW, "--why-not-now", WN, "--effort", "hours", "--fix-card", fix]
+    rc, out, err = run(["kanban", "--board", "default", "studio-override", cards[0], *why, *answers])
+    assert rc == 0, err
+    assert f"fix card: {fix}" in out and "once (next run only)" in out
+    for tid in cards[1:]:
+        rc, out, err = run(["kanban", "--board", "default", "studio-override", tid, *why])
+        assert rc == 0 and f"fix card: {fix}" in out, err
+    with kb.connect_closing() as conn:
+        comments = [x for (x,) in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (fix,))]
+        n = conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='studio_override'").fetchone()[0]
+    assert n == 3
+    assert len(comments) == 1 and " 3 Studio run(s) so far" in comments[0]
+
+
+def test_body_marker_reads_the_whole_line_and_still_its_first_word(operator):
+    """The body marker used to stop at the first space, so a key with a space never matched its own create
+    command's body; a marker followed by a note still names its first word."""
+    import shlex
+    from hermes_cli import kanban_verb_input as kvi
+    key = "ssh-root:x;rm -rf ~"
+    argv = shlex.split(ksg.create_command(key, "default"))
+    body = argv[argv.index("--body") + 1]
+    assert kvi.shell_shapes_in(body) == []  # an agent pasting the command is not refused for its body
+    with kb.connect_closing() as conn:
+        whole = kb.create_task(conn, title="g", assignee="alpha", body=body)
+        noted = kb.create_task(conn, title="g", assignee="alpha", body="capability-gap: operator_admit (render)\nx")
+        lit = kb.create_task(conn, title="g", assignee="alpha", body="capability-gap: operator_admit\\nInstall it")
+        assert ksg.is_fix_card_for(conn, whole, key)
+        assert ksg.is_fix_card_for(conn, noted, "operator_admit")
+        assert ksg.is_fix_card_for(conn, lit, "operator_admit")
+        assert not ksg.is_fix_card_for(conn, noted, "operator")
