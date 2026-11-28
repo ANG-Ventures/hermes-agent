@@ -25,6 +25,7 @@ the next two lines.
 """
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import re
@@ -138,30 +139,79 @@ _EXP_RE = re.compile(
     + r"(?P<v>\d{1,2}[ \t]?[/-][ \t]?(?:\d{4}|\d{2})|\d{4}|\d{2})(?![\d/-])")
 
 
-def _window(text: str, start: int, end: int) -> Tuple[int, int]:
-    """From the start of the line holding [start, end) to the end of the second line after it."""
-    line_start = 0
-    for m in _LINE_BREAK.finditer(text, 0, start):
-        line_start = m.end()
-    stop, breaks = len(text), 0
-    for m in _LINE_BREAK.finditer(text, end):
-        breaks += 1
-        if breaks == 3:
-            stop = m.start()
-            break
+class _LineBreaks:
+    """Every ``_LINE_BREAK`` match in *text*, found once per result, so each card's window is a bisect
+    instead of a rescan from the start of the text (20,000 card rows took 60 s, t_c497904d)."""
+
+    def __init__(self, text: str):
+        spans = [m.span() for m in _LINE_BREAK.finditer(text)]
+        self.starts = [s for s, _ in spans]
+        self.ends = [e for _, e in spans]
+        self.size = len(text)
+
+
+def _window(text: str, start: int, end: int, breaks: Optional[_LineBreaks] = None) -> Tuple[int, int]:
+    """From the start of the line holding [start, end) to the end of the second line after it.
+    A card's first and last characters are digits, so no line break straddles ``start`` or ``end``."""
+    if breaks is None:
+        breaks = _LineBreaks(text)
+    i = bisect.bisect_right(breaks.ends, start)
+    line_start = breaks.ends[i - 1] if i else 0
+    j = bisect.bisect_left(breaks.starts, end) + 2
+    stop = breaks.starts[j] if j < len(breaks.starts) else breaks.size
     return line_start, stop
 
 
 # A bare JSON value: right after ``"key":`` and right before ``,`` ``}`` ``]`` or the end of the text.
 _JSON_KEY_BEFORE = re.compile(r'"[ \t]*:[ \t]*$')
 _JSON_VALUE_AFTER = re.compile(r"[ \t]*(?:[,}\]]|$)")
+# A bare JSON number in an array (after ``[`` or ``,``, before ``,`` or ``]``) or alone at the root. JSON
+# whitespace may be raw or escaped (``\\n`` inside a JSON-encoded string, ``\\\\n`` one level deeper).
+_JSON_WS = r"(?:[ \t\r\n]|\\+[ntr])*"
+_JSON_ITEM_BEFORE = re.compile(r"[\[,]" + _JSON_WS + r"$")
+_JSON_ITEM_AFTER = re.compile(_JSON_WS + r"(?:[,\]]|$)")
+_JSON_ROOT_WS = re.compile(r"[ \t\r\n]*")
+_JSON_WS_RUN = re.compile(_JSON_WS)
+_QUOTE = re.compile(r'"')
+
+
+def _quote_share(text: str, q: int) -> int:
+    """How many backslashes escape the quote at *q*: n backslashes before it = (2**d - 1) for the quote at
+    depth d, plus whole escaped backslashes of the string it ends (2**(d+1) each); the trailing run of
+    1-bits of n is the quote's share."""
+    b = q
+    while b > 0 and text[b - 1] == "\\":
+        b -= 1
+    n = q - b
+    return n & ~(n + 1)
+
+
+def _array_item_quote(text: str, vs: int, ve: int, quotes: List[int]) -> Optional[str]:
+    """The quote to put around a bare JSON number in an array or at the root, or None when [vs, ve) is not
+    one. The escaping follows the nearest quote before the number: the same when that quote ends a key or a
+    value (``:`` ``,`` ``]`` ``}`` after it), one level deeper when it opens the string the array sits in."""
+    if not text[vs:ve].isdigit():
+        return None
+    root = _JSON_ROOT_WS.fullmatch(text, 0, vs) and _JSON_ROOT_WS.fullmatch(text, ve)
+    if not root and not (_JSON_ITEM_BEFORE.search(text, max(0, vs - 64), vs) and _JSON_ITEM_AFTER.match(text, ve)):
+        return None
+    i = bisect.bisect_left(quotes, vs)
+    if not i:
+        return '"'
+    q = quotes[i - 1]
+    share = _quote_share(text, q)
+    after = _JSON_WS_RUN.match(text, q + 1).end()
+    if after >= len(text) or text[after] not in ":,]}":
+        share = 2 * share + 1
+    return "\\" * share + '"'
 
 
 def mask_card_numbers(text: str) -> str:
     """*text* with every card number masked to its last four, plus labelled CVC/expiry near one.
 
     Digits become ``X`` and separators are kept. Numbers that share a group are masked together. A masked
-    bare JSON number (``"cvv":123``) is quoted so a valid JSON payload stays valid."""
+    bare JSON number (``"cvv":123``, ``[4000...]``, or the whole text) is quoted so a valid JSON payload
+    stays valid."""
     if not isinstance(text, str) or len(text) < 15:
         return text
     cards = list(_card_spans(text, strict=True))
@@ -169,12 +219,13 @@ def mask_card_numbers(text: str) -> str:
         return text
     masked: set = set()
     values: List[Tuple[int, int]] = []
+    breaks = _LineBreaks(text)
     for groups in cards:
         digit_pos = [i for s, e in groups for i in range(s, e)]
         masked.update(digit_pos[:-4])
         start, end = groups[0][0], groups[-1][1]
         values.append((start, end))
-        lo, hi = _window(text, start, end)
+        lo, hi = _window(text, start, end, breaks)
         for rx in (_CVC_RE, _EXP_RE):
             for m in rx.finditer(text, lo, hi):
                 vs, ve = m.span("v")
@@ -183,18 +234,20 @@ def mask_card_numbers(text: str) -> str:
     # The inserted quote copies the key's closing quote with its backslashes, so a bare value inside a
     # JSON-encoded string (``\\"key\\":4000...``) gets ``\\"`` and the outer JSON stays valid too.
     quote_at = {}
+    quotes: Optional[List[int]] = None
     for vs, ve in values:
+        if vs > 0 and text[vs - 1] == '"':
+            continue
         lo = max(0, vs - 16)
         key = _JSON_KEY_BEFORE.search(text, lo, vs)
-        if vs > 0 and text[vs - 1] != '"' and key and _JSON_VALUE_AFTER.match(text, ve):
-            q = key.start()
-            b = q
-            while b > 0 and text[b - 1] == "\\":
-                b -= 1
-            # n backslashes before the quote = (2**d - 1) for the quote at depth d, plus whole escaped
-            # backslashes of the key itself (2**(d+1) each); the trailing run of 1-bits of n is the quote's share.
-            n = q - b
-            quote_at[vs] = quote_at[ve] = "\\" * (n & ~(n + 1)) + '"'
+        if key and _JSON_VALUE_AFTER.match(text, ve):
+            quote_at[vs] = quote_at[ve] = "\\" * _quote_share(text, key.start()) + '"'
+            continue
+        if quotes is None:
+            quotes = [m.start() for m in _QUOTE.finditer(text)]
+        quote = _array_item_quote(text, vs, ve, quotes)
+        if quote is not None:
+            quote_at[vs] = quote_at[ve] = quote
     out = []
     for i, ch in enumerate(text):
         if i in quote_at:

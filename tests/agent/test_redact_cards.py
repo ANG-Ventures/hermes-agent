@@ -577,3 +577,98 @@ def test_alpha_dropped_copy_drops_a_trns_colour_key(tmp_path):
     with Image.open(out) as im:
         assert im.mode == "RGB" and "transparency" not in im.info
 
+
+
+# ── t_c497904d: linear time, JSON arrays/root, flattened copy lifetime ───────
+
+def _old_window(text, start, end):
+    """``_window`` as it was before t_c497904d (rescans from the start of the text per card)."""
+    line_start = 0
+    for m in redact_cards._LINE_BREAK.finditer(text, 0, start):
+        line_start = m.end()
+    stop, breaks = len(text), 0
+    for m in redact_cards._LINE_BREAK.finditer(text, end):
+        breaks += 1
+        if breaks == 3:
+            stop = m.start()
+            break
+    return line_start, stop
+
+
+def _card_rows(n, seed=7):
+    """n rows, each with a made-up Luhn-valid Visa number: plain table rows (CRLF) and JSON-escaped rows."""
+    import random
+    rng = random.Random(seed)
+
+    def card():
+        body = "4" + "".join(rng.choice("0123456789") for _ in range(14))
+        return next(body + d for d in "0123456789" if luhn(body + d))
+    return "".join(
+        "order %06d  customer name here  card %s  cvv %03d  exp 08/29  ok\r\n" % (i, card(), rng.randrange(1000))
+        if i % 3 else '{\\"order\\": %d, \\"card\\": %s}\\n  cvc: %03d\n' % (i, card(), rng.randrange(1000))
+        for i in range(n))
+
+
+def test_mask_is_linear_and_matches_the_old_windowing():
+    import time
+    sample = _card_rows(500)
+    with patch.object(redact_cards, "_window", lambda text, s, e, breaks=None: _old_window(text, s, e)):
+        old = mask_card_numbers(sample)
+    assert old != sample and mask_card_numbers(sample) == old
+    big = _card_rows(20000, seed=8)
+    t0 = time.perf_counter()
+    out = mask_card_numbers(big)
+    elapsed = time.perf_counter() - t0
+    assert out.count("XXXXXXXXXXXX") == 20000
+    assert elapsed < 2.0, "20,000 card rows took %.1f s" % elapsed
+
+
+def test_masked_bare_json_numbers_in_arrays_and_at_the_root_stay_valid_json():
+    m = "XXXXXXXXXXXX0366"
+    assert json.loads(mask_card_numbers('{"cards":[%s]}' % VISA)) == {"cards": [m]}
+    assert json.loads(mask_card_numbers('{"cards":[1, %s, 5]}' % VISA)) == {"cards": [1, m, 5]}
+    assert json.loads(mask_card_numbers(json.dumps({"cards": [int(VISA)] * 2}, indent=2))) == {"cards": [m, m]}
+    assert json.loads(mask_card_numbers(VISA)) == m
+    assert json.loads(mask_card_numbers(VISA + "\n")) == m
+    assert json.loads(mask_card_numbers(json.dumps(["say \"hi\"", int(VISA)]))) == ["say \"hi\"", m]
+    # Inside a JSON-encoded string: after a key, after the string's opening quote, pretty-printed, two levels.
+    for inner in ('{"cards":[%s]}' % VISA, "[%s]" % VISA, json.dumps([int(VISA)], indent=2)):
+        out = json.loads(json.loads(mask_card_numbers(json.dumps({"output": inner})))["output"])
+        assert m in json.dumps(out) and VISA not in json.dumps(out)
+    twice = mask_card_numbers(json.dumps({"o": json.dumps({"x": "[%s]" % VISA})}))
+    assert json.loads(json.loads(json.loads(twice)["o"])["x"]) == [m]
+    # Not a JSON number: a spaced card at the root stays unquoted.
+    assert mask_card_numbers(f"{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}") == "XXXX XXXX XXXX 0366"
+
+
+def test_cancelled_image_read_leaves_no_flattened_copy(tmp_path):
+    """The alpha-dropped ``.rgb.png`` copy shows the unmasked card: a read cancelled while the copy exists
+    must still delete it."""
+    import asyncio
+    import threading
+    from tools import vision_tools
+    url = _rgba_card_url(0, (400, 100))
+    made, release = threading.Event(), threading.Event()
+    real = vision_tools._alpha_dropped_copy
+
+    def copy_then_wait(path):
+        out = real(path)
+        made.set()
+        release.wait(10)
+        return out
+
+    async def run():
+        task = asyncio.create_task(vision_tools._prepare_image(url, "t", None, validate_decode=False))
+        assert await asyncio.to_thread(made.wait, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert list(tmp_path.glob("*.rgb.png")), "the copy was not made before the cancel"
+        release.set()
+        # asyncio.run joins the worker thread on exit, so the copy's fate is settled when it returns.
+
+    with _cfg(), patch("tools.vision_tools.get_hermes_dir", return_value=tmp_path), \
+            patch.object(vision_tools, "_alpha_dropped_copy", copy_then_wait), \
+            patch.object(redact_cards, "_ocr", return_value=("", None)):
+        asyncio.run(run())
+    assert not list(tmp_path.glob("*.rgb.png"))
