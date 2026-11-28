@@ -14,6 +14,8 @@ read from ``security.*`` in config.yaml:
 - ``security.browser_vision_card_ocr`` (default true): ``browser_vision`` OCRs its own screenshot locally and
   refuses with ``CARD_IMAGE_REFUSAL`` before any model sees a full card number. Same check and wording as the
   home repo's hook gate (``hooks/gate_card_image.py``), which covers local-file image reads.
+- ``security.image_read_card_ocr`` (default true): the same OCR check inside ``vision_analyze`` on the image
+  bytes it is about to send (any source: a remote terminal host's file, a data: URL, http), t_56a9d083.
 
 Masking rule (false positives cost more than misses): a 15 or 16 digit run in card grouping (4-4-4-4, 4-6-5,
 or unbroken), not touching a letter or digit, that passes the Luhn check, starts with a card-network prefix,
@@ -224,6 +226,7 @@ _KNOB_DEFAULTS = {
     "mask_card_numbers_tool_results": True,
     "mask_card_numbers_user_messages": False,
     "browser_vision_card_ocr": True,
+    "image_read_card_ocr": True,
 }
 
 
@@ -278,13 +281,17 @@ def _ocr(path: str) -> Tuple[Optional[str], Optional[str]]:
     return out.stdout.decode("utf-8", "replace"), None
 
 
-def screenshot_card_refusal(path: Any) -> Optional[str]:
-    """``CARD_IMAGE_REFUSAL`` when the screenshot at *path* shows a full card number, else None.
-    Fails open like the hook gate: no tesseract, an OCR error or timeout allows the image with one warning."""
-    if not card_knob("browser_vision_card_ocr"):
+def screenshot_card_refusal(path: Any, *, knob: str = "browser_vision_card_ocr",
+                            what: str = "screenshot") -> Optional[str]:
+    """``CARD_IMAGE_REFUSAL`` when the image at *path* shows a full card number, else None.
+    Fails open like the hook gate: no tesseract, an OCR error or timeout allows the image with one warning.
+    ``knob`` names the ``security.*`` switch: ``browser_vision_card_ocr`` for browser screenshots,
+    ``image_read_card_ocr`` for ``vision_analyze`` (t_56a9d083: its bytes may come from a worker's remote
+    terminal host, where the hook gate cannot open the file)."""
+    if not card_knob(knob):
         return None
     text, why = _ocr(str(path))
     if text is None:
-        logger.warning("card-image OCR: %s; screenshot sent UNCHECKED for a card number: %s", why, path)
+        logger.warning("card-image OCR: %s; %s sent UNCHECKED for a card number: %s", why, what, path)
         return None
     return CARD_IMAGE_REFUSAL if count_card_numbers(text) else None

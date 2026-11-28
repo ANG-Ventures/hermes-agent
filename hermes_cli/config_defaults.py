@@ -2085,6 +2085,8 @@ DEFAULT_CONFIG = {
         "mask_card_numbers_tool_results": True,
         "mask_card_numbers_user_messages": False,
         "browser_vision_card_ocr": True,
+        # vision_analyze: the same OCR check on the image bytes before any model call (t_56a9d083).
+        "image_read_card_ocr": True,
         # Persisted acknowledgement for unattended model overrides whose tier lets the vendor train
         # on prompts. The startup guard still warns every run; cost guards are unaffected.
         "allow_data_training_tiers_noninteractive": False,
