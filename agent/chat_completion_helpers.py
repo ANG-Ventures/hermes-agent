@@ -86,6 +86,28 @@ logger = logging.getLogger(__name__)
 _CAPACITY_STATUS_CODES = frozenset({429, 503, 529})
 
 
+def _relay_or_capacity_5xx(e: Exception, status: int) -> bool:
+    """True when a pre-delta 5xx is a stated capacity / relay answer, not an opaque crash:
+    a capacity status, any relay error class or hop (headers or body), or the relay's 504
+    ``upstream attempt timed out``. The non-streaming unmask re-send has nothing to surface
+    there (t_17b7602b: 0 of 117 re-sends found a 4xx; one hid a 503 for 120 s). Never raises."""
+    if status in _CAPACITY_STATUS_CODES:
+        return True
+    try:
+        hdrs = getattr(getattr(e, "response", None), "headers", None) or {}
+        hdrs = {str(k).lower(): v for k, v in dict(hdrs).items()}
+        if any(str(hdrs.get(k) or "").strip() for k in ("x-relay-error-class", "x-relay-error-hop")):
+            return True
+        # The openai SDK keeps only body["error"] when that key exists, so the full relay
+        # body survives only in the exception text: read both.
+        text = f"{e} {getattr(e, 'body', '')}".lower()
+        if "relay_error_class" in text or "relay_error_hop" in text:
+            return True
+        return status == 504 and "upstream attempt timed out" in text
+    except Exception:  # noqa: BLE001
+        return False
+
+
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
@@ -6087,6 +6109,8 @@ class _StreamingCall(StreamingWaitMonitor):
         status = _extract_status_code(e)
         if status is None or status < 500 or self.deltas_were_sent["yes"]:
             return False
+        if _relay_or_capacity_5xx(e, status):
+            return False  # nothing to unmask: the loop owns retry, Retry-After and fallback
         if getattr(self.agent, "api_mode", "") not in ("", "chat_completions"):
             return False  # replay handles chat-completions shapes only
         now = time.monotonic()

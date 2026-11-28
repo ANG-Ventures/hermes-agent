@@ -119,10 +119,86 @@ def test_stream_5xx_probe_is_ledgered_on_the_stream_dispatch(monkeypatch):
 
     def fake_probe(agent, kwargs, *, dispatch=None):
         seen.append(dispatch)
-        raise _ProbeErr(503)
+        raise _ProbeErr(502)
 
     monkeypatch.setattr(h, "interruptible_api_call", fake_probe)
 
-    _run_handle_stream_error(call, _StreamErr(503))
+    # An opaque 500 (a 503 is a capacity answer and is never re-sent, t_17b7602b).
+    _run_handle_stream_error(call, _StreamErr(500))
 
     assert seen == [call._dispatch]
+
+
+# --- t_17b7602b: relay / capacity 5xx have nothing to unmask -------------------------------------
+# On relay lanes a pre-delta 5xx is the stack saying "no capacity here" (with Retry-After), not an
+# opaque gateway crash. Studio agent.log 2026-11-27: 117 re-sends, 0 surfaced a 4xx; one hidden
+# re-send held a turn 120 s before the loop heard of the 503. These go straight to the loop.
+
+import httpx
+import openai
+import pytest
+
+
+def _sdk_status_error(status, body, headers=None):
+    """The exact exception the openai SDK raises for this HTTP answer."""
+    client = openai.OpenAI(api_key="x", base_url="http://door.invalid/v1")
+    resp = httpx.Response(status, headers=headers or {}, json=body,
+                          request=httpx.Request("POST", "http://door.invalid/v1/chat/completions"))
+    return client._make_status_error_from_response(resp)
+
+
+_LANE_DOOR_503 = (
+    503,
+    {"error": "local_unavailable", "relay_error_class": "pool_pressure",
+     "relay_error_hop": "front", "relay_error_cause": "local_unavailable"},
+    {"x-relay-error-class": "pool_pressure", "x-relay-error-hop": "front",
+     "x-relay-error-cause": "local_unavailable", "retry-after": "1"},
+)
+_DRAIN_503 = (503, {"error": "draining-for-deploy"}, {"retry-after": "5"})
+_RELAY_504 = (504, {"error": "upstream attempt timed out"}, {})
+
+
+@pytest.mark.parametrize("status,body,headers", [_LANE_DOOR_503, _DRAIN_503, _RELAY_504],
+                         ids=["lane-door-503-local_unavailable", "503-draining-for-deploy",
+                              "504-upstream-attempt-timed-out"])
+def test_relay_or_capacity_5xx_goes_to_loop_without_resend(monkeypatch, status, body, headers):
+    call = _make_call({"model": "m", "stream": True, "messages": []})
+    sent = []
+    monkeypatch.setattr(h, "interruptible_api_call", lambda *a, **k: sent.append(a) or None)
+    err = _sdk_status_error(status, body, headers)
+
+    retry_stream = _run_handle_stream_error(call, err)
+
+    assert sent == []  # no second request
+    assert retry_stream is False
+    assert call.result["error"] is err and call.result["response"] is None
+    assert call.agent._stream_5xx_probe_ts is None  # the 60 s probe window is not spent
+
+
+@pytest.mark.parametrize("headers,body", [
+    ({"x-relay-error-hop": "relay->bridge"}, {"error": {"message": "boom"}}),
+    ({}, {"error": {"message": "boom", "relay_error_class": "conn"}}),
+], ids=["hop-header", "class-in-body"])
+def test_plain_500_with_relay_fields_is_not_resent(monkeypatch, headers, body):
+    call = _make_call({"model": "m", "messages": []})
+    sent = []
+    monkeypatch.setattr(h, "interruptible_api_call", lambda *a, **k: sent.append(a) or None)
+    err = _sdk_status_error(500, body, headers)
+
+    assert _run_handle_stream_error(call, err) is False
+    assert sent == [] and call.result["error"] is err
+
+
+def test_opaque_sdk_500_still_gets_the_one_resend(monkeypatch):
+    call = _make_call({"model": "m", "stream": True, "messages": []})
+    sent = []
+
+    def fake_probe(agent, kwargs, **_kw):
+        sent.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", reasoning_content=None))])
+
+    monkeypatch.setattr(h, "interruptible_api_call", fake_probe)
+    err = _sdk_status_error(500, {"error": {"message": "something went wrong"}})
+
+    assert _run_handle_stream_error(call, err) is False
+    assert len(sent) == 1 and call.result["response"] is not None and call.result["error"] is None
