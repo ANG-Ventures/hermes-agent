@@ -479,7 +479,7 @@ def note_upstream_failure(agent: Any, *, status: Any = None, socket: Optional[st
         code = None
     if code is not None and code < 400:
         code = None   # a 200 head that then dropped is a drop, not a status
-    if code == 429 or (relay_class or "").lower() in ("quota_model", "quota_seat"):
+    if _is_quota_refusal(code, relay_class, text):
         # t_c5cddd09: this wait IS on quota, on THIS route. The clock survives a
         # fallback; the refusal does not speak for the next lane.
         st.setdefault("quota_refused", set()).add(_route_key(agent))
@@ -491,6 +491,25 @@ def note_upstream_failure(agent: Any, *, status: Any = None, socket: Optional[st
     counts[phrase] = int(counts.get(phrase, 0)) + 1
     st["last_failure"] = phrase
     st["last_box"] = (str(box).strip() or None) if box else None
+
+
+_QUOTA_CLASSES = ("quota_model", "quota_seat")
+
+
+def _is_quota_refusal(code: Optional[int], relay_class: Optional[str], text: Any) -> bool:
+    """The relay's stated class decides (t_d1de29dd, Prism #600 4dab164d36f9): a plain
+    rate-limit 429 is not a quota refusal. An unclassed 429 counts only when its text
+    reads as quota (the same text table the ledger uses)."""
+    rc = (relay_class or "").strip().lower()
+    if rc:
+        return rc in _QUOTA_CLASSES
+    if code != 429:
+        return False
+    try:
+        from agent.fallback_events import classify_text
+        return classify_text(str(text or ""), http_status=code) in _QUOTA_CLASSES
+    except Exception:
+        return False
 
 
 def _route_key(agent: Any) -> tuple[str, str]:

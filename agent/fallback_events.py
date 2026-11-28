@@ -1196,6 +1196,10 @@ def dead_letter_cause(rec: Dict[str, Any]) -> str:
     return "no_evidence"
 
 
+# The relay's attribution fields at the top level of an error body (error-class-v2).
+_RELAY_BODY_FIELDS = ("relay_error_class", "relay_error_hop", "relay_error_cause", "relay_seat")
+
+
 def stash_api_error(agent: Any, api_error: BaseException,
                     status_code: Optional[int],
                     error_context: Optional[Dict[str, Any]] = None,
@@ -1219,6 +1223,19 @@ def stash_api_error(agent: Any, api_error: BaseException,
                 _json = response.json()
                 if isinstance(_json, dict):
                     body = _json
+            except Exception:  # noqa: BLE001
+                pass
+        elif isinstance(body, dict) and response is not None \
+                and not all(k in body for k in _RELAY_BODY_FIELDS):
+            # t_d1de29dd (Prism #600 b6e44a030650): ``error`` was an object, so the
+            # SDK kept only it and dropped the relay's top-level hop/cause fields.
+            try:
+                _json = response.json()
+                if isinstance(_json, dict) and _json.get("error") == body:
+                    extra = {k: _json[k] for k in _RELAY_BODY_FIELDS
+                             if k in _json and k not in body}
+                    if extra:
+                        body = {**body, **extra}
             except Exception:  # noqa: BLE001
                 pass
         msg = ""

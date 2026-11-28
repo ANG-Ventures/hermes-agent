@@ -76,3 +76,34 @@ def test_real_anthropic_status_still_names_anthropic():
     print(text)
     assert "(Anthropic 529)" in text
     assert "lane door" not in text
+
+
+def test_hop_read_from_full_json_when_sdk_unwraps_a_nested_error():
+    """Prism #600 b6e44a030650 (t_d1de29dd): no x-relay-error-* headers, the hop and cause
+    only at the top level, ``error`` an object. The SDK's ``body`` is the inner object."""
+    body = {"error": {"message": "lane door has no local relay"},
+            "relay_error_hop": "front", "relay_error_cause": "local_unavailable"}
+    text = _banner(_agent(), 503, {"content-type": "application/json"}, body)
+    print(text)
+    assert "Anthropic" not in text
+    assert "lane door 503 (local_unavailable)" in text
+
+
+def test_relay_hop_and_cause_text_is_bounded():
+    """Prism #600 d4e148ca1690 (t_d1de29dd): a multi-line 500-char cause renders one line,
+    capped; the hop is capped too."""
+    cause = ("bad\nline\x1b[31m" + "x" * 500)
+    body = {"error": "x", "relay_error_hop": "h" * 200 + "\nzz", "relay_error_cause": cause}
+    text = _banner(_agent(), 503, {"content-type": "application/json"}, body)
+    print(repr(text))
+    assert "\n" not in text and "\x1b" not in text and "\r" not in text
+    assert len(text) < 200
+    assert "Anthropic" not in text
+
+
+def test_known_door_causes_render_unchanged():
+    for why in ("local_unavailable", "studio-failover", "studio_unavailable",
+                "upstream_unavailable"):
+        headers = dict(DOOR_HEADERS, **{"x-relay-error-cause": why})
+        text = _banner(_agent(), 503, headers, dict(DOOR_BODY, relay_error_cause=why))
+        assert f"lane door 503 ({why})" in text, text
