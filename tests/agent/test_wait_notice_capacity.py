@@ -105,6 +105,27 @@ def test_slow_call_with_fable_left_does_not_blame_the_allowance(monkeypatch):
     assert "allowance" not in text and "120s elapsed" in text
 
 
+def test_quota_refusal_on_the_old_lane_does_not_blame_the_new_lane(monkeypatch):
+    """Prism #600 e77e9819a17a: a 429 on claude-alr, then a fallback to claude-dtlr that
+    never refused. The clock carries over; the refusal does not."""
+    _relay(monkeypatch, inflight=RETRYING)
+    a = _agent(provider="claude-alr")
+    wb.arm(a, now=0.0)
+    wb.note_upstream_failure(a, status=429)
+    a.provider = "claude-dtlr"
+    wb.note_lane_switch(a)
+    text = wb.notice_due(a, now=120.0)
+    print(text)
+    assert "allowance" not in text
+    assert text == ("⏳ still waiting for a first reply: 120s on claude-dtlr/claude-fable-5-2, "
+                    "2 lanes tried; last failure: HTTP 429 rate limited, retrying")
+    # The same lane refusing again names the allowance.
+    wb.note_upstream_failure(a, status=503, relay_class="quota_model")
+    text = wb.notice_due(a, now=240.0)
+    print(text)
+    assert "Fable allowance used up on 23/25 seats" in text
+
+
 def test_normal_queue_keeps_todays_wording(monkeypatch):
     _relay(monkeypatch, exhausted=0, eligible=20,
            inflight={"stage": "queued", "seat": "sub-vps-7", "since_ms": 95000})
