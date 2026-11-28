@@ -189,7 +189,10 @@ def mask_card_numbers(text: str) -> str:
             b = q
             while b > 0 and text[b - 1] == "\\":
                 b -= 1
-            quote_at[vs] = quote_at[ve] = text[b:q + 1]
+            # n backslashes before the quote = (2**d - 1) for the quote at depth d, plus whole escaped
+            # backslashes of the key itself (2**(d+1) each); the trailing run of 1-bits of n is the quote's share.
+            n = q - b
+            quote_at[vs] = quote_at[ve] = "\\" * (n & ~(n + 1)) + '"'
     out = []
     for i, ch in enumerate(text):
         if i in quote_at:

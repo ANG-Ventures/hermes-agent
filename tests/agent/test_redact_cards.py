@@ -320,3 +320,38 @@ def test_submit_time_user_row_is_masked_when_switched_on(tmp_path):
             session_workdir._write_submit_user_row({"session_key": "k"}, f"card {VISA}", None)
     assert written == ["card XXXXXXXXXXXX0366", f"card {VISA}"]
     assert staged["content"] == "card XXXXXXXXXXXX0366"
+
+
+def test_key_ending_in_a_backslash_keeps_json_valid():
+    out = mask_card_numbers(json.dumps({"C:\\": int(VISA)}))
+    assert json.loads(out) == {"C:\\": "XXXXXXXXXXXX0366"}
+    nested = mask_card_numbers(json.dumps({"o": json.dumps({"C:\\": int(VISA)})}))
+    assert json.loads(json.loads(nested)["o"]) == {"C:\\": "XXXXXXXXXXXX0366"}
+
+
+def test_terminal_spill_file_is_masked_on_disk(tmp_path):
+    from tools.terminal_tool_result import _redact_spill_file
+    spill = tmp_path / "spill.txt"
+    spill.write_text(f"card {VISA}\n", encoding="utf-8")
+    with _cfg():
+        assert _redact_spill_file(str(spill), 100, "echo") != []
+    assert spill.read_text(encoding="utf-8") == "card XXXXXXXXXXXX0366\n"
+
+
+def test_executor_masks_a_result_before_it_spills():
+    from types import SimpleNamespace
+    from tests.agent.test_malformed_tool_arguments import _make_agent
+    agent = _make_agent()
+    call = SimpleNamespace(id="call-1", type="function",
+                           function=SimpleNamespace(name="web_search", arguments='{"query": "q"}'))
+    spilled = []
+
+    def persist(**kw):
+        spilled.append(kw["content"])
+        return kw["content"]
+
+    with _cfg(), patch.object(agent, "_invoke_tool", return_value=f"card {VISA}"), \
+            patch("model_tools.handle_function_call", return_value=f"card {VISA}"), \
+            patch("agent.tool_executor.maybe_persist_tool_result", side_effect=persist):
+        agent._execute_tool_calls_sequential(SimpleNamespace(content="", tool_calls=[call]), [], "task-1")
+    assert spilled == ["card XXXXXXXXXXXX0366"]

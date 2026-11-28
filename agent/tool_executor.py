@@ -41,6 +41,7 @@ from agent.inline_tool_executors import (
 )
 from agent.fork_ext.tool_gate import pre_tool_block_from_builtin_gate
 from agent.tool_dispatch_helpers import (
+    mask_cards_for_tool,
     _NEVER_PARALLEL_TOOLS,
     _count_multimodal_image_parts,
     _is_destructive_command,
@@ -1264,8 +1265,10 @@ def _commit_tool_result(
             persisted_result, function_name, tool_call_id, get_active_env(effective_task_id), budget,
         )
     else:
+        # t_90c8b36c: mask before an oversized result spills to disk, or read_file of the spill
+        # (exempt from the mask) would bring the full card number back into the transcript.
         persisted_result = maybe_persist_tool_result(
-            content=persisted_result,
+            content=mask_cards_for_tool(function_name, persisted_result),
             tool_name=function_name,
             tool_use_id=tool_call_id,
             env=get_active_env(effective_task_id),
