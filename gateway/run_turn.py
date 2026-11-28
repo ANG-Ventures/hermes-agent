@@ -32,6 +32,7 @@ from gateway.response_filters import (
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway import inbound_record
+from gateway import inbox_log
 from gateway.wake_kind import STEER, wake_display_metadata
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
@@ -2660,6 +2661,7 @@ class GatewayTurnMixin:
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
             event._goal_execution_started = True
+            inbox_log.log_disposition("became-next-turn", session_key, event, path="turn_start")
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -4278,6 +4280,11 @@ class GatewayTurnMixin:
             "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
             session_key, len(text),
         )
+        if not internal:
+            inbox_log.log_disposition("requeued-leftover-steer", session_key, None, source=source,
+                                      depth=lambda: self._queue_depth(
+                                          session_key, adapter=self._delivery_adapter_for(source)),
+                                      path="leftover_steer")
 
     async def _run_agent_drain_pending(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str],
@@ -4342,6 +4349,10 @@ class GatewayTurnMixin:
                 # human turn (visible fallback, auth path, no silence allowance) (t_506536db).
                 pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source,
                                              internal=True, wake_kind=STEER)
+            else:
+                inbox_log.log_disposition("requeued-leftover-steer", session_key, None, source=source,
+                                          depth=lambda: self._queue_depth(session_key, adapter=adapter),
+                                          path="leftover_steer")
             logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
         elif result and result.get("pending_steer") and adapter and session_key:
             # Fork (2026-09-29): a follow-up already owns the next turn. Queue the leftover steer
@@ -4643,6 +4654,7 @@ class GatewayTurnMixin:
                 await _run_followup_processing_hook(
                     _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
                 return result
+            inbox_log.log_disposition("became-next-turn", next_session_key, pending_event, path="followup")
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,

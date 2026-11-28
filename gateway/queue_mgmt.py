@@ -36,7 +36,7 @@ import logging
 from typing import Any, List, Optional, Tuple
 
 from agent.i18n import t
-from gateway import inbound_record
+from gateway import inbound_record, inbox_log
 from hermes_cli.queue_verbs import QueueOp, parse_queue_payload
 
 logger = logging.getLogger(__name__)
@@ -185,6 +185,8 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
         raise
     if runner._session_state(key).persistent.run_generation != generation:
         logger.info("queue_mgmt op=resume_invalidated session=%s", key)
+        if any(e is event for e in held_list(runner, key) or ()):
+            log_items(runner, "hold", key, [event], with_preview=False)   # still held (a /queue verb that moved it logs its own line)
         return True
     if not _unpark(runner, key, event):
         return True  # a /queue verb removed or rewrote it meanwhile; that verb owns it now
@@ -193,6 +195,7 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
     if wakes and not rewrite_active(runner, key, adapter, active_items(runner, key, adapter) + wakes):
         raise RuntimeError("Cannot resume held notifications: adapter queue unavailable")
     state.held_queue[:] = [e for e in state.held_queue if not is_system_event(runner, e)]
+    log_items(runner, "resume_wake", key, wakes, with_preview=False)
     state.automatic_turns_paused = False
     return False
 
@@ -464,6 +467,7 @@ def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_r
         return 0
     released = len(users) + len(system)
     merged = release_mode(runner) == "merged" and len(users) > 1
+    originals = list(users)
     if merged:
         users = [merge_user_events(users)]
     for e in users:
@@ -484,6 +488,11 @@ def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_r
                 release_mode(runner), len(system) + len(users), trigger)
     log_items(runner, "release", key, [e for e in combined if is_system_event(runner, e)]
               + [e for e in combined if not is_system_event(runner, e)])
+    if merged:
+        # Prism da666476e0b3: the merged turn carries only the head's id; one line per absorbed message.
+        for e in originals[1:]:
+            inbox_log.log_disposition("merged-into-head", key, e, path="held_release_merged",
+                                      into=getattr(originals[0], "message_id", None))
     return released
 
 

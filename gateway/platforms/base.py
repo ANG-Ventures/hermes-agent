@@ -830,6 +830,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway import inbound_record
+from gateway import inbox_log
 from gateway.platforms.helpers import fence_state_after
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
@@ -4925,6 +4926,8 @@ class BasePlatformAdapter(ABC):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
                     merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
+                    inbox_log.log_slot_write(session_key, event, existing_pending, self._pending_messages,
+                                             path="adapter_debounce_merge")
                 return
         now = time.monotonic()
         if state is None:
@@ -4972,6 +4975,8 @@ class BasePlatformAdapter(ABC):
             return False
         store.pop(session_key, None)
         merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
+        inbox_log.log_slot_write(session_key, state.event, pending, self._pending_messages,
+                                 path="adapter_debounce_flush")
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -5242,8 +5247,10 @@ class BasePlatformAdapter(ABC):
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
+            _head = self._pending_messages.get(session_key)
             merge_pending_message_event(self._pending_messages, session_key, event)
             event._gateway_accepted = True
+            inbox_log.log_slot_write(session_key, event, _head, self._pending_messages, path="adapter_photo")
             return
         if self._is_queue_text_debounce_candidate(event):
             logger.debug("[%s] New text message while session %s is active — "
@@ -5253,9 +5260,11 @@ class BasePlatformAdapter(ABC):
         else:
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
+            _head = self._pending_messages.get(session_key)
             merge_pending_message_event(self._pending_messages, session_key, event,
                                         merge_text=event.message_type == MessageType.TEXT)
             event._gateway_accepted = True
+            inbox_log.log_slot_write(session_key, event, _head, self._pending_messages, path="adapter_default")
 
     def _get_human_delay(self) -> float:
         """Random human-like pacing delay (s) from this adapter's ``human_delay`` config range
