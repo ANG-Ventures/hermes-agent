@@ -118,12 +118,43 @@ def test_real_seat_names_render_unchanged(quiet_relay, seat):
 
 
 @pytest.mark.parametrize("seat", ["sub-vps-12", "evil\n" + "s" * 300])
-def test_relay_hop_seat_and_attribution_bound_the_seat(seat):
+def test_relay_hop_seat_and_attribution_keep_the_seat_verbatim(seat):
+    """The bound is render-time only (Prism #606 1d16abfcfca0): the extracted seat that
+    the ledger stores and the carry compares is the relay's own identifier."""
     for _hop, got in [fallback_events.relay_hop_seat({}, {"relay_seat": seat}),
                       fallback_events.relay_hop_seat({"x-relay-seat": seat}, None)]:
-        assert "\n" not in got and len(got) <= 30
+        assert got == seat.strip()
     from agent.fallback_cause import attribution
-    got = attribution({}, {"relay_seat": seat})["seat"]
-    assert "\n" not in got and len(got) <= 30
-    if seat == "sub-vps-12":
-        assert got == seat
+    assert attribution({}, {"relay_seat": seat})["seat"] == seat.strip()
+
+
+def test_distinct_long_seats_stay_distinct_in_ledger_and_carry():
+    """Prism #606 repro: two seats sharing a 30-char prefix persist as two seats, and the
+    carry does not treat them as one (an older seat's route id must not carry over)."""
+    from agent import fallback_cause as fc
+
+    east, west = "sub-vps-production-east-pool-east", "sub-vps-production-east-pool-west"
+    seats = [fallback_events.relay_hop_seat({}, {"relay_seat": s})[1] for s in (east, west)]
+    assert seats == [east, west]
+    agent = SimpleNamespace(provider="claude-dtlr", _failover_carry=None)
+    fc._carry(agent, fc.attribution({"x-relay-seat": east, "x-relay-route-id": "r-east"}))
+    fc._carry(agent, fc.attribution({"x-relay-seat": west}))
+    assert agent._failover_carry["seat"] == west
+    assert agent._failover_carry.get("route_id") != "r-east"
+
+
+def test_failover_rider_bounds_the_seat_but_not_the_row():
+    from agent import fallback_policy as fp
+
+    seat = "evil\nseat\x1b[31m" + "s" * 300
+    row = {"trigger_class": "quota_seat", "http_status": 429, "from_provider": "claude-dtlr",
+           "from_model": FABLE, "seat": seat, "same_err_prev_seat": seat,
+           "hop": "bridge→anthropic", "return_branch": "warm_seat"}
+    for text in (fp.format_cause_rider(row), fp.format_recovery_rider(row)):
+        print(repr(text))
+        assert "\n" not in text and "\x1b" not in text and "s" * 40 not in text
+        assert "evil seat" in text
+    assert row["seat"] == seat
+    ok = dict(row, seat="sub-vps-12", same_err_prev_seat="sub-vps-12")
+    assert "sub-vps-12" in fp.format_cause_rider(ok)
+    assert "on sub-vps-12" in fp.format_recovery_rider(ok)

@@ -527,7 +527,11 @@ def _failure_text(st: dict) -> str:
         return ""
     n = int((st.get("failure_counts") or {}).get(last, 0))
     count = f" ×{n}" if n > 1 else ""
-    box = f" on {st['last_box']}" if st.get("last_box") else ""
+    if st.get("last_box"):
+        from agent.fallback_cause import bounded_seat
+        box = f" on {bounded_seat(st['last_box'])}"
+    else:
+        box = ""
     return f"last failure: {last}{count}{box}"
 
 

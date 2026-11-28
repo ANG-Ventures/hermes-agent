@@ -1710,6 +1710,19 @@ def _count_window(row: Mapping[str, Any], tz: Optional[_dt.tzinfo]) -> Tuple[str
     return prefix, f"{a.strftime('%H:%M:%S')}-{b.strftime('%H:%M:%S')}"
 
 
+def _banner_seats(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """Copy of ``row`` whose relay-sent seat names are bounded for the banner (one
+    printable line, 30 chars). The ledger row keeps the verbatim seat (t_67969ec8,
+    Prism #606 1d16abfcfca0)."""
+    from agent.fallback_cause import bounded_seat
+
+    out = dict(row)
+    for key in ("seat", "same_err_prev_seat"):
+        if isinstance(out.get(key), str) and out[key]:
+            out[key] = bounded_seat(out[key])
+    return out
+
+
 def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
                        tz: Optional[_dt.tzinfo] = None,
                        floors: Optional[List[str]] = None) -> str:
@@ -1722,7 +1735,7 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
     floor branches the cause rendered from (``FLOOR_CAUSE``: the cause fell to
     ``unclassified error``; ``FLOOR_HOP_SUB``: ``(hop unknown, sub unknown)``).
     """
-    row = fill_pin_evidence(row)
+    row = _banner_seats(fill_pin_evidence(row))
     body, hit = _cause_body(row, seat_names, tz)
     if floors is not None:
         floors.extend(hit)
@@ -2215,6 +2228,7 @@ def _mins(seconds: Optional[float]) -> str:
 def format_recovery_rider(row: Mapping[str, Any], *, seat_names: bool = True) -> str:
     """Recovery rider: return_branch, seat, dwell/turns and the cache
     EXPECTATION (never a claim; the outcome is back-filled, not announced)."""
+    row = _banner_seats(row)
     branch = row.get("return_branch")
     # "sub" is relay-pool vocabulary. A primary with no seat concept (cpa/Kimi,
     # openai-codex, openrouter, xai ...) gets NO seat clause at all; a relay

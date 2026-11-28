@@ -1422,9 +1422,7 @@ def relay_hop_seat(headers: Any, body: Any) -> Tuple[Optional[str], Optional[str
 
             hop = normalize_hop(raw_hop)
         if isinstance(raw_seat, str) and raw_seat.strip().lower() not in _SEAT_UNSTATED:
-            from agent.fallback_cause import bounded_seat
-
-            seat = bounded_seat(raw_seat)
+            seat = raw_seat.strip()
     except Exception:  # noqa: BLE001
         return None, None
     return hop, seat

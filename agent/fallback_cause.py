@@ -122,8 +122,6 @@ def attribution(headers: Any, body: Any = None) -> Dict[str, Optional[str]]:
         v = str(body.get("relay_seat") or inner.get("relay_seat") or "").strip()
         if v.lower() not in _SEAT_UNSTATED:
             seat = v
-    if seat is not None:
-        seat = bounded_seat(seat)
     route = next((h[k].strip() for k in _ROUTE_HEADERS if (h.get(k) or "").strip()), None)
     answered = any(k.startswith(("x-relay-", "x-pool-")) for k in h)
     return {"seat": seat, "route_id": route, "quota_window": quota_window(headers, body),
@@ -239,7 +237,7 @@ def cause_text(agent: Any, cause: "FailoverCause") -> str:
            "seat": cause.seat}
     text = fp._cause_phrase(row)
     if cause.seat:
-        text += f" on {cause.seat}"
+        text += f" on {bounded_seat(cause.seat)}"
     if cause.http_status:
         ours = _our_hop_status(ev, cause.http_status)
         if ours:
@@ -275,7 +273,9 @@ def _bounded(value: Any, cap: int) -> str:
 
 def bounded_seat(value: Any) -> str:
     """A relay-sent seat name as printed in a banner: one printable line, at most 30
-    chars (t_67969ec8, Prism #603 686796853b7c). ``sub-vps-12`` / ``local`` unchanged."""
+    chars (t_67969ec8, Prism #603 686796853b7c). ``sub-vps-12`` / ``local`` unchanged.
+    Render-time only: the stored/compared seat (ledger row, carry) stays verbatim
+    (Prism #606 1d16abfcfca0)."""
     return _bounded(value, 30)
 
 
