@@ -1522,6 +1522,15 @@ def insert_fallback_event(row: dict[str, Any]) -> None:
     for _flag in ("expected_warm", "warm_eligible", "warm_refusal_arm"):
         if values.get(_flag) is not None:
             values[_flag] = _bool_int(values.get(_flag))
+    # Relay-sent text (seat, hop, cause) can carry a lone surrogate from an
+    # escaped JSON string; SQLite cannot bind it and the whole row would be
+    # lost. Escape only values that do not encode; valid text stays verbatim.
+    for _k, _v in values.items():
+        if isinstance(_v, str):
+            try:
+                _v.encode("utf-8")
+            except UnicodeEncodeError:
+                values[_k] = _v.encode("utf-8", "backslashreplace").decode("utf-8")
     cols = ", ".join(_FALLBACK_EVENT_COLUMNS)
     marks = ", ".join("?" for _ in _FALLBACK_EVENT_COLUMNS)
     with _connect() as conn:

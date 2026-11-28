@@ -495,26 +495,20 @@ def note_upstream_failure(agent: Any, *, status: Any = None, socket: Optional[st
 
 _QUOTA_CLASSES = ("quota_model", "quota_seat")
 
-# Ledger text-table needles too generic to prove quota on their own: "You've reached
-# your rate limit" is a rate limit (Prism #603 b9591dd20ab5).
-_WEAK_QUOTA_NEEDLES = ("reached your",)
-
 
 def _is_quota_refusal(code: Optional[int], relay_class: Optional[str], text: Any) -> bool:
     """The relay's stated class decides (t_d1de29dd, Prism #600 4dab164d36f9): a plain
     rate-limit 429 is not a quota refusal. An unclassed 429 counts only when its text
-    carries an actual quota phrase from the ledger's text table ("weekly limit",
-    "Fable limit", ...); the bare "reached your" alone does not count."""
+    carries an actual quota phrase (``fallback_events.text_names_quota``, the same rule
+    the cause label uses): "You've reached your rate limit" does not count."""
     rc = (relay_class or "").strip().lower()
     if rc:
         return rc in _QUOTA_CLASSES
     if code != 429:
         return False
     try:
-        from agent.fallback_events import _TEXT_TABLE
-        t = str(text or "").lower()
-        return any(n in t for cls, needles in _TEXT_TABLE if cls in _QUOTA_CLASSES
-                   for n in needles if n not in _WEAK_QUOTA_NEEDLES)
+        from agent.fallback_events import text_names_quota
+        return text_names_quota(text)
     except Exception:
         return False
 
@@ -533,7 +527,11 @@ def _failure_text(st: dict) -> str:
         return ""
     n = int((st.get("failure_counts") or {}).get(last, 0))
     count = f" ×{n}" if n > 1 else ""
-    box = f" on {st['last_box']}" if st.get("last_box") else ""
+    if st.get("last_box"):
+        from agent.fallback_cause import bounded_seat
+        box = f" on {bounded_seat(st['last_box'])}"
+    else:
+        box = ""
     return f"last failure: {last}{count}{box}"
 
 
@@ -723,7 +721,8 @@ def _allowance_phrase(info: dict, *, shared: bool) -> Optional[str]:
         inflight, seat = allowance.get("seat_inflight"), info.get("seat")
         if type(inflight) is not int or inflight < 0 or not isinstance(seat, str) or not seat:
             return None
-        text += f", {inflight} turns on {seat}"
+        from agent.fallback_cause import bounded_seat
+        text += f", {inflight} turns on {bounded_seat(seat)}"
     reset = allowance.get("earliest_reset")
     if isinstance(reset, str):
         from datetime import datetime
@@ -791,6 +790,9 @@ def _relay_stage_phrase(agent: Any, *, shared: bool = False) -> Optional[str]:
     if not info:
         return None
     seat = info.get("seat") if isinstance(info.get("seat"), str) and info.get("seat") else None
+    if seat:
+        from agent.fallback_cause import bounded_seat
+        seat = bounded_seat(seat) or None
     since_ms = info.get("since_ms")
     # json.loads accepts NaN/Infinity; int() of those raises in the monitor thread.
     in_stage = (f" for {int(since_ms // 1000)}s"

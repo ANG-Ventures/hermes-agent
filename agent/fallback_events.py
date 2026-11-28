@@ -122,11 +122,13 @@ _TEXT_TABLE: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
                        "overflow_exhausted")),
     # "You're out of extra usage" (HTTP 400, t_f00f05bd) is this seat's
     # overage wall, not a malformed request; the third-party-apps 400 above
-    # matches auth first and never reaches this row.
+    # matches auth first and never reaches this row. The model-cap sentence
+    # ("You've reached your Opus 4.5 limit") is matched by _model_cap() in
+    # classify_text; a bare "reached your" is not quota: "You've reached your
+    # rate limit" is a rate limit (t_67969ec8, Prism #603 65513351dee1).
     ("quota_seat", ("fable limit", "session limit", "5-hour limit",
                     "5 hour limit", "weekly limit", "usage limit",
-                    "opus limit", "hit your limit", "reached your",
-                    "out of extra usage")),
+                    "opus limit", "hit your limit", "out of extra usage")),
     ("rate_upstream", ("exceed your account's rate limit",
                        "exceeded your account's rate limit",
                        "rate limit", "rate_limit", "too many requests")),
@@ -410,6 +412,23 @@ def cpa_auth_unavailable_class(text: Optional[str]) -> Optional[str]:
     return "auth"
 
 
+def _model_cap(t: str) -> bool:
+    """The Claude CLI cap sentence ("You've reached your Fable limit", "... Opus 4.5
+    limit"): error_classifier's regex, so the two never disagree."""
+    from agent.error_classifier import _CLAUDE_CLI_USAGE_CAP_RE
+
+    return bool(_CLAUDE_CLI_USAGE_CAP_RE.search(t))
+
+
+def text_names_quota(text: Any) -> bool:
+    """True when the error text carries a real quota phrase (a ``quota_*`` text-table
+    needle or the model-cap sentence). The one rule the cause label and the wall
+    budget's quota gate share (t_67969ec8): "reached your rate limit" is not quota."""
+    t = str(text or "").lower()
+    return _model_cap(t) or any(n in t for cls, needles in _TEXT_TABLE
+                                if cls in ("quota_model", "quota_seat") for n in needles)
+
+
 def classify_text(text: Optional[str], *, http_status: Optional[int] = None,
                   exc_name: Optional[str] = None,
                   reason: Optional[str] = None) -> str:
@@ -421,7 +440,7 @@ def classify_text(text: Optional[str], *, http_status: Optional[int] = None,
         return cpa
     t = (text or "").lower()
     for cls, needles in _TEXT_TABLE:
-        if any(n in t for n in needles):
+        if any(n in t for n in needles) or (cls == "quota_seat" and _model_cap(t)):
             return cls
     if exc_name in _CONN_EXC_NAMES:
         return "conn"
