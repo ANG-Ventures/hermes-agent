@@ -234,3 +234,68 @@ def test_browser_vision_without_a_card_reaches_the_model(tmp_path):
     result, aux = _browser_vision(tmp_path, "Order 112-1234567-1234567 total $41.00")
     aux.assert_called_once()
     assert result["success"] is True and result["analysis"] == "a checkout page"
+
+
+# ── Prism round 1 (ee01291296) ───────────────────────────────────────────────
+
+def test_json_escaped_separators_are_recognised_and_left_intact():
+    nb = "\u2011"
+    raw = json.dumps({"output": f"{VISA[:4]}{nb}{VISA[4:8]}{nb}{VISA[8:12]}{nb}{VISA[12:]}"})
+    assert "\\u2011" in raw
+    assert json.loads(mask_card_numbers(raw)) == {"output": f"XXXX{nb}XXXX{nb}XXXX{nb}0366"}
+    tabbed = json.dumps({"output": "\t".join((VISA[:4], VISA[4:8], VISA[8:12], VISA[12:]))})
+    assert json.loads(mask_card_numbers(tabbed)) == {"output": "XXXX\tXXXX\tXXXX\t0366"}
+
+
+def test_masked_bare_json_numbers_stay_valid_json():
+    out = mask_card_numbers('{"cardNumber":%s,"cvv":417, "exp": 1128}' % VISA)
+    assert json.loads(out) == {"cardNumber": "XXXXXXXXXXXX0366", "cvv": "XXX", "exp": "XXXX"}
+    quoted = mask_card_numbers('{"cardNumber":"%s","cvv":"417"}' % VISA)
+    assert json.loads(quoted) == {"cardNumber": "XXXXXXXXXXXX0366", "cvv": "XXX"}
+
+
+def test_numbers_sharing_a_group_are_both_masked():
+    a, b = "4000 0000 0004 4000", "4000 0000 0000 0366"  # both Luhn-valid; a's last group is b's first
+    assert luhn(a.replace(" ", "")) and luhn(b.replace(" ", ""))
+    out = mask_card_numbers(f"cards {a} 0000 0000 0366 end")
+    assert out == "cards XXXX XXXX XXXX XXXX XXXX XXXX 0366 end"
+
+
+def test_full_width_digits_are_masked():
+    fw = VISA.translate({ord(c): ord(c) + 0xFEE0 for c in "0123456789"})
+    assert mask_card_numbers(f"card {fw}") == "card " + "X" * 12 + fw[-4:]
+    amex_fw = AMEX.translate({ord(c): ord(c) + 0xFEE0 for c in "0123456789"})
+    assert mask_card_numbers(f"card {amex_fw}") == "card " + "X" * 11 + amex_fw[-4:]
+
+
+@pytest.mark.parametrize("tool", ["read_file", "search_files"])
+def test_file_reads_stay_byte_identical_to_disk(tool):
+    content = json.dumps({"content": 'card = "4000 0000 0000 0002"\nother = "%s"' % VISA})
+    with _cfg():
+        assert make_tool_result_message(tool, content, "call_9")["content"] == content
+
+
+def test_submit_time_user_row_is_masked_when_switched_on(tmp_path):
+    from tui_gateway import session_workdir
+
+    written = []
+
+    class _DB:
+        def append_message(self, target, role, content=None, **kw):
+            written.append(content)
+            return 1
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _db(_session):
+        yield _DB()
+
+    with patch.object(session_workdir, "_session_db", _db), \
+            patch.object(session_workdir, "_submit_row_target_key", lambda s: "k"):
+        with _cfg(mask_card_numbers_user_messages=True):
+            staged = session_workdir._write_submit_user_row({"session_key": "k"}, f"card {VISA}", None)
+        with _cfg():
+            session_workdir._write_submit_user_row({"session_key": "k"}, f"card {VISA}", None)
+    assert written == ["card XXXXXXXXXXXX0366", f"card {VISA}"]
+    assert staged["content"] == "card XXXXXXXXXXXX0366"

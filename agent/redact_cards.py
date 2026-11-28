@@ -7,7 +7,8 @@ read from ``security.*`` in config.yaml:
 
 - ``security.mask_card_numbers_tool_results`` (default true): ``mask_card_numbers`` runs on every tool result
   in ``make_tool_result_message`` (``agent/tool_dispatch_helpers.py``), so the masked text is what enters the
-  transcript, the session stores and the next model request.
+  transcript, the session stores and the next model request. ``read_file``/``search_files`` are exempt: their
+  text must match the disk so an edit never writes the X's back.
 - ``security.mask_card_numbers_user_messages`` (default FALSE): the same mask on inbound user text. It changes
   what the owner typed, so it is turned on only after the owner's decision is recorded on t_90c8b36c.
 - ``security.browser_vision_card_ocr`` (default true): ``browser_vision`` OCRs its own screenshot locally and
@@ -43,9 +44,12 @@ CARD_IMAGE_REFUSAL = (
     "them away) in a copy of the image and read that copy; never ask a model to read an unmasked card")
 
 GROUPINGS = ((4, 4, 4, 4), (4, 6, 5), (16,), (15,))
-_SEP = "[ \t]{0,3}[-\u2010-\u2015][ \t]{0,3}|[ \t]{1,3}"  # spaces, or a hyphen/dash padded by spaces
+# A space or tab, raw or as its JSON escape (``\\t``); a hyphen/dash, raw or as a JSON ``\\u2010``-``\\u2015``
+# escape (``json.dumps`` with ``ensure_ascii``). Escape digits are separator text, never card digits.
+_SP = r"(?:[ \t]|\\t)"
+_SEP = r"%s{0,3}(?:[-\u2010-\u2015]|\\u201[0-5])%s{0,3}|%s{1,3}" % (_SP, _SP, _SP)
 _RUN = re.compile(r"\d+(?:(?:%s)\d+)*" % _SEP)
-_GROUP = re.compile(r"\d+")
+_GROUP = re.compile(r"\\u201[0-5]|\d+")
 
 TESSERACT = ("/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract", "/usr/bin/tesseract")
 OCR_TIMEOUT_S = 5.0
@@ -87,19 +91,19 @@ def _touches_word(text: str, start: int, end: int) -> bool:
     return end < len(text) and text[end].isalnum()
 
 
-def _card_spans(text: str, *, strict: bool) -> Iterator[Tuple[int, int, str]]:
-    """(start, end, digits) of each card number in *text*. ``strict`` (the mask) also requires a network
-    prefix and no letter/digit touching the number; non-strict is the hook gate's OCR check."""
+def _card_spans(text: str, *, strict: bool) -> Iterator[List[Tuple[int, int]]]:
+    """The digit-group spans (absolute ``(start, end)``) of each card number in *text*. Every group is tried
+    as a start, so two numbers that share a group are both found. ``strict`` (the mask) also requires a
+    network prefix and no letter/digit touching the number; non-strict is the hook gate's OCR check."""
     for run in _RUN.finditer(text):
-        groups = list(_GROUP.finditer(run.group(0)))
-        i = 0
-        while i < len(groups):
-            hit = None
+        groups = [g for g in _GROUP.finditer(run.group(0)) if g.group(0)[0] != "\\"]
+        for i in range(len(groups)):
             for shape in GROUPINGS:
                 part = groups[i:i + len(shape)]
                 if tuple(len(g.group(0)) for g in part) != shape:
                     continue
-                digits = "".join(g.group(0) for g in part)
+                # Unicode decimal digits (full-width etc.) are judged as their ASCII values.
+                digits = "".join(str(int(c)) for g in part for c in g.group(0))
                 if not luhn(digits) or digits in PLACEHOLDERS:
                     continue
                 start, end = run.start() + part[0].start(), run.start() + part[-1].end()
@@ -108,13 +112,8 @@ def _card_spans(text: str, *, strict: bool) -> Iterator[Tuple[int, int, str]]:
                         continue
                     if _touches_word(text, start, end):
                         continue
-                hit = (start, end, digits, len(shape))
+                yield [(run.start() + g.start(), run.start() + g.end()) for g in part]
                 break
-            if hit is None:
-                i += 1
-                continue
-            yield hit[:3]
-            i += hit[3]
 
 
 def count_card_numbers(text: str) -> int:
@@ -137,18 +136,6 @@ _EXP_RE = re.compile(
     + r"(?P<v>\d{1,2}[ \t]?[/-][ \t]?(?:\d{4}|\d{2})|\d{4}|\d{2})(?![\d/-])")
 
 
-def _mask_digits(s: str, keep_last: int = 0) -> str:
-    total = sum(c.isdigit() for c in s)
-    out, seen = [], 0
-    for c in s:
-        if c.isdigit():
-            seen += 1
-            out.append(c if seen > total - keep_last else "X")
-        else:
-            out.append(c)
-    return "".join(out)
-
-
 def _window(text: str, start: int, end: int) -> Tuple[int, int]:
     """From the start of the line holding [start, end) to the end of the second line after it."""
     line_start = 0
@@ -163,29 +150,46 @@ def _window(text: str, start: int, end: int) -> Tuple[int, int]:
     return line_start, stop
 
 
+# A bare JSON value: right after ``"key":`` and right before ``,`` ``}`` ``]`` or the end of the text.
+_JSON_KEY_BEFORE = re.compile(r'"[ \t]*:[ \t]*$')
+_JSON_VALUE_AFTER = re.compile(r"[ \t]*(?:[,}\]]|$)")
+
+
 def mask_card_numbers(text: str) -> str:
-    """*text* with every card number masked to its last four, plus labelled CVC/expiry near one."""
+    """*text* with every card number masked to its last four, plus labelled CVC/expiry near one.
+
+    Digits become ``X`` and separators are kept. Numbers that share a group are masked together. A masked
+    bare JSON number (``"cvv":123``) is quoted so a valid JSON payload stays valid."""
     if not isinstance(text, str) or len(text) < 15:
         return text
-    spans = list(_card_spans(text, strict=True))
-    if not spans:
+    cards = list(_card_spans(text, strict=True))
+    if not cards:
         return text
-    edits: List[Tuple[int, int, str]] = [(s, e, _mask_digits(text[s:e], keep_last=4)) for s, e, _ in spans]
-    for s, e, _ in spans:
-        lo, hi = _window(text, s, e)
+    masked: set = set()
+    values: List[Tuple[int, int]] = []
+    for groups in cards:
+        digit_pos = [i for s, e in groups for i in range(s, e)]
+        masked.update(digit_pos[:-4])
+        start, end = groups[0][0], groups[-1][1]
+        values.append((start, end))
+        lo, hi = _window(text, start, end)
         for rx in (_CVC_RE, _EXP_RE):
             for m in rx.finditer(text, lo, hi):
                 vs, ve = m.span("v")
-                if not any(a < ve and vs < b for a, b, _ in edits):
-                    edits.append((vs, ve, _mask_digits(m.group("v"))))
-    out, pos = [], 0
-    for s, e, repl in sorted(set(edits)):
-        if s < pos:
-            continue
-        out.append(text[pos:s])
-        out.append(repl)
-        pos = e
-    out.append(text[pos:])
+                masked.update(i for i in range(vs, ve) if text[i].isdigit())
+                values.append((vs, ve))
+    quote_at = set()
+    for vs, ve in values:
+        if (vs > 0 and text[vs - 1] != '"' and _JSON_KEY_BEFORE.search(text[max(0, vs - 16):vs])
+                and _JSON_VALUE_AFTER.match(text, ve)):
+            quote_at.update((vs, ve))
+    out = []
+    for i, ch in enumerate(text):
+        if i in quote_at:
+            out.append('"')
+        out.append("X" if i in masked else ch)
+    if len(text) in quote_at:
+        out.append('"')
     return "".join(out)
 
 
