@@ -140,6 +140,14 @@ def test_ids_that_cannot_be_ordered_are_skipped(caplog):
     assert _lines(caplog, "inbox_reorder_detected") == []
 
 
+def test_without_a_session_store_the_check_starts_no_thread(caplog):
+    inbox_log.log_disposition("steered", SK, _text("a", "3000"))
+    inbox_log.log_disposition("steered", SK, _text("b", "2500"))
+    assert inbox_log._TRACKER._pool is None
+    (warn,) = _lines(caplog, "inbox_reorder_detected")
+    assert _fields(warn)["msg_id"] == "2500" and _fields(warn)["high_water_source"] == "memory"
+
+
 def test_an_odd_event_never_raises(caplog):
     inbox_log.log_disposition("queued", "k", object())
     assert _fields(_lines(caplog)[0])["msg_id"] == "-"
