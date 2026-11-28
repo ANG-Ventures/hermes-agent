@@ -666,11 +666,11 @@ class GatewayInboundMixin:
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
-            _had_head = adapter._pending_messages.get(_quick_key) is not None
+            _head = adapter._pending_messages.get(_quick_key)
             merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
-            inbox_log.log_disposition("merged-into-head" if _had_head else "queued", _quick_key, event,
-                                      depth=lambda: self._queue_depth(_quick_key, adapter=adapter),
-                                      path="pending_slot")
+            inbox_log.log_slot_write(_quick_key, event, _head, adapter._pending_messages,
+                                     depth=lambda: self._queue_depth(_quick_key, adapter=adapter),
+                                     path="pending_slot")
         else:
             inbox_log.log_disposition("refused", _quick_key, event, path="no_adapter")
 
@@ -787,9 +787,10 @@ class GatewayInboundMixin:
         elif not _interrupt_text and getattr(event, "media_urls", None):
             _interrupt_text = _build_media_placeholder(event)
         if not _queue_tried:
-            # Nothing queued: the bare interrupt text is what the turn runner reads as the next turn. A
-            # queue attempt above logged its own outcome; a refused one must not read as delivered here.
-            inbox_log.log_disposition("became-next-turn", _quick_key, event, path="interrupt_text")
+            # Nothing queued: the bare interrupt text goes to the running turn. Whether it then becomes the
+            # next turn is decided later (the depth-cap path re-queues it as a new event), so this line
+            # only says the interrupt was asked for. A queue attempt above logged its own outcome.
+            inbox_log.log_disposition("interrupt-requested", _quick_key, event, path="interrupt_text")
         # Delivered via adapter._pending_messages (read by _run_agent); never also buffered on self
         # — that copy was never consumed and grew unbounded.
         running_agent.interrupt(_interrupt_text)

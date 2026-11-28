@@ -4926,7 +4926,8 @@ class BasePlatformAdapter(ABC):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
                     merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
-                    inbox_log.log_disposition("merged-into-head", session_key, event, path="adapter_debounce_merge")
+                    inbox_log.log_slot_write(session_key, event, existing_pending, self._pending_messages,
+                                             path="adapter_debounce_merge")
                 return
         now = time.monotonic()
         if state is None:
@@ -4974,8 +4975,8 @@ class BasePlatformAdapter(ABC):
             return False
         store.pop(session_key, None)
         merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
-        inbox_log.log_disposition("queued" if pending is None else "merged-into-head", session_key, state.event,
-                                  path="adapter_debounce_flush")
+        inbox_log.log_slot_write(session_key, state.event, pending, self._pending_messages,
+                                 path="adapter_debounce_flush")
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -5246,11 +5247,10 @@ class BasePlatformAdapter(ABC):
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-            _had_head = session_key in self._pending_messages
+            _head = self._pending_messages.get(session_key)
             merge_pending_message_event(self._pending_messages, session_key, event)
             event._gateway_accepted = True
-            inbox_log.log_disposition("merged-into-head" if _had_head else "queued", session_key, event,
-                                      path="adapter_photo")
+            inbox_log.log_slot_write(session_key, event, _head, self._pending_messages, path="adapter_photo")
             return
         if self._is_queue_text_debounce_candidate(event):
             logger.debug("[%s] New text message while session %s is active — "
@@ -5260,12 +5260,11 @@ class BasePlatformAdapter(ABC):
         else:
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
-            _had_head = session_key in self._pending_messages
+            _head = self._pending_messages.get(session_key)
             merge_pending_message_event(self._pending_messages, session_key, event,
                                         merge_text=event.message_type == MessageType.TEXT)
             event._gateway_accepted = True
-            inbox_log.log_disposition("merged-into-head" if _had_head else "queued", session_key, event,
-                                      path="adapter_default")
+            inbox_log.log_slot_write(session_key, event, _head, self._pending_messages, path="adapter_default")
 
     def _get_human_delay(self) -> float:
         """Random human-like pacing delay (s) from this adapter's ``human_delay`` config range

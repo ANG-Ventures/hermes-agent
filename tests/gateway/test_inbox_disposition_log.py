@@ -107,17 +107,22 @@ def test_every_adapter_slot_write_has_its_line():
     sites = [i for i in range(len(src)) if src.startswith("merge_pending_message_event(self._pending_messages", i)]
     assert len(sites) == 4
     for at in sites:
-        assert "inbox_log.log_disposition(" in src[at:at + 420], src[at:at + 120]
+        line = src[at:at + 420]
+        assert "inbox_log.log_disposition(" in line or "inbox_log.log_slot_write(" in line, src[at:at + 120]
 
 
 @pytest.mark.asyncio
-async def test_interrupt_text_that_is_not_queued_logs_became_next_turn(rig, caplog):
+async def test_interrupt_text_that_is_not_queued_logs_interrupt_requested(rig, caplog):
+    """Reader F8: the interrupt path only hands the text to the running turn; the turn runner may later
+    re-queue it as a new event (depth cap) whose own line says ``became-next-turn``. So this line says
+    ``interrupt-requested``, and one message never gets two ``became-next-turn`` lines."""
     runner, adapter, agent, *_ = rig
     agent._supports_active_turn_redirect = False
     await runner._hm_busy_interrupt(_text("stop, do this instead", "9001"), _text("x", "0").source, agent, SK)
     assert agent.interrupted == ["stop, do this instead"] and SK not in adapter._pending_messages
     got = [(f["disposition"], f["msg_id"], f["path"]) for f in map(_fields, _lines(caplog))]
-    assert got == [("became-next-turn", "9001", "interrupt_text")]
+    assert got == [("interrupt-requested", "9001", "interrupt_text")]
+    assert not [x for x in _lines(caplog) if "became-next-turn" in x]
     # With something already queued the event is queued instead: one line, "queued".
     caplog.clear()
     runner._queue_or_replace_pending_event(SK, _document("9002"))
@@ -226,3 +231,46 @@ async def test_a_drain_refusal_at_the_adapter_guard_is_logged(rig, monkeypatch, 
     assert len(sent) == 1
     got = [(f["disposition"], f["msg_id"], f["path"]) for f in map(_fields, _lines(caplog))]
     assert got == [("refused", "130", "drain")]
+
+
+def test_a_slot_write_that_replaces_the_head_says_replaced_head(rig, caplog):
+    """Reader F4 / Prism e4a6812b9358: a photo whose download failed (no media) followed by text is
+    REPLACED in the pending slot, not merged. The line says ``replaced-head`` and names the lost head."""
+    runner, adapter, _agent, _stt, _vision, shots = rig
+    src = _text("x", "0").source
+    runner._hm_merge_pending_for_source(src, SK, MessageEvent(
+        text="", message_type=MessageType.PHOTO, source=src, message_id="7001"))
+    runner._hm_merge_pending_for_source(src, SK, _text("words", "7002"))
+    assert adapter._pending_messages[SK].message_id == "7002"          # 7001 is gone
+    runner._hm_merge_pending_for_source(src, SK, _photo(shots[0], "7003"))
+    assert adapter._pending_messages[SK].message_id == "7002"          # a photo with media merges in
+    got = [(f["disposition"], f["msg_id"], f["path"], f.get("into")) for f in map(_fields, _lines(caplog))]
+    assert got == [("queued", "7001", "pending_slot", None), ("replaced-head", "7002", "pending_slot", "7001"),
+                   ("merged-into-head", "7003", "pending_slot", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_steer_requeued_as_the_next_turn_is_logged(rig, caplog):
+    """Reader F6: steered text the turn never read is put back as the next turn's input: one
+    ``requeued-leftover-steer`` line, ``msg_id=-``; an internal leftover writes none."""
+    runner, adapter, *_ = rig
+    src = _text("x", "0").source
+    # A follow-up owns the next turn: the leftover goes on the overflow queue behind it.
+    runner._queue_or_replace_pending_event(SK, _document("7101"))
+    caplog.clear()
+    runner._queue_leftover_steer("and also check the logs", src, SK, display_metadata={})
+    runner._queue_leftover_steer("wake text", src, SK, display_metadata={}, internal=True)
+    assert len(runner._session_state(SK).conversation.queued_events) == 2
+    (line,) = _lines(caplog)
+    assert _fields(line) == {"disposition": "requeued-leftover-steer", "session": SK, "platform": "discord",
+                             "msg_id": "-", "depth": "2", "path": "leftover_steer"}
+    assert "check the logs" not in line
+    # Nothing pending: the drain makes the leftover itself the next turn, with the same line.
+    adapter._pending_messages.clear()
+    runner._session_state(SK).conversation.queued_events.clear()
+    caplog.clear()
+    adapter.get_pending_message = lambda key: adapter._pending_messages.pop(key, None)
+    _event, pending = await runner._run_agent_drain_pending({"pending_steer": "turn right"}, adapter, src, SK)
+    assert pending == "turn right"
+    assert [(_fields(x)["disposition"], _fields(x)["msg_id"], _fields(x)["path"]) for x in _lines(caplog)] == [
+        ("requeued-leftover-steer", "-", "leftover_steer")]
