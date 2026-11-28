@@ -105,6 +105,32 @@ def test_became_next_turn_line_and_its_two_call_sites(caplog):
         assert "await self._run_agent(" in src[at:at + 260], path
 
 
+def test_every_adapter_slot_write_has_its_line():
+    """The adapter's own queue writes (default path, photo burst, text debounce) are checked in the
+    source, not driven: each direct write of the pending slot is followed by its disposition line."""
+    src = (REPO / "gateway" / "platforms" / "base.py").read_text(encoding="utf-8")
+    sites = [i for i in range(len(src)) if src.startswith("merge_pending_message_event(self._pending_messages", i)]
+    assert len(sites) == 4
+    for at in sites:
+        assert "inbox_log.log_disposition(" in src[at:at + 420], src[at:at + 120]
+
+
+@pytest.mark.asyncio
+async def test_interrupt_text_that_is_not_queued_logs_became_next_turn(rig, caplog):
+    runner, adapter, agent, *_ = rig
+    agent._supports_active_turn_redirect = False
+    await runner._hm_busy_interrupt(_text("stop, do this instead", "9001"), _text("x", "0").source, agent, SK)
+    assert agent.interrupted == ["stop, do this instead"] and SK not in adapter._pending_messages
+    got = [(f["disposition"], f["msg_id"], f["path"]) for f in map(_fields, _lines(caplog))]
+    assert got == [("became-next-turn", "9001", "interrupt_text")]
+    # With something already queued the event is queued instead: one line, "queued".
+    caplog.clear()
+    runner._queue_or_replace_pending_event(SK, _document("9002"))
+    await runner._hm_busy_interrupt(_text("and this", "9003"), _text("x", "0").source, agent, SK)
+    got = [(f["disposition"], f["msg_id"]) for f in map(_fields, _lines(caplog))]
+    assert got == [("queued", "9002"), ("queued", "9003")]
+
+
 def test_ids_that_cannot_be_ordered_are_skipped(caplog):
     source = SessionSource(platform=Platform.MATRIX, chat_id="!room", chat_type="dm", user_id="ace")
     event = MessageEvent(text="hi", source=source, message_id="$abc:server", message_type=MessageType.TEXT)

@@ -782,6 +782,10 @@ class GatewayInboundMixin:
             )
         elif not _interrupt_text and getattr(event, "media_urls", None):
             _interrupt_text = _build_media_placeholder(event)
+        if getattr(event, "_gateway_accepted", False) is not True:
+            # Not queued above: the bare interrupt text is what the turn runner reads as the next turn.
+            inbox_log.log_disposition("became-next-turn", _quick_key, event, path="interrupt_text", runner=self,
+                                      session_id=getattr(running_agent, "session_id", None))
         # Delivered via adapter._pending_messages (read by _run_agent); never also buffered on self
         # — that copy was never consumed and grew unbounded.
         running_agent.interrupt(_interrupt_text)
