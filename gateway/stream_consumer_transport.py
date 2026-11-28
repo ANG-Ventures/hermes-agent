@@ -11,6 +11,7 @@ import logging
 import time
 from typing import Any, Optional
 
+from agent.redact_cards import mask_card_numbers
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from hermes_cli.observability.shared_metrics_gateway import stops_reply_clock
@@ -318,7 +319,9 @@ class StreamTransportMixin:
         """Send or edit the streaming message; True if delivered.  ``finalize`` marks the
         last edit.  Transport order: native frame → draft frame → edit existing → first
         send; a transport returns None to fall through to the next."""
-        text = self._clean_for_display(text)
+        # Native and draft frames are append-only streams (Slack refuses a frame that rewrites sent
+        # text): they go out unmasked; the edit and first-send paths below are masked (t_abd83687).
+        text = self._clean_for_display(text, mask=False)
         # Stream-is-the-message draft frames must stay prefix-stable: a closing ```
         # on a mid-code-block frame makes frame N not a prefix of N+1 and the
         # connector re-appends the whole snapshot.  The final is still fence-closed.
@@ -358,6 +361,7 @@ class StreamTransportMixin:
                                         is_turn_final=is_turn_final)
             if ok is not None:
                 return ok
+        text = mask_card_numbers(text, json_quoting=False)
         self._last_edit_overflowed = False
         try:
             if self._message_id is None:

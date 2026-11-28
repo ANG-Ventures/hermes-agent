@@ -184,12 +184,13 @@ def _quote_share(text: str, q: int) -> int:
     return n & ~(n + 1)
 
 
-def mask_card_numbers(text: str) -> str:
+def mask_card_numbers(text: str, *, json_quoting: bool = True) -> str:
     """*text* with every card number masked to its last four, plus labelled CVC/expiry near one.
 
     Digits become ``X`` and separators are kept. Numbers that share a group are masked together. A masked
     bare JSON number (``"cvv":123``, ``[4000...]``, or the whole text) is quoted so a valid JSON payload
-    stays valid; array/root quotes only for number tokens outside every string of a valid JSON *text*."""
+    stays valid; array/root quotes only for number tokens outside every string of a valid JSON *text*.
+    ``json_quoting=False`` (chat replies, display previews) adds no characters: same length out as in."""
     if not isinstance(text, str) or len(text) < 15:
         return text
     cards = list(_card_spans(text, strict=True))
@@ -214,6 +215,8 @@ def mask_card_numbers(text: str) -> str:
                 vs, ve = m.span("v")
                 masked.update(i for i in range(vs, ve) if text[i].isdigit())
                 values.append((vs, ve))
+    if not json_quoting:
+        return _render(text, masked, {})
     # The inserted quote copies the key's closing quote with its backslashes, so a bare value inside a
     # JSON-encoded string (``\\"key\\":4000...``) gets ``\\"`` and the outer JSON stays valid too.
     quote_at = {}
@@ -380,11 +383,11 @@ def mask_tool_display_value(value: Any) -> Any:
 
     def walk(v: Any) -> Any:
         if isinstance(v, str):
-            masked = mask_card_numbers(v)
+            masked = mask_card_numbers(v, json_quoting=False)
             collapsed = " ".join(masked.split())
             if collapsed == masked:
                 return masked
-            recollapsed = mask_card_numbers(collapsed)
+            recollapsed = mask_card_numbers(collapsed, json_quoting=False)
             return masked if recollapsed == collapsed else recollapsed
         if isinstance(v, dict):
             # Keys too: verbose progress json.dumps the args, keys included (t_abd83687).
@@ -394,12 +397,12 @@ def mask_tool_display_value(value: Any) -> Any:
         # A card supplied as a JSON number renders as its digits (verbose progress json.dumps the args); a
         # whole-number float (``<card>.0``) renders with all of them too.
         if isinstance(v, float) and v.is_integer():
-            masked = mask_card_numbers(repr(v))
+            masked = mask_card_numbers(repr(v), json_quoting=False)
             return masked if masked != repr(v) else v
         if isinstance(v, tuple):
             return tuple(walk(x) for x in v)
         if isinstance(v, int) and not isinstance(v, bool):
-            masked = mask_card_numbers(str(v))
+            masked = mask_card_numbers(str(v), json_quoting=False)
             return masked if masked != str(v) else v
         return v
     return walk(value)

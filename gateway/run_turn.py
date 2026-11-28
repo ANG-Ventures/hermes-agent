@@ -4754,7 +4754,7 @@ class GatewayTurnMixin:
         from agent.redact_cards import mask_card_numbers  # bypasses send_final_ledgered's mask (t_abd83687)
         try:
             _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=mask_card_numbers(content),
+                chat_id=source.chat_id, message_id=_sc.message_id, content=mask_card_numbers(content, json_quoting=False),
                 finalize=True,
             )
         except Exception as _edit_err:

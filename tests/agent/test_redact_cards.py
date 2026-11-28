@@ -1016,7 +1016,7 @@ def test_progress_callback_never_scans_a_completed_tool_result():
     tr, ctx = _runner()
     scanned = []
     real = redact_cards.mask_card_numbers
-    with _cfg(), patch.object(redact_cards, "mask_card_numbers", side_effect=lambda t: scanned.append(t) or real(t)):
+    with _cfg(), patch.object(redact_cards, "mask_card_numbers", side_effect=lambda t, **kw: scanned.append(t) or real(t, **kw)):
         tr.progress_callback("tool.completed", "terminal", None, None, duration=1.0, is_error=False,
                              result=f"stdout card {DISC}")
     assert not any(DISC in t for t in scanned)
@@ -1274,26 +1274,32 @@ def test_final_reply_is_masked_at_the_send_boundary():
     assert all("XXXXXXXXXXXX0993" in s for s in sent)
 
 
-def test_unlimited_tool_preview_is_capped():
-    """Path 3: tool_preview_length 0 ("unlimited") no longer hands a 100 KB preview to the api_server label."""
+def test_unlimited_tool_preview_is_uncut_and_masked_whole():
+    """Path 3: tool_preview_length 0 stays unlimited (no cap): the whole 100 KB preview is masked, nothing
+    is cut. Prism 2d50f75829e9: a long link keeps its full target."""
     from agent import display
     command = "echo " + "x" * 100_000 + f" {DISC}"
-    with patch.object(display, "_tool_preview_max_len", 0):
+    with patch.object(display, "_tool_preview_max_len", 0), _cfg():
         preview = display.build_tool_preview("terminal", {"command": command})
-        assert len(preview) <= display._TOOL_PREVIEW_CEILING
-        assert DISC not in preview
-        assert display.build_tool_preview("terminal", {"command": "ls -la"}) == "ls -la"
-        assert len(display.build_tool_preview("terminal", {"command": command}, max_len=0)) <= 2000
+        assert preview == command
+        masked = redact_cards.mask_tool_display_value(preview)
+        assert len(masked) == len(preview) and DISC not in masked and masked.endswith("XXXXXXXXXXXX0993")
+        url = "https://shop.test/signed?sig=" + "a" * 3000
+        tp = display.prepare_tool_preview("browser_navigate", {"url": url}, fallback="", max_len=80)
+        assert tp.truncated and tp.url == url
 
 
 def test_display_walker_masks_tuple_values_and_dict_keys():
     """Path 4: mask_tool_display_value walks tuples and dict keys (verbose progress json.dumps keys too)."""
     with _cfg():
         out = redact_cards.mask_tool_display_value({DISC: ("a", DISC), "n": [(1, DISC)]})
-    # Shape only: whether a bare masked number is quoted is mask_card_numbers' call (#602), not the walker's.
     (key, val), (_, n) = out.items()
     assert isinstance(val, tuple) and isinstance(n[0], tuple) and DISC not in json.dumps(out)
-    assert all("XXXXXXXXXXXX0993" in s for s in (key, val[1], n[0][1]))
+    # Display copies add no characters (operator B, 00:05): a value that is only the number stays 16 long.
+    assert key == val[1] == n[0][1] == "XXXXXXXXXXXX0993"
+    with _cfg():
+        for v in (DISC, int(DISC), float(DISC)):
+            assert redact_cards.mask_tool_display_value({"text": v})["text"] in ("XXXXXXXXXXXX0993", "XXXXXXXXXXXX0993.0")
 
 
 def test_codex_mcp_numeric_card_in_array_stays_valid_json():
@@ -1336,3 +1342,80 @@ def test_final_reconciliation_edit_is_masked():
         None, sc, NS(chat_id="8"), response, f"Your card: {DISC} (verified)", _sk="k",
         ok=("ok",), fail_result="%s %s", fail_exc="%s %s"))
     assert response.get("already_sent") and sent == ["Your card: XXXXXXXXXXXX0993 (verified)"]
+
+
+# ── t_abd83687 operator send-back (22:40 + 22:29 rulings + 00:05 additions) ──
+
+
+def test_reply_that_is_only_a_card_number_keeps_its_length():
+    """Ruling 3: chat replies add no characters; the JSON root quoting stays on for tool results only."""
+    import asyncio
+    from gateway.platforms.event import MessageEvent, MessageType
+    sent = []
+    adapter = _final_adapter(sent)
+    event = MessageEvent(text="hi", message_type=MessageType.TEXT, message_id="in-1",
+                         source=adapter.build_source(chat_id="8", user_id="u1"))
+    asyncio.run(adapter.send_final_ledgered(event, "k", DISC, {}, reply_to=None))
+    assert sent == ["XXXXXXXXXXXX0993"]
+    assert mask_card_numbers(DISC) == '"XXXXXXXXXXXX0993"'  # tool-result default unchanged
+
+
+def test_append_only_draft_stream_with_a_card_has_no_failed_frame():
+    """Ruling 2 / Prism 688fd1611a31: on an append-only draft transport (Slack) the mask never rewrites
+    sent text, so no frame fails with a prefix mismatch; the edit/first-send paths stay masked."""
+    import asyncio
+    from gateway.platforms.base import SendResult
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    sent, frames, failed = [], [], []
+    adapter = _final_adapter(sent)
+
+    async def send_draft(chat_id, draft_id, content, metadata=None):
+        if frames and not content.startswith(frames[-1]):
+            failed.append(content)
+            return SendResult(success=False, error="stream prefix mismatch")
+        frames.append(content)
+        return SendResult(success=True, message_id="ts1")
+    adapter.send_draft = send_draft
+    consumer = GatewayStreamConsumer(adapter, "8", StreamConsumerConfig(cursor=""))
+    consumer._use_draft_streaming, consumer._draft_id = True, 1
+    for text in ("Card: " + DISC[:12], "Card: " + DISC + ". More to follow"):
+        assert asyncio.run(consumer._send_or_edit(text, is_turn_final=False))
+    assert not failed and len(frames) == 2 and sent == []
+    consumer._use_draft_streaming = False  # drafts off: the first send masks
+    asyncio.run(consumer._send_or_edit("Card: " + DISC + ". Done"))
+    assert sent == ["Card: XXXXXXXXXXXX0993. Done"]
+
+
+def test_codex_mcp_whole_number_fraction_card_stays_valid_json():
+    """Prism 9ca6a5372475 (fixed by the rebase on merged PR 602): <card>.0 in an MCP result stays JSON."""
+    from agent.transports.codex_event_projector import CodexEventProjector
+    item = {"type": "mcpToolCall", "id": "i4", "server": "stripe", "tool": "get_card", "arguments": {},
+            "result": {"structuredContent": {"pan": float(DISC)}}}
+    with _cfg():
+        out = CodexEventProjector().project({"method": "item/completed", "params": {"item": item}})
+    row = out.messages[1]["content"]
+    assert DISC not in row and "XXXXXXXXXXXX0993" in json.dumps(json.loads(row))
+
+
+def test_codex_mcp_result_is_masked_before_the_4000_clip():
+    """Ruling 5: a card cut at the 4000-character clip keeps no clear digit run of 12+."""
+    import re
+    from agent.transports.codex_event_projector import CodexEventProjector
+    text = "a" * (4000 - len('{"content": [{"type": "text", "text": "') - 8) + " " + DISC
+    item = {"type": "mcpToolCall", "id": "i5", "server": "stripe", "tool": "get_card", "arguments": {},
+            "result": {"content": [{"type": "text", "text": text}]}}
+    with _cfg():
+        out = CodexEventProjector().project({"method": "item/completed", "params": {"item": item}})
+    row = out.messages[1]["content"]
+    assert len(row) == 4000 and not re.search(r"\d{5,}", row) and "XXXX" in row
+
+
+def test_native_vision_meta_image_url_is_masked_before_the_clip():
+    """Operator C: image_url was clipped to 200 characters before any mask (up to 15 clear digits)."""
+    import re
+    from tools.vision_tools import _build_native_vision_tool_result
+    url = "https://shop.test/" + "a" * (200 - len("https://shop.test/") - 9) + "/" + DISC
+    with _cfg():
+        env = _build_native_vision_tool_result(url, "q", "data:image/png;base64,AA", 2)
+    meta_url = env["meta"]["image_url"]
+    assert len(meta_url) == 200 and not re.search(r"\d{5,}", meta_url)

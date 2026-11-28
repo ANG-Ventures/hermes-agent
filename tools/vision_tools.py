@@ -512,7 +512,13 @@ def _build_native_vision_tool_result(
         "text_summary": (
             f"Image attached natively for the main model ({image_size_bytes / 1024:.1f} KB). "
             "Answer using built-in vision."),
-        "meta": {"image_url": image_url[:200], "size_bytes": image_size_bytes, "native_vision": True}}
+        # Mask, then clip: a card cut at 200 characters is too short to match afterwards (t_abd83687).
+        "meta": {"image_url": _masked_url(image_url)[:200], "size_bytes": image_size_bytes, "native_vision": True}}
+
+
+def _masked_url(url: str) -> str:
+    from agent.redact_cards import mask_tool_result_content
+    return mask_tool_result_content(url) if isinstance(url, str) else url
 
 
 def _unlink_quietly(path: Optional[Path]) -> None:

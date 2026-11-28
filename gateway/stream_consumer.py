@@ -548,7 +548,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     async def _finalize_boundary_stream(self, _reason: str) -> bool:
         """Close the open native stream at a boundary; send() the pre-prompt text if that
         fails.  False only when both finalize and the fallback send failed."""
-        finalize_text = mask_card_numbers(self._accumulated) or self._boundary_placeholder
+        finalize_text = self._accumulated or self._boundary_placeholder
         try:
             if await self._send_frame(finalize_text, finalize=True):
                 logger.debug("%s boundary: finalized stream (chat=%s, turn=%s)",
@@ -840,7 +840,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         tail stays in _accumulated as the active preview later deltas edit in place.
         True when the turn finished here (the run loop returns)."""
         # A card straddling a split is too short to match in either half: mask the whole buffer first.
-        self._accumulated = mask_card_numbers(self._accumulated)
+        # Accepted limit (no hold-back buffer): a number still arriving at the split can leave 8 + 8 digits.
+        self._accumulated = mask_card_numbers(self._accumulated, json_quoting=False)
         chunks = self._truncate_for_stream(self._accumulated, self._safe_limit, self._len_fn)
         if len(chunks) <= 1:
             # Malformed/legacy adapter result must still be splittable.
@@ -893,7 +894,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     async def _seal_overflow_heads(self) -> None:
         """Existing message overflowing: seal it with the head, start a new message for the rest."""
         # A card straddling a split is too short to match in either half: mask the whole buffer first.
-        self._accumulated = mask_card_numbers(self._accumulated)
+        # Accepted limit (no hold-back buffer): a number still arriving at the split can leave 8 + 8 digits.
+        self._accumulated = mask_card_numbers(self._accumulated, json_quoting=False)
         while self._overflows() and self._message_id is not None and self._edit_supported:
             cp_budget = _custom_unit_to_cp(self._accumulated, self._safe_limit, self._len_fn)
             split_at = self._accumulated.rfind("\n", 0, cp_budget)
@@ -1084,15 +1086,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     # unknown-extension path stays visible instead of being silently dropped (issue #34517). Streaming and
     # non-streaming paths share the same regex, so a tag is treated identically whichever path delivered the
     # text.
-    def _clean_for_display(text: str) -> str:
+    def _clean_for_display(text: str, *, mask: bool = True) -> str:
         """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream.
 
         Media-only on purpose: this runs on every chunk, including sealed non-final overflow
         chunks, so it must never remove text.  The trailing silence-marker strip is a turn-final
         decision (:meth:`_strip_turn_final_marker`).  Card numbers are masked here (length-preserving,
-        t_abd83687): every streamed frame, edit and fallback send passes through this method.
+        t_abd83687) unless *mask* is False: every streamed edit and fallback send passes through it.
         """
-        return mask_card_numbers(_BasePlatformAdapter.strip_media_directives_for_display(text))
+        text = _BasePlatformAdapter.strip_media_directives_for_display(text)
+        return mask_card_numbers(text, json_quoting=False) if mask else text
 
     def _silence_predicate(self):
         if not self.cfg.internal_event:
