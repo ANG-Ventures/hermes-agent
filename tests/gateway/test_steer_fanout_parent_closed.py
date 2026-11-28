@@ -59,6 +59,30 @@ async def test_busy_steer_into_a_closed_parent_with_a_live_child_is_queued(tmp_p
     assert child._pending_steer is None
 
 
+@pytest.mark.asyncio
+async def test_busy_message_into_a_closed_parent_with_a_live_child_reaches_the_queue():
+    """End to end through the busy handler (Prism f37acc69cb88): the refused message is stored as the
+    next turn, the ack says queued, and the orphaned child does not also get it."""
+    from gateway.session import build_session_key
+    from tests.gateway.test_busy_session_ack import _make_adapter, _make_event, _make_runner
+    runner, _ = _make_runner()
+    runner._busy_input_mode = "steer"
+    adapter = _make_adapter()
+    event = _make_event(text="use branch B")
+    sk = build_session_key(event.source)
+    runner.adapters[event.source.platform] = adapter
+    parent, child = _closed_parent_with_open_child()
+    runner._running_agents[sk] = parent
+
+    await runner._handle_active_session_busy_message(event, sk)
+
+    assert adapter._pending_messages.get(sk) is event, "refused steer was not queued as the next turn"
+    assert child._pending_steer is None
+    content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+    assert "Queued for the next turn" in content
+    assert "Steered" not in content
+
+
 def test_open_parent_still_fans_out_to_its_children(tmp_path, monkeypatch):
     """Control: mid-turn, the parent and every live child get the text (#112095), as before."""
     import threading
