@@ -420,15 +420,6 @@ def _model_cap(t: str) -> bool:
     return bool(_CLAUDE_CLI_USAGE_CAP_RE.search(t))
 
 
-def text_names_quota(text: Any) -> bool:
-    """True when the error text carries a real quota phrase (a ``quota_*`` text-table
-    needle or the model-cap sentence). The one rule the cause label and the wall
-    budget's quota gate share (t_67969ec8): "reached your rate limit" is not quota."""
-    t = str(text or "").lower()
-    return _model_cap(t) or any(n in t for cls, needles in _TEXT_TABLE
-                                if cls in ("quota_model", "quota_seat") for n in needles)
-
-
 def classify_text(text: Optional[str], *, http_status: Optional[int] = None,
                   exc_name: Optional[str] = None,
                   reason: Optional[str] = None) -> str:

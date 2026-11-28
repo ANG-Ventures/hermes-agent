@@ -158,3 +158,71 @@ def test_failover_rider_bounds_the_seat_but_not_the_row():
     ok = dict(row, seat="sub-vps-12", same_err_prev_seat="sub-vps-12")
     assert "sub-vps-12" in fp.format_cause_rider(ok)
     assert "on sub-vps-12" in fp.format_recovery_rider(ok)
+
+
+
+# Prism #606 0aa4ea16a348 (t_48bb0de3): the wait line's quota gate reads the same ordered
+# classifier as the cause label, so a capacity 429 that quotes a seat's cap sentence is
+# capacity, not the allowance.
+POOL_CAP = "pool at capacity; last seat reported: You've reached your Opus 4.5 limit."
+RETRYING = {"stage": "upstream_ttfb", "seat": "sub-vps-3", "since_ms": 4000,
+            "attempt_ms": 4000, "request_ms": 62000}
+
+
+def _fable_used_19_of_26(monkeypatch):
+    def fetch(url, timeout):
+        if url.endswith("/health"):
+            return {"fable_allowance": {"exhausted": 19, "of": 26,
+                                        "earliest_reset": "2026-11-15T18:59:59Z"}}
+        if "/eligibility?" in url:
+            return {"model": FABLE, "eligible_count": 7, "model_eligible": True}
+        return None
+
+    monkeypatch.setattr(rc, "fetch_json", fetch)
+    monkeypatch.setattr(rh, "fetch_relay_stage", lambda base, key, **kw: RETRYING)
+    monkeypatch.setattr(wb, "_knobs", lambda: (600.0, 120.0))
+    monkeypatch.setattr(wb, "_dedupe_on", lambda: True)
+    monkeypatch.setattr(wb, "post_logs", lambda text: None)
+
+
+def _wait_line(message, relay_class=None):
+    a = _agent()
+    wb.arm(a, now=0.0)
+    wb.note_upstream_failure(a, status=429, relay_class=relay_class, text=message)
+    return wb.notice_due(a, now=120.0)
+
+
+def test_unclassed_429_capacity_quoting_a_cap_sentence_is_not_the_allowance(monkeypatch):
+    _fable_used_19_of_26(monkeypatch)
+    assert fallback_events.classify_text(POOL_CAP, http_status=429) == "pool_pressure"
+    line = _wait_line(POOL_CAP)
+    print(line)
+    assert "allowance" not in line, line
+    cause = _line(429, POOL_CAP)
+    print(cause)
+    assert "capacity" in cause and "quota" not in cause and "allowance" not in cause, cause
+
+
+@pytest.mark.parametrize("message", ["You've hit your weekly limit",
+                                     "You've reached your Fable limit"])
+def test_unclassed_429_quota_still_names_the_allowance(monkeypatch, message):
+    _fable_used_19_of_26(monkeypatch)
+    line = _wait_line(message)
+    print(line)
+    assert "Fable allowance used up on 19/26 seats" in line, line
+
+
+def test_unclassed_429_rate_limit_does_not_name_the_allowance(monkeypatch):
+    _fable_used_19_of_26(monkeypatch)
+    line = _wait_line("You've reached your rate limit")
+    print(line)
+    assert "allowance" not in line, line
+
+
+@pytest.mark.parametrize("relay_class", ["quota_model", "quota_seat"])
+def test_relay_quota_class_decides_on_its_own(monkeypatch, relay_class):
+    _fable_used_19_of_26(monkeypatch)
+    line = _wait_line("pool at capacity", relay_class=relay_class)
+    print(line)
+    assert "Fable allowance used up on 19/26 seats" in line, line
+    assert not wb._is_quota_refusal(429, "pool_pressure", "You've reached your Fable limit")
