@@ -38,6 +38,8 @@ ENUMERATED = frozenset({
     "dirty_path_through_symlink", "dirty_path_not_plain_file",
     # kill-switch / hand-list only (derived: false, KANBAN_DIRTY_CARRY=0)
     "unpushed_dirty_tree", "unpushed_commits", "derived_mode_off",
+    # every candidate host's clone of the repo just failed: a host fault, never charged (t_4d8fb733)
+    "port_clone_failed",
     # _why's own runtime fallback for a reason outside the table (Prism b4c7ade40781)
     "unenumerated_local_reason",
 })

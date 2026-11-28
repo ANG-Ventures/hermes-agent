@@ -8897,8 +8897,9 @@ def _dispatch_once_locked(
                                                        workspace, board=board)
                 _ct0 = time.monotonic()
                 try:
-                    # A finished background clone (gateway tick) is collected; a failed one raises here.
-                    _kwt.run_clone(_ckey, _cjob, _clock)
+                    # A finished background clone (gateway tick) is collected; a failed one raises here. A failed
+                    # pool-host clone raises WorkspaceUnavailable: a host fault, never charged (t_4d8fb733).
+                    _kwt.run_port_clone(_ckey, _cjob, _clock, placed_host.name, _wt_port[0])
                 finally:
                     result.clone_ms += (time.monotonic() - _ct0) * 1000.0
                 _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,

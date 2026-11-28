@@ -903,15 +903,35 @@ def test_clone_script_expands_a_home_relative_mirror(tmp_path):
     assert subprocess.run(["sh", "-c", sc2], env=env).returncode == 0
 
 
+def test_clone_script_keeps_the_sessions_git_config_env(tmp_path):
+    """t_4d8fb733: fleet-worker-shell hands the session its github.com credential helper as GIT_CONFIG_COUNT/KEY_n/
+    VALUE_n. The clone's safe.directory is appended to that list; a reset dropped the helper and every pool-host clone
+    of a private repo died at "could not read Username" (15 spawn_failed on ci-box, 11-23..11-27). Modelled with a
+    session-provided url.insteadOf: only a clone that still sees the session's GIT_CONFIG_* reaches the origin."""
+    import os
+    origin, _mirror = _origin_with_feature(tmp_path)
+    ws = tmp_path / "ws"
+    sc = kwt.clone_script(str(ws), "acme/r", "~/.hermes/mirrors/acme/r.git", "feature",
+                          url="https://unreachable.invalid/acme/r.git")
+    env = dict(os.environ, HOME=str(tmp_path / "home"), HERMES_WORKTREE_CACHE="0", GIT_TERMINAL_PROMPT="0",
+               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=f"url.{origin}.insteadOf",
+               GIT_CONFIG_VALUE_0="https://unreachable.invalid/acme/r.git")
+    proc = subprocess.run(["sh", "-c", sc], env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert (ws / "f").read_text() == "feature"
+
+
 # -- pool-host clone off the dispatcher tick (t_915b8d2d) ------------------------------------------------------
 
 @pytest.fixture
 def clone_prefetch():
     kwt._prefetch.clear()
+    kwt._port_faults.clear()
     yield kwt._prefetch
     for fut, _t0 in list(kwt._prefetch.values()):
         fut.cancel()
     kwt._prefetch.clear()
+    kwt._port_faults.clear()
 
 
 def _wait_prefetch_done(timeout=10.0):
@@ -965,8 +985,11 @@ def test_gateway_tick_does_not_wait_on_a_slow_pool_host_clone(kanban_home, ancho
     assert not kwt._prefetch
 
 
-def test_failed_background_clone_takes_the_existing_failure_path(kanban_home, anchor, monkeypatch,
-                                                                 clone_prefetch):
+def test_failed_background_clone_is_a_host_fault_never_charged(kanban_home, anchor, monkeypatch, clone_prefetch):
+    """t_4d8fb733: a failed pool-host clone released the claim as a charged spawn_failed; three identical 0 s
+    rc=128 clones on ci-box gave the card up (t_61f4b8e3, 11-27). Now it is a host fault: the run ends
+    workspace_refused with the reason named, no failure is charged, and the next tick does not pick that host
+    for that repo again (the only host here, so the card is named port_clone_failed instead)."""
     _mirrors(kanban_home)
 
     def bad_clone(host, workspace, slug, mirror, branch, runner=None):
@@ -987,11 +1010,19 @@ def test_failed_background_clone_takes_the_existing_failure_path(kanban_home, an
                            (wt,)).fetchone()
         # The refunded slot is free again: a fresh portable card takes it in the next tick.
         other = kb.create_task(conn, title="plain", assignee="alpha")
-        _res3, spawned3 = _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="test")
-    assert spawned2 == [] and wt in res2.spawn_failed
-    assert row["status"] in ("ready", "blocked") and row["claim_lock"] is None
-    assert run["outcome"] == "spawn_failed" and "boom" in (run["error"] or "")
+        res3, spawned3 = _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="test")
+        row3 = _row(conn, wt)
+    assert spawned2 == [] and wt not in res2.spawn_failed
+    assert row["status"] == "ready" and row["claim_lock"] is None and row["consecutive_failures"] == 0
+    assert run["outcome"] == "workspace_refused" and "boom" in (run["error"] or "")
+    assert (run["error"] or "").startswith(f"{kwt.WHY_CLONE_FAILED}:ace-ai")
     assert (other, "ace-ai") in spawned3
+    assert all(tid != wt for tid, _ in res3.placed) and row3["consecutive_failures"] == 0
+    # Prism 00573c799797: the card is held NAMED while the pair cools down (a clone outage is not a Studio
+    # capability, so the Studio last-resort policy does not take it), never charged, never silently dropped
+    route3 = next(r for r in res3.routes if r["task_id"] == wt)
+    assert kwt.WHY_CLONE_FAILED in f"{route3.get('code')} {route3.get('detail')} {res3.placement_waits.get(wt)}", route3
+    assert kwt.port_fault("ace-ai", SLUG) is not None
 
 
 def test_cli_tick_keeps_the_synchronous_clone(kanban_home, anchor, monkeypatch, clone_prefetch):
