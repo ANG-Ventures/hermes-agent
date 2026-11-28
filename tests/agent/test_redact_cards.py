@@ -631,12 +631,12 @@ def test_masked_bare_json_numbers_in_arrays_and_at_the_root_stay_valid_json():
     assert json.loads(mask_card_numbers(VISA)) == m
     assert json.loads(mask_card_numbers(VISA + "\n")) == m
     assert json.loads(mask_card_numbers(json.dumps(["say \"hi\"", int(VISA)]))) == ["say \"hi\"", m]
-    # Inside a JSON-encoded string: after a key, after the string's opening quote, pretty-printed, two levels.
+    # Inside a JSON-encoded string nothing is added: the array item is only X'd, one and two levels deep.
     for inner in ('{"cards":[%s]}' % VISA, "[%s]" % VISA, json.dumps([int(VISA)], indent=2)):
-        out = json.loads(json.loads(mask_card_numbers(json.dumps({"output": inner})))["output"])
-        assert m in json.dumps(out) and VISA not in json.dumps(out)
+        out = json.loads(mask_card_numbers(json.dumps({"output": inner})))["output"]
+        assert out == inner.replace(VISA, m)
     twice = mask_card_numbers(json.dumps({"o": json.dumps({"x": "[%s]" % VISA})}))
-    assert json.loads(json.loads(json.loads(twice)["o"])["x"]) == [m]
+    assert json.loads(json.loads(twice)["o"])["x"] == "[%s]" % m
     # Not a JSON number: a spaced card at the root stays unquoted.
     assert mask_card_numbers(f"{VISA[:4]} {VISA[4:8]} {VISA[8:12]} {VISA[12:]}") == "XXXX XXXX XXXX 0366"
 
@@ -674,20 +674,26 @@ def test_cancelled_image_read_leaves_no_flattened_copy(tmp_path):
     assert not list(tmp_path.glob("*.rgb.png"))
 
 
-def test_array_quotes_only_for_valid_json_and_only_when_the_result_parses():
-    """Prism f224ce988f0c: a CSV field inside a JSON string is not an array item."""
+def test_array_quotes_only_for_number_tokens_outside_every_string():
+    """Prism f224ce988f0c / 800ec6141d53: text inside a JSON string gets X's and nothing else; a bare number
+    is quoted only when it is a token of a valid JSON document, outside every string."""
     m = "XXXXXXXXXXXX0366"
-    for output in (",%s,approved" % VISA, "id,card\n1,%s,ok\n" % VISA, "[x,%s,y" % VISA):
-        envelope = json.dumps({"output": output, "exit_code": 0})
-        got = json.loads(mask_card_numbers(envelope))
-        assert m in got["output"] and VISA not in got["output"] and got["exit_code"] == 0
-    assert json.loads(mask_card_numbers(json.dumps({"output": ",%s,approved" % VISA, "exit_code": 0}))) == {
-        "output": ",%s,approved" % m, "exit_code": 0}
-    # A valid JSON array of bare card numbers is still quoted.
+    # CSV rows inside a terminal result decode to the text with only the digits X'd.
+    for output in (",%s,approved" % VISA, "id,card\n7,%s,ok\n" % VISA, "a,%s,b" % VISA, "[x,%s,y" % VISA,
+                   "cards seen: [%s, %s]" % (VISA, VISA)):
+        got = json.loads(mask_card_numbers(json.dumps({"output": output, "exit_code": 0})))
+        assert got == {"output": output.replace(VISA, m), "exit_code": 0}
+    # One document with a comma-first CSV string AND a bare number array: valid, array item quoted.
+    doc = '{"output":",%s,approved","cards":[%s]}' % (VISA, VISA)
+    assert json.loads(mask_card_numbers(doc)) == {"output": ",%s,approved" % m, "cards": [m]}
+    # A top-level array and a lone root number are quoted.
     assert json.loads(mask_card_numbers(json.dumps([int(VISA), int(MC)]))) == [m, "XXXXXXXXXXXX2226"]
-    # Not JSON: no array or root quotes (prose with a bracketed list, a bare number on a line of prose).
-    assert mask_card_numbers("cards: [%s, %s]" % (VISA, VISA)) == "cards: [%s, %s]" % (m, m)
+    assert json.loads(mask_card_numbers(" %s\n" % VISA)) == m
+    # Not JSON: no quotes (prose with a bracketed list, a bare number on a line of prose).
+    assert mask_card_numbers("cards seen: [%s, %s]" % (VISA, VISA)) == "cards seen: [%s, %s]" % (m, m)
     assert mask_card_numbers("%s\nnext line" % VISA) == m + "\nnext line"
+    # A number token that is more than the card (a negative or a fraction) is left unquoted.
+    assert mask_card_numbers("[-%s]" % VISA) == "[-%s]" % m
 
 
 def test_many_cards_on_one_line_mask_in_linear_time():

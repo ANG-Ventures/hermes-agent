@@ -166,14 +166,8 @@ def _window(text: str, start: int, end: int, breaks: Optional[_LineBreaks] = Non
 # A bare JSON value: right after ``"key":`` and right before ``,`` ``}`` ``]`` or the end of the text.
 _JSON_KEY_BEFORE = re.compile(r'"[ \t]*:[ \t]*$')
 _JSON_VALUE_AFTER = re.compile(r"[ \t]*(?:[,}\]]|$)")
-# A bare JSON number in an array (after ``[`` or ``,``, before ``,`` or ``]``) or alone at the root. JSON
-# whitespace may be raw or escaped (``\\n`` inside a JSON-encoded string, ``\\\\n`` one level deeper).
-_JSON_WS = r"(?:[ \t\r\n]|\\+[ntr])*"
-_JSON_ITEM_BEFORE = re.compile(r"[\[,]" + _JSON_WS + r"$")
-_JSON_ITEM_AFTER = re.compile(_JSON_WS + r"(?:[,\]]|$)")
-_JSON_ROOT_WS = re.compile(r"[ \t\r\n]*")
-_JSON_WS_RUN = re.compile(_JSON_WS)
-_QUOTE = re.compile(r'"')
+# One pass over a valid JSON document: each string (skipped whole) or each number outside every string.
+_JSON_TOKEN = re.compile(r'"(?:[^"\\]+|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?')
 
 
 def _quote_share(text: str, q: int) -> int:
@@ -187,32 +181,12 @@ def _quote_share(text: str, q: int) -> int:
     return n & ~(n + 1)
 
 
-def _array_item_quote(text: str, vs: int, ve: int, quotes: List[int]) -> Optional[str]:
-    """The quote to put around a bare JSON number in an array or at the root, or None when [vs, ve) is not
-    one. The escaping follows the nearest quote before the number: the same when that quote ends a key or a
-    value (``:`` ``,`` ``]`` ``}`` after it), one level deeper when it opens the string the array sits in."""
-    if not text[vs:ve].isdigit():
-        return None
-    root = _JSON_ROOT_WS.fullmatch(text, 0, vs) and _JSON_ROOT_WS.fullmatch(text, ve)
-    if not root and not (_JSON_ITEM_BEFORE.search(text, max(0, vs - 64), vs) and _JSON_ITEM_AFTER.match(text, ve)):
-        return None
-    i = bisect.bisect_left(quotes, vs)
-    if not i:
-        return '"'
-    q = quotes[i - 1]
-    share = _quote_share(text, q)
-    after = _JSON_WS_RUN.match(text, q + 1).end()
-    if after >= len(text) or text[after] not in ":,]}":
-        share = 2 * share + 1
-    return "\\" * share + '"'
-
-
 def mask_card_numbers(text: str) -> str:
     """*text* with every card number masked to its last four, plus labelled CVC/expiry near one.
 
     Digits become ``X`` and separators are kept. Numbers that share a group are masked together. A masked
     bare JSON number (``"cvv":123``, ``[4000...]``, or the whole text) is quoted so a valid JSON payload
-    stays valid; array/root quotes only when *text* is valid JSON and the quoted result parses."""
+    stays valid; array/root quotes only for number tokens outside every string of a valid JSON *text*."""
     if not isinstance(text, str) or len(text) < 15:
         return text
     cards = list(_card_spans(text, strict=True))
@@ -239,31 +213,25 @@ def mask_card_numbers(text: str) -> str:
                 values.append((vs, ve))
     # The inserted quote copies the key's closing quote with its backslashes, so a bare value inside a
     # JSON-encoded string (``\\"key\\":4000...``) gets ``\\"`` and the outer JSON stays valid too.
-    obj_quote = {}
-    arr_quote = {}
-    quotes: Optional[List[int]] = None
+    quote_at = {}
+    rest = []
     for vs, ve in values:
         if vs > 0 and text[vs - 1] == '"':
             continue
         lo = max(0, vs - 16)
         key = _JSON_KEY_BEFORE.search(text, lo, vs)
         if key and _JSON_VALUE_AFTER.match(text, ve):
-            obj_quote[vs] = obj_quote[ve] = "\\" * _quote_share(text, key.start()) + '"'
-            continue
-        if quotes is None:
-            quotes = [m.start() for m in _QUOTE.finditer(text)]
-        quote = _array_item_quote(text, vs, ve, quotes)
-        if quote is not None:
-            arr_quote[vs] = arr_quote[ve] = quote
-    # Array/root quoting is inferred, so it is verified by parsing: only for text that is valid JSON, and
-    # kept only when the result parses (else the object-value quoting alone, else no quotes).
-    if not _parses(text):
-        return _render(text, masked, obj_quote)
-    for quote_at in ({**obj_quote, **arr_quote}, obj_quote):
-        out = _render(text, masked, quote_at)
-        if _parses(out):
-            return out
-    return _render(text, masked, {})
+            quote_at[vs] = quote_at[ve] = "\\" * _quote_share(text, key.start()) + '"'
+        else:
+            rest.append((vs, ve))
+    # A masked bare number in an array or at the root: quoted only when *text* is valid JSON and the number is
+    # a whole number token outside every string of it. Inside a string nothing is added (t_c497904d).
+    if rest and _parses(text):
+        bare = {m.span() for m in _JSON_TOKEN.finditer(text) if text[m.start()] != '"'}
+        for vs, ve in rest:
+            if (vs, ve) in bare:
+                quote_at[vs] = quote_at[ve] = '"'
+    return _render(text, masked, quote_at)
 
 
 def _merge(windows: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
