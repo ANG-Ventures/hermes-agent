@@ -903,6 +903,24 @@ def test_clone_script_expands_a_home_relative_mirror(tmp_path):
     assert subprocess.run(["sh", "-c", sc2], env=env).returncode == 0
 
 
+def test_clone_script_keeps_the_sessions_git_config_env(tmp_path):
+    """t_4d8fb733: fleet-worker-shell hands the session its github.com credential helper as GIT_CONFIG_COUNT/KEY_n/
+    VALUE_n. The clone's safe.directory is appended to that list; a reset dropped the helper and every pool-host clone
+    of a private repo died at "could not read Username" (15 spawn_failed on ci-box, 11-23..11-27). Modelled with a
+    session-provided url.insteadOf: only a clone that still sees the session's GIT_CONFIG_* reaches the origin."""
+    import os
+    origin, _mirror = _origin_with_feature(tmp_path)
+    ws = tmp_path / "ws"
+    sc = kwt.clone_script(str(ws), "acme/r", "~/.hermes/mirrors/acme/r.git", "feature",
+                          url="https://unreachable.invalid/acme/r.git")
+    env = dict(os.environ, HOME=str(tmp_path / "home"), HERMES_WORKTREE_CACHE="0", GIT_TERMINAL_PROMPT="0",
+               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=f"url.{origin}.insteadOf",
+               GIT_CONFIG_VALUE_0="https://unreachable.invalid/acme/r.git")
+    proc = subprocess.run(["sh", "-c", sc], env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert (ws / "f").read_text() == "feature"
+
+
 # -- pool-host clone off the dispatcher tick (t_915b8d2d) ------------------------------------------------------
 
 @pytest.fixture

@@ -1309,8 +1309,12 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     from hermes_cli.kanban_worker_hosts import WORKSPACE_MODE  # t_69e47673: pool workspace, never world-searchable
     return (
         f"set -e; w={w}; mkdir -p -m {WORKSPACE_MODE} -- \"$w\"; "
-        # the mirror is owned by the runner user: trust that one path only
-        f"export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0={m}; "
+        # the mirror is owned by the runner user: trust that one path only. APPENDED to the session's
+        # GIT_CONFIG_* list, never a reset of it: fleet-worker-shell puts the github.com credential helper there,
+        # and a reset left every pool-host clone of a private repo at "could not read Username" (t_4d8fb733).
+        f"sd={m}; n=${{GIT_CONFIG_COUNT:-0}}; "
+        "eval \"export GIT_CONFIG_KEY_$n=safe.directory GIT_CONFIG_VALUE_$n=\\\"\\$sd\\\"\"; "
+        "export GIT_CONFIG_COUNT=$((n + 1)); "
         "if [ -d \"$w/.git\" ]; then "
         f"[ \"$(git -C \"$w\" remote get-url origin)\" = {url} ] || exit 3; "
         + (f"( cd \"$w\" && {_carry_undo()}); " if carried else "") +
