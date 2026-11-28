@@ -12,6 +12,7 @@ then exits. The "restart" is the real ticker startup (``InProcessCronScheduler.s
 stop event already set): hard-kill pass, execution recovery, replay-marker pass.
 """
 
+import faulthandler
 import os
 import signal
 import subprocess
@@ -95,22 +96,48 @@ def _seed(no_agent: bool = False) -> None:
     save_jobs([job])
 
 
+# Each owner wait is bounded well below the harness's 60 s per-test cap, so a stalled owner fails
+# here, by phase, with every thread's stack, instead of as an anonymous cap red (t_489ab61e: two
+# CI runs on 2026-11-27 stalled this file past 60 s while every sibling test took 4-5 s).
+_OWNER_PHASE_S = 25
+
+
+def _owner_stalled(proc: subprocess.Popen, phase: str) -> None:
+    proc.send_signal(signal.SIGABRT)  # PYTHONFAULTHANDLER=1: the owner prints all thread stacks
+    try:
+        _, err = proc.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, err = proc.communicate(timeout=10)
+    pytest.fail(f"owner stalled {_OWNER_PHASE_S}s {phase}; its stacks:\n{(err or '')[-8000:]}")
+
+
 def _owner(home: Path, mode: str, sig: int) -> SimpleNamespace:
     """Run the claim + dispatch in a separate owner process, then stop it with ``sig``."""
+    import selectors
+
     env = {k: v for k, v in os.environ.items() if k != "HERMES_MACHINE_ID"}
     env["HERMES_HOME"] = str(home)
     env["PYTHONPATH"] = str(REPO)
+    env["PYTHONFAULTHANDLER"] = "1"
     proc = subprocess.Popen(
         [sys.executable, "-c", _OWNER, mode], cwd=str(REPO), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
+        with selectors.DefaultSelector() as sel:
+            sel.register(proc.stdout, selectors.EVENT_READ)
+            if not sel.select(_OWNER_PHASE_S):
+                _owner_stalled(proc, "before reaching the run")
         line = proc.stdout.readline().split()
         if not line or line[0] != "RUNNING":
             proc.kill()
             _, err = proc.communicate(timeout=30)
             pytest.fail(f"owner never reached the run: {line!r} {err[-3000:]}")
         proc.send_signal(sig)
-        out, err = proc.communicate(timeout=60)
+        try:
+            out, err = proc.communicate(timeout=_OWNER_PHASE_S)
+        except subprocess.TimeoutExpired:
+            _owner_stalled(proc, f"after signal {sig} without exiting")
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -158,7 +185,11 @@ def home(hermes_env, monkeypatch):
     monkeypatch.setattr(jobs_mod, "_overdue_oneshot_warned", {}, raising=False)
     pages = []
     monkeypatch.setattr(sr, "page_alerts", lambda key, text: pages.append((key, text)) or True)
-    return SimpleNamespace(path=hermes_env, pages=pages)
+    # A stall in this process (not the owner) still meets the 60 s harness cap; dump every
+    # thread's stack first so that red names where it waited (t_489ab61e).
+    faulthandler.dump_traceback_later(50, file=sys.__stderr__)
+    yield SimpleNamespace(path=hermes_env, pages=pages)
+    faulthandler.cancel_dump_traceback_later()
 
 
 def _shift_clock(monkeypatch, seconds: float) -> None:
