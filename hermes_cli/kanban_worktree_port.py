@@ -438,12 +438,13 @@ _port_faults: Dict[Tuple[str, str], Tuple[float, str]] = {}
 
 def mark_port_fault(host: str, slug: str, why: str, *, now: Optional[float] = None) -> None:
     now = time.time() if now is None else now
-    _port_faults[(str(host).lower(), str(slug).lower())] = (now + PORT_FAULT_SECONDS, str(why)[:200])
+    # slug compares byte-exact: port_for hands the same origin_slug to derived_route and run_port_clone
+    _port_faults[(str(host).lower(), str(slug))] = (now + PORT_FAULT_SECONDS, str(why)[:200])
 
 
 def port_fault(host: str, slug: str, *, now: Optional[float] = None) -> Optional[str]:
     """Why ``host`` cannot clone ``slug`` right now, or None."""
-    key = (str(host).lower(), str(slug).lower())
+    key = (str(host).lower(), str(slug))
     got = _port_faults.get(key)
     if got is None:
         return None
