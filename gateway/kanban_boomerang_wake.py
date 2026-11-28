@@ -2548,7 +2548,7 @@ _PATH_RE = re.compile(r"[\w~./-]+\.(?:md|txt)\b")
 # citation check) act on quoted text anywhere in a comment. Every interpolated field has its own allowlist and the
 # final body is checked against this grammar before the write.
 _STALE_READ_PATH = r"[A-Za-z0-9_./~-]{1,300}"
-_STALE_READ_KEY = r"[A-Za-z0-9_.:|-]{1,200}"
+_STALE_READ_KEY = r"[A-Za-z0-9_.:|#-]{1,200}"   # '#': gateway-minted <key>#deferred claims (Prism 07c006b857b0)
 _STALE_READ_DID = r"[A-Za-z0-9_.-]{1,80}"
 _STALE_READ_REASONS = (_OWNER_COMMENT_NEWER, _MERGED_REFUSAL, f"card done{_DONE_REFUSAL}",
                        f"card archived{_DONE_REFUSAL}")

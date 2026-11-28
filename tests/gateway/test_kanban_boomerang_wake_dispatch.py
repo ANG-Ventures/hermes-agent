@@ -684,6 +684,20 @@ def test_two_wakes_on_one_card_each_get_their_own_comment(env):
     assert len(_stale_read_comments(tid)) == 3
 
 
+def test_deferred_deadman_wake_still_gets_its_stale_read_comment(env):
+    """Prism 07c006b857b0 on #614 ae61783c: the gateway mints ``<key>#deferred`` claims when it releases a parked
+    deadman page; the grammar must accept that key, else the refusal leaves neither a turn nor a comment. RED on
+    ae61783c (record_stale_read returned False)."""
+    tid, entry = _owner_comment_card(env)
+    deferred = {**entry, "key": f"{entry['key']}#deferred"}
+    owner = {"action": "surface", "reason": "owner comment newer than handback"}
+    assert ah.record_stale_read(deferred, owner)
+    (comment,) = _stale_read_comments(tid)
+    assert comment.endswith(f"(wake {deferred['key']}) (delegation {entry['delegation_id']})"), comment
+    restart = {**deferred, "key": f"{deferred['key']}#restart1", "delegation_id": "del-20261128-000003-eeee"}
+    assert ah.record_stale_read(restart, owner) is False   # its restart is the same wake
+
+
 @pytest.mark.parametrize("stage", ["execute", "deliver"])
 def test_owner_comment_refusal_card_write_error_still_drops_with_no_turn(env, stage):
     """t_53549b28 r2: a card-write exception at either stage is logged; the row is still dropped, no chat turn."""
