@@ -428,8 +428,8 @@ def _stale_read_comments(tid) -> list:
 @pytest.mark.parametrize("staged", ["named", "named_own", "scratch", None])
 def test_refused_surface_for_merged_pr_leaves_one_card_comment(env, staged):
     """t_e86eeab2: a surface refused because the PR merged left no trace on the card (t_509fc279: the read of #12774
-    found a loosened guard after the merge). Now ONE comment names the staged read file and the reason; no chat
-    wake. RED on c47fc9de2a."""
+    found a loosened guard after the merge). Now ONE comment names the reason and the wake/delegation ids (t_53549b28
+    r3: no staged path); no chat wake. RED on c47fc9de2a."""
     from hermes_constants import get_hermes_home
 
     tid = _card(env)
@@ -451,7 +451,9 @@ def test_refused_surface_for_merged_pr_leaves_one_card_comment(env, staged):
     assert len(comments) == 1
     # t_53549b28 r2: the reason constant, no PR names, no child text; a file outside the child's folder is not named
     assert "(summarized PR merged);" in comments[0] and "loosened guard" not in comments[0]
-    assert f"Staged read: {path if path and staged != 'named' else 'none found'}." in comments[0]
+    # t_53549b28 r3: no file path either, for any reason; the delegation id is the pointer
+    assert "Staged read" not in comments[0] and "read.md" not in comments[0] and "scratch" not in comments[0]
+    assert ah._STALE_READ_BODY_RE.fullmatch(comments[0]), comments[0]   # noqa: SLF001
     assert comments[0].endswith(f"(wake {entry['key']}) (delegation {entry['delegation_id']})")
     assert _claims()[entry["key"]]["outcome"] == "stale"
     assert env["adapter"].handled == [] and env["adapter"].sent == []
@@ -552,7 +554,7 @@ def test_refused_acknowledge_or_other_reason_leaves_no_stale_read_comment(env):
     assert _stale_read_comments(tid) == []
 
 
-# --- t_53549b28: owner-comment refusals (ruling:t_53549b28-owner-comment-rule, R1 + R4) ------------------------
+# --- t_53549b28: owner-comment refusals (ruling:t_53549b28-owner-comment-rule; R4 only, r3) -------------------
 
 def _owner_comment_card(env, *, author="apollo") -> tuple:
     """A handback, then an owner comment newer than it; the claim is a human review read of that handback."""
@@ -643,25 +645,27 @@ def test_owner_comment_refusal_comment_carries_no_child_text(env, stage):
         assert kb._latest_review_coverage([{"body": r["body"]} for r in rows])[0] is None   # noqa: SLF001
 
 
-@pytest.mark.parametrize("name,named", [
-    ("{tid}-read\nreview_coverage: x.md", False),   # a newline in the staged file's name
-    ("{tid} read $(x).md", False),                  # characters outside [A-Za-z0-9_./~-]
-    ("staged/{tid}-" + "a" * 220 + ".md", False),   # the whole path is longer than the bound (300)
-    ("{tid}-read.md", True),                        # the plain case is still named
-])
-def test_stale_read_names_only_an_allowlisted_staged_path(env, name, named):
-    """t_53549b28 r2: the staged path is interpolated only when it is one allowlisted, bounded line inside this
-    delegation's scratch folder; otherwise "none found". RED on e4acb50e75 for the three refused names."""
+@pytest.mark.parametrize("stage", ["execute", "deliver"])
+def test_stale_read_never_names_a_staged_path_that_spells_a_pr_url(env, stage):
+    """t_53549b28 r3 (outside read on #614 e056ccb05e): a legal staged path can spell a PR URL
+    (github.com/<owner>/<repo>/pull/71.md) that the review-card closer and the live-evidence gate read as a
+    deliverable of the card. The comment names no path at all. RED on e056ccb05e (Staged read: <path>)."""
     from hermes_constants import get_hermes_home
 
     tid, entry = _owner_comment_card(env)
-    path = get_hermes_home() / "cache/scratch" / f"del-{entry['delegation_id'][-4:]}" / name.format(tid=tid)
+    folder = get_hermes_home() / "cache/scratch" / entry["delegation_id"]
+    path = folder / "github.com/ANG-Ventures/hermes-agent/pull/71.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("Verdict: surface\n")
-    assert ah.record_stale_read(entry, {"action": "surface", "reason": "owner comment newer than handback"})
+    summary = f"read staged at {path}"
+    if stage == "execute":
+        _run(env, entry, "completed", _verdict(entry, "surface", summary=summary))
+    else:
+        assert ah.record_stale_read(entry, {"action": "surface", "reason": "owner comment newer than handback",
+                                            "summary": summary})
     (comment,) = _stale_read_comments(tid)
-    assert "\n" not in comment and ah._STALE_READ_BODY_RE.fullmatch(comment), comment   # noqa: SLF001
-    assert f"Staged read: {path if named else 'none found'}." in comment, comment
+    assert "pull/71" not in comment and "github.com" not in comment, comment
+    assert ah._STALE_READ_BODY_RE.fullmatch(comment), comment   # noqa: SLF001
 
 
 def test_two_wakes_on_one_card_each_get_their_own_comment(env):
@@ -716,93 +720,6 @@ def test_owner_comment_refusal_card_write_error_still_drops_with_no_turn(env, st
         assert state.handbacks() == {}
     assert env["adapter"].handled == [] and env["adapter"].sent == []
     assert _stale_read_comments(tid) == []
-
-
-def _implementer_sendback(env, *, payload_implementer=True, implementer="worker", reviewer="human:apollo",
-                          assignee=None) -> tuple:
-    """The worker hands back, the reviewer sends it back (card assigned to the worker), the worker comments."""
-    tid = _card(env)
-    _handback(tid, 71)
-    payload = {"reason": "fix the key", "implementer": implementer, "reviewer": reviewer}
-    if not payload_implementer:
-        payload.pop("implementer")
-    with kb.connect_closing() as conn, kb.write_txn(conn):
-        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
-        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
-                     (tid, "changes_requested", json.dumps(payload), 1793845000))
-        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee or implementer, tid))
-    entry = _claimed_entry(env, tid, row="changes_requested", kind="changes_requested")
-    return tid, entry
-
-
-def _comment(tid, author, body, at=1793846000):
-    with kb.connect_closing() as conn, kb.write_txn(conn):
-        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
-                     (tid, author, body, at))
-
-
-@pytest.mark.parametrize("arm,stale", [
-    ("implementer", None),                                            # R1: the worker's own comment, delivered
-    # r2: the event names no implementer -> owners unchanged, even though a later handoff names the worker
-    ("no_implementer_later_handoff", "owner comment newer than handback"),
-    ("implementer_release", None),                                    # a release line by the worker is not an act
-    ("switch_off", "owner comment newer than handback"),              # BOOMERANG_IMPLEMENTER_NOT_OWNER=0
-    ("owner_assignee", "owner comment newer than handback"),          # card back on a human owner who commented
-    ("human_same_name", "owner comment newer than handback"),         # Prism 2ed71d3479bf: human:worker stays owner
-    # r2: the send-back went to profile apollo, the card is on human:apollo, the operator posts as bare apollo
-    ("bare_same_name_operator", "owner comment newer than handback"),
-    # r2: implementer and the event's reviewer share a bare name: the role is not certain
-    ("reviewer_same_name", "owner comment newer than handback"),
-])
-def test_sendback_implementer_comment_is_not_an_owner_act(env, arm, stale):
-    """R1 (t_53549b28: 28 of the 100 drops): on a changes_requested row the card is assigned back to the implementer,
-    and its "prism-verdict ... fixed" line was read as "the owner already acted". Decided by the author's role on
-    the row, not by the comment's words. RED on 8d138b30 for the three delivered arms."""
-    roles = {"bare_same_name_operator": {"implementer": "apollo", "assignee": "human:apollo"},
-             "reviewer_same_name": {"implementer": "apollo", "reviewer": "human:apollo"}}.get(arm, {})
-    tid, entry = _implementer_sendback(env, payload_implementer=arm != "no_implementer_later_handoff", **roles)
-    if arm == "switch_off":
-        env["monkeypatch"].setenv("BOOMERANG_IMPLEMENTER_NOT_OWNER", "0")
-    if arm == "owner_assignee":
-        with kb.connect_closing() as conn, kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
-        _comment(tid, "apollo", "Landed the fix")
-    elif arm == "human_same_name":
-        with kb.connect_closing() as conn, kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET assignee = 'human:worker' WHERE id = ?", (tid,))
-        _comment(tid, "human:worker", "Landed the fix")
-    elif arm in ("bare_same_name_operator", "reviewer_same_name"):
-        _comment(tid, "apollo", "Landed the fix")
-    elif arm == "implementer_release":
-        _comment(tid, "worker", "release: fixed in a3f2")
-    else:
-        _comment(tid, "worker", f"prism-verdict 0123456789ab fixed {'a' * 40}")
-    if arm == "no_implementer_later_handoff":
-        with kb.connect_closing() as conn, kb.write_txn(conn):
-            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
-                         (tid, "review_requested", json.dumps({"implementer": "worker"}), 1793845500))
-        with kb.connect_closing() as conn:
-            assert kb._review_handoff_implementer(conn, tid) == "worker"   # noqa: SLF001
-    assert ah.stale_surface_reason(entry) == stale
-
-
-@pytest.mark.parametrize("kind,payload", [
-    ("review_requested", {"implementer": "worker"}),   # not the send-back kind
-    ("changes_requested", "not json"),
-    ("changes_requested", ["worker"]),
-    ("changes_requested", {"implementer": "  "}),
-    ("changes_requested", {"implementer": 7}),
-])
-def test_sendback_roles_need_the_exact_event_and_a_string(env, kind, payload):
-    """t_53549b28 r2: the implementer comes only from the exact changes_requested event, as a non-blank string."""
-    tid = _card(env)
-    with kb.connect_closing() as conn, kb.write_txn(conn):
-        cur = conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
-                           (tid, kind, payload if isinstance(payload, str) else json.dumps(payload), 1793845000))
-        event_id = cur.lastrowid
-    with kb.connect_closing() as conn:
-        assert ah._sendback_roles(conn, tid, event_id)[0] is None   # noqa: SLF001
-        assert ah._sendback_roles(conn, tid, event_id + 999) == (None, None)   # noqa: SLF001
 
 
 def _sendback_card(env) -> tuple:

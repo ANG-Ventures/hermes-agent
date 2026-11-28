@@ -1723,44 +1723,6 @@ def merged_open_deliver_enabled() -> bool:
     return os.environ.get("BOOMERANG_MERGED_OPEN_DELIVER") != "0"
 
 
-#: t_53549b28 R1 (ruling:t_53549b28-owner-comment-rule): on a changes_requested row the board hands the card back to
-#: the implementer, so the card's assignee is the worker. Its own comments ("prism-verdict ... fixed", a scope split)
-#: are not an owner act on the read: decided by the author's role on the row, never by comment text. 11-23..11-28:
-#: 28 of 100 "owner comment newer" drops. Kill switch: BOOMERANG_IMPLEMENTER_NOT_OWNER=0.
-def implementer_not_owner_enabled() -> bool:
-    return os.environ.get("BOOMERANG_IMPLEMENTER_NOT_OWNER") != "0"
-
-
-def _sendback_roles(conn: Any, task_id: str, event_id: Any) -> tuple:
-    """``(implementer, reviewer)`` of the exact ``changes_requested`` event ``event_id``. The implementer is None
-    unless that event exists, is of that kind, has a JSON object payload and names a non-blank string implementer:
-    no fallback to another handoff (an uncertain role leaves the owners unchanged)."""
-    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND id = ?",
-                       (task_id, event_id)).fetchone()
-    if not row or row["kind"] != "changes_requested":
-        return None, None
-    try:
-        payload = json.loads(row["payload"] or "")
-    except (TypeError, ValueError):
-        return None, None
-    if not isinstance(payload, dict):
-        return None, None
-    implementer, reviewer = payload.get("implementer"), payload.get("reviewer")
-    implementer = implementer.strip() if isinstance(implementer, str) else ""
-    reviewer = reviewer.strip() if isinstance(reviewer, str) else ""
-    return implementer or None, reviewer or None
-
-
-def _implementer_role_certain(implementer: str, reviewer: Optional[str], slots: tuple) -> bool:
-    """R1 applies only when no other identity on the row shares the implementer's bare name: the event's reviewer,
-    or an owner / assignee slot spelled differently from the implementer (``human:apollo`` vs ``apollo``). An
-    implementer that is itself a ``human:`` lane is never certain to be the worker."""
-    if implementer.startswith("human:"):
-        return False
-    others = [reviewer or ""] + [slot for slot in slots if slot and slot != implementer]
-    return implementer not in {name.removeprefix("human:") for name in others if name}
-
-
 #: t_53549b28 R4: a surface refused as "owner comment newer than handback" is written to the card as ONE comment, with
 #: no chat turn, so the read is not lost (94 of 100 such drops left nothing on the card). Kill switch:
 #: BOOMERANG_OWNER_COMMENT_CARD_READ=0 (the read is dropped with no trace, as before).
@@ -1816,11 +1778,6 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False, surfaced: bool
         owners = {name.removeprefix("human:") for name in
                   (owner, str(_field(task, "assignee") or "")) if name}
         owners |= {f"human:{name}" for name in owners}
-        if sendback and implementer_not_owner_enabled():
-            implementer, reviewer = _sendback_roles(conn, entry["task_id"], event_id)
-            if implementer and _implementer_role_certain(implementer, reviewer,
-                                                         (owner, str(_field(task, "assignee") or ""))):
-                owners -= {implementer, f"human:{implementer}"}
         comments = [c for c in kb.list_comments(conn, entry["task_id"])
                     if str(c.author) not in {"boomerang-wake", "kanban-dispatcher"}
                     and not str(c.author).startswith("unverified:")
@@ -2264,10 +2221,10 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
             if why:
                 if why == _OWNER_COMMENT_NEWER:
                     # t_53549b28 R4: the read goes to the card (no chat turn) before its row is dropped.
-                    try:   # the turn is read only to find a staged file; none of its text goes to the card
+                    try:   # none of the turn's text goes to the card
                         await asyncio.to_thread(record_stale_read, {
                             **guard_entry, "key": guard_entry.get("key") or row.get("claim_key") or delegation_id},
-                            {"action": "surface", "reason": why, "summary": row.get("turn") or row.get("line")})
+                            {"action": "surface", "reason": why})
                     except Exception as exc:
                         logger.warning("kanban boomerang-wake: stale-read comment on %s not written: %s",
                                        row.get("task_id"), exc)
@@ -2543,18 +2500,18 @@ _MERGED_REFUSAL = "summarized PR merged"
 _DONE_REFUSAL = " after send-back"   # stale_surface_reason rule (a): "card <status> after send-back"
 _STALE_READ_HEAD = f"{MARKER} stale surface refused"
 _PATH_RE = re.compile(r"[\w~./-]+\.(?:md|txt)\b")
-# t_53549b28 (Apollo send-back on #614 r2): the stale-read comment is fixed words plus opaque pointers, never child
-# text: unanchored, author-blind readers (unblock sweep, archive CLOSED:, closer-echo review_coverage, the ruling
-# citation check) act on quoted text anywhere in a comment. Every interpolated field has its own allowlist and the
-# final body is checked against this grammar before the write.
-_STALE_READ_PATH = r"[A-Za-z0-9_./~-]{1,300}"
+# t_53549b28 (Apollo send-backs on #614 r2, r3): the stale-read comment is fixed words plus the wake and delegation
+# ids, never child text and never a file path (a legal path can spell a PR URL the closer reads): unanchored,
+# author-blind readers (unblock sweep, archive CLOSED:, closer-echo review_coverage, the ruling citation check) act on
+# quoted text anywhere in a comment. Every interpolated field has its own allowlist and the final body is checked
+# against this grammar before the write.
 _STALE_READ_KEY = r"[A-Za-z0-9_.:|#-]{1,200}"   # '#': gateway-minted <key>#deferred claims (Prism 07c006b857b0)
 _STALE_READ_DID = r"[A-Za-z0-9_.-]{1,80}"
 _STALE_READ_REASONS = (_OWNER_COMMENT_NEWER, _MERGED_REFUSAL, f"card done{_DONE_REFUSAL}",
                        f"card archived{_DONE_REFUSAL}")
 _STALE_READ_BODY_RE = re.compile(
     rf"{re.escape(_STALE_READ_HEAD)} \((?:{'|'.join(map(re.escape, _STALE_READ_REASONS))})\); "
-    rf"the child's read was not delivered\. Staged read: (?:none found|{_STALE_READ_PATH})\. "
+    rf"the child's read was not delivered\. "
     rf"\(wake {_STALE_READ_KEY}\) \(delegation {_STALE_READ_DID}\)")
 _STALE_READ_TAG_RE = re.compile(rf"\(wake ({_STALE_READ_KEY})\) \(delegation {_STALE_READ_DID}\)\Z")
 
@@ -2592,44 +2549,23 @@ def _stale_read_reason(reason: str) -> Optional[str]:
     return reason if reason in _STALE_READ_REASONS else None
 
 
-def _stale_read_pointer(entry: dict, staged: Optional[str]) -> Optional[str]:
-    """``staged`` when it is one allowlisted line that resolves inside this delegation's own scratch folder."""
-    from hermes_constants import get_hermes_home
-
-    did = str(entry.get("delegation_id") or "")
-    if not staged or not did or not re.fullmatch(_STALE_READ_PATH, staged):
-        return None
-    scratch = Path(get_hermes_home()) / "cache" / "scratch"
-    try:
-        real = os.path.realpath(staged)
-        roots = [os.path.realpath(scratch / name) for name in (did, f"del-{did[-4:]}")]
-    except (OSError, ValueError):
-        return None
-    return staged if any(real.startswith(root + os.sep) for root in roots) else None
-
-
 def record_stale_read(entry: dict, result: dict) -> bool:
     """t_e86eeab2: ONE card comment when a child's ``surface`` was refused because the PR merged, or (round 3) because
     the card was done/archived after a send-back, or (t_53549b28 R4, kill switch BOOMERANG_OWNER_COMMENT_CARD_READ=0)
     because an owner comment is newer than the handback. No chat wake; the refusal otherwise leaves no trace.
 
-    The body is fixed words and opaque pointers only (t_53549b28 r2): the reason constant, the staged read file if it
-    passes :func:`_stale_read_pointer` (else ``none found``), and ``(wake <key>) (delegation <id>)``. The child's
-    words stay in the staged file and the transcript. Deduped on the WAKE (claim key without its ``#restartN``
-    suffix) read from the exact trailing tag of this author's comments, since a restart redispatch of the same wake
-    mints a new delegation id. Any other refusal or action, or a body outside the grammar, writes nothing."""
+    The body is fixed words and the ids only (t_53549b28 r2, r3): the reason constant, then ``(wake <key>)
+    (delegation <id>)``. The delegation id is the pointer: the child's read is in that delegation's folder and
+    transcript. Deduped on the WAKE (claim key without its ``#restartN`` suffix) read from the exact trailing tag of
+    this author's comments, since a restart redispatch of the same wake mints a new delegation id. Any other refusal or action, or a body outside the grammar, writes nothing."""
     reason = _stale_read_reason(str(result.get("reason") or ""))
     if result.get("action") != "surface" or reason is None:
         return False
     from hermes_cli import kanban_db as kb
 
     wake_key = str(entry["key"]).split("#restart", 1)[0]
-    staged = _stale_read_pointer(entry, _staged_read(
-        entry, [result.get("detail"), *(result.get("evidence") or []), result.get("summary")]))
-    if staged is None:   # a named file outside the child's folder: look in the folder itself
-        staged = _stale_read_pointer(entry, _staged_read(entry, []))
     body = (f"{_STALE_READ_HEAD} ({reason}); the child's read was not delivered. "
-            f"Staged read: {staged or 'none found'}. (wake {wake_key}) (delegation {entry['delegation_id']})")
+            f"(wake {wake_key}) (delegation {entry['delegation_id']})")
     if not _STALE_READ_BODY_RE.fullmatch(body):
         logger.warning("kanban boomerang-wake: stale-read comment on %s not written: body outside the grammar",
                        entry.get("task_id"))
