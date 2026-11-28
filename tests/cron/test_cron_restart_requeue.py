@@ -352,13 +352,17 @@ def test_requeues_in_one_scan_are_staggered(env, monkeypatch):
     from datetime import datetime
     from cron import jobs as cj
 
-    a = _make_named_job("fleet-config-lint")
-    b = _make_named_job("fleet-upstream-leak-lint")
+    # Pin the clock for the whole test and schedule the jobs 12 h from it. A fixed "0 3 * * *"
+    # put the natural run inside the 300 s slot when the suite ran 02:55-03:00 in the cron TZ,
+    # and the cadence cap (t_f1302096) then clamped the gap to 139 s (CI 2026-11-28, t_c0e6d7d5).
+    t0 = cj._hermes_now()
+    monkeypatch.setattr(cj, "_hermes_now", lambda: t0)
+    daily_at = f"0 {(t0.hour + 12) % 24} * * *"
+    a = _make_named_job("fleet-config-lint", daily_at)
+    b = _make_named_job("fleet-upstream-leak-lint", daily_at)
     assert cj.request_restart_requeue(a["id"], "restart") is True
     assert cj.request_restart_requeue(b["id"], "restart") is True
 
-    t0 = cj._hermes_now()
-    monkeypatch.setattr(cj, "_hermes_now", lambda: t0)
     due_ids = {j["id"] for j in cj.get_due_jobs()}
     rows = [cj.get_job(a["id"]), cj.get_job(b["id"])]
     for row in rows:
